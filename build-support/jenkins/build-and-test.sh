@@ -400,7 +400,7 @@ if [ "$BUILD_JAVA" == "1" ]; then
     EXTRA_MVN_FLAGS="$EXTRA_MVN_FLAGS -Dfailsafe.rerunFailingTestsCount=3"
     EXTRA_MVN_FLAGS="$EXTRA_MVN_FLAGS -Dmaven.javadoc.skip"
     EXTRA_MVN_FLAGS="$EXTRA_MVN_FLAGS $MVN_FLAGS"
-    if ! mvn $EXTRA_MVN_FLAGS clean verify ; then
+    if ! mvn $EXTRA_MVN_FLAGS -PbuildCSD clean verify ; then
       TESTS_FAILED=1
       FAILURES="$FAILURES"$'Java Maven build/test failed\n'
     fi

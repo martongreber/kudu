@@ -63,6 +63,7 @@
         <maven-surefire-plugin.version>2.21.0</maven-surefire-plugin.version>
         <scala-maven-plugin.version>3.3.2</scala-maven-plugin.version>
         <mvn-scalafmt-plugin.version>0.7_1.4.0</mvn-scalafmt-plugin.version>
+        <schema-validator-maven-plugin.version>5.10.0</schema-validator-maven-plugin.version>
 
         <!-- Library dependencies -->
         <async.version>1.4.1</async.version>
@@ -351,6 +352,26 @@
             </plugin>
         </plugins>
     </build>
+
+    <pluginRepositories>
+        <!-- For schema-validator-maven-plugin -->
+        <pluginRepository>
+            <id>schema-validator-maven-plugin</id>
+            <url>https://repository.cloudera.com/artifactory/cloudera-repos</url>
+            <name>Cloudera Plugin Repositories</name>
+        </pluginRepository>
+    </pluginRepositories>
+
+    <repositories>
+        <repository>
+            <id>cdh.repo</id>
+            <url>https://repository.cloudera.com/artifactory/cloudera-repos</url>
+            <name>Cloudera Repositories</name>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+        </repository>
+    </repositories>
 
     <profiles>
         <!-- Build the jepsen test for Kudu.

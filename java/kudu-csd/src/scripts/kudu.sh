@@ -31,7 +31,7 @@ export KUDU_HOME=${KUDU_HOME:-$CDH_KUDU_HOME}
 export KUDU_HOME=${KUDU_HOME:-$DEFAULT_KUDU_HOME}
 
 CMD=$1
-shift 2
+shift 1
 
 function log {
   timestamp=$(date)
@@ -142,6 +142,10 @@ elif [ "$CMD" = "tserver" ]; then
   exec "$KUDU_HOME/sbin/kudu-tserver" \
     $KUDU_ARGS \
     --flagfile="$GFLAG_FILE"
+elif [ "$CMD" = "diagnostics" ]; then
+  LOG_DIR=$1
+  shift 1
+  python scripts/gather_diagnostics.py "$LOG_DIR" "$PWD" "$MASTER_IPS"
 else
   log "Unknown command: $CMD"
   exit 2

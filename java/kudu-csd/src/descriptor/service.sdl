@@ -182,6 +182,17 @@
           "default" : "/var/log/kudu"
         }
       ],
+      "supportBundle" : {
+        "description": "Runs and collects the output from ksck, a tool for diagnosing the health of a Kudu cluster.",
+        "runMode" : "single",
+        "runner" : {
+          "program": "scripts/kudu.sh",
+          "args": [
+            "diagnostics",
+            "${log_dir}"
+          ]
+        }
+      },
       "configWriter" : {
         "generators" : [
           {

@@ -35,7 +35,8 @@ ext {
   // These properties can be set in ~/.gradle/gradle.properties file,
   // though it would be open text. They can also be set on the cli via
   // -PmavenUsername and -PmavenPassword.
-  mavenPublishUrl = propertyWithDefault("mavenPublishUrl", "")
+  // Adjusted to use the derived repositoryUrl from cdh.gradle
+  mavenPublishUrl = propertyWithDefault("repositoryUrl", "")
   mavenUsername = propertyWithDefault("mavenUsername", "")
   mavenPassword = propertyWithDefault("mavenPassword", "")
 }

@@ -18,6 +18,9 @@
 // This file contains the dependencies required for the gradle build itself.
 
 repositories {
+  // The mavenArtifactoryUrl is hard coded because the buildSrc project does not have access to
+  // the gradle.properties file: https://github.com/gradle/gradle/issues/1001
+  maven { url "http://maven.jenkins.cloudera.com:8081/artifactory/cloudera-mirrors" }
   mavenCentral()
   jcenter()
   maven { url "http://clojars.org/repo" } // Only used for the clojure plugin below.

@@ -28,3 +28,6 @@ include "kudu-jepsen"
 include "kudu-mapreduce"
 include "kudu-spark"
 include "kudu-spark-tools"
+
+include "kudu-csd"
+include "kudu-csd-5.10"

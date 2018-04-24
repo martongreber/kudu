@@ -93,7 +93,7 @@ def load_historical_metrics():
   for path in sorted(os.listdir(old_dir), key=LooseVersion):
     if not path.endswith(".json") or path.startswith("."):
       continue
-    j = json.load(file(os.path.join(old_dir, path)))
+    j = json.load(open(os.path.join(old_dir, path)))
     old_metrics.update((m['name'], m) for m in j['metrics'])
   return old_metrics.values()
 

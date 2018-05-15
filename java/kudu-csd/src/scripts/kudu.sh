@@ -142,10 +142,14 @@ elif [ "$CMD" = "tserver" ]; then
   exec "$KUDU_HOME/sbin/kudu-tserver" \
     $KUDU_ARGS \
     --flagfile="$GFLAG_FILE"
-elif [ "$CMD" = "diagnostics" ]; then
+elif [ "$CMD" = "diagnostics-master" ]; then
   LOG_DIR=$1
   shift 1
-  python scripts/gather_diagnostics.py "$LOG_DIR" "$PWD" "$MASTER_IPS"
+  python scripts/gather_diagnostics.py "master" "$LOG_DIR" "$PWD" "$MASTER_IPS"
+elif [ "$CMD" = "diagnostics-tserver" ]; then
+  LOG_DIR=$1
+  shift 1
+  python scripts/gather_diagnostics.py "tserver" "$LOG_DIR" "$PWD" "$MASTER_IPS"
 else
   log "Unknown command: $CMD"
   exit 2

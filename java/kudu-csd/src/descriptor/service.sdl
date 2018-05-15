@@ -183,12 +183,12 @@
         }
       ],
       "supportBundle" : {
-        "description": "Runs and collects the output from ksck, a tool for diagnosing the health of a Kudu cluster.",
-        "runMode" : "single",
+        "description": "Collects ksck and the diagnostics logs for support bundles.",
+        "runMode" : "all",
         "runner" : {
           "program": "scripts/kudu.sh",
           "args": [
-            "diagnostics",
+            "diagnostics-master",
             "${log_dir}"
           ]
         }
@@ -359,6 +359,17 @@
          "certificateLocationConfigName" : "webserver_certificate_file",
          "privateKeyPasswordConfigName" : "webserver_private_key_password_cmd",
          "privateKeyPasswordScriptBased" : "true"
+      },
+      "supportBundle" : {
+        "description": "Collects the diagnostics logs for support bundles.",
+        "runMode" : "all",
+        "runner" : {
+        "program": "scripts/kudu.sh",
+          "args": [
+            "diagnostics-tserver",
+            "${log_dir}"
+          ]
+        }
       },
       "configWriter" : {
         "generators" : [

@@ -112,39 +112,6 @@
         }
       ],
       "topology" : { "minInstances" : 1 },
-      "healthAggregation" : {
-        "type" : "nonSingleton",
-        "percentGreenForGreen" : 80.1,
-        "percentYellowGreenForYellow" : 60.0
-      },
-      "healthTests" : [
-        {
-          "type" : "metric",
-          "name" : "FULL_DATA_DIRS",
-          "label" : "Full Data Directories",
-          "description" : "Test for whether any Kudu data directories are full.",
-          "metric" : "kudu_data_dirs_full",
-          "timeWindowSec" : 60,
-          "comparisonOperator" : "gt",
-          "aggregationFunction" : "last",
-          "greenMessage" : "There are no full Kudu data directories.",
-          "redThreshold" : 0,
-          "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
-        },
-        {
-          "type" : "metric",
-          "name" : "FAILED_DATA_DIRS",
-          "label" : "Failed Data Directories",
-          "description" : "Test for whether any Kudu data directories have failed. This is usually a sign of a disk problem. For details and information about recovery, see https://www.cloudera.com/documentation/enterprise/latest/topics/kudu_administration_cli.html#disk_failure.",
-          "metric" : "kudu_data_dirs_failed",
-          "timeWindowSec" : 60,
-          "comparisonOperator" : "gt",
-          "aggregationFunction" : "last",
-          "greenMessage" : "There are no failed Kudu data directories.",
-          "redThreshold" : 0,
-          "redMessage" : "There are ${metric.value} failed Kudu data directories on this host."
-        }
-      ],
       "parameters" : [
         {
           "name" : "webserver_port",
@@ -301,39 +268,6 @@
         }
       ],
       "topology" : { "minInstances" : 1 },
-      "healthAggregation" : {
-        "type" : "nonSingleton",
-        "percentGreenForGreen" : 75.0,
-        "percentYellowGreenForYellow" : 50.0
-      },
-      "healthTests" : [
-        {
-          "type" : "metric",
-          "name" : "FULL_DATA_DIRS",
-          "label" : "Full Data Directories",
-          "description" : "Test for whether any Kudu data directories are full.",
-          "metric" : "kudu_data_dirs_full",
-          "timeWindowSec" : 60,
-          "comparisonOperator" : "gt",
-          "aggregationFunction" : "last",
-          "greenMessage" : "There are no full Kudu data directories.",
-          "redThreshold" : 0,
-          "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
-        },
-        {
-          "type" : "metric",
-          "name" : "FAILED_DATA_DIRS",
-          "label" : "Failed Data Directories",
-          "description" : "Test for whether any Kudu data directories have failed. This is usually a sign of a disk problem. For details and information about recovery, see https://www.cloudera.com/documentation/enterprise/latest/topics/kudu_administration_cli.html#disk_failure.",
-          "metric" : "kudu_data_dirs_failed",
-          "timeWindowSec" : 60,
-          "comparisonOperator" : "gt",
-          "aggregationFunction" : "last",
-          "greenMessage" : "There are no failed Kudu data directories.",
-          "redThreshold" : 0,
-          "redMessage" : "There are ${metric.value} failed Kudu data directories on this host."
-        }
-      ],
       "parameters" : [
         {
           "name" : "webserver_interface",

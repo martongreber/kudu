@@ -21,9 +21,12 @@
 #   http://github.mtv.cloudera.com/CDH/cdh/blob/cdh6.x/README_cauldron.md#branching-and-branch-names
 set -exu
 
-# Update cdh suffix in version.txt and python/setup.py
+# Update cdh suffix in version.txt and python/setup.py. Note that
+# version.txt may optionally include a -SNAPSHOT suffix, while
+# python/setup.py contains just the raw version.
 PREV_FULL_VERSION=$(cat version.txt)
-perl -077 -i -pe "s/cdh$CDH_START_VERSION/cdh$CDH_NEW_VERSION/" python/setup.py version.txt
+perl -077 -i -pe "s/cdh$CDH_START_VERSION/cdh$CDH_NEW_VERSION/" python/setup.py
+perl -077 -i -pe "s/cdh$CDH_START_MAVEN_VERSION/cdh$CDH_NEW_MAVEN_VERSION/" version.txt
 
 # Update cm versions
 perl -077 -i -pe "s/$CM_START_VERSION/$CM_NEW_VERSION/" java/kudu-csd*/src/descriptor/service.sdl

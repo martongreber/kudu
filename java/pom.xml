@@ -382,7 +382,8 @@
             <modules>
                 <module>kudu-csd</module>
                 <module>kudu-csd-5.10</module>
-           </modules>
+                <module>kudu-csd-5.15</module>
+            </modules>
         </profile>
 
         <!-- Build the jepsen test for Kudu.

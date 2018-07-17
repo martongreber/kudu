@@ -381,8 +381,8 @@
             <id>buildCSD</id>
             <modules>
                 <module>kudu-csd</module>
+                <module>kudu-csd-6.0</module>
                 <module>kudu-csd-5.10</module>
-                <module>kudu-csd-5.15</module>
             </modules>
         </profile>
 

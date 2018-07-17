@@ -22,7 +22,7 @@
   "compatibility" : {
     "generation" : 1,
     "cdhVersion" : {
-      "min" : "5.11.0"
+      "min" : "6.1.0"
     }
   },
   "runAs" : {

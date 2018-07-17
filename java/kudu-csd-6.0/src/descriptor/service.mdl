@@ -537,6 +537,30 @@
                     "label": "Leader Memory Pressure Rejections"
                 }, 
                 {
+                    "numeratorUnit": "operations", 
+                    "description": "Number of log GC operations currently running.", 
+                    "context": "log_gc_running::value", 
+                    "name": "kudu_log_gc_running", 
+                    "counter": false, 
+                    "label": "Log GCs Running"
+                }, 
+                {
+                    "numeratorUnit": "samples", 
+                    "description": "Time spent garbage collecting the logs. This is the total number of recorded samples.", 
+                    "context": "log_gc_duration::total_count", 
+                    "name": "kudu_log_gc_duration_count", 
+                    "counter": true, 
+                    "label": "Log GC Duration: Samples"
+                }, 
+                {
+                    "numeratorUnit": "milliseconds", 
+                    "description": "Time spent garbage collecting the logs. This is the total sum of recorded samples.", 
+                    "context": "log_gc_duration::total_sum", 
+                    "name": "kudu_log_gc_duration_sum", 
+                    "counter": true, 
+                    "label": "Log GC Duration: Total"
+                }, 
+                {
                     "numeratorUnit": "samples", 
                     "description": "Number of operations waiting to be prepared within this tablet. High queue lengths indicate that the server is unable to process operations as fast as they are being written to the WAL. This is the total number of recorded samples.", 
                     "context": "op_prepare_queue_length::total_count", 
@@ -634,30 +658,6 @@
                 }, 
                 {
                     "numeratorUnit": "operations", 
-                    "description": "Number of log GC operations currently running.", 
-                    "context": "log_gc_running::value", 
-                    "name": "kudu_log_gc_running", 
-                    "counter": false, 
-                    "label": "Log GCs Running"
-                }, 
-                {
-                    "numeratorUnit": "samples", 
-                    "description": "Time spent garbage collecting the logs. This is the total number of recorded samples.", 
-                    "context": "log_gc_duration::total_count", 
-                    "name": "kudu_log_gc_duration_count", 
-                    "counter": true, 
-                    "label": "Log GC Duration: Samples"
-                }, 
-                {
-                    "numeratorUnit": "milliseconds", 
-                    "description": "Time spent garbage collecting the logs. This is the total sum of recorded samples.", 
-                    "context": "log_gc_duration::total_sum", 
-                    "name": "kudu_log_gc_duration_sum", 
-                    "counter": true, 
-                    "label": "Log GC Duration: Total"
-                }, 
-                {
-                    "numeratorUnit": "operations", 
                     "description": "Number of operations in the leader queue ack'd by a majority but not all peers. This metric is always zero for followers.", 
                     "context": "majority_done_ops::value", 
                     "name": "kudu_majority_done_ops", 
@@ -711,6 +711,22 @@
                     "name": "kudu_raft_term", 
                     "counter": false, 
                     "label": "Current Raft Consensus Term"
+                }, 
+                {
+                    "numeratorUnit": "units", 
+                    "description": "Number of failed elections on this node since there was a stable leader. This number increments on each failed election and resets on each successful one.", 
+                    "context": "failed_elections_since_stable_leader::value", 
+                    "name": "kudu_failed_elections_since_stable_leader", 
+                    "counter": false, 
+                    "label": "Failed Elections Since Stable Leader"
+                }, 
+                {
+                    "numeratorUnit": "milliseconds", 
+                    "description": "The time elapsed since the last heartbeat from the leader in milliseconds. This metric is identically zero on a leader replica.", 
+                    "context": "time_since_last_leader_heartbeat::value", 
+                    "name": "kudu_time_since_last_leader_heartbeat", 
+                    "counter": false, 
+                    "label": "Time Since Last Leader Heartbeat"
                 }, 
                 {
                     "numeratorUnit": "bytes", 
@@ -854,6 +870,62 @@
         {
             "metricDefinitions": [
                 {
+                    "numeratorUnit": "tablets", 
+                    "description": "The difference between the number of replicas on the tablet server hosting the most replicas and the number of replicas on the tablet server hosting the least replicas.", 
+                    "context": "cluster_replica_skew::value", 
+                    "name": "kudu_cluster_replica_skew", 
+                    "counter": false, 
+                    "label": "Cluster Replica Skew"
+                }, 
+                {
+                    "numeratorUnit": "scanners", 
+                    "description": "Number of scanners that have expired due to inactivity since service start", 
+                    "context": "scanners_expired::value", 
+                    "name": "kudu_scanners_expired", 
+                    "counter": true, 
+                    "label": "Scanners Expired"
+                }, 
+                {
+                    "numeratorUnit": "samples", 
+                    "description": "Histogram of the duration of active scanners on this server. This is the total number of recorded samples.", 
+                    "context": "scanner_duration::total_count", 
+                    "name": "kudu_scanner_duration_count", 
+                    "counter": true, 
+                    "label": "Scanner Duration: Samples"
+                }, 
+                {
+                    "numeratorUnit": "microseconds", 
+                    "description": "Histogram of the duration of active scanners on this server. This is the total sum of recorded samples.", 
+                    "context": "scanner_duration::total_sum", 
+                    "name": "kudu_scanner_duration_sum", 
+                    "counter": true, 
+                    "label": "Scanner Duration: Total"
+                }, 
+                {
+                    "numeratorUnit": "scanners", 
+                    "description": "Number of scanners that are currently active", 
+                    "context": "active_scanners::value", 
+                    "name": "kudu_active_scanners", 
+                    "counter": false, 
+                    "label": "Active Scanners"
+                }, 
+                {
+                    "numeratorUnit": "bytes", 
+                    "description": "Number of bytes fetched during tablet copy operations since server start", 
+                    "context": "tablet_copy_bytes_fetched::value", 
+                    "name": "kudu_tablet_copy_bytes_fetched", 
+                    "counter": true, 
+                    "label": "Bytes Fetched By Tablet Copy"
+                }, 
+                {
+                    "numeratorUnit": "sessions", 
+                    "description": "Number of currently open tablet copy client sessions on this server", 
+                    "context": "tablet_copy_open_client_sessions::value", 
+                    "name": "kudu_tablet_copy_open_client_sessions", 
+                    "counter": false, 
+                    "label": "Open Table Copy Client Sessions"
+                }, 
+                {
                     "numeratorUnit": "bytes", 
                     "description": "Number of bytes sent during tablet copy operations since server start", 
                     "context": "tablet_copy_bytes_sent::value", 
@@ -932,54 +1004,6 @@
                     "name": "kudu_tablets_num_shutdown", 
                     "counter": false, 
                     "label": "Number of Shut Down Tablets"
-                }, 
-                {
-                    "numeratorUnit": "scanners", 
-                    "description": "Number of scanners that are currently active", 
-                    "context": "active_scanners::value", 
-                    "name": "kudu_active_scanners", 
-                    "counter": false, 
-                    "label": "Active Scanners"
-                }, 
-                {
-                    "numeratorUnit": "bytes", 
-                    "description": "Number of bytes fetched during tablet copy operations since server start", 
-                    "context": "tablet_copy_bytes_fetched::value", 
-                    "name": "kudu_tablet_copy_bytes_fetched", 
-                    "counter": true, 
-                    "label": "Bytes Fetched By Tablet Copy"
-                }, 
-                {
-                    "numeratorUnit": "sessions", 
-                    "description": "Number of currently open tablet copy client sessions on this server", 
-                    "context": "tablet_copy_open_client_sessions::value", 
-                    "name": "kudu_tablet_copy_open_client_sessions", 
-                    "counter": false, 
-                    "label": "Open Table Copy Client Sessions"
-                }, 
-                {
-                    "numeratorUnit": "scanners", 
-                    "description": "Number of scanners that have expired due to inactivity since service start", 
-                    "context": "scanners_expired::value", 
-                    "name": "kudu_scanners_expired", 
-                    "counter": true, 
-                    "label": "Scanners Expired"
-                }, 
-                {
-                    "numeratorUnit": "samples", 
-                    "description": "Histogram of the duration of active scanners on this server. This is the total number of recorded samples.", 
-                    "context": "scanner_duration::total_count", 
-                    "name": "kudu_scanner_duration_count", 
-                    "counter": true, 
-                    "label": "Scanner Duration: Samples"
-                }, 
-                {
-                    "numeratorUnit": "microseconds", 
-                    "description": "Histogram of the duration of active scanners on this server. This is the total sum of recorded samples.", 
-                    "context": "scanner_duration::total_sum", 
-                    "name": "kudu_scanner_duration_sum", 
-                    "counter": true, 
-                    "label": "Scanner Duration: Total"
                 }, 
                 {
                     "numeratorUnit": "samples", 
@@ -1255,6 +1279,22 @@
                 }, 
                 {
                     "numeratorUnit": "samples", 
+                    "description": "Microseconds spent handling kudu.master.MasterService.ReplaceTablet() RPC requests. This is the total number of recorded samples.", 
+                    "context": "handler_latency_kudu_master_MasterService_ReplaceTablet::total_count", 
+                    "name": "kudu_handler_latency_kudu_master_masterservice_replacetablet_count", 
+                    "counter": true, 
+                    "label": "kudu.master.MasterService.ReplaceTablet RPC Time: Samples"
+                }, 
+                {
+                    "numeratorUnit": "microseconds", 
+                    "description": "Microseconds spent handling kudu.master.MasterService.ReplaceTablet() RPC requests. This is the total sum of recorded samples.", 
+                    "context": "handler_latency_kudu_master_MasterService_ReplaceTablet::total_sum", 
+                    "name": "kudu_handler_latency_kudu_master_masterservice_replacetablet_sum", 
+                    "counter": true, 
+                    "label": "kudu.master.MasterService.ReplaceTablet RPC Time: Total"
+                }, 
+                {
+                    "numeratorUnit": "samples", 
                     "description": "Microseconds spent handling kudu.master.MasterService.GetMasterRegistration() RPC requests. This is the total number of recorded samples.", 
                     "context": "handler_latency_kudu_master_MasterService_GetMasterRegistration::total_count", 
                     "name": "kudu_handler_latency_kudu_master_masterservice_getmasterregistration_count", 
@@ -1268,6 +1308,30 @@
                     "name": "kudu_handler_latency_kudu_master_masterservice_getmasterregistration_sum", 
                     "counter": true, 
                     "label": "kudu.master.MasterService.GetMasterRegistration RPC Time: Total"
+                }, 
+                {
+                    "numeratorUnit": "messages", 
+                    "description": "Number of INFO-level log messages emitted by the application.", 
+                    "context": "glog_info_messages::value", 
+                    "name": "kudu_glog_info_messages", 
+                    "counter": true, 
+                    "label": "INFO-level Log Messages"
+                }, 
+                {
+                    "numeratorUnit": "messages", 
+                    "description": "Number of WARNING-level log messages emitted by the application.", 
+                    "context": "glog_warning_messages::value", 
+                    "name": "kudu_glog_warning_messages", 
+                    "counter": true, 
+                    "label": "WARNING-level Log Messages"
+                }, 
+                {
+                    "numeratorUnit": "messages", 
+                    "description": "Number of ERROR-level log messages emitted by the application.", 
+                    "context": "glog_error_messages::value", 
+                    "name": "kudu_glog_error_messages", 
+                    "counter": true, 
+                    "label": "ERROR-level Log Messages"
                 }, 
                 {
                     "numeratorUnit": "bytes", 
@@ -1318,28 +1382,20 @@
                     "label": "Thread Cache Memory Usage"
                 }, 
                 {
-                    "numeratorUnit": "messages", 
-                    "description": "Number of INFO-level log messages emitted by the application.", 
-                    "context": "glog_info_messages::value", 
-                    "name": "kudu_glog_info_messages", 
+                    "numeratorUnit": "samples", 
+                    "description": "Microseconds spent handling kudu.server.GenericService.GetFlags() RPC requests. This is the total number of recorded samples.", 
+                    "context": "handler_latency_kudu_server_GenericService_GetFlags::total_count", 
+                    "name": "kudu_handler_latency_kudu_server_genericservice_getflags_count", 
                     "counter": true, 
-                    "label": "INFO-level Log Messages"
+                    "label": "kudu.server.GenericService.GetFlags RPC Time: Samples"
                 }, 
                 {
-                    "numeratorUnit": "messages", 
-                    "description": "Number of WARNING-level log messages emitted by the application.", 
-                    "context": "glog_warning_messages::value", 
-                    "name": "kudu_glog_warning_messages", 
+                    "numeratorUnit": "microseconds", 
+                    "description": "Microseconds spent handling kudu.server.GenericService.GetFlags() RPC requests. This is the total sum of recorded samples.", 
+                    "context": "handler_latency_kudu_server_GenericService_GetFlags::total_sum", 
+                    "name": "kudu_handler_latency_kudu_server_genericservice_getflags_sum", 
                     "counter": true, 
-                    "label": "WARNING-level Log Messages"
-                }, 
-                {
-                    "numeratorUnit": "messages", 
-                    "description": "Number of ERROR-level log messages emitted by the application.", 
-                    "context": "glog_error_messages::value", 
-                    "name": "kudu_glog_error_messages", 
-                    "counter": true, 
-                    "label": "ERROR-level Log Messages"
+                    "label": "kudu.server.GenericService.GetFlags RPC Time: Total"
                 }, 
                 {
                     "numeratorUnit": "samples", 
@@ -1478,62 +1534,6 @@
                     "label": "Logical Clock Timestamp"
                 }, 
                 {
-                    "numeratorUnit": "data directories", 
-                    "description": "Number of data directories whose disks are currently in a failed state", 
-                    "context": "data_dirs_failed::value", 
-                    "name": "kudu_data_dirs_failed", 
-                    "counter": false, 
-                    "label": "Data Directories Failed"
-                }, 
-                {
-                    "numeratorUnit": "data directories", 
-                    "description": "Number of data directories whose disks are currently full", 
-                    "context": "data_dirs_full::value", 
-                    "name": "kudu_data_dirs_full", 
-                    "counter": false, 
-                    "label": "Data Directories Full"
-                }, 
-                {
-                    "numeratorUnit": "bytes", 
-                    "description": "Number of bytes of data blocks currently under management", 
-                    "context": "log_block_manager_bytes_under_management::value", 
-                    "name": "kudu_log_block_manager_bytes_under_management", 
-                    "counter": false, 
-                    "label": "Bytes Under Management"
-                }, 
-                {
-                    "numeratorUnit": "blocks", 
-                    "description": "Number of data blocks currently under management", 
-                    "context": "log_block_manager_blocks_under_management::value", 
-                    "name": "kudu_log_block_manager_blocks_under_management", 
-                    "counter": false, 
-                    "label": "Blocks Under Management"
-                }, 
-                {
-                    "numeratorUnit": "log block containers", 
-                    "description": "Number of log block containers", 
-                    "context": "log_block_manager_containers::value", 
-                    "name": "kudu_log_block_manager_containers", 
-                    "counter": false, 
-                    "label": "Number of Block Containers"
-                }, 
-                {
-                    "numeratorUnit": "log block containers", 
-                    "description": "Number of full log block containers", 
-                    "context": "log_block_manager_full_containers::value", 
-                    "name": "kudu_log_block_manager_full_containers", 
-                    "counter": false, 
-                    "label": "Number of Full Block Containers"
-                }, 
-                {
-                    "numeratorUnit": "holes", 
-                    "description": "Number of holes punched since service start", 
-                    "context": "log_block_manager_holes_punched::value", 
-                    "name": "kudu_log_block_manager_holes_punched", 
-                    "counter": true, 
-                    "label": "Number of Holes Punched"
-                }, 
-                {
                     "numeratorUnit": "blocks", 
                     "description": "Number of data blocks currently open for reading", 
                     "context": "block_manager_blocks_open_reading::value", 
@@ -1604,6 +1604,62 @@
                     "name": "kudu_block_manager_total_disk_sync", 
                     "counter": true, 
                     "label": "Block Data Disk Synchronization Count"
+                }, 
+                {
+                    "numeratorUnit": "data directories", 
+                    "description": "Number of data directories whose disks are currently in a failed state", 
+                    "context": "data_dirs_failed::value", 
+                    "name": "kudu_data_dirs_failed", 
+                    "counter": false, 
+                    "label": "Data Directories Failed"
+                }, 
+                {
+                    "numeratorUnit": "data directories", 
+                    "description": "Number of data directories whose disks are currently full", 
+                    "context": "data_dirs_full::value", 
+                    "name": "kudu_data_dirs_full", 
+                    "counter": false, 
+                    "label": "Data Directories Full"
+                }, 
+                {
+                    "numeratorUnit": "bytes", 
+                    "description": "Number of bytes of data blocks currently under management", 
+                    "context": "log_block_manager_bytes_under_management::value", 
+                    "name": "kudu_log_block_manager_bytes_under_management", 
+                    "counter": false, 
+                    "label": "Bytes Under Management"
+                }, 
+                {
+                    "numeratorUnit": "blocks", 
+                    "description": "Number of data blocks currently under management", 
+                    "context": "log_block_manager_blocks_under_management::value", 
+                    "name": "kudu_log_block_manager_blocks_under_management", 
+                    "counter": false, 
+                    "label": "Blocks Under Management"
+                }, 
+                {
+                    "numeratorUnit": "log block containers", 
+                    "description": "Number of log block containers", 
+                    "context": "log_block_manager_containers::value", 
+                    "name": "kudu_log_block_manager_containers", 
+                    "counter": false, 
+                    "label": "Number of Block Containers"
+                }, 
+                {
+                    "numeratorUnit": "log block containers", 
+                    "description": "Number of full log block containers", 
+                    "context": "log_block_manager_full_containers::value", 
+                    "name": "kudu_log_block_manager_full_containers", 
+                    "counter": false, 
+                    "label": "Number of Full Block Containers"
+                }, 
+                {
+                    "numeratorUnit": "holes", 
+                    "description": "Number of holes punched since service start", 
+                    "context": "log_block_manager_holes_punched::value", 
+                    "name": "kudu_log_block_manager_holes_punched", 
+                    "counter": true, 
+                    "label": "Number of Holes Punched"
                 }, 
                 {
                     "numeratorUnit": "samples", 
@@ -2284,6 +2340,62 @@
         {
             "metricDefinitions": [
                 {
+                    "numeratorUnit": "tablets", 
+                    "description": "The difference between the number of replicas on the tablet server hosting the most replicas and the number of replicas on the tablet server hosting the least replicas.", 
+                    "context": "cluster_replica_skew::value", 
+                    "name": "kudu_cluster_replica_skew", 
+                    "counter": false, 
+                    "label": "Cluster Replica Skew"
+                }, 
+                {
+                    "numeratorUnit": "scanners", 
+                    "description": "Number of scanners that have expired due to inactivity since service start", 
+                    "context": "scanners_expired::value", 
+                    "name": "kudu_scanners_expired", 
+                    "counter": true, 
+                    "label": "Scanners Expired"
+                }, 
+                {
+                    "numeratorUnit": "samples", 
+                    "description": "Histogram of the duration of active scanners on this server. This is the total number of recorded samples.", 
+                    "context": "scanner_duration::total_count", 
+                    "name": "kudu_scanner_duration_count", 
+                    "counter": true, 
+                    "label": "Scanner Duration: Samples"
+                }, 
+                {
+                    "numeratorUnit": "microseconds", 
+                    "description": "Histogram of the duration of active scanners on this server. This is the total sum of recorded samples.", 
+                    "context": "scanner_duration::total_sum", 
+                    "name": "kudu_scanner_duration_sum", 
+                    "counter": true, 
+                    "label": "Scanner Duration: Total"
+                }, 
+                {
+                    "numeratorUnit": "scanners", 
+                    "description": "Number of scanners that are currently active", 
+                    "context": "active_scanners::value", 
+                    "name": "kudu_active_scanners", 
+                    "counter": false, 
+                    "label": "Active Scanners"
+                }, 
+                {
+                    "numeratorUnit": "bytes", 
+                    "description": "Number of bytes fetched during tablet copy operations since server start", 
+                    "context": "tablet_copy_bytes_fetched::value", 
+                    "name": "kudu_tablet_copy_bytes_fetched", 
+                    "counter": true, 
+                    "label": "Bytes Fetched By Tablet Copy"
+                }, 
+                {
+                    "numeratorUnit": "sessions", 
+                    "description": "Number of currently open tablet copy client sessions on this server", 
+                    "context": "tablet_copy_open_client_sessions::value", 
+                    "name": "kudu_tablet_copy_open_client_sessions", 
+                    "counter": false, 
+                    "label": "Open Table Copy Client Sessions"
+                }, 
+                {
                     "numeratorUnit": "bytes", 
                     "description": "Number of bytes sent during tablet copy operations since server start", 
                     "context": "tablet_copy_bytes_sent::value", 
@@ -2362,54 +2474,6 @@
                     "name": "kudu_tablets_num_shutdown", 
                     "counter": false, 
                     "label": "Number of Shut Down Tablets"
-                }, 
-                {
-                    "numeratorUnit": "scanners", 
-                    "description": "Number of scanners that are currently active", 
-                    "context": "active_scanners::value", 
-                    "name": "kudu_active_scanners", 
-                    "counter": false, 
-                    "label": "Active Scanners"
-                }, 
-                {
-                    "numeratorUnit": "bytes", 
-                    "description": "Number of bytes fetched during tablet copy operations since server start", 
-                    "context": "tablet_copy_bytes_fetched::value", 
-                    "name": "kudu_tablet_copy_bytes_fetched", 
-                    "counter": true, 
-                    "label": "Bytes Fetched By Tablet Copy"
-                }, 
-                {
-                    "numeratorUnit": "sessions", 
-                    "description": "Number of currently open tablet copy client sessions on this server", 
-                    "context": "tablet_copy_open_client_sessions::value", 
-                    "name": "kudu_tablet_copy_open_client_sessions", 
-                    "counter": false, 
-                    "label": "Open Table Copy Client Sessions"
-                }, 
-                {
-                    "numeratorUnit": "scanners", 
-                    "description": "Number of scanners that have expired due to inactivity since service start", 
-                    "context": "scanners_expired::value", 
-                    "name": "kudu_scanners_expired", 
-                    "counter": true, 
-                    "label": "Scanners Expired"
-                }, 
-                {
-                    "numeratorUnit": "samples", 
-                    "description": "Histogram of the duration of active scanners on this server. This is the total number of recorded samples.", 
-                    "context": "scanner_duration::total_count", 
-                    "name": "kudu_scanner_duration_count", 
-                    "counter": true, 
-                    "label": "Scanner Duration: Samples"
-                }, 
-                {
-                    "numeratorUnit": "microseconds", 
-                    "description": "Histogram of the duration of active scanners on this server. This is the total sum of recorded samples.", 
-                    "context": "scanner_duration::total_sum", 
-                    "name": "kudu_scanner_duration_sum", 
-                    "counter": true, 
-                    "label": "Scanner Duration: Total"
                 }, 
                 {
                     "numeratorUnit": "samples", 
@@ -2685,6 +2749,22 @@
                 }, 
                 {
                     "numeratorUnit": "samples", 
+                    "description": "Microseconds spent handling kudu.master.MasterService.ReplaceTablet() RPC requests. This is the total number of recorded samples.", 
+                    "context": "handler_latency_kudu_master_MasterService_ReplaceTablet::total_count", 
+                    "name": "kudu_handler_latency_kudu_master_masterservice_replacetablet_count", 
+                    "counter": true, 
+                    "label": "kudu.master.MasterService.ReplaceTablet RPC Time: Samples"
+                }, 
+                {
+                    "numeratorUnit": "microseconds", 
+                    "description": "Microseconds spent handling kudu.master.MasterService.ReplaceTablet() RPC requests. This is the total sum of recorded samples.", 
+                    "context": "handler_latency_kudu_master_MasterService_ReplaceTablet::total_sum", 
+                    "name": "kudu_handler_latency_kudu_master_masterservice_replacetablet_sum", 
+                    "counter": true, 
+                    "label": "kudu.master.MasterService.ReplaceTablet RPC Time: Total"
+                }, 
+                {
+                    "numeratorUnit": "samples", 
                     "description": "Microseconds spent handling kudu.master.MasterService.GetMasterRegistration() RPC requests. This is the total number of recorded samples.", 
                     "context": "handler_latency_kudu_master_MasterService_GetMasterRegistration::total_count", 
                     "name": "kudu_handler_latency_kudu_master_masterservice_getmasterregistration_count", 
@@ -2698,6 +2778,30 @@
                     "name": "kudu_handler_latency_kudu_master_masterservice_getmasterregistration_sum", 
                     "counter": true, 
                     "label": "kudu.master.MasterService.GetMasterRegistration RPC Time: Total"
+                }, 
+                {
+                    "numeratorUnit": "messages", 
+                    "description": "Number of INFO-level log messages emitted by the application.", 
+                    "context": "glog_info_messages::value", 
+                    "name": "kudu_glog_info_messages", 
+                    "counter": true, 
+                    "label": "INFO-level Log Messages"
+                }, 
+                {
+                    "numeratorUnit": "messages", 
+                    "description": "Number of WARNING-level log messages emitted by the application.", 
+                    "context": "glog_warning_messages::value", 
+                    "name": "kudu_glog_warning_messages", 
+                    "counter": true, 
+                    "label": "WARNING-level Log Messages"
+                }, 
+                {
+                    "numeratorUnit": "messages", 
+                    "description": "Number of ERROR-level log messages emitted by the application.", 
+                    "context": "glog_error_messages::value", 
+                    "name": "kudu_glog_error_messages", 
+                    "counter": true, 
+                    "label": "ERROR-level Log Messages"
                 }, 
                 {
                     "numeratorUnit": "bytes", 
@@ -2748,28 +2852,20 @@
                     "label": "Thread Cache Memory Usage"
                 }, 
                 {
-                    "numeratorUnit": "messages", 
-                    "description": "Number of INFO-level log messages emitted by the application.", 
-                    "context": "glog_info_messages::value", 
-                    "name": "kudu_glog_info_messages", 
+                    "numeratorUnit": "samples", 
+                    "description": "Microseconds spent handling kudu.server.GenericService.GetFlags() RPC requests. This is the total number of recorded samples.", 
+                    "context": "handler_latency_kudu_server_GenericService_GetFlags::total_count", 
+                    "name": "kudu_handler_latency_kudu_server_genericservice_getflags_count", 
                     "counter": true, 
-                    "label": "INFO-level Log Messages"
+                    "label": "kudu.server.GenericService.GetFlags RPC Time: Samples"
                 }, 
                 {
-                    "numeratorUnit": "messages", 
-                    "description": "Number of WARNING-level log messages emitted by the application.", 
-                    "context": "glog_warning_messages::value", 
-                    "name": "kudu_glog_warning_messages", 
+                    "numeratorUnit": "microseconds", 
+                    "description": "Microseconds spent handling kudu.server.GenericService.GetFlags() RPC requests. This is the total sum of recorded samples.", 
+                    "context": "handler_latency_kudu_server_GenericService_GetFlags::total_sum", 
+                    "name": "kudu_handler_latency_kudu_server_genericservice_getflags_sum", 
                     "counter": true, 
-                    "label": "WARNING-level Log Messages"
-                }, 
-                {
-                    "numeratorUnit": "messages", 
-                    "description": "Number of ERROR-level log messages emitted by the application.", 
-                    "context": "glog_error_messages::value", 
-                    "name": "kudu_glog_error_messages", 
-                    "counter": true, 
-                    "label": "ERROR-level Log Messages"
+                    "label": "kudu.server.GenericService.GetFlags RPC Time: Total"
                 }, 
                 {
                     "numeratorUnit": "samples", 
@@ -2908,62 +3004,6 @@
                     "label": "Logical Clock Timestamp"
                 }, 
                 {
-                    "numeratorUnit": "data directories", 
-                    "description": "Number of data directories whose disks are currently in a failed state", 
-                    "context": "data_dirs_failed::value", 
-                    "name": "kudu_data_dirs_failed", 
-                    "counter": false, 
-                    "label": "Data Directories Failed"
-                }, 
-                {
-                    "numeratorUnit": "data directories", 
-                    "description": "Number of data directories whose disks are currently full", 
-                    "context": "data_dirs_full::value", 
-                    "name": "kudu_data_dirs_full", 
-                    "counter": false, 
-                    "label": "Data Directories Full"
-                }, 
-                {
-                    "numeratorUnit": "bytes", 
-                    "description": "Number of bytes of data blocks currently under management", 
-                    "context": "log_block_manager_bytes_under_management::value", 
-                    "name": "kudu_log_block_manager_bytes_under_management", 
-                    "counter": false, 
-                    "label": "Bytes Under Management"
-                }, 
-                {
-                    "numeratorUnit": "blocks", 
-                    "description": "Number of data blocks currently under management", 
-                    "context": "log_block_manager_blocks_under_management::value", 
-                    "name": "kudu_log_block_manager_blocks_under_management", 
-                    "counter": false, 
-                    "label": "Blocks Under Management"
-                }, 
-                {
-                    "numeratorUnit": "log block containers", 
-                    "description": "Number of log block containers", 
-                    "context": "log_block_manager_containers::value", 
-                    "name": "kudu_log_block_manager_containers", 
-                    "counter": false, 
-                    "label": "Number of Block Containers"
-                }, 
-                {
-                    "numeratorUnit": "log block containers", 
-                    "description": "Number of full log block containers", 
-                    "context": "log_block_manager_full_containers::value", 
-                    "name": "kudu_log_block_manager_full_containers", 
-                    "counter": false, 
-                    "label": "Number of Full Block Containers"
-                }, 
-                {
-                    "numeratorUnit": "holes", 
-                    "description": "Number of holes punched since service start", 
-                    "context": "log_block_manager_holes_punched::value", 
-                    "name": "kudu_log_block_manager_holes_punched", 
-                    "counter": true, 
-                    "label": "Number of Holes Punched"
-                }, 
-                {
                     "numeratorUnit": "blocks", 
                     "description": "Number of data blocks currently open for reading", 
                     "context": "block_manager_blocks_open_reading::value", 
@@ -3034,6 +3074,62 @@
                     "name": "kudu_block_manager_total_disk_sync", 
                     "counter": true, 
                     "label": "Block Data Disk Synchronization Count"
+                }, 
+                {
+                    "numeratorUnit": "data directories", 
+                    "description": "Number of data directories whose disks are currently in a failed state", 
+                    "context": "data_dirs_failed::value", 
+                    "name": "kudu_data_dirs_failed", 
+                    "counter": false, 
+                    "label": "Data Directories Failed"
+                }, 
+                {
+                    "numeratorUnit": "data directories", 
+                    "description": "Number of data directories whose disks are currently full", 
+                    "context": "data_dirs_full::value", 
+                    "name": "kudu_data_dirs_full", 
+                    "counter": false, 
+                    "label": "Data Directories Full"
+                }, 
+                {
+                    "numeratorUnit": "bytes", 
+                    "description": "Number of bytes of data blocks currently under management", 
+                    "context": "log_block_manager_bytes_under_management::value", 
+                    "name": "kudu_log_block_manager_bytes_under_management", 
+                    "counter": false, 
+                    "label": "Bytes Under Management"
+                }, 
+                {
+                    "numeratorUnit": "blocks", 
+                    "description": "Number of data blocks currently under management", 
+                    "context": "log_block_manager_blocks_under_management::value", 
+                    "name": "kudu_log_block_manager_blocks_under_management", 
+                    "counter": false, 
+                    "label": "Blocks Under Management"
+                }, 
+                {
+                    "numeratorUnit": "log block containers", 
+                    "description": "Number of log block containers", 
+                    "context": "log_block_manager_containers::value", 
+                    "name": "kudu_log_block_manager_containers", 
+                    "counter": false, 
+                    "label": "Number of Block Containers"
+                }, 
+                {
+                    "numeratorUnit": "log block containers", 
+                    "description": "Number of full log block containers", 
+                    "context": "log_block_manager_full_containers::value", 
+                    "name": "kudu_log_block_manager_full_containers", 
+                    "counter": false, 
+                    "label": "Number of Full Block Containers"
+                }, 
+                {
+                    "numeratorUnit": "holes", 
+                    "description": "Number of holes punched since service start", 
+                    "context": "log_block_manager_holes_punched::value", 
+                    "name": "kudu_log_block_manager_holes_punched", 
+                    "counter": true, 
+                    "label": "Number of Holes Punched"
                 }, 
                 {
                     "numeratorUnit": "samples", 

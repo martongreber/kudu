@@ -23,9 +23,9 @@ limitations under the License.
   </parent>
 
   <groupId>com.cloudera.csd</groupId>
-  <artifactId>KUDU5_15</artifactId>
+  <artifactId>KUDU6_0</artifactId>
   <version>6.x.0</version>
-  <name>Kudu CSD for CDH 5.15</name>
+  <name>Kudu CSD for CDH 6.0</name>
   <packaging>pom</packaging>
 
   <!-- Publish CSD artifacts to Cloudera internal repos -->

@@ -150,6 +150,8 @@ elif [ "$CMD" = "diagnostics-tserver" ]; then
   LOG_DIR=$1
   shift 1
   python scripts/gather_diagnostics.py "tserver" "$LOG_DIR" "$PWD" "$MASTER_IPS"
+elif [ "$CMD" = "ksck" ]; then
+  exec kudu cluster ksck "$MASTER_IPS"
 else
   log "Unknown command: $CMD"
   exit 2

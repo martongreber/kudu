@@ -36,6 +36,24 @@
   },
   "icon" : "images/icon.png",
   "kerberos" : "${enable_security}",
+  "commands" : [
+    {
+      "name" : "kudu_svc_ksck_cmd",
+      "label" : "Run Kudu ksck",
+      "description" : "Run the Kudu system check (ksck)",
+      "roleName" : "KUDU_MASTER",
+      "roleCommand" : "kudu_master_ksck_cmd",
+      "runMode" : "single"
+    },
+    {
+      "name" : "kudu_svc_rebalance_tool_cmd",
+      "label" : "Run Kudu Rebalancer Tool",
+      "description" : "Run the Kudu tablet rebalancing tool",
+      "roleName" : "KUDU_MASTER",
+      "roleCommand" : "kudu_master_rebalance_tool_cmd",
+      "runMode" : "single"
+    }
+  ],
   "parameters" : [
     {
       "name" : "enable_core_dump",
@@ -70,6 +88,30 @@
       "type" : "string",
       "default" : "*",
       "conformRegex" : "(|\\*|([^,!@#$%*=+'\\\"\\s-][^,]*,?)*)$"
+    },
+    {
+      "name" : "rb_max_moves_per_server",
+      "label" : "Maximum Number of Per-tablet-server Replica Moves",
+      "description" : "Maximum number of replica moves to perform concurrently on one tablet server: moves of replicas to the server and moves of replicas off of the server count against this limit.",
+      "required" : false,
+      "type" : "long",
+      "default" : 5
+    },
+    {
+      "name" : "rb_max_run_time_sec",
+      "label" : "Maximum allowed runtime of the rebalancing tool",
+      "description" : "Maximum time to run the rebalancing, in seconds. Specifying 0 means not imposing any limit on the rebalancing run time.",
+      "required" : false,
+      "type" : "long",
+      "default" : 0
+    },
+    {
+      "name" : "rb_max_staleness_interval_sec",
+      "label" : "Maximum allowed duration without rebalancer progress",
+      "description" : "Maximum duration of the 'staleness' interval where the rebalance can not make progress. If this period elapses without the rebalancer making progress, it will exit indicating failure. This may happen in case of a persistent problem with the cluster or when some unexpected concurrent activity is present (such as automatic recovery of failed replicas, etc.)",
+      "required" : false,
+      "type" : "long",
+      "default" : 300
     }
   ],
   "rolesWithExternalLinks" : [
@@ -112,6 +154,35 @@
         }
       ],
       "topology" : { "minInstances" : 1 },
+      "commands" : [
+        {
+          "name" : "kudu_master_ksck_cmd",
+          "label" : "Run Kudu ksck",
+          "description" : "Run the Kudu system check, ksck",
+          "expectedExitCodes" : [0],
+          "requiredRoleState" : "running",
+          "commandRunner" : {
+            "program" : "scripts/kudu.sh",
+            "args" : ["ksck"]
+          }
+        },
+        {
+          "name" : "kudu_master_rebalance_tool_cmd",
+          "label" : "Run Kudu Rebalancer Tool",
+          "description" : "Run the Kudu tablet rebalancing tool",
+          "expectedExitCodes" : [0],
+          "requiredRoleState" : "running",
+          "commandRunner" : {
+            "program" : "scripts/kudu.sh",
+            "args" : ["rebalance_tool"],
+            "environmentVariables" : {
+              "RB_MAX_MOVES_PER_SERVER" : "${rb_max_moves_per_server}",
+              "RB_MAX_RUN_TIME_SEC" : "${rb_max_run_time_sec}",
+              "RB_MAX_STALENESS_INTERVAL_SEC" : "${rb_max_staleness_interval_sec}"
+            }
+          }
+        }
+      ],
       "parameters" : [
         {
           "name" : "webserver_port",
@@ -203,7 +274,10 @@
               "enable_security",
               "master_address",
               "master_core_dump_directory",
-              "ssl_enabled"
+              "ssl_enabled",
+              "rb_max_moves_per_server",
+              "rb_max_run_time_sec",
+              "rb_max_staleness_interval_sec"
             ]
           },
           {
@@ -380,7 +454,10 @@
               "enable_core_dump",
               "enable_security",
               "tserver_core_dump_directory",
-              "ssl_enabled"
+              "ssl_enabled",
+              "rb_max_moves_per_server",
+              "rb_max_run_time_sec",
+              "rb_max_staleness_interval_sec"
             ]
           },
           {

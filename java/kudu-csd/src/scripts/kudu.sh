@@ -46,6 +46,20 @@ function readconf {
   IFS='=' read key value <<< "$conf"
 }
 
+# Runs the rebalancer tool, if it's available.
+function run_rebalancer_tool {
+  # Heuristic to determine if the rebalance tool is available.
+  if ! kudu cluster 2>&1 > /dev/null | grep -q "rebalance"; then
+    echo "'kudu cluster rebalance' command not available with this version of Kudu"
+    exit 1
+  fi
+
+  exec kudu cluster rebalance "$1" \
+    --max_moves_per_server="$RB_MAX_MOVES_PER_SERVER" \
+    --max_run_time_sec="$RB_MAX_RUN_TIME_SEC" \
+    --max_staleness_interval_sec="$RB_MAX_STALENESS_INTERVAL_SEC"
+}
+
 log "KUDU_HOME: $KUDU_HOME"
 log "CONF_DIR: $CONF_DIR"
 log "CMD: $CMD"
@@ -150,6 +164,10 @@ elif [ "$CMD" = "diagnostics-tserver" ]; then
   LOG_DIR=$1
   shift 1
   python scripts/gather_diagnostics.py "tserver" "$LOG_DIR" "$PWD" "$MASTER_IPS"
+elif [ "$CMD" = "ksck" ]; then
+  exec kudu cluster ksck "$MASTER_IPS"
+elif [ "$CMD" = "rebalance_tool" ]; then
+  run_rebalancer_tool "$MASTER_IPS"
 else
   log "Unknown command: $CMD"
   exit 2

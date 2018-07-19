@@ -37,6 +37,16 @@
   },
   "icon" : "images/icon.png",
   "kerberos" : "${enable_security}",
+  "commands" : [
+    {
+      "name" : "kudu_svc_ksck_cmd",
+      "label" : "Run Kudu ksck",
+      "description" : "Run the Kudu system check (ksck)",
+      "roleName" : "KUDU_MASTER",
+      "roleCommand" : "kudu_master_ksck_cmd",
+      "runMode" : "single"
+    }
+  ],
   "parameters" : [
     {
       "name" : "enable_core_dump",
@@ -118,6 +128,19 @@
 	"percentGreenForGreen" : 80.1,
 	"percentYellowGreenForYellow" : 60.0
       },
+      "commands" : [
+        {
+          "name" : "kudu_master_ksck_cmd",
+          "label" : "Run Kudu ksck",
+          "description" : "Run the Kudu system check, ksck",
+          "expectedExitCodes" : [0],
+          "requiredRoleState" : "running",
+          "commandRunner" : {
+            "program" : "scripts/kudu.sh",
+            "args" : ["ksck"]
+          }
+        }
+      ],
       "parameters" : [
         {
           "name" : "webserver_port",

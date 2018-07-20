@@ -99,7 +99,7 @@
     },
     {
       "name" : "rb_max_run_time_sec",
-      "label" : "Maximum allowed runtime of the rebalancing tool",
+      "label" : "Maximum Allowed Runtime of the Rebalancing Tool",
       "description" : "Maximum time to run the rebalancing, in seconds. Specifying 0 means not imposing any limit on the rebalancing run time.",
       "required" : false,
       "type" : "long",
@@ -107,7 +107,7 @@
     },
     {
       "name" : "rb_max_staleness_interval_sec",
-      "label" : "Maximum allowed duration without rebalancer progress",
+      "label" : "Maximum Allowed Duration Without Rebalancer Progress",
       "description" : "Maximum duration of the 'staleness' interval where the rebalance can not make progress. If this period elapses without the rebalancer making progress, it will exit indicating failure. This may happen in case of a persistent problem with the cluster or when some unexpected concurrent activity is present (such as automatic recovery of failed replicas, etc.)",
       "required" : false,
       "type" : "long",

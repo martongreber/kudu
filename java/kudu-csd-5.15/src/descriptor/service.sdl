@@ -22,8 +22,8 @@
   "compatibility" : {
     "generation" : 1,
     "cdhVersion" : {
-      "min" : "6.0.0",
-      "max" : "6.1.0"
+      "min" : "5.11.0",
+      "max" : "5.16.0"
     }
   },
   "runAs" : {

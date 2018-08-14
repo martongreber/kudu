@@ -382,6 +382,8 @@
             <modules>
                 <module>kudu-csd</module>
                 <module>kudu-csd-6.0</module>
+                <module>kudu-csd-5.16</module>
+                <module>kudu-csd-5.15</module>
                 <module>kudu-csd-5.10</module>
             </modules>
         </profile>

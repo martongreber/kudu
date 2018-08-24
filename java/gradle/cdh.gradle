@@ -74,4 +74,10 @@ for (component in result.resolvedComponents) {
 
   ext.cdhSparkAvroVersion = pom.properties."cdh.spark-avro.version"
   logger.info("Set SparkAvro version to $cdhSparkAvroVersion")
+
+  ext.cdhSlf4jVersion = pom.properties."cdh.slf4j.version"
+  logger.info("Set slf4j version to $cdhSlf4jVersion")
+
+  ext.cdhCommonsIoVersion = pom.properties."cdh.commons-io.version"
+  logger.info("Set commons-io version to $cdhCommonsIoVersion")
 }

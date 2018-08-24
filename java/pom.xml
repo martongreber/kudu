@@ -70,7 +70,7 @@
         <avro.version>${cdh.avro.version}</avro.version>
         <clojure.tools.version>0.3.5</clojure.tools.version>
         <clojure.version>1.9.0</clojure.version>
-        <commons-io.version>2.6</commons-io.version>
+        <commons-io.version>${cdh.commons-io.version}</commons-io.version>
         <flume.version>${cdh.flume-ng.version}</flume.version>
 
         <guava.version>26.0-android</guava.version>
@@ -87,7 +87,7 @@
         <parquet.version>${cdh.apache-parquet.version}</parquet.version>
         <protobuf.version>3.6.1</protobuf.version>
         <scopt.version>3.7.0</scopt.version>
-        <slf4j.version>1.7.25</slf4j.version>
+        <slf4j.version>${cdh.slf4j.version}</slf4j.version>
         <sparkavro.version>${cdh.spark-avro.version}</sparkavro.version>
         <yetus.version>0.8.0</yetus.version>
 

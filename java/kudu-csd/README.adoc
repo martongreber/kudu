@@ -15,3 +15,146 @@ This requirement applies to _at least_ the following kinds of changes:
 1. Conversion from a counter to a gauge (or vice versa).
 2. Change in the metric's label.
 3. Change in the metric's numeratorUnit.
+
+=== Forking the CSD
+
+When adding features to the CSD that break compatibility between the CSD and
+older versions of Kudu, it's necessary to fork the CSD so each version runs with
+a compatible CSD. Examples of when this has been necessary include:
+
+* Adding a health test on a newly-introduced metric.
+* Adding a command that uses a newly-introduced Kudu tool.
+
+There may be other cases in the future.
+
+To cross-reference with the instructions below, here are the commit IDs for a
+fork of the Kudu CSD:
+
+* http://github.mtv.cloudera.com/CDH/kudu/commit/857c1360ebc2955306c61103bf7b2da7009c847b[Changes to Kudu (cdh/kudu)]
+* http://github.mtv.cloudera.com/Starship/cmf/commit/60587bd6b37[Changes to CM (Starship/cmf)]
+
+At the time of writing, the latest Kudu CSD (the `kudu-csd` module) covers all
+Kudu version of at least 6.1.0. Suppose that the CSD needs to fork to support
+changes in Kudu 6.2.0. To perform the fork, take the following steps:
+
+. Copy the `kudu-csd` folder with its contents to a new folder named
+  `kudu-csd-{highest version covered}`, so in this example the folder
+  would be named `kudu-csd-6.1`.
+. Edit the root `pom.xml` for the Java project:
+  * Add the new CSD as a module by adding the line
+    `<module>kudu-csd-{major}.{minor}</module>` to the `<modules>` element of
+    the `buildCSD` profile. In this example, the line would be
+    `<module>kudu-csd-6.1</module>`.
+. Edit `kudu-csd-6.1/pom.xml`:
+  * Change the `artifactId` from `KUDU` to `KUDU{major}_{minor}`, so in this
+    example the `artifactId` should be `KUDU6_1`.
+  * Change the `name` to `Kudu CSD for CDH {major}.{minor}`, so in this example
+    the `name` should be `Kudu CSD for CDH 6.1`.
+  * Delete the `execution` that generates the MDL. It should be preceded by a
+    comment containing the text `Generate the MDL`.
+. Edit `kudu-csd-6.1/src/descriptor/service.sdl`:
+  * Adjust the `min` and `max` keys of the `cdhVersion` object near the top of
+    the SDL. The value of the `min` key should be the first version supported by
+    the CSD, while the value of the `max` key should be the first version
+    greater than the `min` version that is not supported by the CSD. In this
+    example, the proper `cdhVersion` object would be
++
+[source,json]
+----
+"cdhVersion" : {
+  "min" : "6.1.0",
+  "max" : "6.2.0"
+}
+----
+. Generate the MDL. To do this, find or build Kudu master and tablet server
+  binaries of the highest version covered by the CSD, then use the
+  `generate_mdl.py` script to generate the MDL and save it as a file in
+  `kudu-csd-{major.minor}/src/descriptor`. The script expects the binaries to
+  be located in the standard `build/latest` symlink, which means they should
+  be found in `../../build/latest/bin` relative to `generate_mdl.py`. In this
+  example, the MDL must be generated with 6.1 binaries in `build/latest/bin`
+  and the proper command to run in the `kudu-csd-6.1` directory is
++
+[source,bash]
+----
+$ ./generate_mdl.py > src/descriptor/service.mdl
+----
+. Delete extra files:
+  * Delete the fork's `generate_mdl.py`, so in this example delete the file
+    `kudu-csd-6.1/generate_mdl.py`.
+  * Delete the fork's `check_csd_compatibility.py`, so in this example delete
+    the file `kudu-csd-6.1/check_csd_compatibility.py`.
+. Edit `kudu-csd/src/descriptor/service.sdl`:
+  * Adjust the value of the `min` key of the `cdhVersion` object to be the
+    first Kudu version not supported by the new CSD module, i.e. the value of
+    the `max` key in `cdhVersion` in the SDL for `kudu-csd-{major}.{minor}`. In
+    this example the `min` key's new value is `6.2.0`.
+. Test that the CSDs build by running:
++
+[source,bash]
+----
+$ mvn -DskipTests -PbuildCSD verify
+----
+. Test the CSD:
+  * Set up a cluster with CM on the latest version and CDH on the first
+    version supported by the CSD fork. In this example, the CDH version should
+    be `6.1.0`.
+  * Remove the existing CSD for the latest versions of Kudu from
+    `/opt/cloudera/cm/csd`. The CSD will be named like `KUDU-{CM version}.jar`,
+    so, in this example, if the CM version deployed is `6.2.0`, the file
+    `KUDU-6.2.0.jar` should be removed from `/opt/cloudera/cm/csd`.
+  * Copy the CSD jars for the forked CSD and the latest CSD to the CM server.
+    Add both to `/opt/cloudera/cm/csd`.
+  * Restart the CM server and the CM management service. Check everything
+    works as expected. Check that whatever addition prompted the fork is
+    not present.
+  * Upgrade CDH to the latest version, so the new CSD applies. Check everything
+    works as expected. Check that whatever addition prompted the fork is working
+    as expected.
+. Commit the changes locally and get them reviewed.
+. Push the changes. This needs to happen before CM is updated so that a new
+  Cauldron build makes the new CSD artifacts available. It might take a couple
+  of days. A `buildinfo` query can determine if the new CSD artifacts have been
+  published by checking for the existing of the new `KUDU{major}_{minor}` jar.
+  In this example, the following query would return a result if the jar is
+  available:
++
+[source,bash]
+----
+buildinfo contents $(buildinfo query --product cdh --version 6.x --tag official) | grep KUDU6_1 | grep jar
+----
+. Update CM with information about the fork. The master branch needs to be
+  updated, and it might also be necessary to update the branch for a new minor
+  release if the fork is happening after CM branches, before the branch is
+  released, and the forked CSD should exist in the minor release. To make the
+  necessary changes:
+  * To the root `pom.xml`, add a dependency on the new Kudu CSD artifact. In
+    example, the dependency XML would be
++
+[source,xml]
+----
+<dependency>
+  <groupId>com.cloudera.csd</groupId>
+  <artifactId>KUDU6_1</artifactId>
+  <version>${project.version}</version>
+</dependency>
+----
+  * To `web/pom.xml`, add an `artifactItem` for Kudu in the `copy` execution
+    (just search for KUDU to find the right spot). In this example, the XML
+    would be
++
+[source,xml]
+----
+<artifactItem>
+  <groupId>com.cloudera.csd</groupId>
+  <artifactId>KUDU6_1</artifactId>
+</artifactItem>
+----
+. Have the CM changes reviewed.
+. Push the change to CM using its normal commit flow. The precommits will fail
+  until CM can find the new CSD artifacts from a new Cauldron build, so it
+  might be necessary to wait a couple of days after the push to cdh/kudu before
+  the push to CM can succeed.
+. If people to complain that builds are broken, reassure them this is
+  temporary because of the fork.
+. Once everything is well again, the fork is complete!

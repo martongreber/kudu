@@ -45,6 +45,7 @@ esac
 
 
 TP_DIR=$(dirname $BASH_SOURCE)
+source $TP_DIR/vars.sh
 cd $TP_DIR
 
 NEEDS_BUILD=
@@ -98,6 +99,22 @@ else
   done
 fi
 
+# For thirdparty dependency group of CDH distribution, validate whether the build
+# is the latest one by comparing the CDH_GBN queried from BuildDB against the one
+# stored during last build.
+CDH_GBN_FILE=.cdh_gbn.txt
+if [ -n "$CDH_GBN" ]; then
+  if [ -f $CDH_GBN_FILE ]; then
+    CDH_GBN_STORED=$(cat $CDH_GBN_FILE)
+  fi
+  if [ -z "$CDH_GBN_STORED" -o "$CDH_GBN" != "$CDH_GBN_STORED" ]; then
+    GROUP="common"
+    if [[ $NEEDS_BUILD != *"$GROUP"* ]]; then
+      NEEDS_BUILD="$NEEDS_BUILD $GROUP"
+    fi
+  fi
+fi
+
 if [ -z "$NEEDS_BUILD" ]; then
   echo "Not rebuilding thirdparty. No changes since last build."
   exit 0
@@ -123,4 +140,9 @@ else
   for GROUP in $NEEDS_BUILD; do
     touch .build-stamp.$GROUP
   done
+fi
+
+# The build succeeded. Write the new CDH_GBN to disk.
+if [ -n "$CDH_GBN" ]; then
+  echo $CDH_GBN > $CDH_GBN_FILE
 fi

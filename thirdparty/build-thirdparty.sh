@@ -249,11 +249,13 @@ fi
 # are pre-built) into $PREFIX/opt.
 if [ -n "$F_COMMON" -o -n "$F_HADOOP" ]; then
   mkdir -p $PREFIX/opt
+  $TP_DIR/package-hadoop.sh $HADOOP_SOURCE
   ln -nsf $HADOOP_SOURCE $PREFIX/opt/hadoop
 fi
 
 if [ -n "$F_COMMON" -o -n "$F_HIVE" ]; then
   mkdir -p $PREFIX/opt
+  $TP_DIR/package-hive.sh $HIVE_SOURCE
   ln -nsf $HIVE_SOURCE $PREFIX/opt/hive
 fi
 

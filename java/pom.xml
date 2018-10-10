@@ -88,7 +88,6 @@
         <protobuf.version>3.6.1</protobuf.version>
         <scopt.version>3.7.0</scopt.version>
         <slf4j.version>${cdh.slf4j.version}</slf4j.version>
-        <sparkavro.version>${cdh.spark-avro.version}</sparkavro.version>
         <yetus.version>0.8.0</yetus.version>
 
         <!-- Scala Library dependencies -->

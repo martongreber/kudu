@@ -39,7 +39,7 @@ CAULDRON_URL_PREFIX=http://cloudera-build-us-west-1.vpc.cloudera.com/s3/build
 
 # Refer CDH_VERSION from 'version.txt', query BuildDB for the latest CDH build
 # tagged with 'impala-minicluster-tarballs' and use that as the CDH's global
-# build number (KUDU_CDH_GBN).
+# build number (CDH_GBN).
 VERSION_FILE="$TP_DIR/../version.txt"
 if [ -f $VERSION_FILE ]; then
   # Extracts the version number from version.txt and transforms it into a format
@@ -59,17 +59,17 @@ if [ -z "$CDH_VERSION" ]; then
   exit 1
 fi
 
-if [ -z "$KUDU_CDH_GBN" ]; then
+if [ -z "$CDH_GBN" ]; then
   BUILDDB_QUERY='http://builddb.infra.cloudera.com/query?product=cdh;tag=impala-minicluster-tarballs,official;version='"${CDH_VERSION}"
-  KUDU_CDH_GBN=$(curl -L --fail --retry 3 -s -S "${BUILDDB_QUERY}")
-  if [ -z "$KUDU_CDH_GBN" ]; then
-    echo "Error: failed to fetch CDH global build number(GBN)"
+  CDH_GBN=$(curl -L --fail --retry 3 -s -S "${BUILDDB_QUERY}")
+  if [ -z "$CDH_GBN" ]; then
+    echo "Error: failed to fetch CDH global build number(CDH_GBN)"
     exit 1
   fi
-  export KUDU_CDH_GBN=$KUDU_CDH_GBN
+  export CDH_GBN=$CDH_GBN
 fi
 
-BUILD_URL_PREFIX="${CAULDRON_URL_PREFIX}/${KUDU_CDH_GBN}/impala-minicluster-tarballs"
+BUILD_URL_PREFIX="${CAULDRON_URL_PREFIX}/${CDH_GBN}/impala-minicluster-tarballs"
 
 PREFIX_COMMON=$TP_DIR/installed/common
 PREFIX_DEPS=$TP_DIR/installed/uninstrumented
@@ -272,13 +272,13 @@ while read line; do
 done <<< "$INDEX"
 
 HIVE_VERSION=${HIVE_NUMBER}-cdh${CDH_VERSION}
-HIVE_NAME=hive-$HIVE_VERSION-${KUDU_CDH_GBN}
+HIVE_NAME=hive-$HIVE_VERSION-${CDH_GBN}
 HIVE_SOURCE=$TP_SOURCE_DIR/$HIVE_NAME
 
 # Note: The Hadoop release tarball is stripped of unnecessary jars before being
 # uploaded. See thirdparty/package-hadoop.sh for details.
 HADOOP_VERSION=${HADOOP_NUMBER}-cdh${CDH_VERSION}
-HADOOP_NAME=hadoop-$HADOOP_VERSION-${KUDU_CDH_GBN}
+HADOOP_NAME=hadoop-$HADOOP_VERSION-${CDH_GBN}
 HADOOP_SOURCE=$TP_SOURCE_DIR/$HADOOP_NAME
 
 # TODO(dan): bump to a release version once SENTRY-2371 is published. The SHA

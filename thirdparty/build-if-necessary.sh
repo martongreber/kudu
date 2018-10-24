@@ -100,14 +100,14 @@ else
 fi
 
 # For thirdparty dependency group of CDH distribution, validate whether the build
-# is the latest official one by comparing the GBN queried from BuildDB against the
-# one stored during last build.
-KUDU_CDH_GBN_FILE=.kudu_cdh_gbn.txt
-if [ -n "$KUDU_CDH_GBN" ]; then
-  if [ -f $KUDU_CDH_GBN_FILE ]; then
-    KUDU_CDH_GBN_STORED=$(cat $KUDU_CDH_GBN_FILE)
+# is the latest one by comparing the CDH_GBN queried from BuildDB against the one
+# stored during last build.
+CDH_GBN_FILE=.cdh_gbn.txt
+if [ -n "$CDH_GBN" ]; then
+  if [ -f $CDH_GBN_FILE ]; then
+    CDH_GBN_STORED=$(cat $CDH_GBN_FILE)
   fi
-  if [ -z "$KUDU_CDH_GBN_STORED" -o "$KUDU_CDH_GBN" != "$KUDU_CDH_GBN_STORED" ]; then
+  if [ -z "$CDH_GBN_STORED" -o "$CDH_GBN" != "$CDH_GBN_STORED" ]; then
     GROUP="common"
     if [[ $NEEDS_BUILD != *"$GROUP"* ]]; then
       NEEDS_BUILD="$NEEDS_BUILD $GROUP"
@@ -142,7 +142,7 @@ else
   done
 fi
 
-# The build succeeded. Write the new GBN to disk.
-if [ -n "$KUDU_CDH_GBN" ]; then
-  echo $KUDU_CDH_GBN > $KUDU_CDH_GBN_FILE
+# The build succeeded. Write the new CDH_GBN to disk.
+if [ -n "$CDH_GBN" ]; then
+  echo $CDH_GBN > $CDH_GBN_FILE
 fi

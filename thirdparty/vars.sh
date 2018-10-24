@@ -34,43 +34,6 @@ CLOUDFRONT_URL_PREFIX=http://d3dr9sfxru4sde.cloudfront.net
 # Distribution URL.
 DEPENDENCY_URL=${DEPENDENCY_URL:-$CLOUDFRONT_URL_PREFIX}
 
-# This URL corresponds to Cloudera's CDH distribution.
-CAULDRON_URL_PREFIX=http://cloudera-build-us-west-1.vpc.cloudera.com/s3/build
-
-# Refer CDH_VERSION from 'version.txt', query BuildDB for the latest CDH build
-# tagged with 'impala-minicluster-tarballs' and use that as the CDH's global
-# build number (CDH_GBN).
-VERSION_FILE="$TP_DIR/../version.txt"
-if [ -f $VERSION_FILE ]; then
-  # Extracts the version number from version.txt and transforms it into a format
-  # suitable for builddb queries.
-  #
-  # For example:
-  # 1.8.0-cdh6.x-SNAPSHOT --> 6.x
-  # 1.6.0-cdh6.0.x-SNAPSHOT --> 6.0.x
-  VERSION=$(cat $VERSION_FILE | cut -d'-' -f2)
-  if [[ $VERSION == cdh* ]]; then
-    CDH_VERSION=${VERSION#"cdh"}
-  fi
-fi
-
-if [ -z "$CDH_VERSION" ]; then
-  echo "Error: failed to fetch CDH version number"
-  exit 1
-fi
-
-if [ -z "$CDH_GBN" ]; then
-  BUILDDB_QUERY='http://builddb.infra.cloudera.com/query?product=cdh;tag=impala-minicluster-tarballs,official;version='"${CDH_VERSION}"
-  CDH_GBN=$(curl -L --fail --retry 3 -s -S "${BUILDDB_QUERY}")
-  if [ -z "$CDH_GBN" ]; then
-    echo "Error: failed to fetch CDH global build number(CDH_GBN)"
-    exit 1
-  fi
-  export CDH_GBN=$CDH_GBN
-fi
-
-BUILD_URL_PREFIX="${CAULDRON_URL_PREFIX}/${CDH_GBN}/impala-minicluster-tarballs"
-
 PREFIX_COMMON=$TP_DIR/installed/common
 PREFIX_DEPS=$TP_DIR/installed/uninstrumented
 PREFIX_DEPS_TSAN=$TP_DIR/installed/tsan
@@ -253,32 +216,14 @@ BISON_SOURCE=$TP_SOURCE_DIR/$BISON_NAME
 # are published. The SHA below is the current head of branch-2.
 # Note: The Hive release binary tarball is stripped of unnecessary jars before
 # being uploaded. See thirdparty/package-hive.sh for details.
-
-# Dynamically retrieves Hadoop and Hive version number from 'index.txt' in Impala
-# tarball of CDH distribution.
-#
-# For example:
-# hadoop-3.0.0-cdh6.x-569425.tar.gz --> 3.0.0
-# hive-2.1.1-cdh6.x-569425.tar.gz --> 2.1.1
-INDEX_URL="${BUILD_URL_PREFIX}/index.txt"
-INDEX=$(curl -L --fail --retry 3 -s -S "${INDEX_URL}")
-while read line; do
-  if [[ $line == hive* ]]; then
-    HIVE_NUMBER=$(echo $line | cut -d'-' -f2)
-  fi
-  if [[ $line == hadoop* ]]; then
-    HADOOP_NUMBER=$(echo $line | cut -d'-' -f2)
-  fi
-done <<< "$INDEX"
-
-HIVE_VERSION=${HIVE_NUMBER}-cdh${CDH_VERSION}
-HIVE_NAME=hive-$HIVE_VERSION-${CDH_GBN}
+HIVE_VERSION=498021fa15186aee8b282d3c032fbd2cede6bec4
+HIVE_NAME=hive-$HIVE_VERSION
 HIVE_SOURCE=$TP_SOURCE_DIR/$HIVE_NAME
 
 # Note: The Hadoop release tarball is stripped of unnecessary jars before being
 # uploaded. See thirdparty/package-hadoop.sh for details.
-HADOOP_VERSION=${HADOOP_NUMBER}-cdh${CDH_VERSION}
-HADOOP_NAME=hadoop-$HADOOP_VERSION-${CDH_GBN}
+HADOOP_VERSION=2.8.5
+HADOOP_NAME=hadoop-$HADOOP_VERSION
 HADOOP_SOURCE=$TP_SOURCE_DIR/$HADOOP_NAME
 
 # TODO(dan): bump to a release version once SENTRY-2371 is published. The SHA

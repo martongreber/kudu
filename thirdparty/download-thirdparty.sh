@@ -412,18 +412,16 @@ fetch_and_patch \
  # autoreconf 2.69 (RHEL 7): "autoreconf: 'configure.ac' or 'configure.in' is required".
 
 HIVE_PATCHLEVEL=0
-fetch_with_url_and_patch \
- $HIVE_NAME.tar.gz \
+fetch_and_patch \
+ $HIVE_NAME-stripped.tar.gz \
  $HIVE_SOURCE \
- $HIVE_PATCHLEVEL \
- $BUILD_URL_PREFIX
+ $HIVE_PATCHLEVEL
 
 HADOOP_PATCHLEVEL=0
-fetch_with_url_and_patch \
- $HADOOP_NAME.tar.gz \
+fetch_and_patch \
+ $HADOOP_NAME-stripped.tar.gz \
  $HADOOP_SOURCE \
- $HADOOP_PATCHLEVEL \
- $BUILD_URL_PREFIX
+ $HADOOP_PATCHLEVEL
 
 SENTRY_PATCHLEVEL=0
 fetch_and_patch \

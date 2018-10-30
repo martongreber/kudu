@@ -31,3 +31,6 @@ include "kudu-spark-tools"
 
 include "kudu-csd"
 include "kudu-csd-5.10"
+include "kudu-csd-5.15"
+include "kudu-csd-5.16"
+include "kudu-csd-6.0"

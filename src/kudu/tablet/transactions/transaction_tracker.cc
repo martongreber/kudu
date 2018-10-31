@@ -111,10 +111,12 @@ Status TransactionTracker::Add(TransactionDriver* driver) {
     TabletReplica* replica = driver->state()->tablet_replica();
 
     string msg = Substitute(
-        "Transaction failed, tablet $0 transaction memory consumption ($1) "
-        "has exceeded its limit ($2) or the limit of an ancestral tracker",
+        "transaction on tablet $0 rejected due to memory pressure: the memory "
+        "usage of this transaction ($1) plus the current consumption ($2) "
+        "exceeds the transaction memory limit ($3) or the limit of an ancestral "
+        "memory tracker.",
         replica ? replica->tablet()->tablet_id() : "(unknown)",
-        mem_tracker_->consumption(), mem_tracker_->limit());
+        driver_mem_footprint, mem_tracker_->consumption(), mem_tracker_->limit());
 
     KLOG_EVERY_N_SECS(WARNING, 1) << msg << THROTTLE_MSG;
 

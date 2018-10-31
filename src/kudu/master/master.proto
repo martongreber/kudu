@@ -377,6 +377,8 @@ message TSInfoPB {
   required bytes permanent_uuid = 1;
 
   repeated HostPortPB rpc_addresses = 2;
+
+  optional string location = 3;
 }
 
 // Selector to specify policy for listing tablet replicas in
@@ -420,6 +422,10 @@ message CreateTableRequestPB {
   optional RowOperationsPB split_rows_range_bounds = 6;
   optional PartitionSchemaPB partition_schema = 7;
   optional int32 num_replicas = 4;
+
+  // If set, uses the provided value as the table owner when creating the table
+  // in external catalogs such as the Hive Metastore.
+  optional string owner = 8;
 }
 
 message CreateTableResponsePB {

@@ -54,11 +54,31 @@ Status GetConsensusState(
     consensus::ConsensusStatePB* consensus_state,
     bool* is_3_4_3_replication = nullptr);
 
-// Request current leader replica 'leader_uuid' to step down.
+// Request that the replica with UUID 'leader_uuid' step down.
+// In GRACEFUL mode:
+//   * If 'new_leader_uuid' is not boost::none, the leader will attempt
+//     to gracefully transfer leadership to the replica with that UUID.
+//   * If 'new_leader_uuid' is boost::none, the replica will choose its own
+//     successor, preferring to transfer leadership ASAP.
+// In ABRUPT mode, the replica will step down without arranging a successor.
+// 'new_leader_uuid' has no effect in this mode and must be provided as
+// boost::none.
+// Note that in neither mode does this function guarantee that leadership will
+// change, even if it returns OK. In ABRUPT mode, if the function succeeds,
+// the leader will step down, but it may be reelected again. In GRACEFUL mode,
+// the leader may not relinquish leadership at all, or it may and may be
+// reelected, even if the function succeeds. The advantage of GRACEFUL mode is
+// that it is on average less disruptive to tablet operations, particularly
+// when the leadership transfer fails.
+//
+// If a caller wants to ensure leadership changes, it must wait and see if
+// leadership changes as expected and, if not, retry.
 Status DoLeaderStepDown(
     const std::string& tablet_id,
     const std::string& leader_uuid,
     const HostPort& leader_hp,
+    consensus::LeaderStepDownMode mode,
+    const boost::optional<std::string>& new_leader_uuid,
     const MonoDelta& timeout);
 
 // Get information on the current leader replica for the specified tablet.
@@ -96,6 +116,29 @@ Status CheckCompleteMove(
     const std::string& to_ts_uuid,
     bool* is_complete,
     Status* completion_status);
+
+// Set the REPLACE attribute for the specified tablet replica. This is a no-op
+// if the replica already has the REPLACE attribute set.
+Status SetReplace(const client::sp::shared_ptr<client::KuduClient>& client,
+                  const std::string& tablet_id,
+                  const std::string& ts_uuid,
+                  const boost::optional<int64_t>& cas_opid_idx,
+                  bool* cas_failed = nullptr);
+
+// Check if the replica of the tablet 'tablet_id' previously hosted by tserver
+// identified by 'ts_uuid' is no longer hosted by the tablet server.
+// If there was a problem checking if the replica is in the config, non-OK
+// status is returned. On successful removal of the replica from the tablet
+// server, Status::OK() is returned and 'is_complete' output parameter
+// is set to 'true'. If the replica is still there but there was no error while
+// checking for the status of the replica in the config, Status::OK() is
+// returned and 'is_complete' is set to 'false'. The 'completion_status'
+// parameter contains valid information only if 'is_complete' is set to 'true'.
+Status CheckCompleteReplace(const client::sp::shared_ptr<client::KuduClient>& client,
+                            const std::string& tablet_id,
+                            const std::string& ts_uuid,
+                            bool* is_complete,
+                            Status* completion_status);
 
 // Schedule replica move operation for tablet with 'tablet_id', moving replica
 // from the tablet server 'from_ts_uuid' to tablet server 'to_ts_uuid'.

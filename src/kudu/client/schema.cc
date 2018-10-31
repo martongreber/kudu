@@ -738,7 +738,16 @@ void KuduSchema::GetPrimaryKeyColumnIndexes(vector<int>* indexes) const {
 }
 
 string KuduSchema::ToString() const {
-  return schema_ ? schema_->ToString() : "Schema []";
+  return schema_ ? schema_->ToString(Schema::ToStringMode::WITHOUT_COLUMN_IDS)
+                 : "()";
+}
+
+KuduSchema KuduSchema::FromSchema(const Schema& schema) {
+  return KuduSchema(schema);
+}
+
+Schema KuduSchema::ToSchema(const KuduSchema& kudu_schema) {
+  return Schema(*kudu_schema.schema_);
 }
 
 } // namespace client

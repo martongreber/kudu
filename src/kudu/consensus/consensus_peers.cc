@@ -100,6 +100,9 @@ using strings::Substitute;
 namespace kudu {
 namespace consensus {
 
+// The number of retries between failed requests whose failure is logged.
+constexpr auto kNumRetriesBetweenLoggingFailedRequest = 5;
+
 Status Peer::NewRemotePeer(RaftPeerPB peer_pb,
                            string tablet_id,
                            string leader_uuid,
@@ -239,10 +242,10 @@ void Peer::SendNextRequest(bool even_if_queue_empty) {
       // Capture a shared_ptr reference into the RPC callback so that we're guaranteed
       // that this object outlives the RPC.
       shared_ptr<Peer> s_this = shared_from_this();
-      proxy_->StartTabletCopy(&tc_request_, &tc_response_, &controller_,
-                              [s_this]() {
-                                s_this->ProcessTabletCopyResponse();
-                              });
+      proxy_->StartTabletCopyAsync(&tc_request_, &tc_response_, &controller_,
+                                   [s_this]() {
+                                     s_this->ProcessTabletCopyResponse();
+                                   });
     } else {
       LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to generate Tablet Copy request for peer: "
                                         << s.ToString();
@@ -282,6 +285,20 @@ void Peer::SendNextRequest(bool even_if_queue_empty) {
                       [s_this]() {
                         s_this->ProcessResponse();
                       });
+}
+
+Status Peer::StartElection() {
+  RunLeaderElectionRequestPB req;
+  RunLeaderElectionResponsePB resp;
+  RpcController controller;
+  req.set_dest_uuid(peer_pb().permanent_uuid());
+  req.set_tablet_id(tablet_id_);
+  RETURN_NOT_OK(proxy_->StartElection(&req, &resp, &controller));
+  RETURN_NOT_OK(controller.status());
+  if (resp.has_error()) {
+    return StatusFromPB(response_.error().status());
+  }
+  return Status::OK();
 }
 
 void Peer::ProcessResponse() {
@@ -430,12 +447,22 @@ void Peer::ProcessResponseError(const Status& status) {
                                TabletServerErrorPB::Code_Name(response_.error().code()),
                                response_.error().code());
   }
-  LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Couldn't send request to peer " << peer_pb_.permanent_uuid()
-      << " for tablet " << tablet_id_ << "."
-      << resp_err_info
-      << " Status: " << status.ToString() << "."
-      << " Retrying in the next heartbeat period."
-      << " Already tried " << failed_attempts_ << " times.";
+  // We log the warning at the first failure, then every
+  // 'kNumRetriesBetweenLoggingFailedRequest' retries.
+  // TODO(wdberkeley): If a use case comes up elsewhere, consider adding a
+  // KLOG_EVERY_N macro that supports an appropriate LogThrottler. For now,
+  // this class has 'failed_attempts_' available so it's overkill to add
+  // the throttler support.
+  if (failed_attempts_ % kNumRetriesBetweenLoggingFailedRequest == 1) {
+    LOG_WITH_PREFIX_UNLOCKED(WARNING) <<
+      Substitute("Couldn't send request to peer $0.$1 Status: $2. This is "
+                 "attempt $3: this message will repeat every $4th retry.",
+                 peer_pb_.permanent_uuid(),
+                 resp_err_info,
+                 status.ToString(),
+                 failed_attempts_,
+                 kNumRetriesBetweenLoggingFailedRequest);
+  }
   request_pending_ = false;
 }
 
@@ -481,6 +508,13 @@ void RpcPeerProxy::UpdateAsync(const ConsensusRequestPB* request,
   consensus_proxy_->UpdateConsensusAsync(*request, response, controller, callback);
 }
 
+Status RpcPeerProxy::StartElection(const RunLeaderElectionRequestPB* request,
+                                 RunLeaderElectionResponsePB* response,
+                                 rpc::RpcController* controller) {
+  controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
+  return consensus_proxy_->RunLeaderElection(*request, response, controller);
+}
+
 void RpcPeerProxy::RequestConsensusVoteAsync(const VoteRequestPB* request,
                                              VoteResponsePB* response,
                                              rpc::RpcController* controller,
@@ -488,10 +522,10 @@ void RpcPeerProxy::RequestConsensusVoteAsync(const VoteRequestPB* request,
   consensus_proxy_->RequestConsensusVoteAsync(*request, response, controller, callback);
 }
 
-void RpcPeerProxy::StartTabletCopy(const StartTabletCopyRequestPB* request,
-                                   StartTabletCopyResponsePB* response,
-                                   rpc::RpcController* controller,
-                                   const rpc::ResponseCallback& callback) {
+void RpcPeerProxy::StartTabletCopyAsync(const StartTabletCopyRequestPB* request,
+                                        StartTabletCopyResponsePB* response,
+                                        rpc::RpcController* controller,
+                                        const rpc::ResponseCallback& callback) {
   controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
   consensus_proxy_->StartTabletCopyAsync(*request, response, controller, callback);
 }

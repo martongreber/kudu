@@ -94,7 +94,7 @@ class SecurityUnknownTskTest : public KuduTest {
   SecurityUnknownTskTest()
       : num_tablet_servers_(3),
         heartbeat_interval_ms_(100),
-        schema_(client::KuduSchemaFromSchema(CreateKeyValueTestSchema())) {
+        schema_(KuduSchema::FromSchema(CreateKeyValueTestSchema())) {
 
     // Make the ts->master heartbeat interval shorter to run the test faster.
     FLAGS_heartbeat_interval_ms = heartbeat_interval_ms_;
@@ -161,7 +161,7 @@ class SecurityUnknownTskTest : public KuduTest {
       return Status::RuntimeError("failed to serialize token data");
     }
 
-    TokenSigner forger(1, 1);
+    TokenSigner forger(1, 1, 1);
     RETURN_NOT_OK(forger.ImportKeys({ tsk }));
     return forger.SignToken(new_signed_token);
   }

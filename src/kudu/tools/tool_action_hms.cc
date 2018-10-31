@@ -29,8 +29,8 @@
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
-#include "kudu/client/client-test-util.h"
 #include "kudu/client/client.h"
+#include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h"
 #include "kudu/common/schema.h"
 #include "kudu/gutil/map-util.h"
@@ -74,6 +74,7 @@ namespace tools {
 
 using client::KuduClient;
 using client::KuduClientBuilder;
+using client::KuduSchema;
 using client::KuduTable;
 using client::KuduTableAlterer;
 using client::sp::shared_ptr;
@@ -118,7 +119,7 @@ Status Init(const RunnerContext& context,
   // that the check and fix tools use the exact same master address
   // configuration that the masters do, otherwise the HMS table entries will
   // disagree on the master addresses property.
-  *master_addrs = GetMasterAddresses(**kudu_client);
+  *master_addrs = (*kudu_client)->GetMasterAddresses();
 
   if (FLAGS_hive_metastore_uris.empty()) {
     string hive_metastore_uris = (*kudu_client)->GetHiveMetastoreUris();
@@ -163,7 +164,7 @@ Status HmsDowngrade(const RunnerContext& context) {
 bool IsSynced(const string& master_addresses,
               const KuduTable& kudu_table,
               const hive::Table& hms_table) {
-  Schema schema(client::SchemaFromKuduSchema(kudu_table.schema()));
+  auto schema = KuduSchema::ToSchema(kudu_table.schema());
   hive::Table hms_table_copy(hms_table);
   Status s = HmsCatalog::PopulateTable(kudu_table.id(), kudu_table.name(), boost::none,
                                        schema, master_addresses, &hms_table_copy);
@@ -506,7 +507,7 @@ Status FixHmsMetadata(const RunnerContext& context) {
     for (const auto& kudu_table : report.missing_hms_tables) {
       const string& table_id = kudu_table->id();
       const string& table_name = kudu_table->name();
-      Schema schema = client::SchemaFromKuduSchema(kudu_table->schema());
+      auto schema = KuduSchema::ToSchema(kudu_table->schema());
       string normalized_table_name(table_name.data(), table_name.size());
       CHECK_OK(hms::HmsCatalog::NormalizeTableName(&normalized_table_name));
 
@@ -568,7 +569,7 @@ Status FixHmsMetadata(const RunnerContext& context) {
       } else {
         RETURN_NOT_OK_PREPEND(hms_catalog->UpgradeLegacyImpalaTable(
                   kudu_table.id(), hms_table.dbName, hms_table.tableName,
-                  client::SchemaFromKuduSchema(kudu_table.schema())),
+                  KuduSchema::ToSchema(kudu_table.schema())),
             Substitute("failed to upgrade legacy Impala HMS metadata for table $0",
               hms_table_name));
       }
@@ -635,7 +636,7 @@ Status FixHmsMetadata(const RunnerContext& context) {
         LOG(INFO) << "[dryrun] Refreshing HMS table metadata for Kudu table "
                   << TableIdent(kudu_table);
       } else {
-        Schema schema(client::SchemaFromKuduSchema(kudu_table.schema()));
+        auto schema = KuduSchema::ToSchema(kudu_table.schema());
         RETURN_NOT_OK_PREPEND(
             hms_catalog->AlterTable(kudu_table.id(), hms_table_name, hms_table_name, schema),
             Substitute("failed to refresh HMS table metadata for Kudu table $0",

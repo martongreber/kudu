@@ -37,7 +37,7 @@ class function;
 namespace kudu {
 
 class MonoDelta;
-class faststring;
+class faststring; // NOLINT
 
 namespace client {
 class KuduClient;
@@ -132,9 +132,6 @@ Status PrintServerFlags(const std::string& address, uint16_t default_port);
 // If 'address' does not contain a port, 'default_port' is used instead.
 Status SetServerFlag(const std::string& address, uint16_t default_port,
                      const std::string& flag, const std::string& value);
-
-// Get the configured master addresses on the most recently connected to leader master.
-std::string GetMasterAddresses(const client::KuduClient& client);
 
 // Return true if 'str' matches any of the patterns in 'patterns', or if
 // 'patterns' is empty.

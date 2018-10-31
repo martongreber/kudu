@@ -191,8 +191,9 @@ DEFINE_int32(catalog_manager_bg_task_wait_ms, 1000,
              "between runs");
 TAG_FLAG(catalog_manager_bg_task_wait_ms, hidden);
 
-DEFINE_int32(max_create_tablets_per_ts, 20,
-             "The number of tablets per TS that can be requested for a new table.");
+DEFINE_int32(max_create_tablets_per_ts, 60,
+             "The number of tablet replicas per TS that can be requested for a "
+             "new table. If 0, no limit is enforced.");
 TAG_FLAG(max_create_tablets_per_ts, advanced);
 
 DEFINE_int32(master_failover_catchup_timeout_ms, 30 * 1000, // 30 sec
@@ -726,6 +727,13 @@ Status CatalogManager::Init(bool is_first_run) {
         },
         ",");
 
+    // The leader_lock_ isn't really intended for this (it's for serializing
+    // new leadership initialization against regular catalog manager operations)
+    // but we need to use something to protect this hms_catalog_ write vis a vis
+    // the read in PrepareForLeadershipTask(), and that read is performed while
+    // holding leader_lock_, so this is the path of least resistance.
+    std::lock_guard<RWMutex> leader_lock_guard(leader_lock_);
+
     hms_catalog_.reset(new hms::HmsCatalog(std::move(master_addresses)));
     RETURN_NOT_OK_PREPEND(hms_catalog_->Start(),
                           "failed to start Hive Metastore catalog");
@@ -735,7 +743,6 @@ Status CatalogManager::Init(bool is_first_run) {
         "failed to initialize Hive Metastore notification log listener task");
   }
 
-  std::lock_guard<LockType> l(lock_);
   background_tasks_.reset(new CatalogManagerBgTasks(this));
   RETURN_NOT_OK_PREPEND(background_tasks_->Init(),
                         "Failed to initialize catalog manager background tasks");
@@ -1472,28 +1479,41 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
         resp, MasterErrorPB::ILLEGAL_REPLICATION_FACTOR);
   }
 
-  // Verify that the total number of tablets is reasonable, relative to the number
-  // of live tablet servers.
+  // Verify that the number of replicas isn't larger than the number of live tablet
+  // servers.
   TSDescriptorVector ts_descs;
   master_->ts_manager()->GetAllLiveDescriptors(&ts_descs);
   const auto num_live_tservers = ts_descs.size();
-  const auto max_tablets = FLAGS_max_create_tablets_per_ts * num_live_tservers;
-  if (num_replicas > 1 && max_tablets > 0 && partitions.size() > max_tablets) {
-    return SetupError(Status::InvalidArgument(Substitute(
-            "the requested number of tablets is over the maximum permitted at creation time ($0), "
-            "additional tablets may be added by adding range partitions to the table post-creation",
-            max_tablets)),
-        resp, MasterErrorPB::TOO_MANY_TABLETS);
-  }
-
-  // Verify that the number of replicas isn't larger than the number of live tablet
-  // servers.
   if (FLAGS_catalog_manager_check_ts_count_for_create_table && num_replicas > num_live_tservers) {
     // Note: this error message is matched against in master-stress-test.
     return SetupError(Status::InvalidArgument(Substitute(
             "not enough live tablet servers to create a table with the requested replication "
             "factor $0; $1 tablet servers are alive", req.num_replicas(), num_live_tservers)),
         resp, MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH);
+  }
+
+  // Verify that the total number of replicas is reasonable.
+  //
+  // Table creation can generate a fair amount of load, both in the form of RPC
+  // traffic (due to Raft leader elections) and disk I/O (due to durably writing
+  // several files during both replica creation and leader elections).
+  //
+  // Ideally we would have more effective ways of mitigating this load (such
+  // as more efficient on-disk metadata management), but in lieu of that, we
+  // employ this coarse-grained check that prohibits up-front creation of too
+  // many replicas.
+  //
+  // Note: non-replicated tables are exempt because, by not using replication,
+  // they do not generate much of the load described above.
+  const auto max_replicas_total = FLAGS_max_create_tablets_per_ts * num_live_tservers;
+  if (num_replicas > 1 &&
+      max_replicas_total > 0 &&
+      partitions.size() * num_replicas > max_replicas_total) {
+    return SetupError(Status::InvalidArgument(Substitute(
+        "the requested number of tablet replicas is over the maximum permitted "
+        "at creation time ($0), additional tablets may be added by adding "
+        "range partitions to the table post-creation", max_replicas_total)),
+                      resp, MasterErrorPB::TOO_MANY_TABLETS);
   }
 
   // Warn if the number of live tablet servers is not enough to re-replicate
@@ -1574,8 +1594,8 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // It is critical that this step happen before writing the table to the sys catalog,
   // since this step validates that the table name is available in the HMS catalog.
   if (hms_catalog_) {
-    Status s = hms_catalog_->CreateTable(table->id(), normalized_table_name,
-                                         rpc->remote_user().username(), schema);
+    string owner = req.has_owner() ? req.owner() : rpc->remote_user().username();
+    Status s = hms_catalog_->CreateTable(table->id(), normalized_table_name, owner, schema);
     if (!s.ok()) {
       s = s.CloneAndPrepend(Substitute("an error occurred while creating table $0 in the HMS",
                                        normalized_table_name));
@@ -4433,6 +4453,7 @@ Status CatalogManager::BuildLocationsForTablet(
       ServerRegistrationPB reg;
       ts_desc->GetRegistration(&reg);
       tsinfo_pb->mutable_rpc_addresses()->Swap(reg.mutable_rpc_addresses());
+      if (ts_desc->location()) tsinfo_pb->set_location(*(ts_desc->location()));
     } else {
       // If we've never received a heartbeat from the tserver, we'll fall back
       // to the last known RPC address in the RaftPeerPB.

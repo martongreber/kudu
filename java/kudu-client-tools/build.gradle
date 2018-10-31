@@ -28,7 +28,7 @@ dependencies {
 
   optional libs.yetusAnnotations
 
-  testCompile project(path: ":kudu-client", configuration: "shadowTest")
+  testCompile project(path: ":kudu-test-utils", configuration: "shadow")
   testCompile project(path: ":kudu-mapreduce", configuration: "test")
   testCompile libs.commonsIo
   testCompile libs.junit

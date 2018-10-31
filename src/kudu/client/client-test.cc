@@ -3619,7 +3619,7 @@ TEST_F(ClientTest, TestWriteWithBadSchema) {
   unique_ptr<KuduError> error = GetSingleErrorFromSession(session.get());
   ASSERT_TRUE(error->status().IsInvalidArgument());
   ASSERT_STR_CONTAINS(error->status().ToString(),
-            "Client provided column int_val[int32 NOT NULL] "
+            "Client provided column int_val INT32 NOT NULL "
             "not present in tablet");
   ASSERT_EQ(error->failed_op().ToString(),
             R"(INSERT int32 key=12345, int32 int_val=12345, string string_val="x")");
@@ -4426,6 +4426,12 @@ TEST_F(ClientTest, TestCreateDuplicateTable) {
 TEST_F(ClientTest, TestCreateTableWithTooManyTablets) {
   FLAGS_max_create_tablets_per_ts = 1;
 
+  // Add two more tservers so that we can create a table with replication factor
+  // of 3 below.
+  ASSERT_OK(cluster_->AddTabletServer());
+  ASSERT_OK(cluster_->AddTabletServer());
+  ASSERT_OK(cluster_->WaitForTabletServerCount(3));
+
   KuduPartialRow* split1 = schema_.NewRow();
   ASSERT_OK(split1->SetInt32("key", 1));
 
@@ -4441,8 +4447,8 @@ TEST_F(ClientTest, TestCreateTableWithTooManyTablets) {
       .Create();
   ASSERT_TRUE(s.IsInvalidArgument());
   ASSERT_STR_CONTAINS(s.ToString(),
-                      "the requested number of tablets is over the "
-                      "maximum permitted at creation time (1)");
+                      "the requested number of tablet replicas is over the "
+                      "maximum permitted at creation time (3)");
 }
 
 // Tests for too many replicas, too few replicas, even replica count, etc.

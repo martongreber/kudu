@@ -127,9 +127,8 @@ namespace tools {
 
 using client::KuduClient;
 using client::KuduClientBuilder;
-using client::KuduTablet;
-using client::KuduTabletServer;
-using consensus::ConsensusServiceProxy;
+using client::KuduTable;
+using consensus::ConsensusServiceProxy; // NOLINT
 using consensus::ReplicateMsg;
 using log::LogEntryPB;
 using log::LogEntryReader;
@@ -444,10 +443,6 @@ Status SetServerFlag(const string& address, uint16_t default_port,
     default:
       return Status::RemoteError(SecureShortDebugString(resp));
   }
-}
-
-string GetMasterAddresses(const client::KuduClient& client) {
-  return HostPort::ToCommaSeparatedString(client.data_->master_hostports());
 }
 
 bool MatchesAnyPattern(const vector<string>& patterns, const string& str) {

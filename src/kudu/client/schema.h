@@ -338,6 +338,8 @@ class KUDU_EXPORT KuduColumnSpec {
   ///
   /// The precision must be between 1 and 38.
   ///
+  /// @param [in] precision
+  ///   Desired precision to set.
   /// @return Pointer to the modified object.
   KuduColumnSpec* Precision(int8_t precision);
 
@@ -353,6 +355,8 @@ class KUDU_EXPORT KuduColumnSpec {
   /// The scale must be greater than 0 and less than the column's precision.
   /// If no scale is provided a default scale of 0 is used.
   ///
+  /// @param [in] scale
+  ///   Desired scale to set.
   /// @return Pointer to the modified object.
   KuduColumnSpec* Scale(int8_t scale);
   ///@}
@@ -570,6 +574,28 @@ class KUDU_EXPORT KuduSchema {
   /// @return A string describing this schema.
   std::string ToString() const;
 
+  /// @cond PRIVATE_API
+
+  /// Convert a Schema to a KuduSchema.
+  ///
+  /// Private API.
+  ///
+  /// @param[in] schema
+  ///   The Schema to convert
+  /// @return The converted KuduSchema
+  static KuduSchema FromSchema(const Schema& schema) KUDU_NO_EXPORT;
+
+  /// Convert a KuduSchema to a Schema.
+  ///
+  /// Private API.
+  ///
+  /// @param[in] kudu_schema
+  ///   The KuduSchema to convert
+  /// @return The converted Schema
+  static Schema ToSchema(const KuduSchema& kudu_schema) KUDU_NO_EXPORT;
+
+  /// @endcond
+
  private:
   friend class ClientTest;
   friend class KuduClient;
@@ -589,10 +615,7 @@ class KUDU_EXPORT KuduSchema {
   friend class tools::RemoteKsckCluster;
   friend class tools::ReplicaDumper;
 
-  friend KuduSchema KuduSchemaFromSchema(const Schema& schema);
-  friend Schema SchemaFromKuduSchema(const KuduSchema& schema);
-
-  // For use by kudu tests.
+  // For use by KuduSchema::FromSchema.
   explicit KuduSchema(const Schema& schema);
 
   // Private since we don't want users to rely on the first N columns

@@ -85,6 +85,7 @@
 #include "kudu/security/token.pb.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/async_util.h"
 #include "kudu/util/debug-util.h"
 #include "kudu/util/init.h"
 #include "kudu/util/logging.h"
@@ -456,7 +457,7 @@ Status KuduClient::ListTabletServers(vector<KuduTabletServer*>* tablet_servers) 
     HostPort hp;
     RETURN_NOT_OK(HostPortFromPB(e.registration().rpc_addresses(0), &hp));
     unique_ptr<KuduTabletServer> ts(new KuduTabletServer);
-    ts->data_ = new KuduTabletServer::Data(e.instance_id().permanent_uuid(), hp);
+    ts->data_ = new KuduTabletServer::Data(e.instance_id().permanent_uuid(), hp, e.location());
     tablet_servers->push_back(ts.release());
   }
   return Status::OK();
@@ -579,7 +580,7 @@ Status KuduClient::GetTablet(const string& tablet_id, KuduTablet** tablet) {
     HostPort hp;
     RETURN_NOT_OK(HostPortFromPB(ts_info.rpc_addresses(0), &hp));
     unique_ptr<KuduTabletServer> ts(new KuduTabletServer);
-    ts->data_ = new KuduTabletServer::Data(ts_info.permanent_uuid(), hp);
+    ts->data_ = new KuduTabletServer::Data(ts_info.permanent_uuid(), hp, ts_info.location());
 
     // TODO(aserbin): try to use member_type instead of role for metacache.
     bool is_leader = r.role() == consensus::RaftPeerPB::LEADER;
@@ -596,6 +597,10 @@ Status KuduClient::GetTablet(const string& tablet_id, KuduTablet** tablet) {
 
   *tablet = client_tablet.release();
   return Status::OK();
+}
+
+string KuduClient::GetMasterAddresses() const {
+  return HostPort::ToCommaSeparatedString(data_->master_hostports());
 }
 
 bool KuduClient::IsMultiMaster() const {
@@ -924,6 +929,39 @@ KuduPredicate* KuduTable::NewIsNullPredicate(const Slice& col_name) {
   return data_->MakePredicate(col_name, [&](const ColumnSchema& col_schema) {
     return new KuduPredicate(new IsNullPredicateData(col_schema));
   });
+}
+
+// The strategy for retrieving the partitions from the metacache is adapted
+// from KuduScanTokenBuilder::Data::Build.
+Status KuduTable::ListPartitions(vector<Partition>* partitions) {
+  DCHECK(partitions);
+  partitions->clear();
+  auto& client = data_->client_;
+  const auto deadline = MonoTime::Now() + client->default_admin_operation_timeout();
+  PartitionPruner pruner;
+  pruner.Init(*data_->schema_.schema_, data_->partition_schema_, ScanSpec());
+  while (pruner.HasMorePartitionKeyRanges()) {
+    scoped_refptr<client::internal::RemoteTablet> tablet;
+    Synchronizer sync;
+    const string& partition_key = pruner.NextPartitionKey();
+    client->data_->meta_cache_->LookupTabletByKey(
+        this,
+        partition_key,
+        deadline,
+        client::internal::MetaCache::LookupType::kLowerBound,
+        &tablet,
+        sync.AsStatusCallback());
+    Status s = sync.Wait();
+    if (s.IsNotFound()) {
+      // No more tablets.
+      break;
+    }
+    RETURN_NOT_OK(s);
+
+    partitions->emplace_back(tablet->partition());
+    pruner.RemovePartitionKeyRange(tablet->partition().partition_key_end());
+  }
+  return Status::OK();
 }
 
 ////////////////////////////////////////////////////////////
@@ -1357,7 +1395,7 @@ Status KuduScanner::SetCacheBlocks(bool cache_blocks) {
 }
 
 KuduSchema KuduScanner::GetProjectionSchema() const {
-  return KuduSchema(*data_->configuration().projection());
+  return KuduSchema::FromSchema(*data_->configuration().projection());
 }
 
 Status KuduScanner::SetRowFormatFlags(uint64_t flags) {
@@ -1609,7 +1647,8 @@ Status KuduScanner::GetCurrentServer(KuduTabletServer** server) {
   }
   unique_ptr<KuduTabletServer> client_server(new KuduTabletServer);
   client_server->data_ = new KuduTabletServer::Data(rts->permanent_uuid(),
-                                                    host_ports[0]);
+                                                    host_ports[0],
+                                                    rts->location());
   *server = client_server.release();
   return Status::OK();
 }
@@ -1781,6 +1820,10 @@ const string& KuduTabletServer::hostname() const {
 
 uint16_t KuduTabletServer::port() const {
   return data_->hp_.port();
+}
+
+const string& KuduTabletServer::location() const {
+  return data_->location_;
 }
 
 ////////////////////////////////////////////////////////////

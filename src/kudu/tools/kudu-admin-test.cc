@@ -19,9 +19,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <deque>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -35,20 +35,22 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/client/client-test-util.h"
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h"
+#include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.pb.h"
-#include "kudu/consensus/consensus.proxy.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/quorum_util.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/cluster_verifier.h"
@@ -56,22 +58,21 @@
 #include "kudu/integration-tests/ts_itest-base.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
-#include "kudu/rpc/rpc_controller.h"
 #include "kudu/tablet/metadata.pb.h"
-#include "kudu/tablet/tablet.pb.h"
 #include "kudu/tools/tool_test_util.h"
 #include "kudu/tserver/tablet_server-test-base.h"
-#include "kudu/tserver/tserver.pb.h"
-#include "kudu/util/countdown_latch.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
-#include "kudu/util/random.h"
-#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+
+namespace kudu {
+namespace tserver {
+class ListTabletsResponsePB;
+}  // namespace tserver
+}  // namespace kudu
 
 DECLARE_int32(num_replicas);
 DECLARE_int32(num_tablet_servers);
@@ -79,8 +80,10 @@ DECLARE_int32(num_tablet_servers);
 using kudu::client::KuduClient;
 using kudu::client::KuduClientBuilder;
 using kudu::client::KuduColumnSchema;
+using kudu::client::KuduInsert;
 using kudu::client::KuduSchema;
 using kudu::client::KuduSchemaBuilder;
+using kudu::client::KuduTable;
 using kudu::client::KuduTableAlterer;
 using kudu::client::KuduTableCreator;
 using kudu::client::sp::shared_ptr;
@@ -88,6 +91,7 @@ using kudu::cluster::ExternalTabletServer;
 using kudu::consensus::COMMITTED_OPID;
 using kudu::consensus::ConsensusStatePB;
 using kudu::consensus::EXCLUDE_HEALTH_REPORT;
+using kudu::consensus::LeaderStepDownMode;
 using kudu::consensus::OpId;
 using kudu::itest::FindTabletFollowers;
 using kudu::itest::FindTabletLeader;
@@ -121,8 +125,6 @@ using strings::Split;
 using strings::Substitute;
 
 namespace kudu {
-
-class Schema;
 
 namespace tools {
 
@@ -276,10 +278,6 @@ TEST_F(AdminCliTest, TestChangeConfig) {
                                                 MonoDelta::FromSeconds(10)));
 }
 
-enum class Kudu1097 {
-  Disable,
-  Enable,
-};
 enum class DownTS {
   None,
   TabletPeer,
@@ -1206,50 +1204,321 @@ Status GetTermFromConsensus(const vector<TServerDetails*>& tservers,
       "No leader replica found for tablet $0", tablet_id));
 }
 
-TEST_F(AdminCliTest, TestLeaderStepDown) {
+TEST_F(AdminCliTest, TestAbruptLeaderStepDown) {
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(10);
+  const vector<string> kMasterFlags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false",
+  };
+  const vector<string> kTserverFlags = {
+    "--enable_leader_failure_detection=false",
+  };
   FLAGS_num_tablet_servers = 3;
   FLAGS_num_replicas = 3;
-  NO_FATALS(BuildAndStart());
+  NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
 
+  // Wait for the tablet to be running.
   vector<TServerDetails*> tservers;
   AppendValuesFromMap(tablet_servers_, &tservers);
   ASSERT_EQ(FLAGS_num_tablet_servers, tservers.size());
   for (auto& ts : tservers) {
-    ASSERT_OK(WaitUntilTabletRunning(ts,
-                                     tablet_id_,
-                                     MonoDelta::FromSeconds(10)));
+    ASSERT_OK(WaitUntilTabletRunning(ts, tablet_id_, kTimeout));
   }
 
-  int64_t current_term;
-  ASSERT_OK(GetTermFromConsensus(tservers, tablet_id_,
-                                 &current_term));
+  // Elect the leader and wait for the tservers and master to see the leader.
+  const auto* leader = tservers[0];
+  ASSERT_OK(StartElection(leader, tablet_id_, kTimeout));
+  ASSERT_OK(WaitForServersToAgree(kTimeout, tablet_servers_,
+                                  tablet_id_, /*minimum_index=*/1));
+  TServerDetails* master_observed_leader;
+  ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &master_observed_leader));
+  ASSERT_EQ(leader->uuid(), master_observed_leader->uuid());
 
-  // The leader for the given tablet may change anytime, resulting in
-  // the command returning an error code. Hence checking for term advancement
-  // only if the leader_step_down succeeds. It is also unsafe to check
-  // the term advancement without honoring status of the command since
-  // there may not have been another election in the meanwhile.
+  // Ask the leader to step down.
   string stderr;
   Status s = RunKuduTool({
+    "tablet",
+    "leader_step_down",
+    "--abrupt",
+    cluster_->master()->bound_rpc_addr().ToString(),
+    tablet_id_
+  }, nullptr, &stderr);
+
+  // There shouldn't be a leader now, since failure detection is disabled.
+  for (const auto* ts : tservers) {
+    s = GetReplicaStatusAndCheckIfLeader(ts, tablet_id_, kTimeout);
+    ASSERT_TRUE(s.IsIllegalState()) << "Expected IllegalState because replica "
+      "should not be the leader: " << s.ToString();
+  }
+}
+
+TEST_F(AdminCliTest, TestGracefulLeaderStepDown) {
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(10);
+  const vector<string> kMasterFlags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false",
+  };
+  const vector<string> kTserverFlags = {
+    "--enable_leader_failure_detection=false",
+  };
+  FLAGS_num_tablet_servers = 3;
+  FLAGS_num_replicas = 3;
+  NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
+
+  // Wait for the tablet to be running.
+  vector<TServerDetails*> tservers;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ASSERT_EQ(FLAGS_num_tablet_servers, tservers.size());
+  for (auto& ts : tservers) {
+    ASSERT_OK(WaitUntilTabletRunning(ts, tablet_id_, kTimeout));
+  }
+
+  // Elect the leader and wait for the tservers and master to see the leader.
+  const auto* leader = tservers[0];
+  ASSERT_OK(StartElection(leader, tablet_id_, kTimeout));
+  ASSERT_OK(WaitForServersToAgree(kTimeout, tablet_servers_,
+                                  tablet_id_, /*minimum_index=*/1));
+  TServerDetails* master_observed_leader;
+  ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &master_observed_leader));
+  ASSERT_EQ(leader->uuid(), master_observed_leader->uuid());
+
+  // Ask the leader to transfer leadership to a specific peer.
+  const auto new_leader_uuid = tservers[1]->uuid();
+  string stderr;
+  Status s = RunKuduTool({
+    "tablet",
+    "leader_step_down",
+    Substitute("--new_leader_uuid=$0", new_leader_uuid),
+    cluster_->master()->bound_rpc_addr().ToString(),
+    tablet_id_
+  }, nullptr, &stderr);
+  ASSERT_TRUE(s.ok()) << s.ToString();
+
+  // Eventually, the chosen node should become leader.
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &master_observed_leader));
+    ASSERT_EQ(new_leader_uuid, master_observed_leader->uuid());
+  });
+
+  // Ask the leader to transfer leadership.
+  s = RunKuduTool({
     "tablet",
     "leader_step_down",
     cluster_->master()->bound_rpc_addr().ToString(),
     tablet_id_
   }, nullptr, &stderr);
-  bool not_currently_leader = stderr.find(
-      Status::IllegalState("").CodeAsString()) != string::npos;
-  ASSERT_TRUE(s.ok() || not_currently_leader) << "stderr: " << stderr;
-  if (s.ok()) {
-    int64_t new_term;
-    ASSERT_EVENTUALLY([&]() {
-        ASSERT_OK(GetTermFromConsensus(tservers, tablet_id_,
-                                       &new_term));
-        ASSERT_GT(new_term, current_term);
-      });
+  ASSERT_TRUE(s.ok()) << s.ToString();
+
+  // Eventually, some other node should become leader.
+  const std::unordered_set<string> possible_new_leaders = { tservers[0]->uuid(),
+                                                            tservers[2]->uuid() };
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &master_observed_leader));
+    ASSERT_TRUE(ContainsKey(possible_new_leaders, master_observed_leader->uuid()));
+  });
+}
+
+// Leader should reject requests to transfer leadership to a non-member of the
+// config.
+TEST_F(AdminCliTest, TestLeaderTransferToEvictedPeer) {
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(10);
+  // In this test, tablet leadership is manually controlled and the master
+  // should not rereplicate.
+  const vector<string> kMasterFlags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false",
+    "--master_add_server_when_underreplicated=false",
+  };
+  const vector<string> kTserverFlags = {
+    "--enable_leader_failure_detection=false",
+  };
+  FLAGS_num_tablet_servers = 3;
+  FLAGS_num_replicas = 3;
+  NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
+
+  // Wait for the tablet to be running.
+  vector<TServerDetails*> tservers;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ASSERT_EQ(FLAGS_num_tablet_servers, tservers.size());
+  for (auto& ts : tservers) {
+    ASSERT_OK(WaitUntilTabletRunning(ts, tablet_id_, kTimeout));
+  }
+
+  // Elect the leader and wait for the tservers and master to see the leader.
+  const auto* leader = tservers[0];
+  ASSERT_OK(StartElection(leader, tablet_id_, kTimeout));
+  ASSERT_OK(WaitForServersToAgree(kTimeout, tablet_servers_,
+                                  tablet_id_, /*minimum_index=*/1));
+  TServerDetails* master_observed_leader;
+  ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &master_observed_leader));
+  ASSERT_EQ(leader->uuid(), master_observed_leader->uuid());
+
+  const string& master_addr = cluster_->master()->bound_rpc_addr().ToString();
+
+  // Evict the first follower.
+  string stderr;
+  const auto evicted_uuid = tservers[1]->uuid();
+  Status s = RunKuduTool({
+    "tablet",
+    "change_config",
+    "remove_replica",
+    master_addr,
+    tablet_id_,
+    evicted_uuid,
+  }, nullptr, &stderr);
+  ASSERT_TRUE(s.ok()) << s.ToString() << " stderr: " << stderr;
+
+  // Ask the leader to transfer leadership to the evicted peer.
+  stderr.clear();
+  s = RunKuduTool({
+    "tablet",
+    "leader_step_down",
+    Substitute("--new_leader_uuid=$0", evicted_uuid),
+    master_addr,
+    tablet_id_
+  }, nullptr, &stderr);
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString() << " stderr: " << stderr;
+  ASSERT_STR_CONTAINS(stderr,
+                      Substitute("tablet server $0 is not a voter in the active config",
+                                 evicted_uuid));
+}
+
+// Leader should reject requests to transfer leadership to a non-voter of the
+// config.
+TEST_F(AdminCliTest, TestLeaderTransferToNonVoter) {
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(10);
+  // In this test, tablet leadership is manually controlled and the master
+  // should not rereplicate.
+  const vector<string> kMasterFlags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false",
+    "--master_add_server_when_underreplicated=false",
+  };
+  const vector<string> kTserverFlags = {
+    "--enable_leader_failure_detection=false",
+  };
+  FLAGS_num_tablet_servers = 3;
+  FLAGS_num_replicas = 3;
+  NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
+
+  // Wait for the tablet to be running.
+  vector<TServerDetails*> tservers;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ASSERT_EQ(FLAGS_num_tablet_servers, tservers.size());
+  for (auto& ts : tservers) {
+    ASSERT_OK(WaitUntilTabletRunning(ts, tablet_id_, kTimeout));
+  }
+
+  // Elect the leader and wait for the tservers and master to see the leader.
+  const auto* leader = tservers[0];
+  ASSERT_OK(StartElection(leader, tablet_id_, kTimeout));
+  ASSERT_OK(WaitForServersToAgree(kTimeout, tablet_servers_,
+                                  tablet_id_, /*minimum_index=*/1));
+  TServerDetails* master_observed_leader;
+  ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &master_observed_leader));
+  ASSERT_EQ(leader->uuid(), master_observed_leader->uuid());
+
+  const string& master_addr = cluster_->master()->bound_rpc_addr().ToString();
+
+  // Demote the first follower to a non-voter.
+  string stderr;
+  const auto non_voter_uuid = tservers[1]->uuid();
+  Status s = RunKuduTool({
+    "tablet",
+    "change_config",
+    "change_replica_type",
+    master_addr,
+    tablet_id_,
+    non_voter_uuid,
+    "NON_VOTER",
+  }, nullptr, &stderr);
+  ASSERT_TRUE(s.ok()) << s.ToString() << " stderr: " << stderr;
+
+  // Ask the leader to transfer leadership to the non-voter.
+  stderr.clear();
+  s = RunKuduTool({
+    "tablet",
+    "leader_step_down",
+    Substitute("--new_leader_uuid=$0", non_voter_uuid),
+    master_addr,
+    tablet_id_
+  }, nullptr, &stderr);
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString() << " stderr: " << stderr;
+  ASSERT_STR_CONTAINS(stderr,
+                      Substitute("tablet server $0 is not a voter in the active config",
+                                 non_voter_uuid));
+}
+
+// Leader transfer causes the tablet to stop accepting new writes. This test
+// tests that writes can still succeed even if lots of leader transfers and
+// abrupt stepdowns are happening, as long as the writes have long enough
+// timeouts to ride over the unstable leadership.
+TEST_F(AdminCliTest, TestSimultaneousLeaderTransferAndAbruptStepdown) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
+  }
+
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(10);
+  FLAGS_num_tablet_servers = 3;
+  FLAGS_num_replicas = 3;
+  NO_FATALS(BuildAndStart());
+
+  // Wait for the tablet to be running.
+  vector<TServerDetails*> tservers;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ASSERT_EQ(FLAGS_num_tablet_servers, tservers.size());
+  for (auto& ts : tservers) {
+    ASSERT_OK(WaitUntilTabletRunning(ts, tablet_id_, kTimeout));
+  }
+
+  // Start a workload with long timeouts. Everything should eventually go
+  // through but it might take a while given the leadership changes.
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableId);
+  workload.set_timeout_allowed(false);
+  workload.set_write_timeout_millis(60000);
+  workload.set_num_replicas(FLAGS_num_replicas);
+  workload.set_num_write_threads(1);
+  workload.set_write_batch_size(1);
+  workload.Setup();
+  workload.Start();
+
+  // Sometimes this test is flaky under ASAN and the writes are never able to
+  // complete, so we'll back off on how frequently we disrupt leadership to give
+  // time for progress to be made.
+  #if defined(ADDRESS_SANITIZER)
+    const auto leader_change_period_sec = MonoDelta::FromMilliseconds(5000);
+  #else
+    const auto leader_change_period_sec = MonoDelta::FromMilliseconds(1000);
+  #endif
+
+  const string& master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  while (workload.rows_inserted() < 1000) {
+    // Issue a graceful stepdown and then an abrupt stepdown, every
+    // 'leader_change_period_sec' seconds. The results are ignored because the
+    // tools might fail due to the constant leadership changes.
+    ignore_result(RunKuduTool({
+      "tablet",
+      "leader_step_down",
+      master_addr,
+      tablet_id_
+    }));
+    ignore_result(RunKuduTool({
+      "tablet",
+      "leader_step_down",
+      "--abrupt",
+      master_addr,
+      tablet_id_
+    }));
+    SleepFor(leader_change_period_sec);
   }
 }
 
-TEST_F(AdminCliTest, TestLeaderStepDownWhenNotPresent) {
+class TestLeaderStepDown :
+    public AdminCliTest,
+    public ::testing::WithParamInterface<LeaderStepDownMode> {
+};
+INSTANTIATE_TEST_CASE_P(, TestLeaderStepDown,
+                        ::testing::Values(LeaderStepDownMode::ABRUPT,
+                                          LeaderStepDownMode::GRACEFUL));
+TEST_P(TestLeaderStepDown, TestLeaderStepDownWhenNotPresent) {
   FLAGS_num_tablet_servers = 3;
   FLAGS_num_replicas = 3;
   NO_FATALS(BuildAndStart(
@@ -1271,12 +1540,63 @@ TEST_F(AdminCliTest, TestLeaderStepDownWhenNotPresent) {
   ASSERT_OK(RunKuduTool({
     "tablet",
     "leader_step_down",
+    Substitute("--abrupt=$0", GetParam() == LeaderStepDownMode::ABRUPT),
     cluster_->master()->bound_rpc_addr().ToString(),
     tablet_id_
   }, &stdout));
   ASSERT_STR_CONTAINS(stdout,
                       Substitute("No leader replica found for tablet $0",
                                  tablet_id_));
+}
+
+TEST_P(TestLeaderStepDown, TestRepeatedLeaderStepDown) {
+  FLAGS_num_tablet_servers = 3;
+  FLAGS_num_replicas = 3;
+  // Speed up leader failure detection and shorten the leader transfer period.
+  NO_FATALS(BuildAndStart({ "--raft_heartbeat_interval_ms=50" }));
+  vector<TServerDetails*> tservers;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ASSERT_EQ(FLAGS_num_tablet_servers, tservers.size());
+  for (auto& ts : tservers) {
+    ASSERT_OK(WaitUntilTabletRunning(ts,
+                                     tablet_id_,
+                                     MonoDelta::FromSeconds(10)));
+  }
+
+  // Start a workload.
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableId);
+  workload.set_timeout_allowed(false);
+  workload.set_write_timeout_millis(30000);
+  workload.set_num_replicas(FLAGS_num_replicas);
+  workload.set_num_write_threads(4);
+  workload.set_write_batch_size(1);
+  workload.Setup();
+  workload.Start();
+
+  // Issue stepdown requests repeatedly. If we leave some time for an election,
+  // the workload should still make progress.
+  const string abrupt_flag = Substitute("--abrupt=$0",
+                                        GetParam() == LeaderStepDownMode::ABRUPT);
+  string stdout;
+  string stderr;
+  while (workload.rows_inserted() < 2000) {
+    stdout.clear();
+    stderr.clear();
+    Status s = RunKuduTool({
+      "tablet",
+      "leader_step_down",
+      abrupt_flag,
+      cluster_->master()->bound_rpc_addr().ToString(),
+      tablet_id_
+    }, &stdout, &stderr);
+    bool not_currently_leader = stderr.find(
+        Status::IllegalState("").CodeAsString()) != string::npos;
+    ASSERT_TRUE(s.ok() || not_currently_leader) << s.ToString();
+    SleepFor(MonoDelta::FromMilliseconds(1000));
+  }
+
+  ClusterVerifier(cluster_.get()).CheckCluster();
 }
 
 TEST_F(AdminCliTest, TestDeleteTable) {
@@ -1328,7 +1648,7 @@ TEST_F(AdminCliTest, TestListTablesDetail) {
 
   // Add another table to test multiple tables output.
   const string kAnotherTableId = "TestAnotherTable";
-  KuduSchema client_schema(client::KuduSchemaFromSchema(schema_));
+  auto client_schema = KuduSchema::FromSchema(schema_);
   gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(kAnotherTableId)
            .schema(&client_schema)
@@ -1366,1005 +1686,374 @@ TEST_F(AdminCliTest, TestListTablesDetail) {
   }
 }
 
-TEST_F(AdminCliTest, RebalancerReportOnly) {
-  static const char kReferenceOutput[] =
-    R"***(Per-server replica distribution summary:
-       Statistic       |  Value
------------------------+----------
- Minimum Replica Count | 0
- Maximum Replica Count | 1
- Average Replica Count | 0.600000
+TEST_F(AdminCliTest, TestDescribeTable) {
+  FLAGS_num_tablet_servers = 1;
+  FLAGS_num_replicas = 1;
 
-Per-table replica distribution summary:
- Replica Skew |  Value
---------------+----------
- Minimum      | 1
- Maximum      | 1
- Average      | 1.000000)***";
-
-  FLAGS_num_tablet_servers = 5;
   NO_FATALS(BuildAndStart());
 
-  string out;
-  string err;
+  // The default table has a range partition with only one partition.
+  string stdout, stderr;
   Status s = RunKuduTool({
-    "cluster",
-    "rebalance",
+    "table",
+    "describe",
     cluster_->master()->bound_rpc_addr().ToString(),
-    "--report_only",
-  }, &out, &err);
-  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-  // The rebalancer should report on tablet replica distribution. The output
-  // should match the reference report: the distribution of the replicas
-  // is 100% repeatable given the number of tables created by the test,
-  // the replication factor and the number of tablet servers.
-  ASSERT_STR_CONTAINS(out, kReferenceOutput);
-  // The actual rebalancing should not run.
-  ASSERT_STR_NOT_CONTAINS(out, "rebalancing is complete:")
-      << ToolRunInfo(s, out, err);
-}
+    kTableId
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
 
-// Make sure the rebalancer doesn't start if a tablet server is down.
-class RebalanceStartCriteriaTest :
-    public AdminCliTest,
-    public ::testing::WithParamInterface<Kudu1097> {
-};
-INSTANTIATE_TEST_CASE_P(, RebalanceStartCriteriaTest,
-                        ::testing::Values(Kudu1097::Disable, Kudu1097::Enable));
-TEST_P(RebalanceStartCriteriaTest, TabletServerIsDown) {
-  const bool is_343_scheme = (GetParam() == Kudu1097::Enable);
-  const vector<string> kMasterFlags = {
-    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
-  };
-  const vector<string> kTserverFlags = {
-    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
-  };
+  ASSERT_STR_CONTAINS(
+      stdout,
+      "(\n"
+      "    key INT32 NOT NULL,\n"
+      "    int_val INT32 NOT NULL,\n"
+      "    string_val STRING NULLABLE,\n"
+      "    PRIMARY KEY (key)\n"
+      ")\n"
+      "RANGE (key) (\n"
+      "    PARTITION UNBOUNDED"
+      "\n"
+      ")\n"
+      "REPLICAS 1");
 
-  FLAGS_num_tablet_servers = 5;
-  NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
+  // Test a table with all types in its schema, multiple hash partitioning
+  // levels, multiple range partitions, and non-covered ranges.
+  const string kAnotherTableId = "TestAnotherTable";
+  KuduSchema schema;
 
-  // Shutdown one of the tablet servers.
-  HostPort ts_host_port;
+  // Build the schema.
   {
-    auto* ts = cluster_->tablet_server(0);
-    ASSERT_NE(nullptr, ts);
-    ts_host_port = ts->bound_rpc_hostport();
-    ts->Shutdown();
+    KuduSchemaBuilder builder;
+    builder.AddColumn("key_hash0")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_hash1")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_hash2")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_range")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("int8_val")->Type(KuduColumnSchema::INT8);
+    builder.AddColumn("int16_val")->Type(KuduColumnSchema::INT16);
+    builder.AddColumn("int32_val")->Type(KuduColumnSchema::INT32);
+    builder.AddColumn("int64_val")->Type(KuduColumnSchema::INT64);
+    builder.AddColumn("timestamp_val")->Type(KuduColumnSchema::UNIXTIME_MICROS);
+    builder.AddColumn("string_val")->Type(KuduColumnSchema::STRING);
+    builder.AddColumn("bool_val")->Type(KuduColumnSchema::BOOL);
+    builder.AddColumn("float_val")->Type(KuduColumnSchema::FLOAT);
+    builder.AddColumn("double_val")->Type(KuduColumnSchema::DOUBLE);
+    builder.AddColumn("binary_val")->Type(KuduColumnSchema::BINARY);
+    builder.AddColumn("decimal_val")->Type(KuduColumnSchema::DECIMAL)
+        ->Precision(10)
+        ->Scale(4);
+    builder.SetPrimaryKey({ "key_hash0", "key_hash1", "key_hash2", "key_range" });
+    ASSERT_OK(builder.Build(&schema));
   }
 
-  string out;
-  string err;
-  Status s = RunKuduTool({
-    "cluster",
-    "rebalance",
-    cluster_->master()->bound_rpc_addr().ToString()
-  }, &out, &err);
-  ASSERT_TRUE(s.IsRuntimeError()) << ToolRunInfo(s, out, err);
-  const auto err_msg_pattern = Substitute(
-      "Illegal state: tablet server .* \\($0\\): "
-      "unacceptable health status UNAVAILABLE",
-      ts_host_port.ToString());
-  ASSERT_STR_MATCHES(err, err_msg_pattern);
-}
-
-// Create tables with unbalanced replica distribution: useful in
-// rebalancer-related tests.
-static Status CreateUnbalancedTables(
-    cluster::ExternalMiniCluster* cluster,
-    client::KuduClient* client,
-    const Schema& table_schema,
-    const string& table_name_pattern,
-    int num_tables,
-    int rep_factor,
-    int tserver_idx_from,
-    int tserver_num,
-    int tserver_unresponsive_ms) {
-  // Keep running only some tablet servers and shut down the rest.
-  for (auto i = tserver_idx_from; i < tserver_num; ++i) {
-    cluster->tablet_server(i)->Shutdown();
-  }
-
-  // Wait for the catalog manager to understand that not all tablet servers
-  // are available.
-  SleepFor(MonoDelta::FromMilliseconds(5 * tserver_unresponsive_ms / 4));
-
-  // Create tables with their tablet replicas landing only on the tablet servers
-  // which are up and running.
-  KuduSchema client_schema(client::KuduSchemaFromSchema(table_schema));
-  for (auto i = 0; i < num_tables; ++i) {
-    const string table_name = Substitute(table_name_pattern, i);
-    unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
-    RETURN_NOT_OK(table_creator->table_name(table_name)
-                  .schema(&client_schema)
-                  .add_hash_partitions({ "key" }, 3)
-                  .num_replicas(rep_factor)
-                  .Create());
-    RETURN_NOT_OK(RunKuduTool({
-      "perf",
-      "loadgen",
-      cluster->master()->bound_rpc_addr().ToString(),
-      Substitute("--table_name=$0", table_name),
-      Substitute("--table_num_replicas=$0", rep_factor),
-      "--string_fixed=unbalanced_tables_test",
-    }));
-  }
-
-  for (auto i = tserver_idx_from; i < tserver_num; ++i) {
-    RETURN_NOT_OK(cluster->tablet_server(i)->Restart());
-  }
-
-  return Status::OK();
-}
-
-// A test to verify that rebalancing works for both 3-4-3 and 3-2-3 replica
-// management schemes. During replica movement, a light workload is run against
-// every table being rebalanced. This test covers different replication factors.
-class RebalanceParamTest :
-    public AdminCliTest,
-    public ::testing::WithParamInterface<tuple<int, Kudu1097>> {
-};
-INSTANTIATE_TEST_CASE_P(, RebalanceParamTest,
-    ::testing::Combine(::testing::Values(1, 2, 3, 5),
-                       ::testing::Values(Kudu1097::Disable, Kudu1097::Enable)));
-TEST_P(RebalanceParamTest, Rebalance) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
-
-  const auto& param = GetParam();
-  const auto kRepFactor = std::get<0>(param);
-  const auto is_343_scheme = (std::get<1>(param) == Kudu1097::Enable);
-  constexpr auto kNumTservers = 7;
-  constexpr auto kNumTables = 5;
-  const string table_name_pattern = "rebalance_test_table_$0";
-  constexpr auto kTserverUnresponsiveMs = 3000;
-  const auto timeout = MonoDelta::FromSeconds(30);
-  const vector<string> kMasterFlags = {
-    "--allow_unsafe_replication_factor",
-    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
-    Substitute("--tserver_unresponsive_timeout_ms=$0", kTserverUnresponsiveMs),
-  };
-  const vector<string> kTserverFlags = {
-    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
-  };
-
-  FLAGS_num_tablet_servers = kNumTservers;
-  FLAGS_num_replicas = kRepFactor;
-  NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
-
-  ASSERT_OK(CreateUnbalancedTables(
-      cluster_.get(), client_.get(), schema_, table_name_pattern, kNumTables,
-      kRepFactor, kRepFactor + 1, kNumTservers, kTserverUnresponsiveMs));
-
-  // Workloads aren't run for 3-2-3 replica movement with RF = 1 because
-  // the tablet is unavailable during the move until the target voter replica
-  // is up and running. That might take some time, and to avoid flakiness or
-  // setting longer timeouts, RF=1 replicas are moved with no concurrent
-  // workload running.
-  //
-  // TODO(aserbin): clarify why even with 3-4-3 it's a bit flaky now.
-  vector<unique_ptr<TestWorkload>> workloads;
-  //if (kRepFactor > 1 || is_343_scheme) {
-  if (kRepFactor > 1) {
-    for (auto i = 0; i < kNumTables; ++i) {
-      const string table_name = Substitute(table_name_pattern, i);
-      // The workload is light (1 thread, 1 op batches) so that new replicas
-      // bootstrap and converge quickly.
-      unique_ptr<TestWorkload> workload(new TestWorkload(cluster_.get()));
-      workload->set_table_name(table_name);
-      workload->set_num_replicas(kRepFactor);
-      workload->set_num_write_threads(1);
-      workload->set_write_batch_size(1);
-      workload->set_write_timeout_millis(timeout.ToMilliseconds());
-      workload->set_already_present_allowed(true);
-      workload->Setup();
-      workload->Start();
-      workloads.emplace_back(std::move(workload));
-    }
-  }
-
-  const vector<string> tool_args = {
-    "cluster",
-    "rebalance",
-    cluster_->master()->bound_rpc_addr().ToString(),
-    "--move_single_replicas=enabled",
-  };
-
+  // Set up partitioning and create the table.
   {
-    string out;
-    string err;
-    const Status s = RunKuduTool(tool_args, &out, &err);
-    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
-        << "stderr: " << err;
-  }
-
-  // Next run should report the cluster as balanced and no replica movement
-  // should be attempted.
-  {
-    string out;
-    string err;
-    const Status s = RunKuduTool(tool_args, &out, &err);
-    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-    ASSERT_STR_CONTAINS(out,
-        "rebalancing is complete: cluster is balanced (moved 0 replicas)")
-        << "stderr: " << err;
-  }
-
-  for (auto& workload : workloads) {
-    workload->StopAndJoin();
-  }
-
-  NO_FATALS(cluster_->AssertNoCrashes());
-  NO_FATALS(ClusterVerifier(cluster_.get()).CheckCluster());
-
-  // Now add a new tablet server into the cluster and make sure the rebalancer
-  // will re-distribute replicas.
-  ASSERT_OK(cluster_->AddTabletServer());
-  {
-    string out;
-    string err;
-    const Status s = RunKuduTool(tool_args, &out, &err);
-    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
-        << "stderr: " << err;
-    // The cluster was un-balanced, so many replicas should have been moved.
-    ASSERT_STR_NOT_CONTAINS(out, "(moved 0 replicas)");
-  }
-
-  NO_FATALS(cluster_->AssertNoCrashes());
-  NO_FATALS(ClusterVerifier(cluster_.get()).CheckCluster());
-}
-
-// Common base for the rebalancer-related test below.
-class RebalancingTest :
-    public tserver::TabletServerIntegrationTestBase,
-    public ::testing::WithParamInterface<Kudu1097> {
- public:
-  RebalancingTest(int num_tables = 10,
-                  int rep_factor = 3,
-                  int num_tservers = 8,
-                  int tserver_unresponsive_ms = 3000,
-                  const string& table_name_pattern = "rebalance_test_table_$0")
-      : TabletServerIntegrationTestBase(),
-        is_343_scheme_(GetParam() == Kudu1097::Enable),
-        num_tables_(num_tables),
-        rep_factor_(rep_factor),
-        num_tservers_(num_tservers),
-        tserver_unresponsive_ms_(tserver_unresponsive_ms),
-        table_name_pattern_(table_name_pattern) {
-    master_flags_ = {
-      Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme_),
-      Substitute("--tserver_unresponsive_timeout_ms=$0", tserver_unresponsive_ms_),
-    };
-    tserver_flags_ = {
-      Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme_),
-    };
-  }
-
- protected:
-  static const char* const kExitOnSignalStr;
-
-  void Prepare(const vector<string>& extra_tserver_flags = {},
-               const vector<string>& extra_master_flags = {}) {
-    copy(extra_tserver_flags.begin(), extra_tserver_flags.end(),
-         back_inserter(tserver_flags_));
-    copy(extra_master_flags.begin(), extra_master_flags.end(),
-         back_inserter(master_flags_));
-
-    FLAGS_num_tablet_servers = num_tservers_;
-    FLAGS_num_replicas = rep_factor_;
-    NO_FATALS(BuildAndStart(tserver_flags_, master_flags_));
-
-    ASSERT_OK(CreateUnbalancedTables(
-        cluster_.get(), client_.get(), schema_, table_name_pattern_,
-        num_tables_, rep_factor_, rep_factor_ + 1, num_tservers_,
-        tserver_unresponsive_ms_));
-  }
-
-  // When the rebalancer starts moving replicas, ksck detects corruption
-  // (that's why RuntimeError), seeing affected tables as non-healthy
-  // with data state of corresponding tablets as TABLET_DATA_COPYING. If using
-  // this method, it's a good idea to inject some latency into tablet copying
-  // to be able to spot the TABLET_DATA_COPYING state, see the
-  // '--tablet_copy_download_file_inject_latency_ms' flag for tservers.
-  bool IsRebalancingInProgress() {
-    string out;
-    const auto s = RunKuduTool({
-      "cluster",
-      "ksck",
-      cluster_->master()->bound_rpc_addr().ToString(),
-    }, &out);
-    if (s.IsRuntimeError() &&
-        out.find("Data state:  TABLET_DATA_COPYING") != string::npos) {
-      return true;
-    }
-    return false;
-  }
-
-  const bool is_343_scheme_;
-  const int num_tables_;
-  const int rep_factor_;
-  const int num_tservers_;
-  const int tserver_unresponsive_ms_;
-  const string table_name_pattern_;
-  vector<string> tserver_flags_;
-  vector<string> master_flags_;
-};
-const char* const RebalancingTest::kExitOnSignalStr = "kudu: process exited on signal";
-
-// Make sure the rebalancer is able to do its job if running concurrently
-// with DDL activity on the cluster.
-class DDLDuringRebalancingTest : public RebalancingTest {
- public:
-  DDLDuringRebalancingTest()
-      : RebalancingTest(20 /* num_tables */) {
-  }
-};
-INSTANTIATE_TEST_CASE_P(, DDLDuringRebalancingTest,
-                        ::testing::Values(Kudu1097::Disable, Kudu1097::Enable));
-TEST_P(DDLDuringRebalancingTest, TablesCreatedAndDeletedDuringRebalancing) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
-
-  NO_FATALS(Prepare());
-
-  // The latch that controls the lifecycle of the concurrent DDL activity.
-  CountDownLatch run_latch(1);
-
-  thread creator([&]() {
-    KuduSchema client_schema(client::KuduSchemaFromSchema(schema_));
-    for (auto idx = 0; ; ++idx) {
-      if (run_latch.WaitFor(MonoDelta::FromMilliseconds(500))) {
-        break;
-      }
-      const string table_name = Substitute("rebalancer_extra_table_$0", idx++);
-      unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
-      CHECK_OK(table_creator->table_name(table_name)
-               .schema(&client_schema)
-               .add_hash_partitions({ "key" }, 3)
-               .num_replicas(rep_factor_)
-               .Create());
-    }
-  });
-  auto creator_cleanup = MakeScopedCleanup([&]() {
-    run_latch.CountDown();
-    creator.join();
-  });
-
-  thread deleter([&]() {
-    for (auto idx = 0; idx < num_tables_; ++idx) {
-      if (run_latch.WaitFor(MonoDelta::FromMilliseconds(500))) {
-        break;
-      }
-      CHECK_OK(client_->DeleteTable(Substitute(table_name_pattern_, idx++)));
-    }
-  });
-  auto deleter_cleanup = MakeScopedCleanup([&]() {
-    run_latch.CountDown();
-    deleter.join();
-  });
-
-  thread alterer([&]() {
-    const string kTableName = "rebalancer_dynamic_table";
-    const string kNewTableName = "rebalancer_dynamic_table_new_name";
-    while (true) {
-      // Create table.
-      {
-        KuduSchema schema;
-        KuduSchemaBuilder builder;
-        builder.AddColumn("key")->Type(KuduColumnSchema::INT64)->
-            NotNull()->
-            PrimaryKey();
-        builder.AddColumn("a")->Type(KuduColumnSchema::INT64);
-        CHECK_OK(builder.Build(&schema));
-        unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
-        CHECK_OK(table_creator->table_name(kTableName)
-                 .schema(&schema)
-                 .set_range_partition_columns({})
-                 .num_replicas(rep_factor_)
-                 .Create());
-      }
-      if (run_latch.WaitFor(MonoDelta::FromMilliseconds(100))) {
-          break;
-      }
-
-      // Drop a column.
-      {
-        unique_ptr<KuduTableAlterer> alt(client_->NewTableAlterer(kTableName));
-        alt->DropColumn("a");
-        CHECK_OK(alt->Alter());
-      }
-      if (run_latch.WaitFor(MonoDelta::FromMilliseconds(100))) {
-          break;
-      }
-
-      // Add back the column with different type.
-      {
-        unique_ptr<KuduTableAlterer> alt(client_->NewTableAlterer(kTableName));
-        alt->AddColumn("a")->Type(KuduColumnSchema::STRING);
-        CHECK_OK(alt->Alter());
-      }
-      if (run_latch.WaitFor(MonoDelta::FromMilliseconds(100))) {
-          break;
-      }
-
-      // Rename the table.
-      {
-        unique_ptr<KuduTableAlterer> alt(client_->NewTableAlterer(kTableName));
-        alt->RenameTo(kNewTableName);
-        CHECK_OK(alt->Alter());
-      }
-      if (run_latch.WaitFor(MonoDelta::FromMilliseconds(100))) {
-          break;
-      }
-
-      // Drop the renamed table.
-      CHECK_OK(client_->DeleteTable(kNewTableName));
-      if (run_latch.WaitFor(MonoDelta::FromMilliseconds(100))) {
-          break;
-      }
-    }
-  });
-  auto alterer_cleanup = MakeScopedCleanup([&]() {
-    run_latch.CountDown();
-    alterer.join();
-  });
-
-  thread timer([&]() {
-    SleepFor(MonoDelta::FromSeconds(30));
-    run_latch.CountDown();
-  });
-  auto timer_cleanup = MakeScopedCleanup([&]() {
-    timer.join();
-  });
-
-  const vector<string> tool_args = {
-    "cluster",
-    "rebalance",
-    cluster_->master()->bound_rpc_addr().ToString(),
-  };
-
-  // Run the rebalancer concurrently with the DDL operations. The second run
-  // of the rebalancer (the second run starts after joining the timer thread)
-  // is necessary to balance the cluster after the DDL activity stops: that's
-  // the easiest way to make sure the rebalancer will take into account
-  // all DDL changes that happened.
-  //
-  // The signal to terminate the DDL activity (done via run_latch.CountDown())
-  // is sent from a separate timer thread instead of doing SleepFor() after
-  // the first run of the rebalancer followed by run_latch.CountDown().
-  // That's to avoid dependency on the rebalancer behavior if it spots on-going
-  // DDL activity and continues running over and over again.
-  for (auto i = 0; i < 2; ++i) {
-    if (i == 1) {
-      timer.join();
-      timer_cleanup.cancel();
-
-      // Wait for all the DDL activity to complete.
-      alterer.join();
-      alterer_cleanup.cancel();
-
-      deleter.join();
-      deleter_cleanup.cancel();
-
-      creator.join();
-      creator_cleanup.cancel();
-    }
-
-    string out;
-    string err;
-    const auto s = RunKuduTool(tool_args, &out, &err);
-    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
-        << "stderr: " << err;
-  }
-
-  // Next (3rd) run should report the cluster as balanced and
-  // no replica movement should be attempted.
-  {
-    string out;
-    string err;
-    const auto s = RunKuduTool(tool_args, &out, &err);
-    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-    ASSERT_STR_CONTAINS(out,
-        "rebalancing is complete: cluster is balanced (moved 0 replicas)")
-        << "stderr: " << err;
-  }
-
-  NO_FATALS(cluster_->AssertNoCrashes());
-  NO_FATALS(ClusterVerifier(cluster_.get()).CheckCluster());
-}
-
-// Make sure it's safe to run multiple rebalancers concurrently. The rebalancers
-// might report errors, but they should not get stuck and the cluster should
-// remain in good shape (i.e. no crashes, no data inconsistencies). Re-running a
-// single rebalancer session again should bring the cluster to a balanced state.
-class ConcurrentRebalancersTest : public RebalancingTest {
- public:
-  ConcurrentRebalancersTest()
-      : RebalancingTest(10 /* num_tables */) {
-  }
-};
-INSTANTIATE_TEST_CASE_P(, ConcurrentRebalancersTest,
-    ::testing::Values(Kudu1097::Disable, Kudu1097::Enable));
-TEST_P(ConcurrentRebalancersTest, TwoConcurrentRebalancers) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
-
-  NO_FATALS(Prepare());
-
-  const vector<string> tool_args = {
-    "cluster",
-    "rebalance",
-    cluster_->master()->bound_rpc_addr().ToString(),
-  };
-
-  const auto runner_func = [&]() {
-    string out;
-    string err;
-    const auto s = RunKuduTool(tool_args, &out, &err);
-    if (!s.ok()) {
-      // One might expect a bad status returned: e.g., due to some race so
-      // the rebalancer didn't able to make progress for more than
-      // --max_staleness_interval_sec, etc.
-      LOG(INFO) << "rebalancer run info: " << ToolRunInfo(s, out, err);
-    }
-
-    // Should not exit on a signal: not expecting SIGSEGV, SIGABRT, etc.
-    return s.ToString().find(kExitOnSignalStr) == string::npos;
-  };
-
-  CountDownLatch start_synchronizer(1);
-  vector<thread> concurrent_runners;
-  for (auto i = 0; i < 5; ++i) {
-    concurrent_runners.emplace_back([&]() {
-      start_synchronizer.Wait();
-      CHECK(runner_func());
-    });
-  }
-
-  // Run rebalancers concurrently and wait for their completion.
-  start_synchronizer.CountDown();
-  for (auto& runner : concurrent_runners) {
-    runner.join();
-  }
-
-  NO_FATALS(cluster_->AssertNoCrashes());
-  NO_FATALS(ClusterVerifier(cluster_.get()).CheckCluster());
-
-  {
-    string out;
-    string err;
-    const auto s = RunKuduTool(tool_args, &out, &err);
-    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
-        << "stderr: " << err;
-  }
-
-  // Next run should report the cluster as balanced and no replica movement
-  // should be attempted: at least one run of the rebalancer prior to this
-  // should succeed, so next run is about running the tool against already
-  // balanced cluster.
-  {
-    string out;
-    string err;
-    const auto s = RunKuduTool(tool_args, &out, &err);
-    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-    ASSERT_STR_CONTAINS(out,
-        "rebalancing is complete: cluster is balanced (moved 0 replicas)")
-        << "stderr: " << err;
-  }
-
-  NO_FATALS(cluster_->AssertNoCrashes());
-  NO_FATALS(ClusterVerifier(cluster_.get()).CheckCluster());
-}
-
-// The rebalancer should stop and exit upon detecting a tablet server that
-// went down. That's a simple and effective way of preventing concurrent replica
-// movement by the rebalancer and the automatic re-replication (the catalog
-// manager tries to move replicas from the unreachable tablet server).
-class TserverGoesDownDuringRebalancingTest : public RebalancingTest {
- public:
-  TserverGoesDownDuringRebalancingTest() :
-      RebalancingTest(5 /* num_tables */) {
-  }
-};
-INSTANTIATE_TEST_CASE_P(, TserverGoesDownDuringRebalancingTest,
-    ::testing::Values(Kudu1097::Disable, Kudu1097::Enable));
-TEST_P(TserverGoesDownDuringRebalancingTest, TserverDown) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
-
-  const vector<string> kTserverExtraFlags = {
-    // Slow down tablet copy to make rebalancing step running longer
-    // and become observable via tablet data states output by ksck.
-    "--tablet_copy_download_file_inject_latency_ms=1500",
-
-    "--follower_unavailable_considered_failed_sec=30",
-  };
-  NO_FATALS(Prepare(kTserverExtraFlags));
-
-  // Pre-condition: 'kudu cluster ksck' should be happy with the cluster state
-  // shortly after initial setup.
-  ASSERT_EVENTUALLY([&]() {
-    ASSERT_TOOL_OK(
-      "cluster",
-      "ksck",
-      cluster_->master()->bound_rpc_addr().ToString()
-    )
-  });
-
-  Random r(SeedRandom());
-  const uint32_t shutdown_tserver_idx = r.Next() % num_tservers_;
-
-  atomic<bool> run(true);
-  // The thread that shuts down the selected tablet server.
-  thread stopper([&]() {
-    while (run && !IsRebalancingInProgress()) {
-      SleepFor(MonoDelta::FromMilliseconds(10));
-    }
-
-    // All right, it's time to stop the selected tablet server.
-    cluster_->tablet_server(shutdown_tserver_idx)->Shutdown();
-  });
-  auto stopper_cleanup = MakeScopedCleanup([&]() {
-    run = false;
-    stopper.join();
-  });
-
-  {
-    string out;
-    string err;
-    const auto s = RunKuduTool({
-      "cluster",
-      "rebalance",
-      cluster_->master()->bound_rpc_addr().ToString(),
-      // Limiting the number of replicas to move. This is to make the rebalancer
-      // run longer, making sure the rebalancing is in progress when the tablet
-      // server goes down.
-      "--max_moves_per_server=1",
-    }, &out, &err);
-    ASSERT_TRUE(s.IsRuntimeError()) << ToolRunInfo(s, out, err);
-
-    // The rebalancer tool should not crash.
-    ASSERT_STR_NOT_CONTAINS(s.ToString(), kExitOnSignalStr);
-    ASSERT_STR_MATCHES(
-        err, "Illegal state: tablet server .* \\(.*\\): "
-             "unacceptable health status UNAVAILABLE");
-  }
-
-  run = false;
-  stopper.join();
-  stopper_cleanup.cancel();
-
-  ASSERT_OK(cluster_->tablet_server(shutdown_tserver_idx)->Restart());
-  NO_FATALS(cluster_->AssertNoCrashes());
-}
-
-// The rebalancer should continue working and complete rebalancing successfully
-// if a new tablet server is added while the cluster is being rebalanced.
-class TserverAddedDuringRebalancingTest : public RebalancingTest {
- public:
-  TserverAddedDuringRebalancingTest()
-      : RebalancingTest(10 /* num_tables */) {
-  }
-};
-INSTANTIATE_TEST_CASE_P(, TserverAddedDuringRebalancingTest,
-    ::testing::Values(Kudu1097::Disable, Kudu1097::Enable));
-TEST_P(TserverAddedDuringRebalancingTest, TserverStarts) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
-
-  const vector<string> kTserverExtraFlags = {
-    // Slow down tablet copy to make rebalancing step running longer
-    // and become observable via tablet data states output by ksck.
-    "--tablet_copy_download_file_inject_latency_ms=1500",
-
-    "--follower_unavailable_considered_failed_sec=30",
-  };
-  NO_FATALS(Prepare(kTserverExtraFlags));
-
-  const vector<string> tool_args = {
-    "cluster",
-    "rebalance",
-    cluster_->master()->bound_rpc_addr().ToString(),
-  };
-
-  atomic<bool> run(true);
-  thread runner([&]() {
-    while (run) {
-      string out;
-      string err;
-      const auto s = RunKuduTool(tool_args, &out, &err);
-      CHECK(s.ok()) << ToolRunInfo(s, out, err);
-    }
-  });
-  auto runner_cleanup = MakeScopedCleanup([&]() {
-    run = false;
-    runner.join();
-  });
-
-  while (!IsRebalancingInProgress()) {
-    SleepFor(MonoDelta::FromMilliseconds(10));
-  }
-
-  // It's time to sneak in and add new tablet server.
-  ASSERT_OK(cluster_->AddTabletServer());
-  run = false;
-  runner.join();
-  runner_cleanup.cancel();
-
-  // The rebalancer should not fail, and eventually, after a new tablet server
-  // is added, the cluster should become balanced.
-  ASSERT_EVENTUALLY([&]() {
-    string out;
-    string err;
-    const auto s = RunKuduTool(tool_args, &out, &err);
-    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-    ASSERT_STR_CONTAINS(out,
-        "rebalancing is complete: cluster is balanced (moved 0 replicas)")
-        << "stderr: " << err;
-  });
-
-  NO_FATALS(cluster_->AssertNoCrashes());
-  NO_FATALS(ClusterVerifier(cluster_.get()).CheckCluster());
-}
-
-// Run rebalancer in 'election storms' environment and make sure the rebalancer
-// does not exit prematurely or exhibit any other unexpected behavior.
-class RebalancingDuringElectionStormTest : public RebalancingTest {
-};
-INSTANTIATE_TEST_CASE_P(, RebalancingDuringElectionStormTest,
-    ::testing::Values(Kudu1097::Disable, Kudu1097::Enable));
-TEST_P(RebalancingDuringElectionStormTest, RoundRobin) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
-
-  NO_FATALS(Prepare());
-
-  atomic<bool> elector_run(true);
-#if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER)
-  // The timeout is a time-to-run for the stormy elector thread as well.
-  // Making longer timeout for workload in case of TSAN/ASAN is not needed:
-  // having everything generated written is not required.
-  const auto timeout = MonoDelta::FromSeconds(5);
-#else
-  const auto timeout = MonoDelta::FromSeconds(10);
-#endif
-  const auto start_time = MonoTime::Now();
-  thread elector([&]() {
-    // Mininum viable divider for modulo ('%') to allow the result to grow by
-    // the rules below.
-    auto max_sleep_ms = 2.0;
-    while (elector_run && MonoTime::Now() < start_time + timeout) {
-      for (const auto& e : tablet_servers_) {
-        const auto& ts_uuid = e.first;
-        const auto* ts = e.second;
-        vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
-        auto const s = itest::ListTablets(ts, timeout, &tablets);
-        if (!s.ok()) {
-          LOG(WARNING) << ts_uuid << ": failed to get tablet list :"
-                       << s.ToString();
-          continue;
-        }
-        consensus::ConsensusServiceProxy proxy(
-            cluster_->messenger(),
-            cluster_->tablet_server_by_uuid(ts_uuid)->bound_rpc_addr(),
-            "tserver " + ts_uuid);
-        for (const auto& tablet : tablets) {
-          const auto& tablet_id = tablet.tablet_status().tablet_id();
-          consensus::RunLeaderElectionRequestPB req;
-          req.set_tablet_id(tablet_id);
-          req.set_dest_uuid(ts_uuid);
-          rpc::RpcController rpc;
-          rpc.set_timeout(timeout);
-          consensus::RunLeaderElectionResponsePB resp;
-          WARN_NOT_OK(proxy.RunLeaderElection(req, &resp, &rpc),
-                      Substitute("failed to start election for tablet $0",
-                                 tablet_id));
-        }
-        if (!elector_run || start_time + timeout <= MonoTime::Now()) {
-          break;
-        }
-        auto sleep_ms = rand() % static_cast<int>(max_sleep_ms);
-        SleepFor(MonoDelta::FromMilliseconds(sleep_ms));
-        max_sleep_ms = std::min(max_sleep_ms * 1.1, 2000.0);
-      }
-    }
-  });
-  auto elector_cleanup = MakeScopedCleanup([&]() {
-    elector_run = false;
-    elector.join();
-  });
-
-#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
-  vector<unique_ptr<TestWorkload>> workloads;
-  for (auto i = 0; i < num_tables_; ++i) {
-    const string table_name = Substitute(table_name_pattern_, i);
-    // The workload is light (1 thread, 1 op batches) and lenient to failures.
-    unique_ptr<TestWorkload> workload(new TestWorkload(cluster_.get()));
-    workload->set_table_name(table_name);
-    workload->set_num_replicas(rep_factor_);
-    workload->set_num_write_threads(1);
-    workload->set_write_batch_size(1);
-    workload->set_write_timeout_millis(timeout.ToMilliseconds());
-    workload->set_already_present_allowed(true);
-    workload->set_remote_error_allowed(true);
-    workload->set_timeout_allowed(true);
-    workload->Setup();
-    workload->Start();
-    workloads.emplace_back(std::move(workload));
-  }
-#endif
-
-  const vector<string> tool_args = {
-    "cluster",
-    "rebalance",
-    cluster_->master()->bound_rpc_addr().ToString(),
-  };
-
-  while (MonoTime::Now() < start_time + timeout) {
-    // Rebalancer should not report any errors even if it's an election storm
-    // unless a tablet server is reported as unavailable by ksck: the latter
-    // usually happens because GetConsensusState requests are dropped due to
-    // backpressure.
-    string out;
-    string err;
-    const Status s = RunKuduTool(tool_args, &out, &err);
-    if (s.ok()) {
-      ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
-          << ToolRunInfo(s, out, err);
-    } else {
-      ASSERT_STR_CONTAINS(err, "unacceptable health status UNAVAILABLE")
-          << ToolRunInfo(s, out, err);
-    }
-  }
-
-  elector_run = false;
-  elector.join();
-  elector_cleanup.cancel();
-#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
-  for (auto& workload : workloads) {
-    workload->StopAndJoin();
-  }
-#endif
-
-  // There might be some re-replication started as a result of election storm,
-  // etc. Eventually, the system should heal itself and 'kudu cluster ksck'
-  // should report no issues.
-  ASSERT_EVENTUALLY([&]() {
-    ASSERT_TOOL_OK(
-      "cluster",
-      "ksck",
-      cluster_->master()->bound_rpc_addr().ToString()
-    )
-  });
-
-  // The rebalancer should successfully rebalance the cluster after ksck
-  // reported 'all is well'.
-  {
-    string out;
-    string err;
-    const Status s = RunKuduTool(tool_args, &out, &err);
-    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-    ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
-        << ToolRunInfo(s, out, err);
-  }
-
-  NO_FATALS(cluster_->AssertNoCrashes());
-}
-
-// A test to verify how the rebalancer handles replicas of single-replica
-// tablets in case of various values of the '--move_single_replicas' flag
-// and replica management schemes.
-class RebalancerAndSingleReplicaTablets :
-    public AdminCliTest,
-    public ::testing::WithParamInterface<tuple<string, Kudu1097>> {
-};
-INSTANTIATE_TEST_CASE_P(, RebalancerAndSingleReplicaTablets,
-    ::testing::Combine(::testing::Values("auto", "enabled", "disabled"),
-                       ::testing::Values(Kudu1097::Disable, Kudu1097::Enable)));
-TEST_P(RebalancerAndSingleReplicaTablets, SingleReplicasStayOrMove) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
-
-  constexpr auto kRepFactor = 1;
-  constexpr auto kNumTservers = 2 * (kRepFactor + 1);
-  constexpr auto kNumTables = kNumTservers;
-  constexpr auto kTserverUnresponsiveMs = 3000;
-  const auto& param = GetParam();
-  const auto& move_single_replica = std::get<0>(param);
-  const auto is_343_scheme = (std::get<1>(param) == Kudu1097::Enable);
-  const string table_name_pattern = "rebalance_test_table_$0";
-  const vector<string> master_flags = {
-    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
-    Substitute("--tserver_unresponsive_timeout_ms=$0", kTserverUnresponsiveMs),
-  };
-  const vector<string> tserver_flags = {
-    Substitute("--raft_prepare_replacement_before_eviction=$0", is_343_scheme),
-  };
-
-  FLAGS_num_tablet_servers = kNumTservers;
-  FLAGS_num_replicas = kRepFactor;
-  NO_FATALS(BuildAndStart(tserver_flags, master_flags));
-
-  // Keep running only (kRepFactor + 1) tablet servers and shut down the rest.
-  for (auto i = kRepFactor + 1; i < kNumTservers; ++i) {
-    cluster_->tablet_server(i)->Shutdown();
-  }
-
-  // Wait for the catalog manager to understand that only (kRepFactor + 1)
-  // tablet servers are available.
-  SleepFor(MonoDelta::FromMilliseconds(5 * kTserverUnresponsiveMs / 4));
-
-  // Create few tables with their tablet replicas landing only on those
-  // (kRepFactor + 1) running tablet servers.
-  KuduSchema client_schema(client::KuduSchemaFromSchema(schema_));
-  for (auto i = 0; i < kNumTables; ++i) {
-    const string table_name = Substitute(table_name_pattern, i);
+    unique_ptr<KuduPartialRow> lower_bound0(schema.NewRow());
+    ASSERT_OK(lower_bound0->SetInt32("key_range", 0));
+    unique_ptr<KuduPartialRow> upper_bound0(schema.NewRow());
+    ASSERT_OK(upper_bound0->SetInt32("key_range", 1));
+    unique_ptr<KuduPartialRow> lower_bound1(schema.NewRow());
+    ASSERT_OK(lower_bound1->SetInt32("key_range", 2));
+    unique_ptr<KuduPartialRow> upper_bound1(schema.NewRow());
+    ASSERT_OK(upper_bound1->SetInt32("key_range", 3));
     unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
-    ASSERT_OK(table_creator->table_name(table_name)
-              .schema(&client_schema)
-              .add_hash_partitions({ "key" }, 3)
-              .num_replicas(kRepFactor)
-              .Create());
-    ASSERT_TOOL_OK(
-      "perf",
-      "loadgen",
-      cluster_->master()->bound_rpc_addr().ToString(),
-      Substitute("--table_name=$0", table_name),
-      // Don't need much data in there.
-      "--num_threads=1",
-      "--num_rows_per_thread=1",
-    );
-  }
-  for (auto i = kRepFactor + 1; i < kNumTservers; ++i) {
-    ASSERT_OK(cluster_->tablet_server(i)->Restart());
+    ASSERT_OK(table_creator->table_name(kAnotherTableId)
+             .schema(&schema)
+             .add_hash_partitions({ "key_hash0" }, 2)
+             .add_hash_partitions({ "key_hash1", "key_hash2" }, 3)
+             .set_range_partition_columns({ "key_range" })
+             .add_range_partition(lower_bound0.release(), upper_bound0.release())
+             .add_range_partition(lower_bound1.release(), upper_bound1.release())
+             .num_replicas(FLAGS_num_replicas)
+             .Create());
   }
 
-  string out;
-  string err;
-  const Status s = RunKuduTool({
-    "cluster",
-    "rebalance",
+  // OK, all that busywork is done. Test the describe output.
+  stdout.clear();
+  stderr.clear();
+  s = RunKuduTool({
+    "table",
+    "describe",
     cluster_->master()->bound_rpc_addr().ToString(),
-    Substitute("--move_single_replicas=$0", move_single_replica),
-  }, &out, &err);
-  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, out, err);
-  ASSERT_STR_CONTAINS(out, "rebalancing is complete: cluster is balanced")
-      << "stderr: " << err;
-  if (move_single_replica == "enabled" ||
-      (move_single_replica == "auto" && is_343_scheme)) {
-    // Should move appropriate replicas of single-replica tablets.
-    ASSERT_STR_NOT_CONTAINS(out,
-        "rebalancing is complete: cluster is balanced (moved 0 replicas)")
-        << "stderr: " << err;
-    ASSERT_STR_NOT_CONTAINS(err, "has single replica, skipping");
-  } else {
-    ASSERT_STR_CONTAINS(out,
-        "rebalancing is complete: cluster is balanced (moved 0 replicas)")
-        << "stderr: " << err;
-    ASSERT_STR_MATCHES(err, "tablet .* of table '.*' (.*) has single replica, skipping");
-  }
+    kAnotherTableId
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
 
-  NO_FATALS(cluster_->AssertNoCrashes());
-  ClusterVerifier v(cluster_.get());
-  NO_FATALS(v.CheckCluster());
+  ASSERT_STR_CONTAINS(
+      stdout,
+      "(\n"
+      "    key_hash0 INT32 NOT NULL,\n"
+      "    key_hash1 INT32 NOT NULL,\n"
+      "    key_hash2 INT32 NOT NULL,\n"
+      "    key_range INT32 NOT NULL,\n"
+      "    int8_val INT8 NULLABLE,\n"
+      "    int16_val INT16 NULLABLE,\n"
+      "    int32_val INT32 NULLABLE,\n"
+      "    int64_val INT64 NULLABLE,\n"
+      "    timestamp_val UNIXTIME_MICROS NULLABLE,\n"
+      "    string_val STRING NULLABLE,\n"
+      "    bool_val BOOL NULLABLE,\n"
+      "    float_val FLOAT NULLABLE,\n"
+      "    double_val DOUBLE NULLABLE,\n"
+      "    binary_val BINARY NULLABLE,\n"
+      "    decimal_val DECIMAL(10, 4) NULLABLE,\n"
+      "    PRIMARY KEY (key_hash0, key_hash1, key_hash2, key_range)\n"
+      ")\n"
+      "HASH (key_hash0) PARTITIONS 2,\n"
+      "HASH (key_hash1, key_hash2) PARTITIONS 3,\n"
+      "RANGE (key_range) (\n"
+      "    PARTITION 0 <= VALUES < 1,\n"
+      "    PARTITION 2 <= VALUES < 3\n"
+      ")\n"
+      "REPLICAS 1");
 }
 
+TEST_F(AdminCliTest, TestLocateRow) {
+  FLAGS_num_tablet_servers = 1;
+  FLAGS_num_replicas = 1;
+
+  NO_FATALS(BuildAndStart());
+
+  // Test an OK case. Not much going on here since the table has only one
+  // tablet, which covers the whole universe.
+  string stdout, stderr;
+  Status s = RunKuduTool({
+    "table",
+    "locate_row",
+    cluster_->master()->bound_rpc_addr().ToString(),
+    kTableId,
+    "[-1]"
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+
+  // Grab list of tablet_ids from the tserver and check the output.
+  vector<TServerDetails*> tservers;
+  vector<string> tablet_ids;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ListRunningTabletIds(tservers.front(),
+                       MonoDelta::FromSeconds(30),
+                       &tablet_ids);
+  ASSERT_EQ(1, tablet_ids.size());
+  ASSERT_STR_CONTAINS(stdout, tablet_ids[0]);
+
+  // Test a few error cases.
+  const auto check_bad_input = [&](const string& json, const string& error) {
+    string out, err;
+    Status s = RunKuduTool({
+      "table",
+      "locate_row",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      kTableId,
+      json,
+    }, &out, &err);
+    ASSERT_TRUE(s.IsRuntimeError());
+    ASSERT_STR_CONTAINS(err, error);
+  };
+
+  // String instead of int.
+  NO_FATALS(check_bad_input("[\"foo\"]", "unable to parse"));
+
+  // Float instead of int.
+  NO_FATALS(check_bad_input("[1.2]", "unable to parse"));
+
+  // Overflow (recall the key is INT32).
+  NO_FATALS(check_bad_input(
+      Substitute("[$0]", std::to_string(std::numeric_limits<int64_t>::max())),
+      "out of range"));
+}
+
+TEST_F(AdminCliTest, TestLocateRowMore) {
+  FLAGS_num_tablet_servers = 1;
+  FLAGS_num_replicas = 1;
+
+  NO_FATALS(BuildAndStart());
+
+  // Make a complex schema with multiple columns in the primary key, hash and
+  // range partitioning, and non-covered ranges.
+  const string kAnotherTableId = "TestAnotherTable";
+  KuduSchema schema;
+
+  // Build the schema.
+  KuduSchemaBuilder builder;
+  builder.AddColumn("key_hash")->Type(KuduColumnSchema::STRING)->NotNull();
+  builder.AddColumn("key_range")->Type(KuduColumnSchema::INT32)->NotNull();
+  builder.SetPrimaryKey({ "key_hash", "key_range" });
+  ASSERT_OK(builder.Build(&schema));
+
+  // Set up partitioning and create the table.
+  unique_ptr<KuduPartialRow> lower_bound0(schema.NewRow());
+  ASSERT_OK(lower_bound0->SetInt32("key_range", 0));
+  unique_ptr<KuduPartialRow> upper_bound0(schema.NewRow());
+  ASSERT_OK(upper_bound0->SetInt32("key_range", 1));
+  unique_ptr<KuduPartialRow> lower_bound1(schema.NewRow());
+  ASSERT_OK(lower_bound1->SetInt32("key_range", 2));
+  unique_ptr<KuduPartialRow> upper_bound1(schema.NewRow());
+  ASSERT_OK(upper_bound1->SetInt32("key_range", 3));
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kAnotherTableId)
+           .schema(&schema)
+           .add_hash_partitions({ "key_hash" }, 2)
+           .set_range_partition_columns({ "key_range" })
+           .add_range_partition(lower_bound0.release(), upper_bound0.release())
+           .add_range_partition(lower_bound1.release(), upper_bound1.release())
+           .num_replicas(FLAGS_num_replicas)
+           .Create());
+
+  vector<TServerDetails*> tservers;
+  vector<string> tablet_ids;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ListRunningTabletIds(tservers.front(),
+                       MonoDelta::FromSeconds(30),
+                       &tablet_ids);
+  std::unordered_set<string> tablet_id_set(tablet_ids.begin(), tablet_ids.end());
+
+  // Since there isn't a great alternative way to validate the answer the tool
+  // gives, and the scan token code underlying the implementation is extensively
+  // tested, we won't overexert ourselves checking correctness, and instead just
+  // do sanity checks and tool usability checks.
+  string stdout, stderr;
+  Status s = RunKuduTool({
+    "table",
+    "locate_row",
+    cluster_->master()->bound_rpc_addr().ToString(),
+    kAnotherTableId,
+    "[\"foo bar\",0]"
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+  StripWhiteSpace(&stdout);
+  const auto tablet_id_for_0 = stdout;
+  ASSERT_TRUE(ContainsKey(tablet_id_set, tablet_id_for_0))
+      << "expected to find tablet id " << tablet_id_for_0;
+
+  // A row in a different range partition should be in a different tablet.
+  stdout.clear();
+  stderr.clear();
+  s = RunKuduTool({
+    "table",
+    "locate_row",
+    cluster_->master()->bound_rpc_addr().ToString(),
+    kAnotherTableId,
+    "[\"foo\",2]"
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+  StripWhiteSpace(&stdout);
+  const auto tablet_id_for_2 = stdout;
+  ASSERT_TRUE(ContainsKey(tablet_id_set, tablet_id_for_0))
+      << "expected to find tablet id " << tablet_id_for_2;
+  ASSERT_NE(tablet_id_for_0, tablet_id_for_2);
+
+  // Test a few error cases.
+  const auto check_bad_input = [&](const string& json, const string& error) {
+    string out, err;
+    Status s = RunKuduTool({
+      "table",
+      "locate_row",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      kAnotherTableId,
+      json,
+    }, &out, &err);
+    ASSERT_TRUE(s.IsRuntimeError());
+    ASSERT_STR_CONTAINS(err, error);
+  };
+
+  // Test locating a row lying in a non-covered range.
+  NO_FATALS(check_bad_input(
+      "[\"foo\",1]",
+      "row does not belong to any currently existing tablet"));
+
+  // Test providing a missing or incomplete primary key.
+  NO_FATALS(check_bad_input(
+      "[]",
+      "wrong number of key columns specified: expected 2 but received 0"));
+  NO_FATALS(check_bad_input(
+      "[\"foo\"]",
+      "wrong number of key columns specified: expected 2 but received 1"));
+
+  // Test providing too many key column values.
+  NO_FATALS(check_bad_input(
+      "[\"foo\",2,\"bar\"]",
+      "wrong number of key columns specified: expected 2 but received 3"));
+
+  // Test providing an invalid value for a key column when there's multiple
+  // key columns.
+  NO_FATALS(check_bad_input("[\"foo\",\"bar\"]", "unable to parse"));
+
+  // Test providing bad json.
+  NO_FATALS(check_bad_input("[", "JSON text is corrupt"));
+  NO_FATALS(check_bad_input("[\"foo\",]", "JSON text is corrupt"));
+
+  // Test providing valid JSON that's not an array.
+  NO_FATALS(check_bad_input(
+      "{ \"key_hash\" : \"foo\", \"key_range\" : 2 }",
+      "wrong type during field extraction: expected object array"));
+}
+
+TEST_F(AdminCliTest, TestLocateRowAndCheckRowPresence) {
+  FLAGS_num_tablet_servers = 1;
+  FLAGS_num_replicas = 1;
+
+  NO_FATALS(BuildAndStart());
+
+  // Grab list of tablet_ids from any tserver so we can check the output.
+  vector<TServerDetails*> tservers;
+  vector<string> tablet_ids;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ListRunningTabletIds(tservers.front(),
+                       MonoDelta::FromSeconds(30),
+                       &tablet_ids);
+  ASSERT_EQ(1, tablet_ids.size());
+  const string& expected_tablet_id = tablet_ids[0];
+
+  // Test the case when the row does not exist.
+  string stdout, stderr;
+  Status s = RunKuduTool({
+    "table",
+    "locate_row",
+    cluster_->master()->bound_rpc_addr().ToString(),
+    kTableId,
+    "[0]",
+    "-check_row_existence",
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.IsRuntimeError()) << ToolRunInfo(s, stdout, stderr);
+  ASSERT_STR_CONTAINS(stdout, expected_tablet_id);
+  ASSERT_STR_CONTAINS(stderr, "row does not exist");
+
+  // Insert row with key = 0.
+  client::sp::shared_ptr<KuduClient> client;
+  CreateClient(&client);
+  client::sp::shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(kTableId, &table));
+  unique_ptr<KuduInsert> insert(table->NewInsert());
+  auto* row = insert->mutable_row();
+  ASSERT_OK(row->SetInt32("key", 0));
+  ASSERT_OK(row->SetInt32("int_val", 12345));
+  ASSERT_OK(row->SetString("string_val", "hello"));
+  const string row_str = row->ToString();
+  auto session = client->NewSession();
+  ASSERT_OK(session->Apply(insert.release()));
+  ASSERT_OK(session->Flush());
+  ASSERT_OK(session->Close());
+
+  // Test the case when the row exists. Since the scan is done by a subprocess
+  // using a different client instance, it's possible the scan will not
+  // immediately retrieve the row even though the write has already succeeded.
+  // This use case is what timestamp propagation is for, but there's no way to
+  // propagate a timestamp to a tool (and there shouldn't be). Instead, we
+  // ASSERT_EVENTUALLY.
+  ASSERT_EVENTUALLY([&]() {
+    stdout.clear();
+    stderr.clear();
+    s = RunKuduTool({
+      "table",
+      "locate_row",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      kTableId,
+      "[0]",
+      "-check_row_existence",
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+    ASSERT_STR_CONTAINS(stdout, expected_tablet_id);
+    ASSERT_STR_CONTAINS(stdout, row_str);
+  });
+}
 } // namespace tools
 } // namespace kudu

@@ -18,9 +18,11 @@
 #include "kudu/util/jsonreader.h"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
+#include <glog/logging.h> // IWYU pragma: keep
 #include <gtest/gtest.h>
 #include <rapidjson/document.h>
 
@@ -54,6 +56,9 @@ TEST(JsonReaderTest, Empty) {
   ASSERT_TRUE(r.ExtractBool(r.root(), "foo", nullptr).IsNotFound());
   ASSERT_TRUE(r.ExtractInt32(r.root(), "foo", nullptr).IsNotFound());
   ASSERT_TRUE(r.ExtractInt64(r.root(), "foo", nullptr).IsNotFound());
+  ASSERT_TRUE(r.ExtractUint32(r.root(), "foo", nullptr).IsNotFound());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), "foo", nullptr).IsNotFound());
+  ASSERT_TRUE(r.ExtractDouble(r.root(), "foo", nullptr).IsNotFound());
   ASSERT_TRUE(r.ExtractString(r.root(), "foo", nullptr).IsNotFound());
   ASSERT_TRUE(r.ExtractObject(r.root(), "foo", nullptr).IsNotFound());
   ASSERT_TRUE(r.ExtractObjectArray(r.root(), "foo", nullptr).IsNotFound());
@@ -70,6 +75,9 @@ TEST(JsonReaderTest, Basic) {
   ASSERT_TRUE(r.ExtractBool(r.root(), "foo", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt32(r.root(), "foo", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt64(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint32(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractDouble(r.root(), "foo", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObject(r.root(), "foo", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObjectArray(r.root(), "foo", nullptr).IsInvalidArgument());
 }
@@ -110,20 +118,152 @@ TEST(JsonReaderTest, LessBasic) {
   ASSERT_TRUE(r.ExtractBool(r.root(), "null", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt32(r.root(), "null", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt64(r.root(), "null", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint32(r.root(), "null", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), "null", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractDouble(r.root(), "null", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObject(r.root(), "null", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObjectArray(r.root(), "null", nullptr).IsInvalidArgument());
 
   ASSERT_TRUE(r.ExtractBool(r.root(), "empty", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt32(r.root(), "empty", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt64(r.root(), "empty", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint32(r.root(), "empty", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), "empty", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractDouble(r.root(), "empty", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObject(r.root(), "empty", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObjectArray(r.root(), "empty", nullptr).IsInvalidArgument());
 
   ASSERT_TRUE(r.ExtractInt32(r.root(), "bool", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt64(r.root(), "bool", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint32(r.root(), "bool", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), "bool", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractDouble(r.root(), "bool", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractString(r.root(), "bool", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObject(r.root(), "bool", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObjectArray(r.root(), "bool", nullptr).IsInvalidArgument());
+}
+
+TEST(JsonReaderTest, SignedAndUnsignedInts) {
+  // The rapidjson code has some improper handling of the min int32 and min
+  // int64 that exposes UB.
+  #if defined(ADDRESS_SANITIZER)
+    LOG(WARNING) << "this test is skipped in ASAN builds";
+    return;
+  #endif
+
+  constexpr auto kMaxInt32 = std::numeric_limits<int32_t>::max();
+  constexpr auto kMaxInt64 = std::numeric_limits<int64_t>::max();
+  constexpr auto kMaxUint32 = std::numeric_limits<uint32_t>::max();
+  constexpr auto kMaxUint64 = std::numeric_limits<uint64_t>::max();
+  constexpr auto kMinInt32 = std::numeric_limits<int32_t>::min();
+  constexpr auto kMinInt64 = std::numeric_limits<int64_t>::min();
+  const string doc = Substitute(
+      "{ \"negative\" : -1, \"signed_big32\" : $0, \"signed_big64\" : $1, "
+      "\"unsigned_big32\" : $2, \"unsigned_big64\" : $3, "
+      "\"signed_small32\" : $4, \"signed_small64\" : $5 }",
+      kMaxInt32, kMaxInt64, kMaxUint32, kMaxUint64, kMinInt32, kMinInt64);
+  JsonReader r(doc);
+  ASSERT_OK(r.Init());
+
+  // -1.
+  const char* const negative = "negative";
+  int32_t negative32;
+  ASSERT_OK(r.ExtractInt32(r.root(), negative, &negative32));
+  ASSERT_EQ(-1, negative32);
+  int64_t negative64;
+  ASSERT_OK(r.ExtractInt64(r.root(), negative, &negative64));
+  ASSERT_EQ(-1, negative64);
+  ASSERT_TRUE(r.ExtractUint32(r.root(), negative, nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), negative, nullptr).IsInvalidArgument());
+
+  // Max signed 32-bit integer.
+  const char* const signed_big32 = "signed_big32";
+  int32_t signed_big32_int32;
+  ASSERT_OK(r.ExtractInt32(r.root(), signed_big32, &signed_big32_int32));
+  ASSERT_EQ(kMaxInt32, signed_big32_int32);
+  int64_t signed_big32_int64;
+  ASSERT_OK(r.ExtractInt64(r.root(), signed_big32, &signed_big32_int64));
+  ASSERT_EQ(kMaxInt32, signed_big32_int64);
+  uint32_t signed_big32_uint32;
+  ASSERT_OK(r.ExtractUint32(r.root(), signed_big32, &signed_big32_uint32));
+  ASSERT_EQ(kMaxInt32, signed_big32_uint32);
+  uint64_t signed_big32_uint64;
+  ASSERT_OK(r.ExtractUint64(r.root(), signed_big32, &signed_big32_uint64));
+  ASSERT_EQ(kMaxInt32, signed_big32_uint64);
+
+  // Max signed 64-bit integer.
+  const char* const signed_big64 = "signed_big64";
+  ASSERT_TRUE(r.ExtractInt32(r.root(), signed_big64, nullptr).IsInvalidArgument());
+  int64_t signed_big64_int64;
+  ASSERT_OK(r.ExtractInt64(r.root(), signed_big64, &signed_big64_int64));
+  ASSERT_EQ(kMaxInt64, signed_big64_int64);
+  ASSERT_TRUE(r.ExtractUint32(r.root(), signed_big64, nullptr).IsInvalidArgument());
+  uint64_t signed_big64_uint64;
+  ASSERT_OK(r.ExtractUint64(r.root(), signed_big64, &signed_big64_uint64));
+  ASSERT_EQ(kMaxInt64, signed_big64_uint64);
+  ASSERT_TRUE(r.ExtractDouble(r.root(), signed_big64, nullptr).IsInvalidArgument());
+
+  // Max unsigned 32-bit integer.
+  const char* const unsigned_big32 = "unsigned_big32";
+  ASSERT_TRUE(r.ExtractInt32(r.root(), unsigned_big32, nullptr).IsInvalidArgument());
+  int64_t unsigned_big32_int64;
+  ASSERT_OK(r.ExtractInt64(r.root(), unsigned_big32, &unsigned_big32_int64));
+  ASSERT_EQ(kMaxUint32, unsigned_big32_int64);
+  uint32_t unsigned_big32_uint32;
+  ASSERT_OK(r.ExtractUint32(r.root(), unsigned_big32, &unsigned_big32_uint32));
+  ASSERT_EQ(kMaxUint32, unsigned_big32_uint32);
+  uint64_t unsigned_big32_uint64;
+  ASSERT_OK(r.ExtractUint64(r.root(), unsigned_big32, &unsigned_big32_uint64));
+  ASSERT_EQ(kMaxUint32, unsigned_big32_uint64);
+
+  // Max unsigned 64-bit integer.
+  const char* const unsigned_big64 = "unsigned_big64";
+  ASSERT_TRUE(r.ExtractInt32(r.root(), unsigned_big64, nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractInt64(r.root(), unsigned_big64, nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint32(r.root(), unsigned_big64, nullptr).IsInvalidArgument());
+  uint64_t unsigned_big64_uint64;
+  ASSERT_OK(r.ExtractUint64(r.root(), unsigned_big64, &unsigned_big64_uint64));
+  ASSERT_EQ(kMaxUint64, unsigned_big64_uint64);
+  ASSERT_TRUE(r.ExtractDouble(r.root(), unsigned_big64, nullptr).IsInvalidArgument());
+
+  // Min signed 32-bit integer.
+  const char* const signed_small32 = "signed_small32";
+  int32_t small32_int32;
+  ASSERT_OK(r.ExtractInt32(r.root(), signed_small32, &small32_int32));
+  ASSERT_EQ(kMinInt32, small32_int32);
+  int64_t small32_int64;
+  ASSERT_OK(r.ExtractInt64(r.root(), signed_small32, &small32_int64));
+  ASSERT_EQ(kMinInt32, small32_int64);
+  ASSERT_TRUE(r.ExtractUint32(r.root(), signed_small32, nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), signed_small32, nullptr).IsInvalidArgument());
+
+  // Min signed 32-bit integer.
+  const char* const signed_small64 = "signed_small64";
+  ASSERT_TRUE(r.ExtractInt32(r.root(), signed_small64, nullptr).IsInvalidArgument());
+  int64_t small64_int64;
+  ASSERT_OK(r.ExtractInt64(r.root(), signed_small64, &small64_int64));
+  ASSERT_EQ(kMinInt64, small64_int64);
+  ASSERT_TRUE(r.ExtractUint32(r.root(), signed_small64, nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), signed_small64, nullptr).IsInvalidArgument());
+}
+
+TEST(JsonReaderTest, Doubles) {
+  JsonReader r("{ \"foo\" : 5.125 }");
+  ASSERT_OK(r.Init());
+
+  double foo;
+  ASSERT_OK(r.ExtractDouble(r.root(), "foo", &foo));
+  ASSERT_EQ(5.125, foo);
+
+  // Bad types.
+  ASSERT_TRUE(r.ExtractBool(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractInt32(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractInt64(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint32(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractString(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractObject(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractObjectArray(r.root(), "foo", nullptr).IsInvalidArgument());
 }
 
 TEST(JsonReaderTest, Objects) {
@@ -142,6 +282,9 @@ TEST(JsonReaderTest, Objects) {
   ASSERT_TRUE(r.ExtractBool(r.root(), "foo", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt32(r.root(), "foo", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt64(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint32(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), "foo", nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractDouble(r.root(), "foo", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractString(r.root(), "foo", nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObjectArray(r.root(), "foo", nullptr).IsInvalidArgument());
 }
@@ -163,6 +306,9 @@ TEST(JsonReaderTest, TopLevelArray) {
   ASSERT_TRUE(r.ExtractBool(r.root(), nullptr, nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt32(r.root(), nullptr, nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractInt64(r.root(), nullptr, nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint32(r.root(), nullptr, nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractUint64(r.root(), nullptr, nullptr).IsInvalidArgument());
+  ASSERT_TRUE(r.ExtractDouble(r.root(), nullptr, nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractString(r.root(), nullptr, nullptr).IsInvalidArgument());
   ASSERT_TRUE(r.ExtractObject(r.root(), nullptr, nullptr).IsInvalidArgument());
 }

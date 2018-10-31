@@ -17,6 +17,8 @@
 //
 // Tests for the client which are true unit tests and don't require a cluster, etc.
 
+#include "kudu/client/client.h"
+
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -25,18 +27,21 @@
 #include <boost/function.hpp>
 #include <gtest/gtest.h>
 
-#include "kudu/client/client.h"
 #include "kudu/client/client-internal.h"
 #include "kudu/client/error_collector.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/value.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/schema.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 
 using std::string;
 using std::vector;
+using strings::Substitute;
 using kudu::client::internal::ErrorCollector;
 
 namespace kudu {
@@ -232,18 +237,18 @@ TEST(ClientUnitTest, TestKuduSchemaToString) {
     ->Default(KuduValue::FromInt(12345));
   ASSERT_OK(b1.Build(&s1));
 
-  string schema_str_1 = "Schema [\n"
-                        "\tprimary key (key),\n"
-                        "\tkey[int32 NOT NULL],\n"
-                        "\tint_val[int32 NOT NULL],\n"
-                        "\tstring_val[string NULLABLE],\n"
-                        "\tnon_null_with_default[int32 NOT NULL]\n"
-                        "]";
+  string schema_str_1 = "(\n"
+                        "    key INT32 NOT NULL,\n"
+                        "    int_val INT32 NOT NULL,\n"
+                        "    string_val STRING NULLABLE,\n"
+                        "    non_null_with_default INT32 NOT NULL,\n"
+                        "    PRIMARY KEY (key)\n"
+                        ")";
   EXPECT_EQ(schema_str_1, s1.ToString());
 
   // Test empty schema.
   KuduSchema s2;
-  EXPECT_EQ("Schema []", s2.ToString());
+  EXPECT_EQ("()", s2.ToString());
 
   // Test on composite PK.
   // Create a different schema with a multi-column PK.
@@ -259,17 +264,41 @@ TEST(ClientUnitTest, TestKuduSchemaToString) {
   b2.SetPrimaryKey({"k1", "k2", "k3"});
   ASSERT_OK(b2.Build(&s2));
 
-  string schema_str_2 = "Schema [\n"
-                        "\tprimary key (k1, k2, k3),\n"
-                        "\tk1[int32 NOT NULL],\n"
-                        "\tk2[unixtime_micros NOT NULL],\n"
-                        "\tk3[int8 NOT NULL],\n"
-                        "\tdec_val[decimal(9, 2) NULLABLE],\n"
-                        "\tint_val[int32 NOT NULL],\n"
-                        "\tstring_val[string NULLABLE],\n"
-                        "\tnon_null_with_default[int32 NOT NULL]\n"
-                        "]";
+  string schema_str_2 = "(\n"
+                        "    k1 INT32 NOT NULL,\n"
+                        "    k2 UNIXTIME_MICROS NOT NULL,\n"
+                        "    k3 INT8 NOT NULL,\n"
+                        "    dec_val DECIMAL(9, 2) NULLABLE,\n"
+                        "    int_val INT32 NOT NULL,\n"
+                        "    string_val STRING NULLABLE,\n"
+                        "    non_null_with_default INT32 NOT NULL,\n"
+                        "    PRIMARY KEY (k1, k2, k3)\n"
+                        ")";
   EXPECT_EQ(schema_str_2, s2.ToString());
+}
+
+TEST(ClientUnitTest, TestKuduSchemaToStringWithColumnIds) {
+  // Build a KuduSchema from a Schema, so that the KuduSchema's internal Schema
+  // has column ids.
+  SchemaBuilder builder;
+  builder.AddKeyColumn("key", DataType::INT32);
+  const auto schema = builder.Build();
+  const auto kudu_schema = KuduSchema::FromSchema(schema);
+
+  // The string version of the KuduSchema should not have column ids, even
+  // though the default string version of the underlying Schema should.
+  EXPECT_EQ(
+      Substitute("(\n"
+                 "    $0:key INT32 NOT NULL,\n"
+                 "    PRIMARY KEY (key)\n"
+                 ")",
+                 schema.column_id(0)),
+      schema.ToString());
+  EXPECT_EQ("(\n"
+            "    key INT32 NOT NULL,\n"
+            "    PRIMARY KEY (key)\n"
+            ")",
+            kudu_schema.ToString());
 }
 
 } // namespace client

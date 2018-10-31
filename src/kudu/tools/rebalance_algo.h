@@ -19,7 +19,9 @@
 #include <cstdint>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <gtest/gtest_prod.h>
@@ -33,8 +35,9 @@ template <class T> class optional;
 namespace kudu {
 namespace tools {
 
-// A map from a count of replicas to a server id. The "reversed" relationship
-// facilitates finding the servers with the maximum and minimum counts.
+// A map from a count of replicas to a server identifier. The "reversed"
+// relationship facilitates finding the servers with the maximum and minimum
+// replica counts.
 typedef std::multimap<int32_t, std::string> ServersByCountMap;
 
 // Balance information for a table.
@@ -59,11 +62,28 @@ struct ClusterBalanceInfo {
   // skew between them decreases, or when the skew decreases.
   std::multimap<int32_t, TableBalanceInfo> table_info_by_skew;
 
-  // Mapping total replica count -> tablet server.
+  // Mapping total replica count -> tablet server identifier.
   //
   // The total replica count of a tablet server is defined as the total number
   // of replicas hosted on the tablet server.
   ServersByCountMap servers_by_total_replica_count;
+};
+
+// Locality information for a cluster: distribution of tablet servers among
+// locations.
+struct ClusterLocalityInfo {
+  // Location-related information: distribution of tablet servers by locations.
+  // Mapping 'location' --> 'identifiers of tablet servers in the location'.
+  std::unordered_map<std::string, std::set<std::string>> servers_by_location;
+
+  // Mapping 'tablet server identifier' --> 'location'.
+  std::unordered_map<std::string, std::string> location_by_ts_id;
+};
+
+// Information on a cluster as input for various rebalancing algorithms.
+struct ClusterInfo {
+  ClusterBalanceInfo balance;
+  ClusterLocalityInfo locality;
 };
 
 // A directive to move some replica of a table between two tablet servers.
@@ -91,7 +111,7 @@ class RebalancingAlgo {
   // is considered balanced.
   //
   // 'moves' must be non-NULL.
-  virtual Status GetNextMoves(const ClusterBalanceInfo& cluster_info,
+  virtual Status GetNextMoves(const ClusterInfo& cluster_info,
                               int max_moves_num,
                               std::vector<TableReplicaMove>* moves);
  protected:
@@ -99,15 +119,13 @@ class RebalancingAlgo {
   // the 'move' output parameter is set to 'boost::none'.
   //
   // 'move' must be non-NULL.
-  virtual Status GetNextMove(const ClusterBalanceInfo& cluster_info,
+  virtual Status GetNextMove(const ClusterInfo& cluster_info,
                              boost::optional<TableReplicaMove>* move) = 0;
 
-  // Update the balance state in 'cluster_info' with the outcome of the move
-  // 'move'. 'cluster_info' is an in-out parameter.
-  //
-  // 'cluster_info' must be non-NULL.
+  // Update the balance state in 'balance_info' with the outcome of the move
+  // 'move'. 'balance_info' is an in-out parameter and must be non-NULL.
   static Status ApplyMove(const TableReplicaMove& move,
-                          ClusterBalanceInfo* cluster_info);
+                          ClusterBalanceInfo* balance_info);
 };
 
 // A two-dimensional greedy rebalancing algorithm. From among moves that
@@ -128,14 +146,16 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
   explicit TwoDimensionalGreedyAlgo(
       EqualSkewOption opt = EqualSkewOption::PICK_RANDOM);
 
-  Status GetNextMove(const ClusterBalanceInfo& cluster_info,
+ protected:
+  Status GetNextMove(const ClusterInfo& cluster_info,
                      boost::optional<TableReplicaMove>* move) override;
 
  private:
   enum class ExtremumType { MAX, MIN, };
 
   FRIEND_TEST(RebalanceAlgoUnitTest, RandomizedTest);
-  FRIEND_TEST(RebalanceAlgoUnitTest, EmptyClusterBalanceInfoGetNextMove);
+  FRIEND_TEST(RebalanceAlgoUnitTest, EmptyBalanceInfoGetNextMove);
+  FRIEND_TEST(RebalanceAlgoUnitTest, EmptyClusterInfoGetNextMove);
 
   // Compute the intersection of the least or most loaded tablet servers for a
   // table with the least or most loaded tablet servers in the cluster:
@@ -175,6 +195,91 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
   const EqualSkewOption equal_skew_opt_;
   std::random_device random_device_;
   std::mt19937 generator_;
+};
+
+// Algorithm to balance among locations in the cluster.
+//
+// The inter-location rebalancing is to minimize location load skew per table.
+// The idea is to equalize the density of the distribution of each table across
+// locations.
+//
+// Q: Why is it beneficial to equalize the density of table replicas across
+//    locations?
+// A: Assuming the homogeneous structure of the cluster (e.g., that's about
+//    having machines of the same hardware specs across the cluster) and
+//    uniform distribution of requests among all tables in the cluster
+//    (the latter is questionable, but in Kudu there isn't currently a way
+//    to specify any deviations anyway), that gives better usage
+//    of the available hardware resources.
+//
+// NOTE: probably, in the future we might add a notion of some preference in
+//       table placements regarding selected locations.
+//
+// Q: What is per-table location load skew?
+// A: Consider number of replicas per location for tablets comprising
+//    a table T. Assume we have locations L_0, ..., L_n, where
+//    replica_num(T, L_0), ..., replica_num(T, L_n) are numbers of replicas
+//    of T's tablets at corresponding locations. We want to make the following
+//    ratios to devicate as less as possible:
+//
+//    replica_num(T, L_0) / ts_num(L_0), ..., replica_num(T, L_n) / ts_num(L_n)
+//
+// ******* Some Examples *******
+//
+// Tablet T of replication factor 5, and locations L_0, ..., L_4. Consider
+// the following tablet servers disposition:
+//
+//   ts_num(L_0): 2
+//   ts_num(L_1): 2
+//   ts_num(L_2): 1
+//   ts_num(L_3): 1
+//   ts_num(L_4): 1
+//
+// What distribution of replicas is preferred for a tablet t0 of table T?
+//  (a) { L_0: 1, L_1: 1, L_2: 1, L_3: 1, L_4: 1 }
+//          skew 0.5: { 0.5, 0.5, 1.0, 1.0, 1.0 }
+//
+//  (b) { L_0: 2, L_1: 2, L_2: 1, L_3: 0, L_4: 0 }
+//          skew 1.0 : { 1.0, 1.0, 1.0, 0.0, 0.0 }
+//
+// The main idea is to prevent moving tablets if the distribution is 'good
+// enough'. E.g., the distribution of (b) is acceptable if the rebalancer finds
+// the replicas already placed like that, and it should not try to move
+// the replicas to achieve the ideal distribution of (a).
+//
+// How about:
+//  (c) { L_0: 0, L_1: 0, L_2: 1, L_3: 2, L_4: 2 }
+//          skew 2.0: { 0.0, 0.0, 1.0, 2.0, 2.0 }
+//
+// We want to move replicas to make the distribution (c) more balanced;
+// 2 movements gives us the 'ideal' location-wise replica placement.
+class LocationBalancingAlgo : public RebalancingAlgo {
+ protected:
+  Status GetNextMove(const ClusterInfo& cluster_info,
+                     boost::optional<TableReplicaMove>* move) override;
+ private:
+  FRIEND_TEST(RebalanceAlgoUnitTest, RandomizedTest);
+  typedef std::multimap<double, std::string> TableByLoadImbalance;
+
+  // Check if any rebalancing is needed across cluster locations based on the
+  // information provided by the 'imbalance_info' parameter. Returns 'true'
+  // if rebalancing is needed, 'false' otherwise. Upon returning 'true',
+  // the identifier of the most cross-location imbalanced table is output into
+  // the 'most_imbalanced_table_id' parameter (which must not be null).
+  static bool IsBalancingNeeded(
+      const TableByLoadImbalance& imbalance_info,
+      std::string* most_imbalanced_table_id);
+
+  // Given the set of the most and the least table-wise loaded locations, choose
+  // the source and destination tablet server to move a replica of the specified
+  // tablet to improve per-table location load balance as much as possible.
+  // If no replica can be moved to balance the load, the 'move' output parameter
+  // is set to 'boost::none'.
+  Status FindBestMove(const std::string& table_id,
+      const std::vector<std::string>& loc_loaded_least,
+      const std::vector<std::string>& loc_loaded_most,
+      const ClusterInfo& cluster_info,
+      boost::optional<TableReplicaMove>* move);
 };
 
 } // namespace tools

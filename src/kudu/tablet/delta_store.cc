@@ -19,18 +19,28 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
+#include <ostream>
 
 #include <glog/logging.h>
 
+#include "kudu/common/columnblock.h"
+#include "kudu/common/row.h"
 #include "kudu/common/row_changelist.h"
+#include "kudu/common/rowblock.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
+#include "kudu/common/types.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/delta_stats.h"
 #include "kudu/tablet/deltafile.h"
+#include "kudu/tablet/mutation.h"
+#include "kudu/tablet/mvcc.h"
+#include "kudu/util/debug-util.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/memory/arena.h"
 
 namespace kudu {
@@ -41,6 +51,47 @@ using std::string;
 using std::vector;
 using strings::Substitute;
 
+namespace {
+
+// Returns whether a mutation at 'ts' is relevant under 'snap'.
+//
+// If not relevant, further checks whether any remaining deltas for this row can
+// be skipped; this is an optimization and not necessary for correctness.
+template<DeltaType Type>
+bool IsDeltaRelevant(const MvccSnapshot& snap,
+                     const Timestamp& ts,
+                     bool* finished_row);
+
+template<>
+bool IsDeltaRelevant<REDO>(const MvccSnapshot& snap,
+                           const Timestamp& ts,
+                           bool* finished_row) {
+  *finished_row = false;
+  if (!snap.IsCommitted(ts)) {
+    if (!snap.MayHaveCommittedTransactionsAtOrAfter(ts)) {
+      *finished_row = true;
+    }
+    return false;
+  }
+  return true;
+}
+
+template<>
+bool IsDeltaRelevant<UNDO>(const MvccSnapshot& snap,
+                           const Timestamp& ts,
+                           bool* finished_row) {
+  *finished_row = false;
+  if (snap.IsCommitted(ts)) {
+    if (!snap.MayHaveUncommittedTransactionsAtOrBefore(ts)) {
+      *finished_row = true;
+    }
+    return false;
+  }
+  return true;
+}
+
+} // anonymous namespace
+
 string DeltaKeyAndUpdate::Stringify(DeltaType type, const Schema& schema, bool pad_key) const {
   return StrCat(Substitute("($0 delta key=$2, change_list=$1)",
                            DeltaType_Name(type),
@@ -50,6 +101,280 @@ string DeltaKeyAndUpdate::Stringify(DeltaType type, const Schema& schema, bool p
                                     : Substitute("$0@tx$1", key.row_idx(),
                                                  key.timestamp().ToString()))));
 }
+
+template<class Traits>
+DeltaPreparer<Traits>::DeltaPreparer(RowIteratorOptions opts)
+    : opts_(std::move(opts)),
+      cur_prepared_idx_(0),
+      prev_prepared_idx_(0),
+      prepared_for_(NOT_PREPARED),
+      deletion_state_(UNKNOWN) {
+}
+
+template<class Traits>
+void DeltaPreparer<Traits>::Seek(rowid_t row_idx) {
+  cur_prepared_idx_ = row_idx;
+  prev_prepared_idx_ = row_idx;
+  prepared_for_ = NOT_PREPARED;
+}
+
+template<class Traits>
+void DeltaPreparer<Traits>::Start(DeltaIterator::PrepareFlag flag) {
+  if (updates_by_col_.empty()) {
+    updates_by_col_.resize(opts_.projection->num_columns());
+  }
+  for (UpdatesForColumn& ufc : updates_by_col_) {
+    ufc.clear();
+  }
+  deleted_.clear();
+  reinserted_.clear();
+  prepared_deltas_.clear();
+  deletion_state_ = UNKNOWN;
+  switch (flag) {
+    case DeltaIterator::PREPARE_FOR_APPLY:
+      prepared_for_ = PREPARED_FOR_APPLY;
+      break;
+    case DeltaIterator::PREPARE_FOR_COLLECT:
+      prepared_for_ = PREPARED_FOR_COLLECT;
+      break;
+    default:
+      LOG(FATAL) << "Unknown prepare flag: " << flag;
+  }
+}
+
+template<class Traits>
+void DeltaPreparer<Traits>::Finish(size_t nrows) {
+  MaybeProcessPreviousRowChange(boost::none);
+  prev_prepared_idx_ = cur_prepared_idx_;
+  cur_prepared_idx_ += nrows;
+}
+
+template<class Traits>
+Status DeltaPreparer<Traits>::AddDelta(const DeltaKey& key, Slice val, bool* finished_row) {
+  if (!IsDeltaRelevant<Traits::kType>(opts_.snap_to_include,
+                                      key.timestamp(), finished_row)) {
+    return Status::OK();
+  }
+  MaybeProcessPreviousRowChange(key.row_idx());
+
+  if (prepared_for_ == PREPARED_FOR_APPLY) {
+    RowChangeListDecoder decoder((RowChangeList(val)));
+    if (Traits::kInitializeDecodersWithSafetyChecks) {
+      RETURN_NOT_OK(decoder.Init());
+    } else {
+      decoder.InitNoSafetyChecks();
+    }
+    if (!Traits::kAllowReinserts && decoder.is_reinsert()) {
+      LOG(DFATAL) << "Attempted to reinsert but not supported" << GetStackTrace();
+      return Status::InvalidArgument("Reinserts are not supported");
+    }
+    UpdateDeletionState(decoder.get_type());
+    if (!decoder.is_delete()) {
+      while (decoder.HasNext()) {
+        RowChangeListDecoder::DecodedUpdate dec;
+        RETURN_NOT_OK(decoder.DecodeNext(&dec));
+        int col_idx;
+        const void* col_val;
+        RETURN_NOT_OK(dec.Validate(*opts_.projection, &col_idx, &col_val));
+        if (col_idx == -1) {
+          // This column isn't being projected.
+          continue;
+        }
+        int col_size = opts_.projection->column(col_idx).type_info()->size();
+
+        // If we already have an earlier update for the same column, we can
+        // just overwrite that one.
+        if (updates_by_col_[col_idx].empty() ||
+            updates_by_col_[col_idx].back().row_id != key.row_idx()) {
+          updates_by_col_[col_idx].emplace_back();
+        }
+
+        ColumnUpdate& cu = updates_by_col_[col_idx].back();
+        cu.row_id = key.row_idx();
+        if (col_val == nullptr) {
+          cu.new_val_ptr = nullptr;
+        } else {
+          memcpy(cu.new_val_buf, col_val, col_size);
+          // NOTE: we're constructing a pointer here to an element inside the deque.
+          // This is safe because deques never invalidate pointers to their elements.
+          cu.new_val_ptr = cu.new_val_buf;
+        }
+      }
+    }
+  } else {
+    DCHECK_EQ(prepared_for_, PREPARED_FOR_COLLECT);
+    PreparedDelta d;
+    d.key = key;
+    d.val = val;
+    prepared_deltas_.emplace_back(d);
+  }
+
+  last_added_idx_ = key.row_idx();
+  return Status::OK();
+}
+
+template<class Traits>
+Status DeltaPreparer<Traits>::ApplyUpdates(size_t col_to_apply, ColumnBlock* dst) {
+  DCHECK_EQ(prepared_for_, PREPARED_FOR_APPLY);
+  DCHECK_LE(cur_prepared_idx_ - prev_prepared_idx_, dst->nrows());
+
+  const ColumnSchema* col_schema = &opts_.projection->column(col_to_apply);
+  for (const ColumnUpdate& cu : updates_by_col_[col_to_apply]) {
+    int32_t idx_in_block = cu.row_id - prev_prepared_idx_;
+    DCHECK_GE(idx_in_block, 0);
+    SimpleConstCell src(col_schema, cu.new_val_ptr);
+    ColumnBlock::Cell dst_cell = dst->cell(idx_in_block);
+    RETURN_NOT_OK(CopyCell(src, &dst_cell, dst->arena()));
+  }
+
+  return Status::OK();
+}
+
+template<class Traits>
+Status DeltaPreparer<Traits>::ApplyDeletes(SelectionVector* sel_vec) {
+  DCHECK_EQ(prepared_for_, PREPARED_FOR_APPLY);
+  DCHECK_LE(cur_prepared_idx_ - prev_prepared_idx_, sel_vec->nrows());
+
+  for (const auto& row_id : deleted_) {
+    uint32_t idx_in_block = row_id - prev_prepared_idx_;
+    sel_vec->SetRowUnselected(idx_in_block);
+  }
+
+  for (const auto& row_id : reinserted_) {
+    uint32_t idx_in_block = row_id - prev_prepared_idx_;
+    sel_vec->SetRowSelected(idx_in_block);
+  }
+
+  return Status::OK();
+}
+
+template<class Traits>
+Status DeltaPreparer<Traits>::CollectMutations(vector<Mutation*>* dst, Arena* arena) {
+  DCHECK_EQ(prepared_for_, PREPARED_FOR_COLLECT);
+  DCHECK_LE(cur_prepared_idx_ - prev_prepared_idx_, dst->size());
+  for (const PreparedDelta& src : prepared_deltas_) {
+    DeltaKey key = src.key;
+    RowChangeList changelist(src.val);
+    uint32_t rel_idx = key.row_idx() - prev_prepared_idx_;
+
+    Mutation *mutation = Mutation::CreateInArena(arena, key.timestamp(), changelist);
+    mutation->PrependToList(&dst->at(rel_idx));
+  }
+  return Status::OK();
+}
+
+template<class Traits>
+Status DeltaPreparer<Traits>::FilterColumnIdsAndCollectDeltas(
+    const vector<ColumnId>& col_ids,
+    vector<DeltaKeyAndUpdate>* out,
+    Arena* arena) {
+  if (!Traits::kAllowFilterColumnIdsAndCollectDeltas) {
+    LOG(DFATAL) << "Attempted to call FilterColumnIdsAndCollectDeltas on DMS"
+                << GetStackTrace();
+    return Status::InvalidArgument(
+        "FilterColumnIdsAndCollectDeltas is not supported");
+  }
+
+  // May only be used on a fully inclusive snapshot.
+  DCHECK(opts_.snap_to_include.Equals(Traits::kType == REDO ?
+                                      MvccSnapshot::CreateSnapshotIncludingAllTransactions() :
+                                      MvccSnapshot::CreateSnapshotIncludingNoTransactions()));
+
+  faststring buf;
+  RowChangeListEncoder encoder(&buf);
+  for (const auto& src : prepared_deltas_) {
+    encoder.Reset();
+    RETURN_NOT_OK(
+        RowChangeListDecoder::RemoveColumnIdsFromChangeList(RowChangeList(src.val),
+                                                            col_ids,
+                                                            &encoder));
+    if (encoder.is_initialized()) {
+      RowChangeList rcl = encoder.as_changelist();
+      DeltaKeyAndUpdate upd;
+      upd.key = src.key;
+      CHECK(arena->RelocateSlice(rcl.slice(), &upd.cell));
+      out->emplace_back(upd);
+    }
+  }
+
+  return Status::OK();
+}
+
+template<class Traits>
+bool DeltaPreparer<Traits>::MayHaveDeltas() const {
+  DCHECK_EQ(prepared_for_, PREPARED_FOR_APPLY);
+  if (!deleted_.empty()) {
+    return true;
+  }
+  if (!reinserted_.empty()) {
+    return true;
+  }
+  for (auto& col : updates_by_col_) {
+    if (!col.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template<class Traits>
+void DeltaPreparer<Traits>::MaybeProcessPreviousRowChange(boost::optional<rowid_t> cur_row_idx) {
+  if (prepared_for_ == PREPARED_FOR_APPLY &&
+      last_added_idx_ &&
+      (!cur_row_idx || cur_row_idx != *last_added_idx_)) {
+    switch (deletion_state_) {
+      case DELETED:
+        deleted_.emplace_back(*last_added_idx_);
+        deletion_state_ = UNKNOWN;
+        break;
+      case REINSERTED:
+        reinserted_.emplace_back(*last_added_idx_);
+        deletion_state_ = UNKNOWN;
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+template<class Traits>
+void DeltaPreparer<Traits>::UpdateDeletionState(RowChangeList::ChangeType op) {
+  // We can't use RowChangeListDecoder.TwiddleDeleteStatus because:
+  // 1. Our deletion status includes an additional UNKNOWN state.
+  // 2. The logical chain of DELETEs and REINSERTs for a given row may extend
+  //    across DeltaPreparer instances. For example, the same row may be deleted
+  //    in one delta file and reinserted in the next. But, because
+  //    DeltaPreparers cannot exchange this information in the context of batch
+  //    preparation, we have to allow any state transition from UNKNOWN.
+  //
+  // DELETE+REINSERT pairs are reset back to UNKNOWN: these rows were both
+  // deleted and reinserted in the same batch, so their states haven't actually changed.
+  if (op == RowChangeList::kDelete) {
+    DCHECK_NE(deletion_state_, DELETED);
+    if (deletion_state_ == UNKNOWN) {
+      deletion_state_ = DELETED;
+    } else {
+      DCHECK_EQ(deletion_state_, REINSERTED);
+      deletion_state_ = UNKNOWN;
+    }
+  } else {
+    DCHECK(op == RowChangeList::kUpdate || op == RowChangeList::kReinsert);
+    if (op == RowChangeList::kReinsert) {
+      DCHECK_NE(deletion_state_, REINSERTED);
+      if (deletion_state_ == UNKNOWN) {
+        deletion_state_ = REINSERTED;
+      } else {
+        DCHECK_EQ(deletion_state_, DELETED);
+        deletion_state_ = UNKNOWN;
+      }
+    }
+  }
+}
+
+// Explicit specialization for callers outside this compilation unit.
+template class DeltaPreparer<DMSPreparerTraits>;
+template class DeltaPreparer<DeltaFilePreparerTraits<REDO>>;
+template class DeltaPreparer<DeltaFilePreparerTraits<UNDO>>;
 
 Status DebugDumpDeltaIterator(DeltaType type,
                               DeltaIterator* iter,

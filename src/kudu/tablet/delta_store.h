@@ -19,12 +19,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "kudu/common/row_changelist.h"
 #include "kudu/common/rowid.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/tablet/delta_key.h"
+#include "kudu/tablet/rowset.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
@@ -47,8 +53,6 @@ class DeltaFileWriter;
 class DeltaIterator;
 class DeltaStats;
 class Mutation;
-class MvccSnapshot;
-struct RowIteratorOptions;
 
 // Interface for the pieces of the system that track deltas/updates.
 // This is implemented by DeltaMemStore and by DeltaFileReader.
@@ -126,7 +130,60 @@ struct DeltaKeyAndUpdate {
   std::string Stringify(DeltaType type, const Schema& schema, bool pad_key = false) const;
 };
 
-class DeltaIterator {
+// Representation of deltas that have been "prepared" by an iterator. That is,
+// they have been consistently read (at a snapshot) from their backing store
+// into an in-memory format suitable for efficient retrieval.
+class PreparedDeltas {
+ public:
+  // Applies the snapshotted updates to one of the columns.
+  //
+  // 'dst' must be the same length as was previously passed to PrepareBatch()
+  //
+  // Deltas must have been prepared with the flag PREPARE_FOR_APPLY.
+  virtual Status ApplyUpdates(size_t col_to_apply, ColumnBlock* dst) = 0;
+
+  // Applies any deletes to the given selection vector.
+  //
+  // Rows which have been deleted in the associated MVCC snapshot are set to 0
+  // in the selection vector so that they don't show up in the output.
+  //
+  // Deltas must have been prepared with the flag PREPARE_FOR_APPLY.
+  virtual Status ApplyDeletes(SelectionVector* sel_vec) = 0;
+
+  // Collects the mutations associated with each row in the current prepared batch.
+  //
+  // Each entry in the vector will be treated as a singly linked list of Mutation
+  // objects. If there are no mutations for that row, the entry will be unmodified.
+  // If there are mutations, they will be prepended at the head of the linked list
+  // (i.e the resulting list will be in descending timestamp order)
+  //
+  // The Mutation objects will be allocated out of the provided Arena, which must be non-NULL.
+  //
+  // Deltas must have been prepared with the flag PREPARE_FOR_COLLECT.
+  virtual Status CollectMutations(std::vector<Mutation*>* dst, Arena* arena) = 0;
+
+  // Iterates through all deltas, adding deltas for columns not specified in
+  // 'col_ids' to 'out'.
+  //
+  // Unlike CollectMutations, the iterator's MVCC snapshots are ignored; all
+  // deltas are considered relevant.
+  //
+  // The delta objects will be allocated out the provided Arena, which must be non-NULL.
+  //
+  // Deltas must have been prepared with the flag PREPARE_FOR_COLLECT.
+  virtual Status FilterColumnIdsAndCollectDeltas(const std::vector<ColumnId>& col_ids,
+                                                 std::vector<DeltaKeyAndUpdate>* out,
+                                                 Arena* arena) = 0;
+
+  // Returns true if there might exist deltas to be applied. It is safe to
+  // conservatively return true, but this would force a skip over decoder-level
+  // evaluation.
+  //
+  // Deltas must have been prepared with the flag PREPARE_FOR_APPLY.
+  virtual bool MayHaveDeltas() const = 0;
+};
+
+class DeltaIterator : public PreparedDeltas {
  public:
   // Initialize the iterator. This must be called once before any other
   // call.
@@ -143,8 +200,8 @@ class DeltaIterator {
   };
 
   // Prepare to apply deltas to a block of rows. This takes a consistent snapshot
-  // of all updates to the next 'nrows' rows, so that subsequent calls to
-  // ApplyUpdates() will not cause any "tearing"/non-atomicity.
+  // of all updates to the next 'nrows' rows, so that subsequent calls to a
+  // PreparedDeltas method will not cause any "tearing"/non-atomicity.
   //
   // 'flag' denotes whether the batch will be used for collecting mutations or
   // for applying them. Some implementations may choose to prepare differently.
@@ -153,46 +210,8 @@ class DeltaIterator {
   // of the previously prepared block.
   virtual Status PrepareBatch(size_t nrows, PrepareFlag flag) = 0;
 
-  // Apply the snapshotted updates to one of the columns.
-  // 'dst' must be the same length as was previously passed to PrepareBatch()
-  // Must have called PrepareBatch() with flag = PREPARE_FOR_APPLY.
-  virtual Status ApplyUpdates(size_t col_to_apply, ColumnBlock *dst) = 0;
-
-  // Apply any deletes to the given selection vector.
-  // Rows which have been deleted in the associated MVCC snapshot are set to
-  // 0 in the selection vector so that they don't show up in the output.
-  // Must have called PrepareBatch() with flag = PREPARE_FOR_APPLY.
-  virtual Status ApplyDeletes(SelectionVector *sel_vec) = 0;
-
-  // Collect the mutations associated with each row in the current prepared batch.
-  //
-  // Each entry in the vector will be treated as a singly linked list of Mutation
-  // objects. If there are no mutations for that row, the entry will be unmodified.
-  // If there are mutations, they will be prepended at the head of the linked list
-  // (i.e the resulting list will be in descending timestamp order)
-  //
-  // The Mutation objects will be allocated out of the provided Arena, which must be non-NULL.
-  // Must have called PrepareBatch() with flag = PREPARE_FOR_COLLECT.
-  virtual Status CollectMutations(std::vector<Mutation *> *dst, Arena *arena) = 0;
-
-  // Iterate through all deltas, adding deltas for columns not
-  // specified in 'col_ids' to 'out'.
-  //
-  // The delta objects will be allocated out the provided Arena which
-  // must be non-NULL.
-  // Must have called PrepareBatch() with flag = PREPARE_FOR_COLLECT.
-  virtual Status FilterColumnIdsAndCollectDeltas(const std::vector<ColumnId>& col_ids,
-                                                 std::vector<DeltaKeyAndUpdate>* out,
-                                                 Arena* arena) = 0;
-
   // Returns true if there are any more rows left in this iterator.
   virtual bool HasNext() = 0;
-
-  // Returns true if there might exist deltas to be applied. It is safe to
-  // conservatively return true, but this would force a skip over decoder-level
-  // evaluation.
-  // Must have called PrepareBatch() with flag = PREPARE_FOR_APPLY.
-  virtual bool MayHaveDeltas() = 0;
 
   // Return a string representation suitable for debug printouts.
   virtual std::string ToString() const = 0;
@@ -200,14 +219,170 @@ class DeltaIterator {
   virtual ~DeltaIterator() {}
 };
 
-enum {
-  ITERATE_OVER_ALL_ROWS = 0
+// DeltaPreparer traits suited for a DMSIterator.
+struct DMSPreparerTraits {
+  static constexpr DeltaType kType = REDO;
+  static constexpr bool kAllowReinserts = false;
+  static constexpr bool kAllowFilterColumnIdsAndCollectDeltas = false;
+  static constexpr bool kInitializeDecodersWithSafetyChecks = false;
 };
+
+// DeltaPreparer traits suited for a DeltaFileIterator.
+//
+// This is just a partial specialization; the DeltaFileIterator is expected to
+// dictate the DeltaType.
+template<DeltaType Type>
+struct DeltaFilePreparerTraits {
+  static constexpr DeltaType kType = Type;
+  static constexpr bool kAllowReinserts = true;
+  static constexpr bool kAllowFilterColumnIdsAndCollectDeltas = true;
+  static constexpr bool kInitializeDecodersWithSafetyChecks = true;
+};
+
+// Encapsulates all logic and responsibility related to "delta preparation";
+// that is, the transformation of encoded deltas into an in-memory
+// representation more suitable for efficient service during iteration.
+//
+// This class is intended to be composed inside a DeltaIterator. The iterator
+// is responsible for loading encoded deltas from a backing store, passing them
+// to the DeltaPreparer to be transformed, and later, calling the DeltaPreparer
+// to serve the deltas.
+template <class Traits>
+class DeltaPreparer : public PreparedDeltas {
+ public:
+  explicit DeltaPreparer(RowIteratorOptions opts);
+
+  // Updates internal state to reflect a seek performed by a DeltaIterator.
+  //
+  // Call upon completion of DeltaIterator::SeekToOrdinal.
+  void Seek(rowid_t row_idx);
+
+  // Updates internal state to reflect the beginning of delta batch preparation
+  // on the part of a DeltaIterator.
+  //
+  // Call at the beginning of DeltaIterator::PrepareBatch.
+  void Start(DeltaIterator::PrepareFlag flag);
+
+  // Updates internal state to reflect the end of delta batch preparation on the
+  // part of a DeltaIterator.
+  //
+  // Call at the end of DeltaIterator::PrepareBatch.
+  void Finish(size_t nrows);
+
+  // Prepares the delta given by 'key' whose encoded changes are pointed to by 'val'.
+  //
+  // On success, the memory pointed to by 'val' can be destroyed. The
+  // 'finished_row' output parameter will be set if we can determine that all
+  // future deltas belonging to 'key.row_idx()' are irrelevant under the
+  // snapshot provided at preparer construction time; the caller can skip ahead
+  // to deltas belonging to the next row.
+  //
+  // Call when a new delta becomes available in DeltaIterator::PrepareBatch.
+  Status AddDelta(const DeltaKey& key, Slice val, bool* finished_row);
+
+  Status ApplyUpdates(size_t col_to_apply, ColumnBlock* dst) override;
+
+  Status ApplyDeletes(SelectionVector* sel_vec) override;
+
+  Status CollectMutations(std::vector<Mutation*>* dst, Arena* arena) override;
+
+  Status FilterColumnIdsAndCollectDeltas(const std::vector<ColumnId>& col_ids,
+                                         std::vector<DeltaKeyAndUpdate>* out,
+                                         Arena* arena) override;
+
+  bool MayHaveDeltas() const override;
+
+  rowid_t cur_prepared_idx() const { return cur_prepared_idx_; }
+  boost::optional<rowid_t> last_added_idx() const { return last_added_idx_; }
+  const RowIteratorOptions& opts() const { return opts_; }
+
+ private:
+  // Checks whether we are done processing a row's deltas. If so, attempts to
+  // convert the row's latest deletion state into a saved deletion or
+  // reinsertion. By deferring this work to when a row is finished, we avoid
+  // creating unnecessary deletions and reinsertions for rows that are
+  // repeatedly deleted and reinserted.
+  //
+  // 'cur_row_idx' may be unset when there is no new row index, such as when
+  // called upon completion of an entire batch of deltas (i.e. from Finish()).
+  void MaybeProcessPreviousRowChange(boost::optional<rowid_t> cur_row_idx);
+
+  // Update the deletion state of the current row being processed based on 'op'.
+  void UpdateDeletionState(RowChangeList::ChangeType op);
+
+  // Options with which the DeltaPreparer's iterator was constructed.
+  const RowIteratorOptions opts_;
+
+  // The row index at which the most recent batch preparation ended.
+  rowid_t cur_prepared_idx_;
+
+  // The value of 'cur_prepared_idx_' from the previous batch.
+  rowid_t prev_prepared_idx_;
+
+  // The index of the row last added in AddDelta(), if one exists.
+  boost::optional<rowid_t> last_added_idx_;
+
+  // Whether there are any prepared blocks.
+  enum PreparedFor {
+    // There are no prepared blocks. Attempts to call a PreparedDeltas function
+    // will fail.
+    NOT_PREPARED,
+
+    // The DeltaPreparer has prepared a batch of deltas for applying. All deltas
+    // in the batch have been decoded. Operations affecting row data (i.e.
+    // UPDATEs and REINSERTs) have been coalesced into a column-major data
+    // structure suitable for ApplyUpdates. Operations affecting row lifecycle
+    // (i.e. DELETES and REINSERTs) have been coalesced into a row-major data
+    // structure suitable for ApplyDeletes.
+    //
+    // ApplyUpdates and ApplyDeltas are now callable.
+    PREPARED_FOR_APPLY,
+
+    // The DeltaPreparer has prepared a batch of deltas for collecting. Deltas
+    // remain encoded and in the order that they were loaded from the backing store.
+    //
+    // CollectMutations and FilterColumnIdsAndCollectDeltas are now callable.
+    PREPARED_FOR_COLLECT
+  };
+  PreparedFor prepared_for_;
+
+  // State when prepared_for_ == PREPARED_FOR_APPLY
+  // ------------------------------------------------------------
+  struct ColumnUpdate {
+    rowid_t row_id;
+    void* new_val_ptr;
+    uint8_t new_val_buf[16];
+  };
+  typedef std::deque<ColumnUpdate> UpdatesForColumn;
+  std::vector<UpdatesForColumn> updates_by_col_;
+  std::deque<rowid_t> deleted_;
+  std::deque<rowid_t> reinserted_;
+
+  // The deletion state of the row last processed by AddDelta().
+  enum RowDeletionState {
+    UNKNOWN,
+    DELETED,
+    REINSERTED
+  };
+  RowDeletionState deletion_state_;
+
+  // State when prepared_for_ == PREPARED_FOR_COLLECT
+  // ------------------------------------------------------------
+  struct PreparedDelta {
+    DeltaKey key;
+    Slice val;
+  };
+  std::deque<PreparedDelta> prepared_deltas_;
+
+  DISALLOW_COPY_AND_ASSIGN(DeltaPreparer);
+};
+
+enum { ITERATE_OVER_ALL_ROWS = 0 };
 
 // Dumps contents of 'iter' to 'out', line-by-line.  Used to unit test
 // minor delta compaction.
 //
-// If nrows is 0, all rows will be dumped.
+// If 'nrows' is ITERATE_OVER_ALL_ROWS, all rows will be dumped.
 Status DebugDumpDeltaIterator(DeltaType type,
                               DeltaIterator* iter,
                               const Schema& schema,
@@ -217,7 +392,7 @@ Status DebugDumpDeltaIterator(DeltaType type,
 // Writes the contents of 'iter' to 'out', block by block.  Used by
 // minor delta compaction.
 //
-// If nrows is 0, all rows will be dumped.
+// If 'nrows' is ITERATE_OVER_ALL_ROWS, all rows will be dumped.
 template<DeltaType Type>
 Status WriteDeltaIteratorToFile(DeltaIterator* iter,
                                 size_t nrows,

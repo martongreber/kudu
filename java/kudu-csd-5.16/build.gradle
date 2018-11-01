@@ -72,7 +72,12 @@ check.dependsOn(validate)
 // Write out a pom file for use when installing when packaging (see do-component-build).
 task generatePom {
   doLast {
-    pom().writeTo("$buildDir/pom.xml")
+    pom {
+      project {
+        // Make sure the pom uses the correct artifact id.
+        artifactId = "${archivesBaseName}"
+      }
+    }.writeTo("$buildDir/pom.xml")
   }
 }
 assemble.dependsOn(generatePom)

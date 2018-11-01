@@ -21,30 +21,21 @@
 #   http://github.mtv.cloudera.com/CDH/cdh/blob/cdh6.x/README_cauldron.md#branching-and-branch-names
 set -exu
 
-# Update cdh suffix in version.txt and python/setup.py. Note that
-# version.txt may optionally include a -SNAPSHOT suffix, while
-# python/setup.py contains just the raw version.
+# Update cdh suffix in version.txt.
+# Note that version.txt may optionally include a -SNAPSHOT suffix.
 PREV_FULL_VERSION=$(cat version.txt)
-perl -077 -i -pe "s/cdh$CDH_START_VERSION/cdh$CDH_NEW_VERSION/" python/setup.py
 perl -077 -i -pe "s/cdh$CDH_START_MAVEN_VERSION/cdh$CDH_NEW_MAVEN_VERSION/" version.txt
 
-# Update cm versions
+# Update cm versions in the csd service descriptors.
 perl -077 -i -pe "s/$CM_START_VERSION/$CM_NEW_VERSION/" java/kudu-csd*/src/descriptor/service.sdl
 
-# Update the version for the Java client from within the `java` directory:
+# Update the cdh and cm versions for the Java modules from within the `java` directory:
 FULL_VERSION=$(cat version.txt)
-
 (
 cd java
-mvn --batch-mode versions:set -DnewVersion=$FULL_VERSION
-find -type f -path './kudu-csd*/pom.xml' -execdir mvn --batch-mode versions:set -DnewVersion=$CM_NEW_VERSION \;
-# Update the parent version, do this after mvn versions:set since the parent version may not be deployed yet
-perl -077 -i -pe "s#<version>$CDH_START_MAVEN_VERSION</version>#<version>$CDH_NEW_MAVEN_VERSION</version>#" pom.xml
-
 # Update gradle.properties
 perl -077 -i -pe "s/cdhversion\s*=\s*$CDH_START_MAVEN_VERSION/cdhversion=$CDH_NEW_MAVEN_VERSION/; \
-                  s/cmVersion\s*=\s*$CM_START_VERSION/cmVersion=$CM_NEW_VERSION/; \
-                  s/version\s*=\s*$PREV_FULL_VERSION/version = $FULL_VERSION/" gradle.properties
+                  s/cmVersion\s*=\s*$CM_START_VERSION/cmVersion=$CM_NEW_VERSION/" gradle.properties
 )
 
 # Assert something changed and print the diff.

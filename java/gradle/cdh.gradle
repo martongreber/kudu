@@ -80,4 +80,7 @@ for (component in result.resolvedComponents) {
 
   ext.cdhCommonsIoVersion = pom.properties."cdh.commons-io.version"
   logger.info("Set commons-io version to $cdhCommonsIoVersion")
+
+  ext.cdhNettyVersion = pom.properties."cdh.io.netty.version"
+  logger.info("Set netty version to $cdhNettyVersion")
 }

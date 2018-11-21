@@ -28,13 +28,14 @@
 #include <vector>
 
 #include <boost/algorithm/string/predicate.hpp>
-#include <boost/algorithm/string/replace.hpp>
-#include <boost/bind.hpp> // IWYU pragma: keep
-#include <boost/iterator/iterator_traits.hpp>
+#include <boost/bind.hpp>
 #include <gflags/gflags.h>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
+
 #ifdef TCMALLOC_ENABLED
+#include <boost/algorithm/string/replace.hpp>
+#include <boost/iterator/iterator_traits.hpp>
 #include <gperftools/malloc_extension.h>
 #endif
 
@@ -50,7 +51,6 @@
 #include "kudu/util/array_view.h"
 #include "kudu/util/debug-util.h"
 #include "kudu/util/easy_json.h"
-#include "kudu/util/faststring.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/jsonwriter.h"
@@ -62,7 +62,13 @@
 #include "kudu/util/status.h"
 #include "kudu/util/web_callback_registry.h"
 
+#ifdef TCMALLOC_ENABLED
+#include "kudu/util/faststring.h"
+#endif
+
 using std::ifstream;
+using std::ostringstream;
+using std::shared_ptr;
 using std::string;
 using std::vector;
 using strings::Substitute;
@@ -79,8 +85,6 @@ DECLARE_string(rpc_authentication);
 DECLARE_string(webserver_certificate_file);
 
 namespace kudu {
-
-using std::shared_ptr;
 
 namespace {
 // Html/Text formatting tags
@@ -125,7 +129,7 @@ static void LogsHandler(const Webserver::WebRequest& req, Webserver::WebResponse
     // practice.
     log.seekg(seekpos);
     (*output)["web_log_bytes"] = FLAGS_web_log_bytes;
-    std::ostringstream ss;
+    ostringstream ss;
     ss << log.rdbuf();
     (*output)["log"] = ss.str();
   }
@@ -137,7 +141,7 @@ static void LogsHandler(const Webserver::WebRequest& req, Webserver::WebResponse
 // escaped if in the raw text mode, e.g. "/varz?raw".
 static void FlagsHandler(const Webserver::WebRequest& req,
                          Webserver::PrerenderedWebResponse* resp) {
-  std::ostringstream* output = resp->output;
+  ostringstream* output = resp->output;
   bool as_text = (req.parsed_args.find("raw") != req.parsed_args.end());
   Tags tags(as_text);
 
@@ -152,7 +156,7 @@ static void FlagsHandler(const Webserver::WebRequest& req,
 // Prints out the current stack trace of all threads in the process.
 static void StacksHandler(const Webserver::WebRequest& /*req*/,
                           Webserver::PrerenderedWebResponse* resp) {
-  std::ostringstream* output = resp->output;
+  ostringstream* output = resp->output;
 
   StackTraceSnapshot snap;
   auto start = MonoTime::Now();
@@ -185,7 +189,7 @@ static void StacksHandler(const Webserver::WebRequest& /*req*/,
 // Registered to handle "/memz", and prints out memory allocation statistics.
 static void MemUsageHandler(const Webserver::WebRequest& req,
                             Webserver::PrerenderedWebResponse* resp) {
-  std::ostringstream* output = resp->output;
+  ostringstream* output = resp->output;
   bool as_text = (req.parsed_args.find("raw") != req.parsed_args.end());
   Tags tags(as_text);
 
@@ -203,10 +207,10 @@ static void MemUsageHandler(const Webserver::WebRequest& req,
 #endif
 }
 
-// Registered to handle "/mem-trackers", and prints out to handle memory tracker information.
+// Registered to handle "/mem-trackers", and prints out memory tracker information.
 static void MemTrackersHandler(const Webserver::WebRequest& /*req*/,
                                Webserver::PrerenderedWebResponse* resp) {
-  std::ostringstream* output = resp->output;
+  ostringstream* output = resp->output;
   int64_t current_consumption = process_memory::CurrentConsumption();
   int64_t hard_limit = process_memory::HardLimit();
   *output << "<h1>Process memory usage</h1>\n";
@@ -231,9 +235,20 @@ static void MemTrackersHandler(const Webserver::WebRequest& /*req*/,
 #endif
 
   *output << "<h1>Memory usage by subsystem</h1>\n";
-  *output << "<table class='table table-striped'>\n";
-  *output << "  <thead><tr><th>Id</th><th>Parent</th><th>Limit</th><th>Current Consumption</th>"
-      "<th>Peak consumption</th></tr></thead>\n";
+  *output << "<table data-toggle='table' "
+             "       data-pagination='true' "
+             "       data-search='true' "
+             "       class='table table-striped'>\n";
+  *output << "<thead><tr>"
+             "<th>Id</th>"
+             "<th>Parent</th>"
+             "<th>Limit</th>"
+             "<th data-sorter='bytesSorter' "
+             "    data-sortable='true' "
+             ">Current Consumption</th>"
+             "<th data-sorter='bytesSorter' "
+             "    data-sortable='true' "
+             ">Peak Consumption</th>";
   *output << "<tbody>\n";
 
   vector<shared_ptr<MemTracker> > trackers;
@@ -244,7 +259,7 @@ static void MemTrackersHandler(const Webserver::WebRequest& /*req*/,
                        HumanReadableNumBytes::ToString(tracker->limit());
     string current_consumption_str = HumanReadableNumBytes::ToString(tracker->consumption());
     string peak_consumption_str = HumanReadableNumBytes::ToString(tracker->peak_consumption());
-    (*output) << Substitute("  <tr><td>$0</td><td>$1</td><td>$2</td>" // id, parent, limit
+    (*output) << Substitute("<tr><td>$0</td><td>$1</td><td>$2</td>" // id, parent, limit
                             "<td>$3</td><td>$4</td></tr>\n", // current, peak
                             tracker->id(), parent, limit_str, current_consumption_str,
                             peak_consumption_str);
@@ -312,7 +327,7 @@ void AddDefaultPathHandlers(Webserver* webserver) {
 static void WriteMetricsAsJson(const MetricRegistry* const metrics,
                                const Webserver::WebRequest& req,
                                Webserver::PrerenderedWebResponse* resp) {
-  std::ostringstream* output = resp->output;
+  ostringstream* output = resp->output;
   const string* requested_metrics_param = FindOrNull(req.parsed_args, "metrics");
   vector<string> requested_metrics;
   MetricJsonOptions opts;

@@ -32,9 +32,11 @@
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/common/types.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/tablet/delta_relevancy.h"
 #include "kudu/tablet/delta_stats.h"
 #include "kudu/tablet/deltafile.h"
 #include "kudu/tablet/mutation.h"
@@ -51,47 +53,6 @@ using std::string;
 using std::vector;
 using strings::Substitute;
 
-namespace {
-
-// Returns whether a mutation at 'ts' is relevant under 'snap'.
-//
-// If not relevant, further checks whether any remaining deltas for this row can
-// be skipped; this is an optimization and not necessary for correctness.
-template<DeltaType Type>
-bool IsDeltaRelevant(const MvccSnapshot& snap,
-                     const Timestamp& ts,
-                     bool* finished_row);
-
-template<>
-bool IsDeltaRelevant<REDO>(const MvccSnapshot& snap,
-                           const Timestamp& ts,
-                           bool* finished_row) {
-  *finished_row = false;
-  if (!snap.IsCommitted(ts)) {
-    if (!snap.MayHaveCommittedTransactionsAtOrAfter(ts)) {
-      *finished_row = true;
-    }
-    return false;
-  }
-  return true;
-}
-
-template<>
-bool IsDeltaRelevant<UNDO>(const MvccSnapshot& snap,
-                           const Timestamp& ts,
-                           bool* finished_row) {
-  *finished_row = false;
-  if (snap.IsCommitted(ts)) {
-    if (!snap.MayHaveUncommittedTransactionsAtOrBefore(ts)) {
-      *finished_row = true;
-    }
-    return false;
-  }
-  return true;
-}
-
-} // anonymous namespace
-
 string DeltaKeyAndUpdate::Stringify(DeltaType type, const Schema& schema, bool pad_key) const {
   return StrCat(Substitute("($0 delta key=$2, change_list=$1)",
                            DeltaType_Name(type),
@@ -105,9 +66,10 @@ string DeltaKeyAndUpdate::Stringify(DeltaType type, const Schema& schema, bool p
 template<class Traits>
 DeltaPreparer<Traits>::DeltaPreparer(RowIteratorOptions opts)
     : opts_(std::move(opts)),
+      projection_vc_is_deleted_idx_(opts_.projection->find_first_is_deleted_virtual_column()),
       cur_prepared_idx_(0),
       prev_prepared_idx_(0),
-      prepared_for_(NOT_PREPARED),
+      prepared_flags_(DeltaIterator::PREPARE_NONE),
       deletion_state_(UNKNOWN) {
 }
 
@@ -115,11 +77,23 @@ template<class Traits>
 void DeltaPreparer<Traits>::Seek(rowid_t row_idx) {
   cur_prepared_idx_ = row_idx;
   prev_prepared_idx_ = row_idx;
-  prepared_for_ = NOT_PREPARED;
+  prepared_flags_ = DeltaIterator::PREPARE_NONE;
 }
 
 template<class Traits>
-void DeltaPreparer<Traits>::Start(DeltaIterator::PrepareFlag flag) {
+void DeltaPreparer<Traits>::Start(size_t nrows, int prepare_flags) {
+  DCHECK_NE(prepare_flags, DeltaIterator::PREPARE_NONE);
+
+  if (prepare_flags & DeltaIterator::PREPARE_FOR_SELECT) {
+    DCHECK(opts_.snap_to_exclude);
+
+    // Ensure we have a selection vector at least 'nrows' long.
+    if (!selected_ || selected_->nrows() < nrows) {
+      selected_.reset(new SelectionVector(nrows));
+    }
+    selected_->SetAllFalse();
+  }
+  prepared_flags_ = prepare_flags;
   if (updates_by_col_.empty()) {
     updates_by_col_.resize(opts_.projection->num_columns());
   }
@@ -130,15 +104,12 @@ void DeltaPreparer<Traits>::Start(DeltaIterator::PrepareFlag flag) {
   reinserted_.clear();
   prepared_deltas_.clear();
   deletion_state_ = UNKNOWN;
-  switch (flag) {
-    case DeltaIterator::PREPARE_FOR_APPLY:
-      prepared_for_ = PREPARED_FOR_APPLY;
-      break;
-    case DeltaIterator::PREPARE_FOR_COLLECT:
-      prepared_for_ = PREPARED_FOR_COLLECT;
-      break;
-    default:
-      LOG(FATAL) << "Unknown prepare flag: " << flag;
+
+  if (VLOG_IS_ON(3)) {
+    string snap_to_exclude = opts_.snap_to_exclude ?
+                             opts_.snap_to_exclude->ToString() : "INF";
+    VLOG(3) << "Starting batch for [" << snap_to_exclude << ","
+            << opts_.snap_to_include.ToString() << ")";
   }
 }
 
@@ -147,17 +118,53 @@ void DeltaPreparer<Traits>::Finish(size_t nrows) {
   MaybeProcessPreviousRowChange(boost::none);
   prev_prepared_idx_ = cur_prepared_idx_;
   cur_prepared_idx_ += nrows;
+
+  if (VLOG_IS_ON(3)) {
+    string snap_to_exclude = opts_.snap_to_exclude ?
+                             opts_.snap_to_exclude->ToString() : "INF";
+    VLOG(3) << "Finishing batch for [" << snap_to_exclude << ","
+            << opts_.snap_to_include.ToString() << ")";
+  }
 }
 
 template<class Traits>
 Status DeltaPreparer<Traits>::AddDelta(const DeltaKey& key, Slice val, bool* finished_row) {
-  if (!IsDeltaRelevant<Traits::kType>(opts_.snap_to_include,
-                                      key.timestamp(), finished_row)) {
-    return Status::OK();
-  }
   MaybeProcessPreviousRowChange(key.row_idx());
 
-  if (prepared_for_ == PREPARED_FOR_APPLY) {
+  VLOG(4) << "Considering delta " << key.ToString() << ": "
+          << RowChangeList(val).ToString(*opts_.projection);
+
+  // Different preparations may use different criteria for delta relevancy. Each
+  // criteria offers a short-circuit when processing of the current row is known
+  // to be finished, but that short-circuit can only be used if we're not also
+  // handling a preparation with a different criteria.
+
+  if (prepared_flags_ & DeltaIterator::PREPARE_FOR_SELECT) {
+    bool finished_row_for_select;
+    if (IsDeltaRelevantForSelect<Traits::kType>(*opts_.snap_to_exclude,
+                                                opts_.snap_to_include,
+                                                key.timestamp(),
+                                                &finished_row_for_select)) {
+      selected_->SetRowSelected(key.row_idx() - cur_prepared_idx_);
+    }
+
+    if (finished_row_for_select &&
+        !(prepared_flags_ & ~DeltaIterator::PREPARE_FOR_SELECT)) {
+      *finished_row = true;
+    }
+  }
+
+  // Apply and collect use the same relevancy criteria.
+  bool relevant_for_apply_or_collect = false;
+  bool finished_row_for_apply_or_collect = false;
+  if (prepared_flags_ & (DeltaIterator::PREPARE_FOR_APPLY |
+                         DeltaIterator::PREPARE_FOR_COLLECT)) {
+    relevant_for_apply_or_collect = IsDeltaRelevantForApply<Traits::kType>(
+        opts_.snap_to_include, key.timestamp(), &finished_row_for_apply_or_collect);
+  }
+
+  if (prepared_flags_ & DeltaIterator::PREPARE_FOR_APPLY &&
+      relevant_for_apply_or_collect) {
     RowChangeListDecoder decoder((RowChangeList(val)));
     if (Traits::kInitializeDecodersWithSafetyChecks) {
       RETURN_NOT_OK(decoder.Init());
@@ -201,12 +208,20 @@ Status DeltaPreparer<Traits>::AddDelta(const DeltaKey& key, Slice val, bool* fin
         }
       }
     }
-  } else {
-    DCHECK_EQ(prepared_for_, PREPARED_FOR_COLLECT);
+  }
+
+  if (prepared_flags_ & DeltaIterator::PREPARE_FOR_COLLECT &&
+      relevant_for_apply_or_collect) {
     PreparedDelta d;
     d.key = key;
     d.val = val;
     prepared_deltas_.emplace_back(d);
+  }
+
+  if (finished_row_for_apply_or_collect &&
+      !(prepared_flags_ & ~(DeltaIterator::PREPARE_FOR_APPLY |
+                            DeltaIterator::PREPARE_FOR_COLLECT))) {
+    *finished_row = true;
   }
 
   last_added_idx_ = key.row_idx();
@@ -216,8 +231,32 @@ Status DeltaPreparer<Traits>::AddDelta(const DeltaKey& key, Slice val, bool* fin
 template<class Traits>
 Status DeltaPreparer<Traits>::ApplyUpdates(size_t col_to_apply, ColumnBlock* dst,
                                            const SelectionVector& filter) {
-  DCHECK_EQ(prepared_for_, PREPARED_FOR_APPLY);
+  DCHECK(prepared_flags_ & DeltaIterator::PREPARE_FOR_APPLY);
   DCHECK_LE(cur_prepared_idx_ - prev_prepared_idx_, dst->nrows());
+
+  // Special handling for the IS_DELETED virtual column: convert 'deleted_' and
+  // 'reinserted_' into true and false cell values.
+  if (col_to_apply == projection_vc_is_deleted_idx_) {
+    // See ApplyDeletes() to understand why we adjust the virtual column's value
+    // for both deleted and reinserted rows.
+    for (const auto& row_id : deleted_) {
+      uint32_t idx_in_block = row_id - prev_prepared_idx_;
+      if (filter.IsRowSelected(idx_in_block)) {
+        ColumnBlock::Cell cell = dst->cell(idx_in_block);
+        UnalignedStore(cell.mutable_ptr(), true);
+      }
+    }
+
+    for (const auto& row_id : reinserted_) {
+      uint32_t idx_in_block = row_id - prev_prepared_idx_;
+      if (filter.IsRowSelected(idx_in_block)) {
+        ColumnBlock::Cell cell = dst->cell(idx_in_block);
+        UnalignedStore(cell.mutable_ptr(), false);
+      }
+    }
+
+    return Status::OK();
+  }
 
   const ColumnSchema* col_schema = &opts_.projection->column(col_to_apply);
   for (const ColumnUpdate& cu : updates_by_col_[col_to_apply]) {
@@ -236,9 +275,15 @@ Status DeltaPreparer<Traits>::ApplyUpdates(size_t col_to_apply, ColumnBlock* dst
 
 template<class Traits>
 Status DeltaPreparer<Traits>::ApplyDeletes(SelectionVector* sel_vec) {
-  DCHECK_EQ(prepared_for_, PREPARED_FOR_APPLY);
+  DCHECK(prepared_flags_ & DeltaIterator::PREPARE_FOR_APPLY);
   DCHECK_LE(cur_prepared_idx_ - prev_prepared_idx_, sel_vec->nrows());
 
+  // To understand why we must adjust sel_vec for both deleted_ and reinserted_,
+  // consider that DeltaIterators are often used en masse (i.e. via
+  // DeltaIteratorMerger). In such cases, it's possible for one DeltaPreparer to
+  // delete a row and for the next to reinsert it. Given that ApplyDeletes is
+  // called on each DeltaPreparer in order, we must "twiddle" sel_vec in either
+  // direction in order for the row's bit to hold the correct state at the end.
   for (const auto& row_id : deleted_) {
     uint32_t idx_in_block = row_id - prev_prepared_idx_;
     sel_vec->SetRowUnselected(idx_in_block);
@@ -253,8 +298,23 @@ Status DeltaPreparer<Traits>::ApplyDeletes(SelectionVector* sel_vec) {
 }
 
 template<class Traits>
+Status DeltaPreparer<Traits>::SelectUpdates(SelectionVector* sel_vec) {
+  DCHECK(prepared_flags_ & DeltaIterator::PREPARE_FOR_SELECT);
+  DCHECK_LE(cur_prepared_idx_ - prev_prepared_idx_, sel_vec->nrows());
+
+  // SelectUpdates() is additive: it should never exclude rows, only include them.
+  for (rowid_t idx = 0; idx < sel_vec->nrows(); idx++) {
+    if (selected_->IsRowSelected(idx)) {
+      sel_vec->SetRowSelected(idx);
+    }
+  }
+
+  return Status::OK();
+}
+
+template<class Traits>
 Status DeltaPreparer<Traits>::CollectMutations(vector<Mutation*>* dst, Arena* arena) {
-  DCHECK_EQ(prepared_for_, PREPARED_FOR_COLLECT);
+  DCHECK(prepared_flags_ & DeltaIterator::PREPARE_FOR_COLLECT);
   DCHECK_LE(cur_prepared_idx_ - prev_prepared_idx_, dst->size());
   for (const PreparedDelta& src : prepared_deltas_) {
     DeltaKey key = src.key;
@@ -306,7 +366,7 @@ Status DeltaPreparer<Traits>::FilterColumnIdsAndCollectDeltas(
 
 template<class Traits>
 bool DeltaPreparer<Traits>::MayHaveDeltas() const {
-  DCHECK_EQ(prepared_for_, PREPARED_FOR_APPLY);
+  DCHECK(prepared_flags_ & DeltaIterator::PREPARE_FOR_APPLY);
   if (!deleted_.empty()) {
     return true;
   }
@@ -323,7 +383,7 @@ bool DeltaPreparer<Traits>::MayHaveDeltas() const {
 
 template<class Traits>
 void DeltaPreparer<Traits>::MaybeProcessPreviousRowChange(boost::optional<rowid_t> cur_row_idx) {
-  if (prepared_for_ == PREPARED_FOR_APPLY &&
+  if (prepared_flags_ & DeltaIterator::PREPARE_FOR_APPLY &&
       last_added_idx_ &&
       (!cur_row_idx || cur_row_idx != *last_added_idx_)) {
     switch (deletion_state_) {

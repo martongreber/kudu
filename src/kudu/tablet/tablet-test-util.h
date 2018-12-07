@@ -365,10 +365,15 @@ class MirroredDeltas {
   }
 
   // Returns true if all tracked deltas are irrelevant to 'ts', false otherwise.
-  bool CheckAllDeltasCulled(Timestamp ts) const {
+  bool CheckAllDeltasCulled(const boost::optional<Timestamp>& lower_ts,
+                            Timestamp upper_ts) const {
     for (const auto& e1 : all_deltas_) {
       for (const auto& e2 : e1.second) {
-        if (IsDeltaRelevant(ts, e2.first)) {
+        bool relevant = IsDeltaRelevantForApply(upper_ts, e2.first);
+        if (lower_ts) {
+          relevant |= IsDeltaRelevantForSelect(*lower_ts, upper_ts, e2.first);
+        }
+        if (relevant) {
           return false;
         }
       }
@@ -401,15 +406,44 @@ class MirroredDeltas {
   //
   // Rows not set in 'filter' are skipped.
   //
-  // Deltas not relevant to 'ts' are skipped. The set of rows considered is
-  // determined by 'start_row_idx' and the number of rows in 'cb'.
-  Status ApplyUpdates(const Schema& projection, Timestamp ts,
+  // Deltas not relevant to 'lower_ts' or 'upper_ts' are skipped. The set of
+  // rows considered is determined by 'start_row_idx' and the number of rows in 'cb'.
+  Status ApplyUpdates(const Schema& projection,
+                      const boost::optional<Timestamp>& lower_ts, Timestamp upper_ts,
                       rowid_t start_row_idx, int col_idx, ColumnBlock* cb,
                       const SelectionVector& filter) {
+    if (VLOG_IS_ON(3)) {
+      std::string lower_ts_str = lower_ts ? lower_ts->ToString() : "INF";
+      VLOG(3) << "Begin applying for timestamps [" << lower_ts_str << ","
+              << upper_ts << ")";
+    }
     for (int i = 0; i < cb->nrows(); i++) {
       rowid_t row_idx = start_row_idx + i;
+
+      if (lower_ts) {
+        // First pass: establish whether this row should be applied at all.
+        bool at_least_one_delta_relevant = false;
+        for (const auto& e : all_deltas_[row_idx]) {
+          bool is_relevant = IsDeltaRelevantForSelect(*lower_ts, upper_ts, e.first);
+          if (VLOG_IS_ON(3)) {
+            RowChangeList changes(e.second);
+            VLOG(3) << "Row " << i << " ts " << e.first << " (relevant: "
+                    << is_relevant << "): " << changes.ToString(*schema_);
+          }
+          if (is_relevant) {
+            at_least_one_delta_relevant = true;
+            break;
+          }
+        }
+        if (!at_least_one_delta_relevant) {
+          // Not one delta was relevant; skip the row.
+          continue;
+        }
+      }
+
+      // Second pass: apply all relevant deltas.
       for (const auto& e : all_deltas_[row_idx]) {
-        if (!IsDeltaRelevant(ts, e.first)) {
+        if (!IsDeltaRelevantForApply(upper_ts, e.first)) {
           // No need to keep iterating; all future deltas for this row will also
           // be irrelevant.
           break;
@@ -438,7 +472,7 @@ class MirroredDeltas {
     for (int i = 0; i < sel_vec->nrows(); i++) {
       bool deleted = false;
       for (const auto& e : all_deltas_[start_row_idx + i]) {
-        if (!IsDeltaRelevant(ts, e.first)) {
+        if (!IsDeltaRelevantForApply(ts, e.first)) {
           // No need to keep iterating; all future deltas for this row will also
           // be irrelevant.
           break;
@@ -455,6 +489,25 @@ class MirroredDeltas {
     return Status::OK();
   }
 
+  // Selects all rows in 'sel_vec' for which there exists a tracked delta.
+  //
+  // Deltas not relevant to 'lower_ts' or 'upper_ts' are skipped. The set of
+  // rows considered is determined by 'start_row_idx' and the number of rows in 'sel_vec'.
+  void SelectUpdates(Timestamp lower_ts, Timestamp upper_ts,
+                     rowid_t start_row_idx, SelectionVector* sel_vec) {
+    for (int i = 0; i < sel_vec->nrows(); i++) {
+      for (const auto& e : all_deltas_[start_row_idx + i]) {
+        if (!IsDeltaRelevantForSelect(lower_ts, upper_ts, e.first)) {
+          // Must keep iterating; short-circuit out of the select criteria is
+          // complex and not worth using in test code.
+          continue;
+        }
+        sel_vec->SetRowSelected(i);
+        break;
+      }
+    }
+  }
+
   // Transforms and writes deltas into 'deltas', a vector of "delta lists", each
   // of which represents a particular row, and each entry of which is a
   // Timestamp and encoded delta pair. The encoded delta is a Slice into
@@ -467,7 +520,7 @@ class MirroredDeltas {
                         std::vector<DeltaList>* deltas) {
     for (int i = 0; i < deltas->size(); i++) {
       for (const auto& e : all_deltas_[start_row_idx + i]) {
-        if (!IsDeltaRelevant(ts, e.first)) {
+        if (!IsDeltaRelevantForApply(ts, e.first)) {
           // No need to keep iterating; all future deltas for this row will also
           // be irrelevant.
           break;
@@ -513,7 +566,13 @@ class MirroredDeltas {
 
  private:
   // Returns true if 'ts' is relevant to 'to_include', false otherwise.
-  bool IsDeltaRelevant(Timestamp to_include, Timestamp ts) const;
+  bool IsDeltaRelevantForApply(Timestamp to_include, Timestamp ts) const;
+
+  // Returns true if 'ts' is relevant with respect to both 'to_exclude' and
+  // 'to_include', false otherwise.
+  bool IsDeltaRelevantForSelect(Timestamp to_exclude,
+                                Timestamp to_include,
+                                Timestamp ts) const;
 
   // All encoded deltas, arranged in DeltaKey order.
   MirroredDeltaMap all_deltas_;
@@ -550,6 +609,13 @@ static inline std::vector<size_t> GetRandomIntegerSequence(
   return std::vector<size_t>(integers.begin(), integers.end());
 }
 
+// Generates random deltas conforming to 'schema' and stores them in 'mirror'.
+//
+// 'row_range' and 'ts_range' constrain the DeltaKeys used in the created deltas.
+//
+// If 'allow_reinserts' is true, REINSERT deltas may also be generated.
+// Otherwise, a row won't receive any more deltas after a DELETE has been
+// generated for it.
 template <typename T>
 void CreateRandomDeltas(const Schema& schema,
                         Random* prng,
@@ -644,9 +710,22 @@ void CreateRandomDeltas(const Schema& schema,
   }
 }
 
+// Create a random projection conforming to 'schema'.
+//
+// 'max_cols_to_project' defines the maximum number of columns that should be
+// allowed into the projection; the actual number of columns is randomly
+// generated.
+//
+// If 'allow' is true, an IS_DELETED virtual column may be randomly added to
+// the projection.
+enum class AllowIsDeleted {
+  YES,
+  NO
+};
 static inline Schema GetRandomProjection(const Schema& schema,
                                          Random* prng,
-                                         size_t max_cols_to_project) {
+                                         size_t max_cols_to_project,
+                                         AllowIsDeleted allow) {
   // Set up the projection.
   auto idxs_to_project = GetRandomIntegerSequence(prng,
                                                   schema.num_columns(),
@@ -656,6 +735,14 @@ static inline Schema GetRandomProjection(const Schema& schema,
   for (auto idx : idxs_to_project) {
     projected_cols.emplace_back(schema.column(idx));
     projected_col_ids.emplace_back(schema.column_id(idx));
+  }
+
+  // Add a IS_DELETED virtual column some of the time.
+  if (allow == AllowIsDeleted::YES && prng->Uniform(10) == 0) {
+    bool read_default = false;
+    projected_cols.emplace_back("is_deleted", IS_DELETED, /*is_nullable=*/ false,
+                                &read_default);
+    projected_col_ids.emplace_back(schema.max_col_id() + 1);
   }
   return Schema(projected_cols, projected_col_ids, 0);
 }
@@ -779,57 +866,93 @@ void RunDeltaFuzzTest(const DeltaStore& store,
   for (int i = 0; i < kNumScans + 1; i++) {
     // Pick a timestamp for the iterator. The last iteration will use a snapshot
     // that includes all deltas.
-    Timestamp ts;
+    Timestamp upper_ts;
+    boost::optional<Timestamp> lower_ts;
     if (i < kNumScans) {
-      ts = Timestamp(prng->Uniform(ts_range.second - ts_range.first) +
-                     ts_range.first);
+      uint64_t upper_ts_val = prng->Uniform(ts_range.second - ts_range.first) +
+                              ts_range.first;
+      upper_ts = Timestamp(upper_ts_val);
+
+      // Use a lower bound in half the scans.
+      if (prng->Uniform(2)) {
+        uint64_t lower_ts_val = upper_ts_val > 0 ? prng->Uniform(upper_ts_val) : 0;
+        lower_ts = Timestamp(lower_ts_val);
+      }
     } else if (T::kTag == REDO) {
-      ts = Timestamp::kMax;
+      upper_ts = Timestamp::kMax;
     } else {
       DCHECK(T::kTag == UNDO);
-      ts = Timestamp::kMin;
+      upper_ts = Timestamp::kMin;
     }
 
     // Create and initialize the iterator. If none iterator is returned, it's
     // because all deltas in 'store' were irrelevant; verify this.
-    Schema projection = GetRandomProjection(*mirror->schema(), prng, kMaxColsToProject);
+    Schema projection = GetRandomProjection(*mirror->schema(), prng, kMaxColsToProject,
+                                            lower_ts ? AllowIsDeleted::YES :
+                                                       AllowIsDeleted::NO);
+    size_t projection_vc_is_deleted_idx =
+        projection.find_first_is_deleted_virtual_column();
     SCOPED_TRACE(strings::Substitute("Projection $0", projection.ToString()));
     RowIteratorOptions opts;
     opts.projection = &projection;
-    opts.snap_to_include = MvccSnapshot(ts);
-    SCOPED_TRACE(strings::Substitute("Timestamp $0", ts.ToString()));
+    if (lower_ts) {
+      opts.snap_to_exclude = MvccSnapshot(*lower_ts);
+    }
+    opts.snap_to_include = MvccSnapshot(upper_ts);
+    SCOPED_TRACE(strings::Substitute("Timestamps: [$0,$1)",
+                                     lower_ts ? lower_ts->ToString() : "INF",
+                                     upper_ts.ToString()));
     DeltaIterator* raw_iter;
     Status s = store.NewDeltaIterator(opts, &raw_iter);
     if (s.IsNotFound()) {
       ASSERT_STR_CONTAINS(s.ToString(), "MvccSnapshot outside the range of this delta");
-      ASSERT_TRUE(mirror->CheckAllDeltasCulled(ts));
+      ASSERT_TRUE(mirror->CheckAllDeltasCulled(lower_ts, upper_ts));
       continue;
     }
     ASSERT_OK(s);
     std::unique_ptr<DeltaIterator> iter(raw_iter);
     ASSERT_OK(iter->Init(nullptr));
 
-    // Run PREPARE_FOR_APPLY method tests in batches, in case there's some bug
-    // related to batching.
+    // Run tests in batches, in case there's some bug related to batching.
     ASSERT_OK(iter->SeekToOrdinal(0));
     rowid_t start_row_idx = 0;
     while (iter->HasNext()) {
       int batch_size = prng->Uniform(kMaxBatchSize) + 1;
-      SCOPED_TRACE(strings::Substitute("APPLY: batch starting at $0 ($1 rows)",
+      SCOPED_TRACE(strings::Substitute("batch starting at $0 ($1 rows)",
                                        start_row_idx, batch_size));
-      ASSERT_OK(iter->PrepareBatch(batch_size, DeltaIterator::PREPARE_FOR_APPLY));
+      int prepare_flags = DeltaIterator::PREPARE_FOR_APPLY |
+                          DeltaIterator::PREPARE_FOR_COLLECT;
+      if (lower_ts) {
+        prepare_flags |= DeltaIterator::PREPARE_FOR_SELECT;
+      }
+      ASSERT_OK(iter->PrepareBatch(batch_size, prepare_flags));
+
+      // Test SelectUpdates: the selection vector begins all false and a row is
+      // set if there is at least one relevant update for it.
+      //
+      // Note: we retain 'actual_selected' for use as a possible filter in the
+      // ApplyUpdates test below.
+      SelectionVector actual_selected(batch_size);
+      if (lower_ts) {
+        SelectionVector expected_selected(batch_size);
+        expected_selected.SetAllFalse();
+        actual_selected.SetAllFalse();
+        mirror->SelectUpdates(*lower_ts, upper_ts, start_row_idx, &expected_selected);
+        ASSERT_OK(iter->SelectUpdates(&actual_selected));
+        ASSERT_EQ(expected_selected, actual_selected);
+      }
 
       // Test ApplyDeletes: the selection vector is all true and a row is unset
       // if the last relevant update deleted it.
       //
-      // Note: we retain 'actual_deleted' for use as a filter in the
+      // Note: we retain 'actual_deleted' for use as a possible filter in the
       // ApplyUpdates test below.
       SelectionVector actual_deleted(batch_size);
       {
         SelectionVector expected_deleted(batch_size);
         expected_deleted.SetAllTrue();
         actual_deleted.SetAllTrue();
-        ASSERT_OK(mirror->ApplyDeletes(ts, start_row_idx, &expected_deleted));
+        ASSERT_OK(mirror->ApplyDeletes(upper_ts, start_row_idx, &expected_deleted));
         ASSERT_OK(iter->ApplyDeletes(&actual_deleted));
         ASSERT_EQ(expected_deleted, actual_deleted);
       }
@@ -843,25 +966,25 @@ void RunDeltaFuzzTest(const DeltaStore& store,
           expected_scb[k] = 0;
           actual_scb[k] = 0;
         }
-        ASSERT_OK(mirror->ApplyUpdates(*opts.projection, ts, start_row_idx, j,
-                                       &expected_scb, actual_deleted));
-        ASSERT_OK(iter->ApplyUpdates(j, &actual_scb, actual_deleted));
+        const SelectionVector& filter = lower_ts ? actual_selected : actual_deleted;
+        if (j == projection_vc_is_deleted_idx) {
+          // Reconstruct the expected IS_DELETED state using 'actual_selected'
+          // and 'actual_deleted', which we've already verified above.
+          DCHECK(lower_ts);
+          for (int k = 0; k < batch_size; k++) {
+            if (actual_selected.IsRowSelected(k)) {
+              expected_scb[k] = !actual_deleted.IsRowSelected(k);
+            }
+          }
+        } else {
+          ASSERT_OK(mirror->ApplyUpdates(*opts.projection, lower_ts, upper_ts,
+                                         start_row_idx, j, &expected_scb, filter));
+        }
+        ASSERT_OK(iter->ApplyUpdates(j, &actual_scb, filter));
         ASSERT_EQ(expected_scb, actual_scb)
             << "Expected column block: " << expected_scb.ToString()
             << "\nActual column block: " << actual_scb.ToString();
       }
-
-      start_row_idx += batch_size;
-    }
-
-    // Now run PREPARE_FOR_COLLECT method tests.
-    ASSERT_OK(iter->SeekToOrdinal(0));
-    start_row_idx = 0;
-    while (iter->HasNext()) {
-      int batch_size = prng->Uniform(kMaxBatchSize - 1) + 1;
-      SCOPED_TRACE(strings::Substitute("COLLECT: batch starting at $0 ($1 rows)",
-                                       start_row_idx, batch_size));
-      ASSERT_OK(iter->PrepareBatch(batch_size, DeltaIterator::PREPARE_FOR_COLLECT));
 
       // Test CollectMutations: all relevant updates are returned.
       {
@@ -869,7 +992,7 @@ void RunDeltaFuzzTest(const DeltaStore& store,
         std::vector<typename MirroredDeltas<T>::DeltaList> expected_muts(batch_size);
         std::vector<Mutation*> actual_muts(batch_size);
         ASSERT_OK(iter->CollectMutations(&actual_muts, &arena));
-        mirror->CollectMutations(ts, start_row_idx, &expected_muts);
+        mirror->CollectMutations(upper_ts, start_row_idx, &expected_muts);
         for (int i = 0; i < expected_muts.size(); i++) {
           const auto& expected = expected_muts[i];
           auto* actual = actual_muts[i];
@@ -917,6 +1040,7 @@ void RunDeltaFuzzTest(const DeltaStore& store,
           ASSERT_EQ(expected_deltas[j].second, actual_deltas[j].cell);
         }
       }
+
       start_row_idx += batch_size;
     }
   }

@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 
 #include "kudu/cfile/block_handle.h"
@@ -180,9 +181,10 @@ class DeltaFileReader : public DeltaStore,
   }
 
   // Returns true if this delta file may include any deltas which need to be
-  // applied when scanning the given snapshot, or if the file has not yet
+  // applied when scanning the given snapshots, or if the file has not yet
   // been fully initialized.
-  bool IsRelevantForSnapshot(const MvccSnapshot& snap) const;
+  bool IsRelevantForSnapshots(const boost::optional<MvccSnapshot>& snap_to_exclude,
+                              const MvccSnapshot& snap_to_include) const;
 
   // Clone this DeltaFileReader for testing and validation purposes (such as
   // while in DEBUG mode). The resulting object will not be Initted().
@@ -227,12 +229,14 @@ class DeltaFileIterator : public DeltaIterator {
 
   Status SeekToOrdinal(rowid_t idx) override;
 
-  Status PrepareBatch(size_t nrows, PrepareFlag flag) override;
+  Status PrepareBatch(size_t nrows, int prepare_flags) override;
 
   Status ApplyUpdates(size_t col_to_apply, ColumnBlock* dst,
                       const SelectionVector& filter) override;
 
   Status ApplyDeletes(SelectionVector* sel_vec) override;
+
+  Status SelectUpdates(SelectionVector* sel_vec) override;
 
   Status CollectMutations(std::vector<Mutation*>*dst, Arena* arena) override;
 

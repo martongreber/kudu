@@ -400,7 +400,8 @@
           "unit" : "bytes",
           "min" : 1073741824,
           "softMin" : 4294967296,
-          "default" : 4294967296
+          "default" : 4294967296,
+          "autoConfigShare" : 100
         },
         {
           "name" : "block_cache_capacity_mb",

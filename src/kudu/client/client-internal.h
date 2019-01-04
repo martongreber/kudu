@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_CLIENT_CLIENT_INTERNAL_H
-#define KUDU_CLIENT_CLIENT_INTERNAL_H
+#pragma once
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +31,7 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/util/atomic.h"
@@ -188,18 +188,6 @@ class KuduClient::Data {
       const MonoTime& deadline,
       rpc::CredentialsPolicy creds_policy = rpc::CredentialsPolicy::ANY_CREDENTIALS);
 
-  // A wrapper around ConnectToCluster() to handle various errors in case
-  // if a call to thought-to-be-leader master fails. First, this method calls
-  // ConnectToCluster() with current client credentials unless
-  // INVALID_AUTHN_TOKEN reason is specified. If the ConnectToCluster() with the
-  // current client credentials fails, call ConnectToCluster() with primary
-  // credentials. The ReconnectionReason is a dedicated enumeration for the
-  // third parameter of the method.
-  enum class ReconnectionReason { INVALID_AUTHN_TOKEN, OTHER };
-  void ReconnectToCluster(KuduClient* client,
-                          const MonoTime& deadline,
-                          ReconnectionReason reason);
-
   std::shared_ptr<master::MasterServiceProxy> master_proxy() const;
 
   HostPort leader_master_hostport() const;
@@ -210,39 +198,12 @@ class KuduClient::Data {
 
   void UpdateLatestObservedTimestamp(uint64_t timestamp);
 
-  // Retry 'func' until either:
-  //
-  // 1) Methods succeeds on a leader master.
-  // 2) Method fails for a reason that is not related to network
-  //    errors, timeouts, or leadership issues.
-  // 3) 'deadline' (if initialized) elapses.
-  //
-  // NOTE: 'rpc_timeout' is a per-call timeout, while 'deadline' is a
-  // per operation deadline. If 'deadline' is not initialized, 'func' is
-  // retried forever. If 'deadline' expires, 'func_name' is included in
-  // the resulting Status.
-  template<class ReqClass, class RespClass>
-  Status SyncLeaderMasterRpc(
-      const MonoTime& deadline,
-      KuduClient* client,
-      const ReqClass& req,
-      RespClass* resp,
-      const char* func_name,
-      const boost::function<Status(master::MasterServiceProxy*,
-                                   const ReqClass&, RespClass*,
-                                   rpc::RpcController*)>& func,
-      std::vector<uint32_t> required_feature_flags);
-
-  // Exponential backoff with jitter anchored between 10ms and 20ms, and an
-  // upper bound between 2.5s and 5s.
-  static MonoDelta ComputeExponentialBackoff(int num_attempts) {
-    return MonoDelta::FromMilliseconds(
-        (10 + rand() % 10) * static_cast<int>(
-            std::pow(2.0, std::min(8, num_attempts - 1))));
-  }
-
   // The unique id of this client.
   std::string client_id_;
+
+  // The location of this client. This is an empty string if a location has not
+  // been assigned by the leader master. Protected by 'leader_master_lock_'.
+  std::string location_;
 
   // The user credentials of the client. This field is constant after the client
   // is built.
@@ -292,7 +253,8 @@ class KuduClient::Data {
   std::vector<StatusCallback> leader_master_callbacks_primary_creds_;
 
   // Protects 'leader_master_rpc_{any,primary}_creds_',
-  // 'leader_master_hostport_', 'master_hostports_', and 'master_proxy_'.
+  // 'leader_master_hostport_', 'master_hostports_', 'master_proxy_', and
+  // 'location_'.
   //
   // See: KuduClient::Data::ConnectToClusterAsync for a more
   // in-depth explanation of why this is needed and how it works.
@@ -321,4 +283,3 @@ extern const char* kVerboseEnvVar;
 } // namespace client
 } // namespace kudu
 
-#endif

@@ -85,6 +85,8 @@ class KuduWriteOperation;
 class ResourceMetrics;
 
 namespace internal {
+template <class ReqClass, class RespClass>
+class AsyncLeaderMasterRpc; // IWYU pragma: keep
 class Batcher;
 class ErrorCollector;
 class GetTableSchemaRpc;
@@ -585,10 +587,20 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   ///   arbitrary value if the Hive Metastore integration is not enabled.
   std::string GetHiveMetastoreUuid() const KUDU_NO_EXPORT;
 
+  /// Private API.
+  ///
+  /// @return The location of the client, assigned when it first connects to
+  ///   a cluster. An empty string will be returned if no location has been
+  ///   assigned yet, or if the leader master did not assign a location to
+  ///   the client.
+  std::string location() const KUDU_NO_EXPORT;
   /// @endcond
 
  private:
   class KUDU_NO_EXPORT Data;
+
+  template <class ReqClass, class RespClass>
+  friend class internal::AsyncLeaderMasterRpc;
 
   friend class ClientTest;
   friend class ConnectToClusterBaseTest;

@@ -63,7 +63,7 @@ for (component in result.resolvedComponents) {
   ext.cdhHiveVersion = pom.properties."cdh.hive.version"
   logger.info("Set Hive version to $cdhHiveVersion")
 
-  ext.cdhParquetVersion = pom.properties."cdh.apache-parquet.version"
+  ext.cdhParquetVersion = pom.properties."cdh.parquet.version"
   logger.info("Set Parquet version to $cdhParquetVersion")
 
   ext.cdhScalaVersion = pom.properties."cdh.scala.version"
@@ -71,9 +71,6 @@ for (component in result.resolvedComponents) {
 
   ext.cdhSparkVersion = pom.properties."cdh.spark.version"
   logger.info("Set Spark version to $cdhSparkVersion")
-
-  ext.cdhSparkAvroVersion = pom.properties."cdh.spark-avro.version"
-  logger.info("Set SparkAvro version to $cdhSparkAvroVersion")
 
   ext.cdhSlf4jVersion = pom.properties."cdh.slf4j.version"
   logger.info("Set slf4j version to $cdhSlf4jVersion")

@@ -1012,9 +1012,9 @@ Status RaftConsensus::Update(const ConsensusRequestPB* request,
   Status s = UpdateReplica(request, response);
   if (PREDICT_FALSE(VLOG_IS_ON(1))) {
     if (request->ops().empty()) {
-      VLOG_WITH_PREFIX(1) << "Replica replied to status only request. Replica: "
-                          << ToString() << ". Response: "
-                          << SecureShortDebugString(*response);
+      VLOG_WITH_PREFIX(1)
+          << Substitute("Replica replied to status only request. Replica: $0. Response: $1",
+                        ToString(), SecureShortDebugString(*response));
     }
   }
   return s;
@@ -2831,10 +2831,10 @@ void RaftConsensus::SnoozeFailureDetector(boost::optional<string> reason_for_log
                                           boost::optional<MonoDelta> delta) {
   if (PREDICT_TRUE(failure_detector_ && FLAGS_enable_leader_failure_detection)) {
     if (reason_for_log) {
-      LOG(INFO) << LogPrefixThreadSafe()
-                << Substitute("Snoozing failure detection for $0 ($1)",
-                              delta ? delta->ToString() : "election timeout",
-                              *reason_for_log);
+      VLOG(1) << LogPrefixThreadSafe()
+              << Substitute("Snoozing failure detection for $0 ($1)",
+                            delta ? delta->ToString() : "election timeout",
+                            *reason_for_log);
     }
 
     if (!delta) {

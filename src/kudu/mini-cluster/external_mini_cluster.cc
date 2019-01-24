@@ -48,6 +48,7 @@
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/security/test/mini_kdc.h"
+#include "kudu/sentry/mini_sentry.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -104,10 +105,11 @@ static double kMasterCatalogManagerTimeoutSeconds = 60.0;
 ExternalMiniClusterOptions::ExternalMiniClusterOptions()
     : num_masters(1),
       num_tablet_servers(1),
-      bind_mode(MiniCluster::kDefaultBindMode),
+      bind_mode(kDefaultBindMode),
       num_data_dirs(1),
       enable_kerberos(false),
       hms_mode(HmsMode::NONE),
+      enable_sentry(false),
       logtostderr(true),
       start_process_timeout(MonoDelta::FromSeconds(30)),
       rpc_negotiation_timeout(MonoDelta::FromSeconds(3)) {
@@ -153,6 +155,30 @@ Status ExternalMiniCluster::HandleOptions() {
   return Status::OK();
 }
 
+Status ExternalMiniCluster::StartSentry() {
+  sentry_->SetDataRoot(opts_.cluster_root);
+
+  if (hms_) {
+    sentry_->EnableHms(hms_->uris());
+  }
+
+  if (opts_.enable_kerberos) {
+    string spn = Substitute("sentry/$0", sentry_->address().host());
+    string ktpath;
+    RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(spn, &ktpath),
+                          "could not create keytab");
+    sentry_->EnableKerberos(kdc_->GetEnvVars()["KRB5_CONFIG"],
+                            Substitute("$0@KRBTEST.COM", spn),
+                            ktpath);
+  }
+
+  return sentry_->Start();
+}
+
+Status ExternalMiniCluster::StopSentry() {
+  return sentry_->Stop();
+}
+
 Status ExternalMiniCluster::Start() {
   CHECK(masters_.empty()) << "Masters are not empty (size: " << masters_.size()
       << "). Maybe you meant Restart()?";
@@ -193,13 +219,46 @@ Status ExternalMiniCluster::Start() {
                           "could not set krb5 client env");
   }
 
+  // Start the Sentry service and the HMS in the following steps, in order
+  // to deal with the circular dependency in terms of configuring each
+  // with the other's IP/port.
+  // 1. Pick a bind IP using UNIQUE_LOOPBACK mode for the Sentry service.
+  //    Statically choose a random port. Since the Sentry service will
+  //    live on its own IP address, there's no danger of collision.
+  // 2. Start the HMS, configured to talk to the Sentry service. Find out
+  //    which port it's on.
+  // 3. Start the Sentry service with the chosen address/port from step 1.
+  //
+  // We can also pick a random port for the HMS in step 2, however, due to
+  // HIVE-18998 (which is addressed in Hive 4.0.0 by HIVE-20794), this is not
+  // an option.
+  // TODO(hao): Pick a static port for the HMS to bind to when we move to Hive 4.
+  //
+  // Note that when UNIQUE_LOOPBACK mode is not supported (i.e. on macOS),
+  // we cannot choose a port at random as that can cause a port collision.
+  // In that case, we start the Sentry service with the picked IP address
+  // and port 0 in step 1. Find out which port it's on by polling lsof.
+  // In step 3, restart the Sentry service and reconfigure it to talk to
+  // the HMS's port.
+
+  if (opts_.enable_sentry) {
+    sentry_.reset(new sentry::MiniSentry());
+    string host = GetBindIpForExternalServer(0);
+    uint16_t port = opts_.bind_mode == BindMode::UNIQUE_LOOPBACK ? 10000 : 0;
+    sentry_->SetAddress(HostPort(host, port));
+    if (opts_.bind_mode != BindMode::UNIQUE_LOOPBACK) {
+      RETURN_NOT_OK_PREPEND(StartSentry(), "Failed to start the Sentry service");
+    }
+  }
+
+  // Start the HMS.
   if (opts_.hms_mode == HmsMode::ENABLE_HIVE_METASTORE ||
       opts_.hms_mode == HmsMode::ENABLE_METASTORE_INTEGRATION) {
     hms_.reset(new hms::MiniHms());
     hms_->SetDataRoot(opts_.cluster_root);
 
     if (opts_.enable_kerberos) {
-      string spn = "hive/127.0.0.1";
+      string spn = Substitute("hive/$0", hms_->address().host());
       string ktpath;
       RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(spn, &ktpath),
                             "could not create keytab");
@@ -207,8 +266,23 @@ Status ExternalMiniCluster::Start() {
                            rpc::SaslProtection::kAuthentication);
     }
 
+    if (opts_.enable_sentry) {
+      string sentry_spn = Substitute("sentry/$0@KRBTEST.COM", sentry_->address().host());
+      hms_->EnableSentry(sentry_->address(), sentry_spn);
+    }
+
     RETURN_NOT_OK_PREPEND(hms_->Start(),
                           "Failed to start the Hive Metastore");
+
+    // (Re)start Sentry with the HMS address.
+    if (opts_.enable_sentry) {
+      if (opts_.bind_mode != BindMode::UNIQUE_LOOPBACK) {
+        RETURN_NOT_OK_PREPEND(StopSentry(),
+                              "Failed to stop the Sentry service");
+      }
+      RETURN_NOT_OK_PREPEND(StartSentry(),
+                            "Failed to start the Sentry service");
+    }
   }
 
   RETURN_NOT_OK_PREPEND(StartMasters(), "failed to start masters");
@@ -360,7 +434,7 @@ Status ExternalMiniCluster::StartMasters() {
   } else {
     for (int i = 0; i < num_masters; i++) {
       unique_ptr<Socket> reserved_socket;
-      RETURN_NOT_OK_PREPEND(ReserveDaemonSocket(MiniCluster::MASTER, i, opts_.bind_mode,
+      RETURN_NOT_OK_PREPEND(ReserveDaemonSocket(DaemonType::MASTER, i, opts_.bind_mode,
                                                 &reserved_socket),
                             "failed to reserve master socket address");
       Sockaddr addr;
@@ -425,6 +499,13 @@ Status ExternalMiniCluster::StartMasters() {
         opts.extra_flags.emplace_back("--hive_metastore_sasl_enabled=true");
       }
     }
+    if (opts_.enable_sentry) {
+      opts.extra_flags.emplace_back(Substitute("--sentry_service_rpc_addresses=$0",
+                                               sentry_->address().ToString()));
+      if (!opts_.enable_kerberos) {
+        opts.extra_flags.emplace_back("--sentry_service_security_mode=none");
+      }
+    }
     opts.logtostderr = opts_.logtostderr;
 
     scoped_refptr<ExternalMaster> peer = new ExternalMaster(opts);
@@ -441,11 +522,18 @@ Status ExternalMiniCluster::StartMasters() {
 }
 
 string ExternalMiniCluster::GetBindIpForTabletServer(int index) const {
-  return MiniCluster::GetBindIpForDaemon(MiniCluster::TSERVER, index, opts_.bind_mode);
+  return MiniCluster::GetBindIpForDaemonWithType(MiniCluster::TSERVER, index,
+                                                 opts_.bind_mode);
 }
 
 string ExternalMiniCluster::GetBindIpForMaster(int index) const {
-  return MiniCluster::GetBindIpForDaemon(MiniCluster::MASTER, index, opts_.bind_mode);
+  return MiniCluster::GetBindIpForDaemonWithType(MiniCluster::MASTER, index,
+                                                 opts_.bind_mode);
+}
+
+string ExternalMiniCluster::GetBindIpForExternalServer(int index) const {
+  return MiniCluster::GetBindIpForDaemonWithType(MiniCluster::EXTERNAL_SERVER,
+                                                 index, opts_.bind_mode);
 }
 
 Status ExternalMiniCluster::AddTabletServer() {
@@ -1020,13 +1108,13 @@ void ExternalDaemon::Shutdown() {
   // Before we kill the process, store the addresses. If we're told to
   // start again we'll reuse these. Store only the port if the
   // daemons were using wildcard address for binding.
-  if (rpc_bind_address().host() != MiniCluster::kWildcardIpAddr) {
+  if (rpc_bind_address().host() != kWildcardIpAddr) {
     bound_rpc_ = bound_rpc_hostport();
     bound_http_ = bound_http_hostport();
   } else {
-    bound_rpc_.set_host(MiniCluster::kWildcardIpAddr);
+    bound_rpc_.set_host(kWildcardIpAddr);
     bound_rpc_.set_port(bound_rpc_hostport().port());
-    bound_http_.set_host(MiniCluster::kWildcardIpAddr);
+    bound_http_.set_host(kWildcardIpAddr);
     bound_http_.set_port(bound_http_hostport().port());
   }
 

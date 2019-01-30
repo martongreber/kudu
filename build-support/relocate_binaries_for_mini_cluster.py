@@ -184,11 +184,18 @@ def get_dep_library_paths_macos(binary_path):
 
 def get_artifact_name():
   """
-  Read the Kudu version to create an archive with an appropriate name.
+  Create an archive with an appropriate name. Including version, OS, and architecture.
   """
+  if IS_LINUX:
+    os_str = "linux"
+  elif IS_MACOS:
+    os_str = "osx"
+  else:
+    raise NotImplementedError("Unsupported platform")
+  arch = os.uname()[4]
   with open(os.path.join(SOURCE_ROOT, "version.txt"), 'r') as version:
     version = version.readline().strip().decode("utf-8")
-  artifact_name = "apache-kudu-%s" % (version, )
+  artifact_name = "kudu-binary-%s-%s-%s" % (version, os_str, arch)
   return artifact_name
 
 def mkconfig(build_root, artifact_root):
@@ -217,12 +224,11 @@ def prep_artifact_dirs(config):
 
 def copy_file(src, dest):
   """
-  Copy the file with path 'src' to path 'dest', including the file mode.
+  Copy the file with path 'src' to path 'dest'.
   If 'src' is a symlink, the link will be followed and 'dest' will be written
   as a plain file.
   """
   shutil.copyfile(src, dest)
-  shutil.copymode(src, dest)
 
 def chrpath(target, new_rpath):
   """
@@ -344,6 +350,9 @@ def main():
 
   artifact_name = get_artifact_name()
   artifact_root = os.path.join(build_root, artifact_name)
+  # Clear the artifact root to ensure a clean build.
+  if os.path.exists(artifact_root):
+    shutil.rmtree(artifact_root)
 
   logging.info("Including targets and their dependencies in archive...")
   config = mkconfig(build_root, artifact_root)

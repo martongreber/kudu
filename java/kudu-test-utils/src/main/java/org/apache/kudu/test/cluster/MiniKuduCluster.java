@@ -25,7 +25,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -130,7 +129,8 @@ public class MiniKuduCluster implements AutoCloseable {
       // If a cluster root was not set, create a unique temp directory to use.
       // The mini cluster will clean this directory up on exit.
       try {
-        File tempRoot = TempDirUtils.getTempDirectory("mini-kudu-cluster");
+        File tempRoot = TempDirUtils.makeTempDirectory("mini-kudu-cluster",
+            TempDirUtils.DeleteOnExit.NO_DELETE_ON_EXIT);
         this.clusterRoot = tempRoot.toString();
       } catch (IOException ex) {
         throw new RuntimeException("Could not create cluster root directory", ex);
@@ -179,13 +179,15 @@ public class MiniKuduCluster implements AutoCloseable {
     Preconditions.checkArgument(numMasters > 0, "Need at least one master");
 
     // Start the control shell and the communication channel to it.
-    List<String> commandLine = Lists.newArrayList(
-        KuduBinaryLocator.findBinary("kudu"),
-        "test",
-        "mini_cluster",
-        "--serialization=pb");
+    KuduBinaryLocator.ExecutableInfo exeInfo = KuduBinaryLocator.findBinary("kudu");
+    List<String> commandLine = Lists.newArrayList(exeInfo.exePath(),
+                                                  "test",
+                                                  "mini_cluster",
+                                                  "--serialization=pb");
     LOG.info("Starting process: {}", commandLine);
     ProcessBuilder processBuilder = new ProcessBuilder(commandLine);
+    processBuilder.environment().putAll(exeInfo.environment());
+
     miniCluster = processBuilder.start();
     miniClusterStdin = new DataOutputStream(miniCluster.getOutputStream());
     miniClusterStdout = new DataInputStream(miniCluster.getInputStream());

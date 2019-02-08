@@ -89,7 +89,8 @@ Rebalancer::Config::Config(
     bool output_replica_distribution_details,
     bool run_policy_fixer,
     bool run_cross_location_rebalancing,
-    bool run_intra_location_rebalancing)
+    bool run_intra_location_rebalancing,
+    double load_imbalance_threshold)
     : master_addresses(std::move(master_addresses)),
       table_filters(std::move(table_filters)),
       max_moves_per_server(max_moves_per_server),
@@ -99,7 +100,8 @@ Rebalancer::Config::Config(
       output_replica_distribution_details(output_replica_distribution_details),
       run_policy_fixer(run_policy_fixer),
       run_cross_location_rebalancing(run_cross_location_rebalancing),
-      run_intra_location_rebalancing(run_intra_location_rebalancing) {
+      run_intra_location_rebalancing(run_intra_location_rebalancing),
+      load_imbalance_threshold(load_imbalance_threshold) {
   DCHECK_GE(max_moves_per_server, 0);
 }
 
@@ -225,7 +227,10 @@ Status Rebalancer::Run(RunStatus* result_status, size_t* moves_count) {
     if (config_.run_cross_location_rebalancing) {
       // Run the rebalancing across locations (inter-location rebalancing).
       LOG(INFO) << "running cross-location rebalancing";
-      CrossLocationRunner runner(this, config_.max_moves_per_server, deadline);
+      CrossLocationRunner runner(this,
+                                 config_.max_moves_per_server,
+                                 config_.load_imbalance_threshold,
+                                 deadline);
       RETURN_NOT_OK(runner.Init(config_.master_addresses));
       RETURN_NOT_OK(RunWith(&runner, result_status));
       moves_count_total += runner.moves_count();
@@ -455,6 +460,11 @@ Status Rebalancer::FilterCrossLocationTabletCandidates(
         "the source ($2) and the destination ($3) tablet servers",
          move.table_id, src_location, move.from, move.to));
   }
+  if (dst_location.empty()) {
+    // The destination location is not specified, so no restrictions on the
+    // destination location to check for.
+    return Status::OK();
+  }
 
   vector<string> tablet_ids_filtered;
   for (auto& tablet_id : *tablet_ids) {
@@ -471,7 +481,11 @@ Status Rebalancer::FilterCrossLocationTabletCandidates(
     const auto& table_id = FindOrDie(placement_info.tablet_to_table_id, tablet_id);
     const auto& table_info = FindOrDie(placement_info.tables_info, table_id);
     const auto rf = table_info.replication_factor;
-    if (location_replica_num + 1 >= consensus::MajoritySize(rf)) {
+    // In case of RF=2*N+1, losing (N + 1) replicas means losing the majority.
+    // In case of RF=2*N, losing at least N replicas means losing the majority.
+    const auto replica_num_threshold = rf % 2 ? consensus::MajoritySize(rf)
+                                              : rf / 2;
+    if (location_replica_num + 1 >= replica_num_threshold) {
       VLOG(1) << Substitute("destination location '$0' for candidate tablet $1 "
                             "already contains $2 of $3 replicas",
                             dst_location, tablet_id, location_replica_num, rf);
@@ -623,12 +637,13 @@ Status Rebalancer::PrintLocationBalanceStats(const string& location,
 Status Rebalancer::PrintPolicyViolationInfo(const ClusterRawInfo& raw_info,
                                             ostream& out) const {
   TabletsPlacementInfo placement_info;
-  RETURN_NOT_OK(BuildTabletsPlacementInfo(raw_info, &placement_info));
+  RETURN_NOT_OK(BuildTabletsPlacementInfo(
+      raw_info, MovesInProgress(), &placement_info));
   vector<PlacementPolicyViolationInfo> ppvi;
   RETURN_NOT_OK(DetectPlacementPolicyViolations(placement_info, &ppvi));
   out << "Placement policy violations:" << endl;
   if (ppvi.empty()) {
-    out << "  none" << endl << endl;;
+    out << "  none" << endl << endl;
     return Status::OK();
   }
 
@@ -736,6 +751,32 @@ Status Rebalancer::BuildClusterInfo(const ClusterRawInfo& raw_info,
     // If so, interpret the move as successfully completed, updating the
     // replica counts correspondingly.
     const auto it_pending_moves = moves_in_progress.find(tablet.id);
+    if (it_pending_moves != moves_in_progress.end()) {
+      const auto& move_info = it_pending_moves->second;
+      bool is_target_replica_present = false;
+      // Verify that the target replica is present in the config.
+      for (const auto& tr : tablet.replicas) {
+        if (tr.ts_uuid == move_info.ts_uuid_to) {
+          is_target_replica_present = true;
+          break;
+        }
+      }
+      // If the target replica is present, it will be processed in the code
+      // below. Otherwise, it's necessary to pretend as if the target replica
+      // is in the config already: the idea is to count in the absent target
+      // replica as if the movement has successfully completed already.
+      auto it = tserver_replicas_count.find(move_info.ts_uuid_to);
+      if (!is_target_replica_present && !move_info.ts_uuid_to.empty() &&
+          it != tserver_replicas_count.end()) {
+        it->second++;
+        auto table_ins = table_replicas_info.emplace(
+            tablet.table_id, TableReplicasAtServer());
+        TableReplicasAtServer& replicas_at_server = table_ins.first->second;
+
+        auto replicas_ins = replicas_at_server.emplace(move_info.ts_uuid_to, 0);
+        replicas_ins.first->second++;
+      }
+    }
 
     for (const auto& ri : tablet.replicas) {
       // Increment total count of replicas at the tablet server.
@@ -750,22 +791,12 @@ Status Rebalancer::BuildClusterInfo(const ClusterRawInfo& raw_info,
         continue;
       }
       bool do_count_replica = true;
-      if (it_pending_moves != moves_in_progress.end() &&
-          tablet.result == KsckCheckResult::RECOVERING) {
+      if (it_pending_moves != moves_in_progress.end()) {
         const auto& move_info = it_pending_moves->second;
-        bool is_target_replica_present = false;
-        // Verify that the target replica is present in the config.
-        for (const auto& tr : tablet.replicas) {
-          if (tr.ts_uuid == move_info.ts_uuid_to) {
-            is_target_replica_present = true;
-            break;
-          }
-        }
-        if (move_info.ts_uuid_from == ri.ts_uuid && is_target_replica_present) {
-          // It seems both the source and the destination replicas of the
-          // scheduled replica movement operation are still in the config.
-          // That's a sign that the move operation hasn't yet completed.
-          // As explained above, let's interpret the move as successfully
+        if (move_info.ts_uuid_from == ri.ts_uuid) {
+          DCHECK(!ri.ts_uuid.empty());
+          // The source replica of the scheduled replica movement operation
+          // are still in the config. Interpreting the move as successfully
           // completed, so the source replica should not be counted in.
           do_count_replica = false;
         }
@@ -1198,7 +1229,7 @@ Status Rebalancer::AlgoBasedRunner::GetNextMovesImpl(
 
   TabletsPlacementInfo tpi;
   if (!loc) {
-    RETURN_NOT_OK(BuildTabletsPlacementInfo(raw_info, &tpi));
+    RETURN_NOT_OK(BuildTabletsPlacementInfo(raw_info, scheduled_moves_, &tpi));
   }
 
   // Build 'tablet_id' --> 'target tablet replication factor' map.
@@ -1400,11 +1431,12 @@ Rebalancer::IntraLocationRunner::IntraLocationRunner(
       location_(std::move(location)) {
 }
 
-Rebalancer::CrossLocationRunner::CrossLocationRunner(
-    Rebalancer* rebalancer,
+Rebalancer::CrossLocationRunner::CrossLocationRunner(Rebalancer* rebalancer,
     size_t max_moves_per_server,
+    double load_imbalance_threshold,
     boost::optional<MonoTime> deadline)
-    : AlgoBasedRunner(rebalancer, max_moves_per_server, std::move(deadline)) {
+    : AlgoBasedRunner(rebalancer, max_moves_per_server, std::move(deadline)),
+      algorithm_(load_imbalance_threshold) {
 }
 
 Rebalancer::PolicyFixer::PolicyFixer(
@@ -1484,7 +1516,7 @@ bool Rebalancer::PolicyFixer::ScheduleNextMove(bool* has_errors,
   }
   CHECK(erased) << Substitute("T $0 P $1: move information not found",
                               move_info.tablet_uuid, move_info.ts_uuid_from);
-  LOG(INFO) << Substitute("tablet $0: $1 -> ? move scheduled",
+  LOG(INFO) << Substitute("tablet $0: '$1' -> '?' move scheduled",
                           move_info.tablet_uuid, move_info.ts_uuid_from);
   // Add information on scheduled move into the scheduled_moves_.
   // Only one replica of a tablet can be moved at a time.
@@ -1559,10 +1591,11 @@ Status Rebalancer::PolicyFixer::GetNextMovesImpl(
     }
   }
   ClusterInfo ci;
-  RETURN_NOT_OK(rebalancer_->BuildClusterInfo(raw_info, MovesInProgress(), &ci));
+  RETURN_NOT_OK(rebalancer_->BuildClusterInfo(raw_info, scheduled_moves_, &ci));
 
   TabletsPlacementInfo placement_info;
-  RETURN_NOT_OK(BuildTabletsPlacementInfo(raw_info, &placement_info));
+  RETURN_NOT_OK(
+      BuildTabletsPlacementInfo(raw_info, scheduled_moves_, &placement_info));
 
   vector<PlacementPolicyViolationInfo> ppvi;
   RETURN_NOT_OK(DetectPlacementPolicyViolations(placement_info, &ppvi));

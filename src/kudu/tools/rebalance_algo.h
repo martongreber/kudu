@@ -167,7 +167,7 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
   // output into the 'server_uuids' parameter. Whether to consider most or least
   // loaded servers is controlled by 'extremum'. An empty 'intersection' on
   // return means no intersection was found for the mentioned sets of the
-  // extremally loaded servers: in that case optimizing the load by table would
+  // extremely loaded servers: in that case optimizing the load by table would
   // not affect the extreme load by server.
   //
   // None of the output parameters may be NULL.
@@ -220,7 +220,7 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
 //    a table T. Assume we have locations L_0, ..., L_n, where
 //    replica_num(T, L_0), ..., replica_num(T, L_n) are numbers of replicas
 //    of T's tablets at corresponding locations. We want to make the following
-//    ratios to devicate as less as possible:
+//    ratios to deviate as less as possible:
 //
 //    replica_num(T, L_0) / ts_num(L_0), ..., replica_num(T, L_n) / ts_num(L_n)
 //
@@ -254,6 +254,9 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
 // We want to move replicas to make the distribution (c) more balanced;
 // 2 movements gives us the 'ideal' location-wise replica placement.
 class LocationBalancingAlgo : public RebalancingAlgo {
+ public:
+  explicit LocationBalancingAlgo(double load_imbalance_threshold);
+
  protected:
   Status GetNextMove(const ClusterInfo& cluster_info,
                      boost::optional<TableReplicaMove>* move) override;
@@ -266,9 +269,8 @@ class LocationBalancingAlgo : public RebalancingAlgo {
   // if rebalancing is needed, 'false' otherwise. Upon returning 'true',
   // the identifier of the most cross-location imbalanced table is output into
   // the 'most_imbalanced_table_id' parameter (which must not be null).
-  static bool IsBalancingNeeded(
-      const TableByLoadImbalance& imbalance_info,
-      std::string* most_imbalanced_table_id);
+  bool IsBalancingNeeded(const TableByLoadImbalance& imbalance_info,
+                         std::string* most_imbalanced_table_id) const;
 
   // Given the set of the most and the least table-wise loaded locations, choose
   // the source and destination tablet server to move a replica of the specified
@@ -280,6 +282,8 @@ class LocationBalancingAlgo : public RebalancingAlgo {
       const std::vector<std::string>& loc_loaded_most,
       const ClusterInfo& cluster_info,
       boost::optional<TableReplicaMove>* move);
+
+  const double load_imbalance_threshold_;
 };
 
 } // namespace tools

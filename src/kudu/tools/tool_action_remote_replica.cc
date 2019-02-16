@@ -21,6 +21,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,8 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/human_readable.h"
+#include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/server/server_base.pb.h"
@@ -61,6 +64,10 @@
 
 DEFINE_bool(force_copy, false,
             "Force the copy when the destination tablet server has this replica");
+DEFINE_bool(include_schema, true,
+            "Whether to include the schema of each replica");
+DECLARE_string(table_name);
+DECLARE_string(tablets);
 DECLARE_int64(timeout_ms); // defined in ksck
 
 namespace kudu {
@@ -81,6 +88,7 @@ using std::cout;
 using std::endl;
 using std::string;
 using std::unique_ptr;
+using std::unordered_set;
 using std::vector;
 using tablet::TabletStatusPB;
 using tserver::DeleteTabletRequestPB;
@@ -177,6 +185,10 @@ Status GetReplicas(TabletServerServiceProxy* proxy,
   RpcController rpc;
   rpc.set_timeout(MonoDelta::FromMilliseconds(FLAGS_timeout_ms));
 
+  // Even with FLAGS_include_schema=false, don't set need_schema_info=false
+  // in the request. The reason is that the schema is still needed to decode
+  // the partition of each replica, and the partition information is pretty
+  // much always nice to have.
   RETURN_NOT_OK(proxy->ListTablets(req, &resp, &rpc));
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
@@ -280,7 +292,16 @@ Status ListReplicas(const RunnerContext& context) {
   vector<ListTabletsResponsePB::StatusAndSchemaPB> replicas;
   RETURN_NOT_OK(GetReplicas(proxy.get(), &replicas));
 
+  unordered_set<string> tablet_ids = strings::Split(FLAGS_tablets, ",");
   for (const auto& r : replicas) {
+    if (!FLAGS_table_name.empty() &&
+        r.tablet_status().table_name() != FLAGS_table_name) {
+      continue;
+    }
+    if (!FLAGS_tablets.empty() &&
+        !ContainsKey(tablet_ids, r.tablet_status().tablet_id())) {
+      continue;
+    }
     Schema schema;
     RETURN_NOT_OK_PREPEND(
         SchemaFromPB(r.schema(), &schema),
@@ -305,7 +326,14 @@ Status ListReplicas(const RunnerContext& context) {
       cout << "Estimated on disk size: "
            << HumanReadableNumBytes::ToString(rs.estimated_on_disk_size()) << endl;
     }
-    cout << "Schema: " << schema.ToString() << endl;
+    if (rs.data_dirs_size() != 0) {
+      cout << "Data dirs: " << JoinStrings(rs.data_dirs(), ", ") << endl;
+    } else {
+      cout << "Data dirs: <not available>" << endl;
+    }
+    if (FLAGS_include_schema) {
+      cout << "Schema: " << schema.ToString() << endl;
+    }
   }
 
   return Status::OK();
@@ -431,6 +459,12 @@ unique_ptr<Mode> BuildRemoteReplicaMode() {
       ActionBuilder("list", &ListReplicas)
       .Description("List all tablet replicas on a Kudu Tablet Server")
       .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
+      .AddOptionalParameter("include_schema")
+      .AddOptionalParameter("table_name")
+      .AddOptionalParameter("tablets",
+                            string(""),
+                            string("Comma-separated list of tablet IDs used to "
+                                   "filter the list of replicas"))
       .Build();
 
   unique_ptr<Action> unsafe_change_config =

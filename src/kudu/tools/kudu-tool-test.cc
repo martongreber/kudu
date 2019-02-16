@@ -552,6 +552,7 @@ TEST_F(ToolTest, TestModeHelp) {
   {
     const vector<string> kLocalReplicaDumpModeRegexes = {
         "block_ids.*Dump the IDs of all blocks",
+        "data_dirs.*Dump the data directories",
         "meta.*Dump the metadata",
         "rowset.*Dump the rowset contents",
         "wals.*Dump all WAL"
@@ -1172,6 +1173,47 @@ TEST_F(ToolTest, TestWalDump) {
       ASSERT_STR_NOT_MATCHES(stdout, "Footer:");
     }
   }
+}
+
+TEST_F(ToolTest, TestLocalReplicaDumpDataDirs) {
+  const string kTestTablet = "ffffffffffffffffffffffffffffffff";
+  const string kTestTableId = "test-table";
+  const string kTestTableName = "test-fs-data-dirs-dump-table";
+  const Schema kSchema(GetSimpleTestSchema());
+  const Schema kSchemaWithIds(SchemaBuilder(kSchema).Build());
+
+  FsManagerOpts opts;
+  opts.wal_root = GetTestPath("wal");
+  opts.data_roots = {
+    GetTestPath("data0"),
+    GetTestPath("data1"),
+    GetTestPath("data2"),
+  };
+  FsManager fs(env_, opts);
+  ASSERT_OK(fs.CreateInitialFileSystemLayout());
+  ASSERT_OK(fs.Open());
+
+  pair<PartitionSchema, Partition> partition = tablet::CreateDefaultPartition(
+        kSchemaWithIds);
+  scoped_refptr<TabletMetadata> meta;
+  ASSERT_OK(TabletMetadata::CreateNew(
+      &fs, kTestTablet, kTestTableName, kTestTableId,
+      kSchemaWithIds, partition.first, partition.second,
+      tablet::TABLET_DATA_READY,
+      /*tombstone_last_logged_opid=*/ boost::none,
+      &meta));
+  string stdout;
+  NO_FATALS(RunActionStdoutString(Substitute("local_replica dump data_dirs $0 "
+                                             "--fs_wal_dir=$1 "
+                                             "--fs_data_dirs=$2",
+                                             kTestTablet, opts.wal_root,
+                                             JoinStrings(opts.data_roots, ",")),
+                                  &stdout));
+  vector<string> expected;
+  for (const auto& data_root : opts.data_roots) {
+    expected.emplace_back(JoinPathSegments(data_root, "data"));
+  }
+  ASSERT_EQ(JoinStrings(expected, "\n"), stdout);
 }
 
 TEST_F(ToolTest, TestLocalReplicaDumpMeta) {
@@ -1849,6 +1891,109 @@ TEST_F(ToolTest, TestRemoteReplicaCopy) {
                                            deleted_tablet_id, src_ts_addr, dst_ts_addr)));
   ASSERT_OK(WaitUntilTabletInState(dst_ts, deleted_tablet_id,
                                    tablet::RUNNING, kTimeout));
+}
+
+// Test the 'kudu remote_replica list' tool.
+TEST_F(ToolTest, TestRemoteReplicaList) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  const int kNumTservers = 1;
+  const int kNumTablets = 1;
+  ExternalMiniClusterOptions opts;
+  opts.num_data_dirs = 3;
+  opts.num_tablet_servers = kNumTservers;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+
+  // TestWorkLoad.Setup() internally generates a table.
+  TestWorkload workload(cluster_.get());
+  workload.set_num_tablets(kNumTablets);
+  workload.set_num_replicas(kNumTservers);
+  workload.Setup();
+
+  TServerDetails* ts = ts_map_[cluster_->tablet_server(0)->uuid()];
+  vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+  ASSERT_OK(WaitForNumTabletsOnTS(ts, kNumTablets, kTimeout, &tablets));
+  const string& ts_addr = cluster_->tablet_server(0)->bound_rpc_addr().ToString();
+
+  const auto& tablet_status = tablets[0].tablet_status();
+  {
+    // Test the basic case.
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("remote_replica list $0", ts_addr), &stdout));
+
+    // Some fields like state or estimated on disk size may vary. Just check a
+    // few whose values we should know exactly.
+    ASSERT_STR_CONTAINS(stdout,
+                        Substitute("Tablet id: $0", tablet_status.tablet_id()));
+    ASSERT_STR_CONTAINS(stdout,
+                        Substitute("Table name: $0", workload.table_name()));
+    ASSERT_STR_CONTAINS(stdout, "key INT32 NOT NULL");
+    ASSERT_STR_CONTAINS(stdout,
+        Substitute("Data dirs: $0", JoinStrings(tablet_status.data_dirs(), ", ")));
+  }
+
+  {
+    // Test we lose the schema with --include_schema=false.
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+          Substitute("remote_replica list $0 --include_schema=false", ts_addr),
+          &stdout));
+    ASSERT_STR_NOT_CONTAINS(stdout, "key INT32 NOT NULL");
+  }
+
+  {
+    // Test we see the tablet when matching on wrong tablet id or wrong table
+    // name.
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+          Substitute("remote_replica list $0 --table_name=$1",
+                     ts_addr, workload.table_name()),
+          &stdout));
+    ASSERT_STR_CONTAINS(stdout,
+                        Substitute("Tablet id: $0",
+                                   tablet_status.tablet_id()));
+    stdout.clear();
+    NO_FATALS(RunActionStdoutString(
+          Substitute("remote_replica list $0 --tablets=$1",
+                     ts_addr, tablet_status.tablet_id()),
+          &stdout));
+    ASSERT_STR_CONTAINS(stdout,
+                        Substitute("Tablet id: $0",
+                                   tablet_status.tablet_id()));
+  }
+
+  {
+    // Test we lose the tablet when matching on the wrong tablet id or the wrong
+    // table name.
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+          Substitute("remote_replica list $0 --table_name=foo", ts_addr),
+          &stdout));
+    ASSERT_STR_NOT_CONTAINS(stdout,
+                            Substitute("Tablet id: $0",
+                                       tablet_status.tablet_id()));
+    stdout.clear();
+    NO_FATALS(RunActionStdoutString(
+          Substitute("remote_replica list $0 --tablets=foo", ts_addr),
+          &stdout));
+    ASSERT_STR_NOT_CONTAINS(stdout,
+                            Substitute("Tablet id: $0",
+                                       tablet_status.tablet_id()));
+  }
+
+  {
+    // Finally, tombstone the replica and try again.
+    string stdout;
+    ASSERT_OK(DeleteTablet(ts, tablet_status.tablet_id(),
+                           TabletDataState::TABLET_DATA_TOMBSTONED, kTimeout));
+    NO_FATALS(RunActionStdoutString(
+          Substitute("remote_replica list $0", ts_addr), &stdout));
+    ASSERT_STR_CONTAINS(stdout,
+                        Substitute("Tablet id: $0", tablet_status.tablet_id()));
+    ASSERT_STR_CONTAINS(stdout,
+                        Substitute("Table name: $0", workload.table_name()));
+    ASSERT_STR_CONTAINS(stdout, "Data dirs: <not available>");
+  }
 }
 
 // Test 'kudu local_replica delete' tool with --clean_unsafe flag for

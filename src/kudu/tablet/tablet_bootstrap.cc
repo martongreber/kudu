@@ -907,10 +907,10 @@ Status TabletBootstrap::HandleReplicateMessage(ReplayState* state,
     DCHECK(OpIdEquals(iter->second->replicate().id(), existing_entry->replicate().id()));
 
     const auto& last_entry = state->pending_replicates.rbegin()->second;
-    LOG_WITH_PREFIX(INFO) << "Overwriting operations starting at: "
-                          << existing_entry->replicate().id()
-                          << " up to: " << last_entry->replicate().id()
-                          << " with operation: " << replicate.id();
+    VLOG_WITH_PREFIX(1) << "Overwriting operations starting at: "
+                        << existing_entry->replicate().id()
+                        << " up to: " << last_entry->replicate().id()
+                        << " with operation: " << replicate.id();
 
     while (iter != state->pending_replicates.end()) {
       iter = state->pending_replicates.erase(iter);
@@ -1381,7 +1381,7 @@ Status TabletBootstrap::PlayWriteRequest(const IOContext* io_context,
 
   // If the results are being tracked and this write has a request id, register
   // it with the result tracker.
-  ResultTracker::RpcState state;
+  ResultTracker::RpcState state = ResultTracker::RpcState::NEW;
   if (tracking_results) {
     VLOG(1) << result_tracker_.get() << " Boostrapping request for tablet: "
         << write->tablet_id() << ". State: " << 0 << " id: "

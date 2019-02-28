@@ -300,16 +300,17 @@ class ColumnSchema {
   }
 
   // compare types in Equals function
-  enum {
+  enum CompareFlags {
     COMPARE_NAME = 1 << 0,
     COMPARE_TYPE = 1 << 1,
     COMPARE_DEFAULTS = 1 << 2,
 
+    COMPARE_NAME_AND_TYPE = COMPARE_NAME | COMPARE_TYPE,
     COMPARE_ALL = COMPARE_NAME | COMPARE_TYPE | COMPARE_DEFAULTS
   };
 
   bool Equals(const ColumnSchema &other,
-              int flags = COMPARE_ALL) const {
+              CompareFlags flags = COMPARE_ALL) const {
     if (this == &other) return true;
 
     if ((flags & COMPARE_NAME) && this->name_ != other.name_)
@@ -747,15 +748,33 @@ class Schema {
   // so should only be used when necessary for output.
   std::string ToString(ToStringMode mode = ToStringMode::WITH_COLUMN_IDS) const;
 
+  // Compare column ids in Equals() method.
+  enum SchemaComparisonType {
+    COMPARE_COLUMNS = 1 << 0,
+    COMPARE_COLUMN_IDS = 1 << 1,
+
+    COMPARE_ALL = COMPARE_COLUMNS | COMPARE_COLUMN_IDS
+  };
+
   // Return true if the schemas have exactly the same set of columns
   // and respective types.
-  bool Equals(const Schema &other) const {
+  bool Equals(const Schema& other, SchemaComparisonType flags = COMPARE_COLUMNS) const {
     if (this == &other) return true;
-    if (this->num_key_columns_ != other.num_key_columns_) return false;
-    if (this->num_columns() != other.num_columns()) return false;
 
-    for (size_t i = 0; i < other.num_columns(); i++) {
-      if (!this->cols_[i].Equals(other.cols_[i])) return false;
+    if (flags & COMPARE_COLUMNS) {
+      if (this->num_key_columns_ != other.num_key_columns_) return false;
+      if (this->num_columns() != other.num_columns()) return false;
+      for (size_t i = 0; i < other.num_columns(); i++) {
+        if (!this->cols_[i].Equals(other.cols_[i])) return false;
+      }
+    }
+
+    if (flags & COMPARE_COLUMN_IDS) {
+      if (this->has_column_ids() != other.has_column_ids()) return false;
+      if (this->has_column_ids()) {
+        if (this->col_ids_ != other.col_ids_) return false;
+        if (this->max_col_id() != other.max_col_id()) return false;
+      }
     }
 
     return true;
@@ -764,8 +783,7 @@ class Schema {
   // Return true if the key projection schemas have exactly the same set of
   // columns and respective types.
   bool KeyEquals(const Schema& other,
-                 int flags
-                    = ColumnSchema::COMPARE_NAME | ColumnSchema::COMPARE_TYPE) const {
+                 ColumnSchema::CompareFlags flags = ColumnSchema::COMPARE_NAME_AND_TYPE) const {
     if (this == &other) return true;
     if (this->num_key_columns_ != other.num_key_columns_) return false;
     for (size_t i = 0; i < this->num_key_columns_; i++) {
@@ -886,6 +904,7 @@ class Schema {
       if (col.type_info()->type() == IS_DELETED) {
         // Enforce some properties on the virtual column that simplify our
         // implementation.
+        // TODO(KUDU-2692): Consider removing these requirements.
         DCHECK(!col.is_nullable());
         DCHECK(col.has_read_default());
 
@@ -918,8 +937,8 @@ class Schema {
 
   std::vector<ColumnSchema> cols_;
   size_t num_key_columns_;
-  ColumnId max_col_id_;
   std::vector<ColumnId> col_ids_;
+  ColumnId max_col_id_;
   std::vector<size_t> col_offsets_;
 
   // The keys of this map are StringPiece references to the actual name members of the

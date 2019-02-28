@@ -170,6 +170,7 @@ void Schema::CopyFrom(const Schema& other) {
   num_key_columns_ = other.num_key_columns_;
   cols_ = other.cols_;
   col_ids_ = other.col_ids_;
+  max_col_id_ = other.max_col_id_;
   col_offsets_ = other.col_offsets_;
   id_to_index_ = other.id_to_index_;
 
@@ -189,9 +190,10 @@ Schema::Schema(Schema&& other) noexcept
     : cols_(std::move(other.cols_)),
       num_key_columns_(other.num_key_columns_),
       col_ids_(std::move(other.col_ids_)),
+      max_col_id_(other.max_col_id_),
       col_offsets_(std::move(other.col_offsets_)),
       name_to_index_bytes_(0),
-      name_to_index_(/*bucket_count=*/10,
+      name_to_index_(/*bucket_count*/ 10,
                      NameToIndexMap::hasher(),
                      NameToIndexMap::key_equal(),
                      NameToIndexMapAllocator(&name_to_index_bytes_)),
@@ -215,6 +217,7 @@ Schema& Schema::operator=(Schema&& other) noexcept {
     cols_ = std::move(other.cols_);
     num_key_columns_ = other.num_key_columns_;
     col_ids_ = std::move(other.col_ids_);
+    max_col_id_ = other.max_col_id_;
     col_offsets_ = std::move(other.col_offsets_);
     id_to_index_ = std::move(other.id_to_index_);
     has_nullables_ = other.has_nullables_;
@@ -353,11 +356,16 @@ Status Schema::VerifyProjectionCompatibility(const Schema& projection) const {
 
   vector<string> missing_columns;
   for (const ColumnSchema& pcol : projection.columns()) {
+    if (pcol.type_info()->is_virtual()) {
+      // Virtual columns may appear in a projection without appearing in the
+      // schema being projected onto.
+      continue;
+    }
     int index = find_column(pcol.name());
     if (index < 0) {
       missing_columns.push_back(pcol.name());
     } else if (!pcol.EqualsType(cols_[index])) {
-      // TODO: We don't support query with type adaptors yet
+      // TODO(matteo): We don't support query with type adaptors yet.
       return Status::InvalidArgument("The column '" + pcol.name() + "' must have type " +
                                      cols_[index].TypeToString() + " found " + pcol.TypeToString());
     }
@@ -388,8 +396,25 @@ Status Schema::GetMappedReadProjection(const Schema& projection,
   mapped_cols.reserve(projection.num_columns());
   mapped_ids.reserve(projection.num_columns());
 
+  int32_t proj_max_col_id = max_col_id_;
   for (const ColumnSchema& col : projection.columns()) {
     int index = find_column(col.name());
+    if (col.type_info()->is_virtual()) {
+      DCHECK_EQ(kColumnNotFound, index) << "virtual column not expected in tablet schema";
+      if (col.is_nullable()) {
+        return Status::InvalidArgument(Substitute("Virtual column $0 $1 must not be nullable",
+                                                  col.name(), col.TypeToString()));
+      }
+      if (!col.has_read_default()) {
+        return Status::InvalidArgument(Substitute("Virtual column $0 $1 must "
+                                                  "have a default value for read",
+                                                  col.name(), col.TypeToString()));
+      }
+      mapped_cols.push_back(col);
+      // Generate a "fake" column id for virtual columns.
+      mapped_ids.emplace_back(++proj_max_col_id);
+      continue;
+    }
     DCHECK_GE(index, 0) << col.name();
     mapped_cols.push_back(cols_[index]);
     mapped_ids.push_back(col_ids_[index]);

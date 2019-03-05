@@ -55,7 +55,7 @@ versions += [
     protobuf       : "3.6.1",
     scala          : "$cdhScalaVersion",
     scalatest      : "3.0.5",
-    schemaValidator: "5.14.0",
+    schemaValidator: "6.2.0",
     scopt          : "3.7.1",
     slf4j          : "$cdhSlf4jVersion",
     spark          : "$cdhSparkVersion",

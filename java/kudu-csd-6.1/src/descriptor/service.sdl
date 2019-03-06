@@ -154,7 +154,6 @@
           "instance" : "${host}"
         }
       ],
-      "usesRackAssignments" : true,
       "topology" : { "minInstances" : 1 },
       "healthTests" : [
         {

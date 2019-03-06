@@ -148,12 +148,6 @@ if [ "$CMD" = "master" ]; then
     KUDU_ARGS="$KUDU_ARGS --master_addresses=$MASTER_IPS"
   fi
 
-  # Add the location mapping command.
-  # This is hardcoded but can be overridden by specifying the flag
-  # --location_mapping_cmd in the master gflagfile safety valve.
-  TOPOLOGY_SCRIPT="./topology.py"
-  KUDU_ARGS="$KUDU_ARGS --location_mapping_cmd=$TOPOLOGY_SCRIPT"
-
   exec "$KUDU_HOME/sbin/kudu-master" \
     $KUDU_ARGS \
     --flagfile="$GFLAG_FILE"

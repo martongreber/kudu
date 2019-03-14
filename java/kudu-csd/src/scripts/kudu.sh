@@ -151,7 +151,7 @@ if [ "$CMD" = "master" ]; then
   # Add the location mapping command.
   # This is hardcoded but can be overridden by specifying the flag
   # --location_mapping_cmd in the master gflagfile safety valve.
-  TOPOLOGY_SCRIPT="./topology.py"
+  TOPOLOGY_SCRIPT="$CONF_DIR/topology.py"
   KUDU_ARGS="$KUDU_ARGS --location_mapping_cmd=$TOPOLOGY_SCRIPT"
 
   exec "$KUDU_HOME/sbin/kudu-master" \

@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -61,6 +62,7 @@
 #include "kudu/gutil/callback.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stringprintf.h"
@@ -74,6 +76,7 @@
 #include "kudu/server/rpc_server.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
+#include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
@@ -121,10 +124,13 @@ using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
+using kudu::tablet::LocalTabletWriter;
 using kudu::tablet::RowSetDataPB;
 using kudu::tablet::Tablet;
 using kudu::tablet::TabletReplica;
 using kudu::tablet::TabletSuperBlockPB;
+using std::map;
+using std::pair;
 using std::set;
 using std::shared_ptr;
 using std::string;
@@ -186,7 +192,7 @@ class TabletServerTest : public TabletServerTestBase {
   // Starts the tablet server, override to start it later.
   virtual void SetUp() OVERRIDE {
     NO_FATALS(TabletServerTestBase::SetUp());
-    NO_FATALS(StartTabletServer(/* num_data_dirs */ 1));
+    NO_FATALS(StartTabletServer(/*num_data_dirs=*/1));
   }
 
   void DoOrderedScanTest(const Schema& projection, const string& expected_rows_as_string);
@@ -2117,7 +2123,7 @@ TEST_F(TabletServerTest, TestScanYourWrites) {
   // Scan with READ_YOUR_WRITES mode and use the previous
   // write response as the propagated timestamp.
   ScanResponsePB resp;
-  int64_t propagated_timestamp = write_timestamps_collector[0];
+  uint64_t propagated_timestamp = write_timestamps_collector[0];
   ScanYourWritesTest(propagated_timestamp, &resp);
 
   // Store the returned snapshot timestamp as the propagated
@@ -2252,20 +2258,20 @@ TEST_F(TabletServerTest, TestNonPositiveLimitsShortCircuit) {
 // Randomized test that runs a few scans with varying limits.
 TEST_F(TabletServerTest, TestRandomizedScanLimits) {
   // Set a relatively small batch size...
-  const int64_t kBatchSizeRows = rand() % 1000;
+  const int kBatchSizeRows = rand() % 1000;
   // ...and decent number of rows, such that we can get a good mix of
   // multiple-batch and single-batch scans.
-  const int64_t kNumRows = rand() % 2000;
+  const int kNumRows = rand() % 2000;
   FLAGS_scanner_batch_size_rows = kBatchSizeRows;
   InsertTestRowsDirect(0, kNumRows);
   LOG(INFO) << Substitute("Rows inserted: $0, batch size: $1", kNumRows, kBatchSizeRows);
 
-  for (int64_t i = 1; i < 100; i++) {
+  for (int i = 1; i < 100; i++) {
     // To broaden a range of coverage, gradiate the max limit that we can set.
-    const int64_t kMaxLimit = kNumRows * static_cast<double>(0.01 * i);
+    const int kMaxLimit = kNumRows * static_cast<double>(0.01 * i);
 
     // Get a random limit, capped by the max, inclusive.
-    const int64_t kLimit = rand() % kMaxLimit + 1;
+    const int kLimit = rand() % kMaxLimit + 1;
     LOG(INFO) << "Scanning with a limit of " << kLimit;
 
     ScanRequestPB req;
@@ -2379,6 +2385,190 @@ TEST_F(TabletServerTest, TestScanWithEncodedPredicates) {
             results.back());
 }
 
+// Test for diff scan RPC interface.
+TEST_F(TabletServerTest, TestDiffScan) {
+  // Insert 100 rows with the usual pattern.
+  const int kStartRow = 0;
+  const int kNumRows = 1000;
+  const int kNumToUpdate = 200;
+  const int kNumToDelete = 100;
+  InsertTestRowsDirect(kStartRow, kNumRows);
+  Timestamp before_mutations = tablet_replica_->clock()->Now();
+
+  // Structure: key -> {val, is_deleted}
+  map<int32_t, pair<int32_t, bool>> expected;
+
+  vector<int32_t> keys;
+  keys.reserve(kNumRows);
+  for (int32_t i = 0; i < kNumRows; i++) {
+    keys.emplace_back(i);
+  }
+
+  // Update some random rows.
+  LocalTabletWriter writer(tablet_replica_->tablet(), &schema_);
+  std::random_shuffle(keys.begin(), keys.end());
+  for (int i = 0; i < kNumToUpdate; i++) {
+    KuduPartialRow row(&schema_);
+    int32_t key = keys[i];
+    CHECK_OK(row.SetInt32(0, key));
+    int32_t new_val = key * 3;
+    CHECK_OK(row.SetInt32(1, new_val));
+    InsertOrDie(&expected, key, pair<int32_t, bool>(new_val, false));
+    CHECK_OK(writer.Update(row));
+  }
+
+  // Delete some random rows.
+  std::random_shuffle(keys.begin(), keys.end());
+  for (int i = 0; i < kNumToDelete; i++) {
+    KuduPartialRow row(&schema_);
+    int32_t key = keys[i];
+    CHECK_OK(row.SetInt32(0, key));
+    EmplaceOrUpdate(&expected, key, pair<int32_t, bool>(0 /* ignored */, true));
+    CHECK_OK(writer.Delete(row));
+  }
+
+  Timestamp after_mutations = tablet_replica_->clock()->Now();
+
+  ScanRequestPB req;
+  ScanResponsePB resp;
+  RpcController rpc;
+
+  // Build a projection with an IS_DELETED column.
+  SchemaBuilder builder(*tablet_replica_->tablet()->schema());
+  const bool kIsDeletedDefault = false;
+  ASSERT_OK(builder.AddColumn("is_deleted", IS_DELETED,
+                              /*is_nullable=*/ false,
+                              /*read_default=*/ &kIsDeletedDefault,
+                              /*write_default=*/ nullptr));
+  Schema projection = builder.BuildWithoutIds();
+
+  // Start scan.
+  auto* new_scan = req.mutable_new_scan_request();
+  new_scan->set_tablet_id(kTabletId);
+  ASSERT_OK(SchemaToColumnPBs(projection, new_scan->mutable_projected_columns()));
+  new_scan->set_read_mode(READ_AT_SNAPSHOT);
+  new_scan->set_order_mode(ORDERED);
+  new_scan->set_snap_start_timestamp(before_mutations.ToUint64());
+  new_scan->set_snap_timestamp(after_mutations.ToUint64());
+
+  int call_seq_id = 0;
+  {
+    req.set_call_seq_id(call_seq_id);
+    req.set_batch_size_bytes(0); // So it won't return data right away.
+    SCOPED_TRACE(SecureDebugString(req));
+    ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_EQ(0, resp.data().num_rows());
+  }
+
+  // Consume the scan results and validate that the values are as expected.
+  req.clear_new_scan_request();
+  req.set_scanner_id(resp.scanner_id());
+
+  vector<string> results;
+  while (resp.has_more_results()) {
+    rpc.Reset();
+    req.set_call_seq_id(++call_seq_id);
+    SCOPED_TRACE(SecureDebugString(req));
+    ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+    NO_FATALS(StringifyRowsFromResponse(projection, rpc, &resp, &results));
+  }
+
+  // Verify that the scan results match what we expected.
+  ASSERT_EQ(expected.size(), results.size());
+  int i = 0;
+  for (const auto& entry : expected) {
+    int32_t key = entry.first;
+    int32_t val = entry.second.first;
+    bool is_deleted = entry.second.second;
+    string val_str = Substitute("$0", val);
+    if (is_deleted) {
+      val_str = ".*"; // Match any value on deleted values.
+    }
+    ASSERT_STR_MATCHES(results[i++],
+        Substitute("^\\(int32 key=$0, int32 int_val=$1, string string_val=\"hello $0\", "
+                   "is_deleted is_deleted=$2\\)$$", key, val_str, is_deleted));
+  }
+}
+
+// Send various "bad" diff scan requests and validate that we catch the errors
+// and respond with reasonable error messages.
+TEST_F(TabletServerTest, TestDiffScanErrors) {
+  Timestamp before_insert = tablet_replica_->clock()->Now();
+  InsertTestRowsDirect(/*start_row=*/0, /*num_rows=*/100);
+  Timestamp after_insert = tablet_replica_->clock()->Now();
+
+  // Build a projection with an IS_DELETED column.
+  SchemaBuilder builder(*tablet_replica_->tablet()->schema());
+  const bool kIsDeletedDefault = false;
+  ASSERT_OK(builder.AddColumn("is_deleted", IS_DELETED,
+                              /*is_nullable=*/ false,
+                              /*read_default=*/ &kIsDeletedDefault,
+                              /*write_default=*/ nullptr));
+  Schema projection = builder.BuildWithoutIds();
+
+  ScanRequestPB req;
+  ScanResponsePB resp;
+  RpcController rpc;
+
+  // Set up the RPC request.
+  auto* new_scan = req.mutable_new_scan_request();
+  new_scan->set_tablet_id(kTabletId);
+  ASSERT_OK(SchemaToColumnPBs(projection, new_scan->mutable_projected_columns()));
+  new_scan->set_snap_start_timestamp(before_insert.ToUint64());
+  new_scan->set_snap_timestamp(after_insert.ToUint64());
+
+  req.set_call_seq_id(0);
+  req.set_batch_size_bytes(0); // So it won't return data right away.
+
+  // Send a scan request to the server and assert
+  auto req_assert_invalid_argument = [&](const TabletServerErrorPB::Code expected_code,
+                                         const string& expected_msg) {
+    rpc.Reset();
+    ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
+    ASSERT_TRUE(resp.has_error());
+    ASSERT_EQ(expected_code, resp.error().code())
+      << "Expected " << TabletServerErrorPB::Code_Name(expected_code)
+      << ", got " << TabletServerErrorPB::Code_Name(resp.error().code());
+    Status s = StatusFromPB(resp.error().status());
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), expected_msg);
+  };
+
+  // Attempt to start a diff scan with an illegal scan mode.
+  for (ReadMode read_mode : {READ_YOUR_WRITES, READ_LATEST}) {
+    new_scan->set_read_mode(read_mode);
+    NO_FATALS(req_assert_invalid_argument(TabletServerErrorPB::INVALID_SCAN_SPEC,
+        "scan start timestamp is only supported in READ_AT_SNAPSHOT read mode"));
+  }
+  new_scan->set_read_mode(READ_AT_SNAPSHOT);
+
+  // Attempt to start a diff scan with an illegal order mode.
+  new_scan->set_order_mode(UNORDERED);
+  NO_FATALS(req_assert_invalid_argument(TabletServerErrorPB::INVALID_SCAN_SPEC,
+      "scan start timestamp is only supported in ORDERED order mode"));
+  new_scan->set_order_mode(ORDERED);
+
+  // Attempt to start a diff scan with a too-early start timestamp.
+  new_scan->set_snap_start_timestamp(0); // Way before the AHM.
+  NO_FATALS(req_assert_invalid_argument(TabletServerErrorPB::INVALID_SNAPSHOT,
+      "snapshot scan start timestamp is earlier than the ancient history mark"));
+
+  // Attempt to start a diff scan with a too-early end timestamp.
+  new_scan->set_snap_timestamp(1);
+  NO_FATALS(req_assert_invalid_argument(TabletServerErrorPB::INVALID_SNAPSHOT,
+      "snapshot scan end timestamp is earlier than the ancient history mark"));
+
+  // Attempt to start a diff scan with a start timestamp higher than the end
+  // timestamp.
+  new_scan->set_snap_start_timestamp(after_insert.ToUint64());
+  new_scan->set_snap_timestamp(before_insert.ToUint64());
+  NO_FATALS(req_assert_invalid_argument(TabletServerErrorPB::INVALID_SNAPSHOT,
+      "must be less than or equal to end timestamp"));
+}
 
 // Test requesting more rows from a scanner which doesn't exist
 TEST_F(TabletServerTest, TestBadScannerID) {
@@ -2469,6 +2659,19 @@ TEST_F(TabletServerTest, TestInvalidScanRequest_BadProjectionTypes) {
                            TabletServerErrorPB::MISMATCHED_SCHEMA,
                            "The column 'string_val' must have type STRING "
                            "NULLABLE found INT32 NULLABLE");
+}
+
+TEST_F(TabletServerTest, TestInvalidScanRequest_UnknownOrderMode) {
+  NO_FATALS(InsertTestRowsDirect(0, 10));
+  ScanRequestPB req;
+  NewScanRequestPB* scan = req.mutable_new_scan_request();
+  scan->set_tablet_id(kTabletId);
+  scan->set_order_mode(OrderMode::UNKNOWN_ORDER_MODE);
+  ASSERT_OK(SchemaToColumnPBs(schema_, scan->mutable_projected_columns()));
+  req.set_call_seq_id(0);
+  NO_FATALS(VerifyScanRequestFailure(req,
+                                     TabletServerErrorPB::INVALID_SCAN_SPEC,
+                                     "Unknown order mode specified"));
 }
 
 // Test that passing a projection with Column IDs throws an exception.
@@ -3034,14 +3237,14 @@ TEST_F(TabletServerTest, TestInsertLatencyMicroBenchmark) {
 
   scoped_refptr<Histogram> histogram = METRIC_insert_latency.Instantiate(ts_test_metric_entity_);
 
-  uint64_t warmup = AllowSlowTests() ?
+  int warmup = AllowSlowTests() ?
       FLAGS_single_threaded_insert_latency_bench_warmup_rows : 10;
 
   for (int i = 0; i < warmup; i++) {
     InsertTestRowsRemote(i, 1);
   }
 
-  uint64_t max_rows = AllowSlowTests() ?
+  int max_rows = AllowSlowTests() ?
       FLAGS_single_threaded_insert_latency_bench_insert_rows : 100;
 
   MonoTime start = MonoTime::Now();
@@ -3489,7 +3692,7 @@ TEST_F(TabletServerTest, TestScannerCheckMatchingUser) {
 
   // Now do a checksum scan as the user.
   string checksum_scanner_id;
-  int64_t checksum_val;
+  uint64_t checksum_val;
   {
     ChecksumRequestPB checksum_req;
     ChecksumResponsePB checksum_resp;

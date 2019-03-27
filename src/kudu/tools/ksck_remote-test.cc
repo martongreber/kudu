@@ -475,7 +475,7 @@ TEST_F(RemoteKsckTest, TestChecksumSnapshotLastingLongerThanAHM) {
   ASSERT_TRUE(s.IsAborted()) << s.ToString();
   ASSERT_OK(ksck_->PrintResults());
   ASSERT_STR_CONTAINS(err_stream_.str(),
-                      "Invalid argument: Snapshot timestamp is earlier than "
+                      "Invalid argument: snapshot scan end timestamp is earlier than "
                       "the ancient history mark.");
 
   // Now let's try again using the special current timestamp, which will run

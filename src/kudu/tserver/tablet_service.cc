@@ -192,6 +192,7 @@ using kudu::security::TokenVerifier;
 using kudu::security::TokenPB;
 using kudu::server::ServerBase;
 using kudu::tablet::AlterSchemaTransactionState;
+using kudu::tablet::MvccSnapshot;
 using kudu::tablet::TABLET_DATA_COPYING;
 using kudu::tablet::TABLET_DATA_DELETED;
 using kudu::tablet::TABLET_DATA_TOMBSTONED;
@@ -2158,19 +2159,43 @@ namespace {
 // Checks if 'timestamp' is before the tablet's AHM if this is a
 // READ_AT_SNAPSHOT/READ_YOUR_WRITES scan. Returns Status::OK() if it's
 // not or Status::InvalidArgument() if it is.
-Status VerifyNotAncientHistory(Tablet* tablet, ReadMode read_mode, Timestamp timestamp) {
+Status VerifyNotAncientHistory(Tablet* tablet, ReadMode read_mode, Timestamp timestamp,
+                               const string& timestamp_desc) {
   tablet::HistoryGcOpts history_gc_opts = tablet->GetHistoryGcOpts();
   if ((read_mode == READ_AT_SNAPSHOT || read_mode == READ_YOUR_WRITES) &&
       history_gc_opts.IsAncientHistory(timestamp)) {
     return Status::InvalidArgument(
-        Substitute("Snapshot timestamp is earlier than the ancient history mark. Consider "
-                       "increasing the value of the configuration parameter "
-                       "--tablet_history_max_age_sec. Snapshot timestamp: $0 "
-                       "Ancient History Mark: $1 Physical time difference: $2",
+        Substitute("$0 is earlier than the ancient history mark. Consider "
+                   "increasing the value of the configuration parameter "
+                   "--tablet_history_max_age_sec. Snapshot timestamp: $1 "
+                   "Ancient History Mark: $2 Physical time difference: $3",
+                   timestamp_desc,
                    tablet->clock()->Stringify(timestamp),
                    tablet->clock()->Stringify(history_gc_opts.ancient_history_mark()),
                    tablet->clock()->GetPhysicalComponentDifference(
                        timestamp, history_gc_opts.ancient_history_mark()).ToString()));
+  }
+  return Status::OK();
+}
+
+// Verify that the start (if specified) and end snapshot timestamps are legal
+// to read by checking against the ancient history mark and ensuring that the
+// start timestamp is earlier than the end timestamp.
+Status VerifyLegalSnapshotTimestamps(Tablet* tablet, ReadMode read_mode,
+                                     const boost::optional<Timestamp>& snap_start_timestamp,
+                                     const Timestamp& snap_end_timestamp) {
+  RETURN_NOT_OK(VerifyNotAncientHistory(tablet, read_mode, snap_end_timestamp,
+                                        "snapshot scan end timestamp"));
+  if (snap_start_timestamp) {
+    // Validate diff scan start timestamp, if set.
+    RETURN_NOT_OK(VerifyNotAncientHistory(tablet, read_mode, *snap_start_timestamp,
+                                          "snapshot scan start timestamp"));
+    if (snap_start_timestamp->CompareTo(snap_end_timestamp) > 0) {
+      return Status::InvalidArgument(
+          Substitute("start timestamp ($0) must be less than or equal to end timestamp ($1)",
+                     tablet->clock()->Stringify(*snap_start_timestamp),
+                     tablet->clock()->Stringify(snap_end_timestamp)));
+    }
   }
   return Status::OK();
 }
@@ -2220,11 +2245,16 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     return Status::InvalidArgument("User requests should not have Column IDs");
   }
 
+  if (scan_pb.order_mode() == UNKNOWN_ORDER_MODE) {
+    *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+    return Status::InvalidArgument("Unknown order mode specified");
+  }
+
   if (scan_pb.order_mode() == ORDERED) {
     // Ordered scans must be at a snapshot so that we perform a serializable read (which can be
     // resumed). Otherwise, this would be read committed isolation, which is not resumable.
     if (scan_pb.read_mode() != READ_AT_SNAPSHOT) {
-      *error_code = TabletServerErrorPB::INVALID_SNAPSHOT;
+      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
           return Status::InvalidArgument("Cannot do an ordered scan that is not a snapshot read");
     }
   }
@@ -2268,8 +2298,6 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   projection = projection_builder.BuildWithoutIds();
 
   unique_ptr<RowwiseIterator> iter;
-  // Preset the error code for when creating the iterator on the tablet fails
-  TabletServerErrorPB::Code tmp_error_code = TabletServerErrorPB::MISMATCHED_SCHEMA;
 
   // It's important to keep the reference to the tablet for the case when the
   // tablet replica's shutdown is run concurrently with the code below.
@@ -2286,6 +2314,9 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     *error_code = TabletServerErrorPB::TABLET_NOT_RUNNING;
     return s;
   }
+
+  boost::optional<Timestamp> snap_start_timestamp;
+
   {
     TRACE("Creating iterator");
     TRACE_EVENT0("tserver", "Create iterator");
@@ -2293,10 +2324,14 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     switch (scan_pb.read_mode()) {
       case UNKNOWN_READ_MODE: {
         *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
-        s = Status::NotSupported("Unknown read mode.");
-        return s;
+        return Status::NotSupported("Unknown read mode.");
       }
       case READ_LATEST: {
+        if (scan_pb.has_snap_start_timestamp()) {
+          *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+          return Status::InvalidArgument("scan start timestamp is only supported "
+                                         "in READ_AT_SNAPSHOT read mode");
+        }
         s = tablet->NewRowIterator(projection, &iter);
         break;
       }
@@ -2304,16 +2339,8 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
       case READ_AT_SNAPSHOT: {
         scoped_refptr<consensus::TimeManager> time_manager = replica->time_manager();
         s = HandleScanAtSnapshot(scan_pb, rpc_context, projection, tablet.get(),
-                                 time_manager.get(), &iter, snap_timestamp);
-        // If we got a Status::ServiceUnavailable() from HandleScanAtSnapshot() it might
-        // mean we're just behind so let the client try again.
-        if (s.IsServiceUnavailable()) {
-          *error_code = TabletServerErrorPB::THROTTLED;
-          return s;
-        }
-        if (!s.ok()) {
-          tmp_error_code = TabletServerErrorPB::INVALID_SNAPSHOT;
-        }
+                                 time_manager.get(), &iter, &snap_start_timestamp, snap_timestamp,
+                                 error_code);
         break;
       }
     }
@@ -2329,25 +2356,27 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   if (PREDICT_TRUE(s.ok())) {
     TRACE_EVENT0("tserver", "iter->Init");
     s = iter->Init(spec.get());
+    if (PREDICT_FALSE(s.IsInvalidArgument())) {
+      // Tablet::Iterator::Init() returns InvalidArgument when an invalid
+      // projection is specified.
+      // TODO(todd): would be nice if we threaded these more specific
+      // error codes throughout Kudu.
+      *error_code = TabletServerErrorPB::MISMATCHED_SCHEMA;
+      return s;
+    }
   }
 
   TRACE("Iterator init: $0", s.ToString());
 
-  if (PREDICT_FALSE(s.IsInvalidArgument())) {
-    // An invalid projection returns InvalidArgument above.
-    // TODO: would be nice if we threaded these more specific
-    // error codes throughout Kudu.
-    *error_code = tmp_error_code;
-    return s;
-  }
   if (PREDICT_FALSE(!s.ok())) {
     LOG(WARNING) << Substitute("Error setting up scanner with request $0: $1",
                                SecureShortDebugString(*req), s.ToString());
     // If the replica has been stopped, e.g. due to disk failure, return
     // TABLET_FAILED so the scan can be handled appropriately (fail over to
     // another tablet server if fault-tolerant).
-    *error_code = tablet->HasBeenStopped() ?
-        TabletServerErrorPB::TABLET_FAILED : TabletServerErrorPB::UNKNOWN_ERROR;
+    if (tablet->HasBeenStopped()) {
+      *error_code = TabletServerErrorPB::TABLET_FAILED;
+    }
     return s;
   }
 
@@ -2372,12 +2401,11 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   // Now that we have initialized our row iterator at a snapshot, return an
   // error if the snapshot timestamp was prior to the ancient history mark.
   // We have to check after we open the iterator in order to avoid a TOCTOU
-  // error.
-  s = VerifyNotAncientHistory(tablet.get(), scan_pb.read_mode(), *snap_timestamp);
-  if (!s.ok()) {
-    *error_code = TabletServerErrorPB::INVALID_SNAPSHOT;
-    return s;
-  }
+  // error since it's possible that initializing the row iterator could race
+  // against the tablet history GC maintenance task.
+  RETURN_NOT_OK_EVAL(VerifyLegalSnapshotTimestamps(tablet.get(), scan_pb.read_mode(),
+                                                   snap_start_timestamp, *snap_timestamp),
+                     *error_code = TabletServerErrorPB::INVALID_SNAPSHOT);
 
   *has_more_results = iter->HasNext() && !scanner->has_fulfilled_limit();
   TRACE("has_more: $0", *has_more_results);
@@ -2607,7 +2635,9 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
                                                Tablet* tablet,
                                                consensus::TimeManager* time_manager,
                                                unique_ptr<RowwiseIterator>* iter,
-                                               Timestamp* snap_timestamp) {
+                                               boost::optional<Timestamp>* snap_start_timestamp,
+                                               Timestamp* snap_timestamp,
+                                               TabletServerErrorPB::Code* error_code) {
   switch (scan_pb.read_mode()) {
     case READ_AT_SNAPSHOT: // Fallthrough intended
     case READ_YOUR_WRITES:
@@ -2618,7 +2648,11 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
 
   // Based on the read mode, pick a timestamp and verify it.
   Timestamp tmp_snap_timestamp;
-  RETURN_NOT_OK(PickAndVerifyTimestamp(scan_pb, tablet, &tmp_snap_timestamp));
+  Status s = PickAndVerifyTimestamp(scan_pb, tablet, &tmp_snap_timestamp);
+  if (PREDICT_FALSE(!s.ok())) {
+    *error_code = TabletServerErrorPB::INVALID_SNAPSHOT;
+    return s.CloneAndPrepend("cannot verify timestamp");
+  }
 
   // Reduce the client's deadline by a few msecs to allow for overhead.
   MonoTime client_deadline = rpc_context->GetClientDeadline() - MonoDelta::FromMilliseconds(10);
@@ -2627,8 +2661,9 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   // server will have one less available thread and the client might be stuck spending all
   // of the allotted time for the scan on a partitioned server that will never have a consistent
   // snapshot at 'snap_timestamp'.
-  // Because of this we clamp the client's deadline to the max. configured. If the client
-  // sets a long timeout then it can use it by trying in other servers.
+  // Because of this we clamp the client's deadline to the maximum configured
+  // scanner wait time. If the client sets a longer timeout then it can use it
+  // by retrying (possibly on other servers).
   bool was_clamped = false;
   MonoTime final_deadline = ClampScanDeadlineForWait(client_deadline, &was_clamped);
 
@@ -2638,19 +2673,20 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   // the same timestamp (repeatable reads).
   TRACE("Waiting safe time to advance");
   MonoTime before = MonoTime::Now();
-  Status s = time_manager->WaitUntilSafe(tmp_snap_timestamp, final_deadline);
+  s = time_manager->WaitUntilSafe(tmp_snap_timestamp, final_deadline);
 
   tablet::MvccSnapshot snap;
-  tablet::MvccManager* mvcc_manager = tablet->mvcc_manager();
-  if (s.ok()) {
+  if (PREDICT_TRUE(s.ok())) {
     // Wait for the in-flights in the snapshot to be finished.
     TRACE("Waiting for operations to commit");
-    s = mvcc_manager->WaitForSnapshotWithAllCommitted(tmp_snap_timestamp, &snap, client_deadline);
+    s = tablet->mvcc_manager()->WaitForSnapshotWithAllCommitted(
+          tmp_snap_timestamp, &snap, client_deadline);
   }
 
   // If we got an TimeOut but we had clamped the deadline, return a ServiceUnavailable instead
   // so that the client retries.
-  if (s.IsTimedOut() && was_clamped) {
+  if (PREDICT_FALSE(s.IsTimedOut() && was_clamped)) {
+    *error_code = TabletServerErrorPB::THROTTLED;
     return Status::ServiceUnavailable(s.CloneAndPrepend(
         "could not wait for desired snapshot timestamp to be consistent").ToString());
   }
@@ -2660,17 +2696,47 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   tablet->metrics()->snapshot_read_inflight_wait_duration->Increment(duration_usec);
   TRACE("All operations in snapshot committed. Waited for $0 microseconds", duration_usec);
 
-  if (scan_pb.order_mode() == UNKNOWN_ORDER_MODE) {
-    return Status::InvalidArgument("Unknown order mode specified");
-  }
   tablet::RowIteratorOptions opts;
   opts.projection = &projection;
   opts.snap_to_include = snap;
   opts.order = scan_pb.order_mode();
+
+  boost::optional<Timestamp> tmp_snap_start_timestamp;
+  if (scan_pb.has_snap_start_timestamp()) {
+    if (scan_pb.read_mode() != READ_AT_SNAPSHOT) {
+      // TODO(mpercy): Should we allow READ_YOUR_WRITES mode? There is no
+      // obvious use for it, but also no obvious reason not to support it,
+      // except for the fact that we would also have to test it.
+      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+      return Status::InvalidArgument("scan start timestamp is only supported "
+                                     "in READ_AT_SNAPSHOT read mode");
+    }
+    if (scan_pb.order_mode() != ORDERED) {
+      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+      return Status::InvalidArgument("scan start timestamp is only supported "
+                                     "in ORDERED order mode");
+    }
+    tmp_snap_start_timestamp = Timestamp(scan_pb.snap_start_timestamp());
+    opts.snap_to_exclude = MvccSnapshot(*tmp_snap_start_timestamp);
+    opts.include_deleted_rows = true;
+  }
+
+  // Before we open / wait on anything check that the timestamp(s) are after
+  // the AHM. This is not the final check. We'll check this again after the
+  // iterators are open but there is no point in doing the work to initialize
+  // the iterators and spending the time to wait for a snapshot timestamp to be
+  // readable when we can't read back to one of the requested timestamps.
+  RETURN_NOT_OK_EVAL(VerifyLegalSnapshotTimestamps(tablet, scan_pb.read_mode(),
+                                                   tmp_snap_start_timestamp,
+                                                   tmp_snap_timestamp),
+                     *error_code = TabletServerErrorPB::INVALID_SNAPSHOT);
+
   RETURN_NOT_OK(tablet->NewRowIterator(std::move(opts), iter));
 
   // Return the picked snapshot timestamp for both READ_AT_SNAPSHOT
-  // and READ_YOUR_WRITES mode.
+  // and READ_YOUR_WRITES mode, as well as the parsed start timestamp for
+  // READ_AT_SNAPSHOT mode, if specified.
+  *snap_start_timestamp = std::move(tmp_snap_start_timestamp);
   *snap_timestamp = tmp_snap_timestamp;
   return Status::OK();
 }
@@ -2742,13 +2808,6 @@ Status TabletServiceImpl::PickAndVerifyTimestamp(const NewScanRequestPB& scan_pb
                                     scan_pb.propagated_timestamp() : Timestamp::kMin.ToUint64();
     tmp_snap_timestamp = Timestamp(std::max(propagated_timestamp + 1, clean_timestamp));
   }
-
-  // Before we wait on anything check that the timestamp is after the AHM.
-  // This is not the final check. We'll check this again after the iterators are open but
-  // there is no point in waiting if we can't actually scan afterwards.
-  RETURN_NOT_OK(VerifyNotAncientHistory(tablet,
-                                        read_mode,
-                                        tmp_snap_timestamp));
   *snap_timestamp = tmp_snap_timestamp;
   return Status::OK();
 }

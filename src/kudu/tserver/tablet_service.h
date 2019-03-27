@@ -27,6 +27,10 @@
 #include "kudu/tserver/tserver_admin.service.h"
 #include "kudu/tserver/tserver_service.service.h"
 
+namespace boost {
+template <class T> class optional;
+} // namespace boost
+
 namespace google {
 namespace protobuf {
 class Message;
@@ -151,13 +155,18 @@ class TabletServiceImpl : public TabletServerServiceIf {
                                    bool* has_more_results,
                                    TabletServerErrorPB::Code* error_code);
 
+  // Handle READ_AT_SNAPSHOT and READ_YOUR_WRITES scans.
+  // Returns the opened row iterator, the start timestamp of a snapshot scan,
+  // if applicable, and the ending timestamp of a scan.
   Status HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
                               const rpc::RpcContext* rpc_context,
                               const Schema& projection,
                               tablet::Tablet* tablet,
                               consensus::TimeManager* time_manager,
                               std::unique_ptr<RowwiseIterator>* iter,
-                              Timestamp* snap_timestamp);
+                              boost::optional<Timestamp>* snap_start_timestamp,
+                              Timestamp* snap_timestamp,
+                              TabletServerErrorPB::Code* error_code);
 
   // Validates the given timestamp is not so far in the future that
   // it exceeds the maximum allowed clock synchronization error time,

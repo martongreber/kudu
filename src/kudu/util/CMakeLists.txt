@@ -149,7 +149,6 @@ set(UTIL_SRCS
   bitmap.cc
   block_cache_metrics.cc
   bloom_filter.cc
-  bitmap.cc
   cache.cc
   coding.cc
   condition_variable.cc
@@ -225,6 +224,7 @@ set(UTIL_SRCS
   throttler.cc
   trace.cc
   trace_metrics.cc
+  ttl_cache_test_metrics.cc
   user.cc
   url-coding.cc
   version_info.cc
@@ -394,6 +394,7 @@ ADD_KUDU_TEST(async_util-test)
 ADD_KUDU_TEST(atomic-test)
 ADD_KUDU_TEST(bit-util-test)
 ADD_KUDU_TEST(bitmap-test)
+ADD_KUDU_TEST(bitset-test)
 ADD_KUDU_TEST(blocking_queue-test)
 ADD_KUDU_TEST(bloom_filter-test)
 ADD_KUDU_TEST(cache-bench RUN_SERIAL true)
@@ -462,6 +463,7 @@ ADD_KUDU_TEST(thread-test)
 ADD_KUDU_TEST(threadpool-test)
 ADD_KUDU_TEST(throttler-test)
 ADD_KUDU_TEST(trace-test PROCESSORS 4)
+ADD_KUDU_TEST(ttl_cache-test)
 ADD_KUDU_TEST(url-coding-test)
 ADD_KUDU_TEST(user-test)
 ADD_KUDU_TEST(version_util-test)
@@ -533,4 +535,13 @@ if(NOT NO_TESTS)
   target_link_libraries(compression-test
     cfile
     kudu_util_compression)
+endif()
+
+#######################################
+# curl_util-test
+#######################################
+ADD_KUDU_TEST(curl_util-test)
+if(NOT NO_TESTS)
+  target_link_libraries(curl_util-test
+    kudu_curl_util)
 endif()

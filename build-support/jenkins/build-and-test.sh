@@ -74,6 +74,9 @@
 #
 #   ERROR_ON_TEST_FAILURE    Default: 1
 #     Whether test failures will cause this script to return an error.
+#
+#   KUDU_REPORT_TEST_RESULTS Default: 0
+#     If non-zero, tests are reported to the central test server.
 
 # If a commit messages contains a line that says 'DONT_BUILD', exit
 # immediately.
@@ -220,6 +223,13 @@ if [ "$RUN_FLAKY_ONLY" == "1" -o "$KUDU_FLAKY_TEST_ATTEMPTS" -gt 1 ]; then
   fi
 
   if [ "$RUN_FLAKY_ONLY" == "1" ]; then
+    # TODO(adar): we can't yet pass the flaky test list into the dist-test
+    # machinery (in order to control which tests are executed).
+    if [ "$ENABLE_DIST_TEST" == "1" ]; then
+      echo "Distributed testing is incompatible with RUN_FLAKY_ONLY=1"
+      exit 1
+    fi
+
     test_regex=$(perl -e '
       chomp(my @lines = <>);
       print join("|", map { "^" . quotemeta($_) } @lines);
@@ -229,14 +239,25 @@ if [ "$RUN_FLAKY_ONLY" == "1" -o "$KUDU_FLAKY_TEST_ATTEMPTS" -gt 1 ]; then
       exit 0
     fi
 
+    # Set up ctest/gradle to run only those tests found in the flaky test list.
+    #
+    # Note: the flaky test list contains both C++ and Java tests and we pass it
+    # in its entirety to both ctest and gradle. This is safe because:
+    # 1. There are no test name collisions between C++ and Java tests.
+    # 2. Both ctest and gradle will happily ignore tests they can't find.
+    #
+    # If either of these assumptions changes, we'll need to explicitly split the
+    # test list into two lists, either here or in the test result server.
     EXTRA_TEST_FLAGS="$EXTRA_TEST_FLAGS -R $test_regex"
+    while IFS="" read t || [ -n "$t" ]
+    do
+      EXTRA_GRADLE_TEST_FLAGS="--tests $t $EXTRA_GRADLE_TEST_FLAGS"
+    done < $KUDU_FLAKY_TEST_LIST
 
-    # We don't support detecting java and python flaky tests at the moment.
-    echo "RUN_FLAKY_ONLY=1: running flaky tests only,"\
-         "disabling Java and python builds."
+    # We don't support detecting python flaky tests at the moment.
+    echo "RUN_FLAKY_ONLY=1: running flaky tests only, disabling python build."
     BUILD_PYTHON=0
     BUILD_PYTHON3=0
-    BUILD_JAVA=0
   elif [ "$KUDU_FLAKY_TEST_ATTEMPTS" -gt 1 ]; then
     echo Will retry the flaky tests up to $KUDU_FLAKY_TEST_ATTEMPTS times.
   fi
@@ -292,6 +313,37 @@ $CMAKE
 mkdir -p Testing/Temporary
 mkdir -p $TEST_LOGDIR
 
+if [ -n "$KUDU_REPORT_TEST_RESULTS" ] && [ "$KUDU_REPORT_TEST_RESULTS" -ne 0 ]; then
+  # Export environment variables needed for flaky test reporting.
+  #
+  # The actual reporting happens in the test runners themselves.
+
+  # On Jenkins, we'll have this variable set. Otherwise,
+  # report the build tag as non-jenkins.
+  export BUILD_TAG=${BUILD_TAG:-non-jenkins}
+
+  # Figure out the current git revision, and append a "-dirty" tag if it's
+  # not a pristine checkout.
+  GIT_REVISION=$(cd $SOURCE_ROOT && git rev-parse HEAD)
+  if ! ( cd $SOURCE_ROOT && git diff --quiet .  && git diff --cached --quiet . ) ; then
+    GIT_REVISION="${GIT_REVISION}-dirty"
+  fi
+  export GIT_REVISION
+
+  # Parse out our "build config" - a space-separated list of tags
+  # which include the cmake build type as well as the list of configured
+  # sanitizers.
+
+  # Define BUILD_CONFIG for flaky test reporting.
+  BUILD_CONFIG="$CMAKE_BUILD"
+  if [ "$BUILD_TYPE" = "ASAN" ]; then
+    BUILD_CONFIG="$BUILD_CONFIG asan ubsan"
+  elif [ "$BUILD_TYPE" = "TSAN" ]; then
+    BUILD_CONFIG="$BUILD_CONFIG tsan"
+  fi
+  export BUILD_CONFIG
+fi
+
 # Short circuit for LINT builds.
 if [ "$BUILD_TYPE" = "LINT" ]; then
   make lint | tee $TEST_LOGDIR/lint.log
@@ -339,7 +391,7 @@ EXIT_STATUS=0
 FAILURES=""
 
 # If we're running distributed C++ tests, submit them asynchronously while
-# we run the Java and Python tests.
+# we run any local tests.
 if [ "$ENABLE_DIST_TEST" == "1" ]; then
   echo
   echo Submitting C++ distributed-test job.
@@ -390,7 +442,6 @@ if [ "$BUILD_JAVA" == "1" ]; then
   export EXTRA_GRADLE_FLAGS="--console=plain"
   EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --no-daemon"
   EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --continue"
-  EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DrerunFailingTestsCount=3"
   # KUDU-2524: temporarily disable scalafmt until we can work out its JDK
   # incompatibility issue.
   EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DskipFormat"
@@ -411,7 +462,7 @@ if [ "$BUILD_JAVA" == "1" ]; then
     fi
   else
     # TODO: Run `gradle check` in BUILD_TYPE DEBUG when static code analysis is fixed
-    if ! ./gradlew $EXTRA_GRADLE_FLAGS clean test ; then
+    if ! ./gradlew $EXTRA_GRADLE_FLAGS clean test $EXTRA_GRADLE_TEST_FLAGS; then
       TESTS_FAILED=1
       FAILURES="$FAILURES"$'Java Gradle build/test failed\n'
     fi

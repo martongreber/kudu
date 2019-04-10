@@ -17,9 +17,11 @@
 
 #include "kudu/master/sentry_authz_provider.h"
 
+#include <memory>
 #include <ostream>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -27,14 +29,18 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/common/common.pb.h"
 #include "kudu/common/table_util.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/master/sentry_client_metrics.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/sentry/sentry_action.h"
 #include "kudu/sentry/sentry_client.h"
 #include "kudu/sentry/sentry_policy_service_types.h"
 #include "kudu/thrift/client.h"
+#include "kudu/thrift/ha_client_metrics.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -47,6 +53,7 @@ using sentry::TSentryGrantOption;
 using sentry::TSentryPrivilege;
 using std::string;
 using std::unordered_map;
+using std::unordered_set;
 using std::vector;
 
 DEFINE_string(sentry_service_rpc_addresses, "",
@@ -120,6 +127,8 @@ using strings::Substitute;
 
 namespace kudu {
 
+using security::ColumnPrivilegePB;
+using security::TablePrivilegePB;
 using sentry::SentryAction;
 using sentry::SentryAuthorizableScope;
 using sentry::AuthorizableScopesSet;
@@ -181,6 +190,16 @@ bool SentryPrivilegesBranch::Implies(SentryAuthorizableScope::Scope required_sco
     }
   }
   return false;
+}
+
+SentryAuthzProvider::SentryAuthzProvider(
+    scoped_refptr<MetricEntity> metric_entity)
+    : metric_entity_(std::move(metric_entity)) {
+  if (metric_entity_) {
+    std::unique_ptr<SentryClientMetrics> metrics(
+        new SentryClientMetrics(metric_entity_));
+    ha_client_.SetMetrics(std::move(metrics));
+  }
 }
 
 SentryAuthzProvider::~SentryAuthzProvider() {
@@ -525,6 +544,77 @@ Status SentryAuthzProvider::GetSentryPrivileges(SentryAuthorizableScope::Scope s
     }
   }
   EmplaceValuesFromMap(std::move(privileges_map), &privileges->privileges);
+  return Status::OK();
+}
+
+Status SentryAuthzProvider::FillTablePrivilegePB(const string& table_name,
+                                                 const string& user,
+                                                 const SchemaPB& schema_pb,
+                                                 TablePrivilegePB* pb) {
+  DCHECK(pb);
+  DCHECK(pb->has_table_id());
+  if (AuthzProvider::IsTrustedUser(user)) {
+    pb->set_delete_privilege(true);
+    pb->set_insert_privilege(true);
+    pb->set_scan_privilege(true);
+    pb->set_update_privilege(true);
+    return Status::OK();
+  }
+  static ColumnPrivilegePB scan_col_privilege;
+  scan_col_privilege.set_scan_privilege(true);
+
+  // Note: it might seem like we could cache these TablePrivilegePBs rather
+  // than parsing them from Sentry privileges every time. This is tricky
+  // because the column-level privileges depend on the input schema, which may
+  // be different upon subsequent calls to this function.
+  SentryPrivilegesBranch privileges;
+  RETURN_NOT_OK(GetSentryPrivileges(SentryAuthorizableScope::TABLE, table_name,
+                                    user, &privileges));
+  unordered_set<string> scannable_col_names;
+  static const SentryAuthorizableScope kTableScope(SentryAuthorizableScope::TABLE);
+  for (const auto& privilege : privileges.privileges) {
+    if (SentryAuthorizableScope(privilege.scope).Implies(kTableScope)) {
+      // Pull out any privileges at the table scope or higher.
+      if (ContainsKey(privilege.granted_privileges, SentryAction::ALL) ||
+          ContainsKey(privilege.granted_privileges, SentryAction::OWNER)) {
+        // Generate privilege with everything.
+        pb->set_delete_privilege(true);
+        pb->set_insert_privilege(true);
+        pb->set_scan_privilege(true);
+        pb->set_update_privilege(true);
+        return Status::OK();
+      }
+      if (ContainsKey(privilege.granted_privileges, SentryAction::DELETE)) {
+        pb->set_delete_privilege(true);
+      }
+      if (ContainsKey(privilege.granted_privileges, SentryAction::INSERT)) {
+        pb->set_insert_privilege(true);
+      }
+      if (ContainsKey(privilege.granted_privileges, SentryAction::SELECT)) {
+        pb->set_scan_privilege(true);
+      }
+      if (ContainsKey(privilege.granted_privileges, SentryAction::UPDATE)) {
+        pb->set_update_privilege(true);
+      }
+    } else if (!pb->scan_privilege() &&
+               (ContainsKey(privilege.granted_privileges, SentryAction::ALL) ||
+                ContainsKey(privilege.granted_privileges, SentryAction::OWNER) ||
+                ContainsKey(privilege.granted_privileges, SentryAction::SELECT))) {
+      // Pull out any scan privileges at the column scope.
+      DCHECK_EQ(SentryAuthorizableScope::COLUMN, privilege.scope);
+      DCHECK(!privilege.column_name.empty());
+      EmplaceIfNotPresent(&scannable_col_names, privilege.column_name);
+    }
+  }
+  // If we got any column-level scan privileges and we don't already have
+  // table-level scan privileges, set them now.
+  if (!pb->scan_privilege()) {
+    for (const auto& col : schema_pb.columns()) {
+      if (ContainsKey(scannable_col_names, col.name())) {
+        InsertIfNotPresent(pb->mutable_column_privileges(), col.id(), scan_col_privilege);
+      }
+    }
+  }
   return Status::OK();
 }
 

@@ -783,7 +783,7 @@ class ScanResultChecksummer : public ScanResultCollector {
 
     const Schema* client_projection_schema = scanner->client_projection_schema();
     if (!client_projection_schema) {
-      client_projection_schema = &row_block.schema();
+      client_projection_schema = row_block.schema();
     }
 
     size_t nrows = row_block.nrows();
@@ -874,6 +874,15 @@ bool TabletServiceImpl::AuthorizeClientOrServiceUser(const google::protobuf::Mes
                                                      rpc::RpcContext* context) {
   return server_->Authorize(context, ServerBase::SUPER_USER | ServerBase::USER |
                             ServerBase::SERVICE_USER);
+}
+
+bool TabletServiceImpl::AuthorizeListTablets(const google::protobuf::Message* req,
+                                             google::protobuf::Message* resp,
+                                             rpc::RpcContext* context) {
+  if (FLAGS_tserver_enforce_access_control) {
+    return server_->Authorize(context, ServerBase::SUPER_USER);
+  }
+  return AuthorizeClient(req, resp, context);
 }
 
 bool TabletServiceImpl::AuthorizeClient(const google::protobuf::Message* /*req*/,
@@ -2534,7 +2543,7 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
   // If people had really large indirect objects, we would currently overshoot
   // their requested batch size by a lot.
   Arena arena(32 * 1024);
-  RowBlock block(scanner->iter()->schema(),
+  RowBlock block(&scanner->iter()->schema(),
                  FLAGS_scanner_batch_size_rows, &arena);
 
   // TODO(todd): in the future, use the client timeout to set a budget. For now,

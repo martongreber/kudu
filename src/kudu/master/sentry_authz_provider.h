@@ -27,11 +27,13 @@
 
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/master/authz_provider.h"
 #include "kudu/sentry/sentry_action.h"
 #include "kudu/sentry/sentry_authorizable_scope.h"
 #include "kudu/sentry/sentry_client.h"
 #include "kudu/thrift/client.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/status.h"
 
 namespace sentry {
@@ -40,6 +42,12 @@ class TSentryPrivilege;
 } // namespace sentry
 
 namespace kudu {
+
+class SchemaPB;
+
+namespace security {
+class TablePrivilegePB;
+} // namespace security
 
 namespace master {
 
@@ -113,6 +121,7 @@ struct SentryPrivilegesBranch {
 // This class is thread-safe after Start() is called.
 class SentryAuthzProvider : public AuthzProvider {
  public:
+  explicit SentryAuthzProvider(scoped_refptr<MetricEntity> metric_entity = {});
 
   ~SentryAuthzProvider();
 
@@ -147,12 +156,17 @@ class SentryAuthzProvider : public AuthzProvider {
   Status AuthorizeGetTableMetadata(const std::string& table_name,
                                    const std::string& user) override WARN_UNUSED_RESULT;
 
+  Status FillTablePrivilegePB(const std::string& table_name,
+                              const std::string& user,
+                              const SchemaPB& schema_pb,
+                              security::TablePrivilegePB* pb) override WARN_UNUSED_RESULT;
+
  private:
-  friend class SentryAuthzProviderFilterResponsesTest;
+  friend class SentryAuthzProviderFilterPrivilegesTest;
   FRIEND_TEST(SentryAuthzProviderStaticTest, TestPrivilegesWellFormed);
   FRIEND_TEST(TestAuthzHierarchy, TestAuthorizableScope);
-  FRIEND_TEST(SentryAuthzProviderFilterResponsesTest, TestFilterInvalidResponses);
-  FRIEND_TEST(SentryAuthzProviderFilterResponsesTest, TestFilterValidResponses);
+  FRIEND_TEST(SentryAuthzProviderFilterPrivilegesScopeTest, TestFilterInvalidResponses);
+  FRIEND_TEST(SentryAuthzProviderFilterPrivilegesScopeTest, TestFilterValidResponses);
 
   // Utility function to determine whether the given privilege is a well-formed
   // possibly Kudu-related privilege describing a descendent or ancestor of the
@@ -201,6 +215,7 @@ class SentryAuthzProvider : public AuthzProvider {
                    const std::string& user,
                    bool require_grant_option = false);
 
+  scoped_refptr<MetricEntity> metric_entity_;
   thrift::HaClient<sentry::SentryClient> ha_client_;
 };
 

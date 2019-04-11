@@ -17,10 +17,12 @@
 
 #include "kudu/master/sentry_authz_provider.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -38,7 +40,9 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/sysinfo.h"
 #include "kudu/master/sentry_authz_provider-test-base.h"
+#include "kudu/master/sentry_privileges_fetcher.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/sentry/mini_sentry.h"
 #include "kudu/sentry/sentry-test-base.h"
@@ -46,6 +50,7 @@
 #include "kudu/sentry/sentry_authorizable_scope.h"
 #include "kudu/sentry/sentry_client.h"
 #include "kudu/sentry/sentry_policy_service_types.h"
+#include "kudu/util/barrier.h"
 #include "kudu/util/hdr_histogram.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/net/net_util.h"
@@ -58,6 +63,7 @@
 
 DECLARE_int32(sentry_service_recv_timeout_seconds);
 DECLARE_int32(sentry_service_send_timeout_seconds);
+DECLARE_uint32(sentry_privileges_cache_capacity_mb);
 DECLARE_string(sentry_service_rpc_addresses);
 DECLARE_string(server_name);
 DECLARE_string(trusted_user_acl);
@@ -82,6 +88,7 @@ using sentry::TSentryAuthorizable;
 using sentry::TSentryGrantOption;
 using sentry::TSentryPrivilege;
 using std::string;
+using std::thread;
 using std::unique_ptr;
 using std::unordered_map;
 using std::unordered_set;
@@ -101,7 +108,7 @@ TEST(SentryAuthzProviderStaticTest, TestTrustedUserAcl) {
 }
 
 // Basic unit test for validations on ill-formed privileges.
-TEST(SentryAuthzProviderStaticTest, TestPrivilegesWellFormed) {
+TEST(SentryPrivilegesFetcherStaticTest, TestPrivilegesWellFormed) {
   const string kDb = "db";
   const string kTable = "table";
   TSentryAuthorizable requested_authorizable;
@@ -113,21 +120,21 @@ TEST(SentryAuthzProviderStaticTest, TestPrivilegesWellFormed) {
     // Privilege with a bogus action set.
     TSentryPrivilege privilege = real_privilege;
     privilege.__set_action("NotAnAction");
-    ASSERT_FALSE(SentryAuthzProvider::SentryPrivilegeIsWellFormed(
+    ASSERT_FALSE(SentryPrivilegesFetcher::SentryPrivilegeIsWellFormed(
         privilege, requested_authorizable, /*scope=*/nullptr, /*action=*/nullptr));
   }
   {
     // Privilege with a bogus authorizable scope set.
     TSentryPrivilege privilege = real_privilege;
     privilege.__set_privilegeScope("NotAnAuthorizableScope");
-    ASSERT_FALSE(SentryAuthzProvider::SentryPrivilegeIsWellFormed(
+    ASSERT_FALSE(SentryPrivilegesFetcher::SentryPrivilegeIsWellFormed(
         privilege, requested_authorizable, /*scope=*/nullptr, /*action=*/nullptr));
   }
   {
     // Privilege with a valid, but unexpected scope for the set fields.
     TSentryPrivilege privilege = real_privilege;
     privilege.__set_privilegeScope("COLUMN");
-    ASSERT_FALSE(SentryAuthzProvider::SentryPrivilegeIsWellFormed(
+    ASSERT_FALSE(SentryPrivilegesFetcher::SentryPrivilegeIsWellFormed(
         privilege, requested_authorizable, /*scope=*/nullptr, /*action=*/nullptr));
   }
   {
@@ -135,21 +142,21 @@ TEST(SentryAuthzProviderStaticTest, TestPrivilegesWellFormed) {
     // requested.
     TSentryPrivilege privilege = real_privilege;
     privilege.__set_dbName("NotTheActualDb");
-    ASSERT_FALSE(SentryAuthzProvider::SentryPrivilegeIsWellFormed(
+    ASSERT_FALSE(SentryPrivilegesFetcher::SentryPrivilegeIsWellFormed(
         privilege, requested_authorizable, /*scope=*/nullptr, /*action=*/nullptr));
   }
   {
     // Privilege with an field set that isn't meant to be set at its scope.
     TSentryPrivilege privilege = real_privilege;
     privilege.__set_columnName("SomeColumn");
-    ASSERT_FALSE(SentryAuthzProvider::SentryPrivilegeIsWellFormed(
+    ASSERT_FALSE(SentryPrivilegesFetcher::SentryPrivilegeIsWellFormed(
         privilege, requested_authorizable, /*scope=*/nullptr, /*action=*/nullptr));
   }
   {
     // Privilege with a missing field for its scope.
     TSentryPrivilege privilege = real_privilege;
     privilege.__isset.tableName = false;
-    ASSERT_FALSE(SentryAuthzProvider::SentryPrivilegeIsWellFormed(
+    ASSERT_FALSE(SentryPrivilegesFetcher::SentryPrivilegeIsWellFormed(
         privilege, requested_authorizable, /*scope=*/nullptr, /*action=*/nullptr));
   }
   {
@@ -157,7 +164,7 @@ TEST(SentryAuthzProviderStaticTest, TestPrivilegesWellFormed) {
     SentryAuthorizableScope::Scope granted_scope;
     SentryAction::Action granted_action;
     real_privilege.printTo(LOG(INFO));
-    ASSERT_TRUE(SentryAuthzProvider::SentryPrivilegeIsWellFormed(
+    ASSERT_TRUE(SentryPrivilegesFetcher::SentryPrivilegeIsWellFormed(
         real_privilege, requested_authorizable, &granted_scope, &granted_action));
     ASSERT_EQ(SentryAuthorizableScope::TABLE, granted_scope);
     ASSERT_EQ(SentryAction::ALL, granted_action);
@@ -166,9 +173,9 @@ TEST(SentryAuthzProviderStaticTest, TestPrivilegesWellFormed) {
 
 class SentryAuthzProviderTest : public SentryTestBase {
  public:
-  const char* const kTestUser = "test-user";
-  const char* const kUserGroup = "user";
-  const char* const kRoleName = "developer";
+  static const char* const kTestUser;
+  static const char* const kUserGroup;
+  static const char* const kRoleName;
 
   void SetUp() override {
     SentryTestBase::SetUp();
@@ -177,9 +184,20 @@ class SentryAuthzProviderTest : public SentryTestBase {
         &metric_registry_, "sentry_auth_provider-test");
 
     // Configure the SentryAuthzProvider flags.
+    FLAGS_sentry_privileges_cache_capacity_mb = CachingEnabled() ? 1 : 0;
     FLAGS_sentry_service_rpc_addresses = sentry_->address().ToString();
     sentry_authz_provider_.reset(new SentryAuthzProvider(metric_entity_));
     ASSERT_OK(sentry_authz_provider_->Start());
+  }
+
+  bool KerberosEnabled() const override {
+    // The returned value corresponds to the actual setting of the
+    // --sentry_service_security_mode flag; now it's "kerberos" by default.
+    return true;
+  }
+
+  virtual bool CachingEnabled() const {
+    return true;
   }
 
   Status StopSentry() {
@@ -194,8 +212,21 @@ class SentryAuthzProviderTest : public SentryTestBase {
     return Status::OK();
   }
 
-  bool KerberosEnabled() const override {
-    return true;
+  Status DropRole() {
+    RETURN_NOT_OK(kudu::master::DropRole(sentry_client_.get(), kRoleName));
+    return sentry_authz_provider_->fetcher_.ResetCache();
+  }
+
+  Status CreateRoleAndAddToGroups() {
+    RETURN_NOT_OK(kudu::master::CreateRoleAndAddToGroups(
+        sentry_client_.get(), kRoleName, kUserGroup));
+    return sentry_authz_provider_->fetcher_.ResetCache();
+  }
+
+  Status AlterRoleGrantPrivilege(const TSentryPrivilege& privilege) {
+    RETURN_NOT_OK(kudu::master::AlterRoleGrantPrivilege(
+        sentry_client_.get(), kRoleName, privilege));
+    return sentry_authz_provider_->fetcher_.ResetCache();
   }
 
 #define GET_GAUGE_READINGS(func_name, counter_name_suffix) \
@@ -217,6 +248,10 @@ class SentryAuthzProviderTest : public SentryTestBase {
   scoped_refptr<MetricEntity> metric_entity_;
   unique_ptr<SentryAuthzProvider> sentry_authz_provider_;
 };
+
+const char* const SentryAuthzProviderTest::kTestUser = "test-user";
+const char* const SentryAuthzProviderTest::kUserGroup = "user";
+const char* const SentryAuthzProviderTest::kRoleName = "developer";
 
 namespace {
 
@@ -273,11 +308,12 @@ constexpr const char* kColumn = "column";
 class SentryAuthzProviderFilterPrivilegesTest : public SentryAuthzProviderTest {
  public:
   SentryAuthzProviderFilterPrivilegesTest()
-      : prng_(SeedRandom()) {}
+      : prng_(SeedRandom()) {
+  }
 
   void SetUp() override {
     SentryAuthzProviderTest::SetUp();
-    ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
+    ASSERT_OK(CreateRoleAndAddToGroups());
     full_authorizable_.server = FLAGS_server_name;
     full_authorizable_.db = kDb;
     full_authorizable_.table = kTable;
@@ -302,7 +338,7 @@ class SentryAuthzProviderFilterPrivilegesTest : public SentryAuthzProviderTest {
 
     // Select a scope at which we'll mess up the privilege request's field.
     AuthorizableScopesSet nonempty_fields =
-        SentryAuthzProvider::ExpectedNonEmptyFields(scope.scope());
+        SentryPrivilegesFetcher::ExpectedNonEmptyFields(scope.scope());
     if (invalid_privilege == InvalidPrivilege::FLIPPED_FIELD) {
       static const AuthorizableScopesSet kMessUpCandidates = {
         SentryAuthorizableScope::SERVER,
@@ -397,7 +433,7 @@ TEST_F(SentryAuthzProviderFilterPrivilegesTest, TestTablePrivilegePBParsing) {
       // Grant the privilege to the user.
       TSentryPrivilege table_privilege = CreatePrivilege(table_authorizable,
           SentryAuthorizableScope(granted_scope), SentryAction(action));
-      ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, table_privilege));
+      ASSERT_OK(AlterRoleGrantPrivilege(table_privilege));
 
       // All of the privileges imply the table-level action.
       InsertIfNotPresent(&table_privileges, action);
@@ -414,7 +450,7 @@ TEST_F(SentryAuthzProviderFilterPrivilegesTest, TestTablePrivilegePBParsing) {
       // Grant the privilege to the user.
       TSentryPrivilege column_privilege =
           GetColumnPrivilege(kDb, kTable, column_name, ActionToString(action));
-      ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, column_privilege));
+      ASSERT_OK(AlterRoleGrantPrivilege(column_privilege));
 
       if (SentryAction(action).Implies(SentryAction(SentryAction::SELECT))) {
         InsertIfNotPresent(&scannable_columns, FindOrDie(col_name_to_id, column_name));
@@ -481,17 +517,17 @@ TEST_P(SentryAuthzProviderFilterPrivilegesScopeTest, TestFilterInvalidResponses)
     for (const auto& ip : kInvalidPrivileges) {
       TSentryPrivilege privilege = CreatePrivilege(full_authorizable_, granted_scope,
                                                    SentryAction(action), ip);
-      ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+      ASSERT_OK(AlterRoleGrantPrivilege(privilege));
     }
   }
   for (const auto& requested_scope : { SentryAuthorizableScope::SERVER,
                                        SentryAuthorizableScope::DATABASE,
                                        SentryAuthorizableScope::TABLE }) {
-    SentryPrivilegesBranch privileges;
-    ASSERT_OK(sentry_authz_provider_->GetSentryPrivileges(
-        requested_scope, table_ident, kTestUser, &privileges));
+    SentryPrivilegesBranch privileges_info;
+    ASSERT_OK(sentry_authz_provider_->fetcher_.GetSentryPrivileges(
+        requested_scope, table_ident, kTestUser, &privileges_info));
     // Kudu should ignore all of the invalid privileges.
-    ASSERT_TRUE(privileges.privileges.empty());
+    ASSERT_TRUE(privileges_info.privileges().empty());
   }
 }
 
@@ -504,19 +540,19 @@ TEST_P(SentryAuthzProviderFilterPrivilegesScopeTest, TestFilterValidResponses) {
   for (const auto& action : kAllActions) {
     TSentryPrivilege privilege = CreatePrivilege(full_authorizable_, granted_scope,
                                                  SentryAction(action));
-    ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+    ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   }
   for (const auto& requested_scope : { SentryAuthorizableScope::SERVER,
                                        SentryAuthorizableScope::DATABASE,
                                        SentryAuthorizableScope::TABLE }) {
-    SentryPrivilegesBranch privileges;
-    ASSERT_OK(sentry_authz_provider_->GetSentryPrivileges(
-        requested_scope, table_ident, kTestUser, &privileges));
-    ASSERT_EQ(1, privileges.privileges.size());
-    const auto& authorizable_privileges = privileges.privileges[0];
+    SentryPrivilegesBranch privileges_info;
+    ASSERT_OK(sentry_authz_provider_->fetcher_.GetSentryPrivileges(
+        requested_scope, table_ident, kTestUser, &privileges_info));
+    ASSERT_EQ(1, privileges_info.privileges().size());
+    const auto& authorizable_privileges = *privileges_info.privileges().cbegin();
     ASSERT_EQ(GetParam(), authorizable_privileges.scope)
         << ScopeToString(authorizable_privileges.scope);
-    ASSERT_FALSE(authorizable_privileges.granted_privileges.empty());
+    ASSERT_FALSE(authorizable_privileges.allowed_actions.empty());
   }
 }
 
@@ -526,13 +562,13 @@ INSTANTIATE_TEST_CASE_P(GrantedScopes, SentryAuthzProviderFilterPrivilegesScopeT
                                           SentryAuthorizableScope::TABLE,
                                           SentryAuthorizableScope::COLUMN));
 
-
-
 // Test to create tables requiring ALL ON DATABASE with the grant option. This
 // is parameterized on the ALL scope and OWNER actions, which behave
 // identically.
-class CreateTableAuthorizationTest : public SentryAuthzProviderTest,
-                                     public ::testing::WithParamInterface<string> {};
+class CreateTableAuthorizationTest :
+    public SentryAuthzProviderTest,
+    public ::testing::WithParamInterface<string> {
+};
 
 TEST_P(CreateTableAuthorizationTest, TestAuthorizeCreateTable) {
   // Don't authorize create table on a non-existent user.
@@ -546,15 +582,15 @@ TEST_P(CreateTableAuthorizationTest, TestAuthorizeCreateTable) {
   ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
 
   // Don't authorize create table on a user without required privileges.
-  ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
+  ASSERT_OK(CreateRoleAndAddToGroups());
   TSentryPrivilege privilege = GetDatabasePrivilege("db", "DROP");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   s = sentry_authz_provider_->AuthorizeCreateTable("db.table", kTestUser, kTestUser);
   ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
 
   // Authorize create table on a user with proper privileges.
   privilege = GetDatabasePrivilege("db", "CREATE");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   ASSERT_OK(sentry_authz_provider_->AuthorizeCreateTable("db.table", kTestUser, kTestUser));
 
   // Table creation with a different owner than the user
@@ -567,7 +603,7 @@ TEST_P(CreateTableAuthorizationTest, TestAuthorizeCreateTable) {
   s = sentry_authz_provider_->AuthorizeCreateTable("db.table", kTestUser, "diff-user");
   ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
   privilege = GetDatabasePrivilege("db", all, TSentryGrantOption::ENABLED);
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   ASSERT_OK(sentry_authz_provider_->AuthorizeCreateTable("db.table", kTestUser, "diff-user"));
 }
 
@@ -576,29 +612,29 @@ INSTANTIATE_TEST_CASE_P(AllOrOwner, CreateTableAuthorizationTest,
 
 TEST_F(SentryAuthzProviderTest, TestAuthorizeDropTable) {
   // Don't authorize delete table on a user without required privileges.
-  ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
+  ASSERT_OK(CreateRoleAndAddToGroups());
   TSentryPrivilege privilege = GetDatabasePrivilege("db", "SELECT");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   Status s = sentry_authz_provider_->AuthorizeDropTable("db.table", kTestUser);
   ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
 
   // Authorize delete table on a user with proper privileges.
   privilege = GetDatabasePrivilege("db", "DROP");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   ASSERT_OK(sentry_authz_provider_->AuthorizeDropTable("db.table", kTestUser));
 }
 
 TEST_F(SentryAuthzProviderTest, TestAuthorizeAlterTable) {
   // Don't authorize alter table on a user without required privileges.
-  ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
+  ASSERT_OK(CreateRoleAndAddToGroups());
   TSentryPrivilege db_privilege = GetDatabasePrivilege("db", "SELECT");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, db_privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(db_privilege));
   Status s = sentry_authz_provider_->AuthorizeAlterTable("db.table", "db.table", kTestUser);
   ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
 
   // Authorize alter table without rename on a user with proper privileges.
   db_privilege = GetDatabasePrivilege("db", "ALTER");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, db_privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(db_privilege));
   ASSERT_OK(sentry_authz_provider_->AuthorizeAlterTable("db.table", "db.table", kTestUser));
 
   // Table alteration with rename requires 'ALL ON TABLE <old-table>' and
@@ -608,9 +644,9 @@ TEST_F(SentryAuthzProviderTest, TestAuthorizeAlterTable) {
 
   // Authorize alter table without rename on a user with proper privileges.
   db_privilege = GetDatabasePrivilege("new_db", "CREATE");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, db_privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(db_privilege));
   TSentryPrivilege table_privilege = GetTablePrivilege("db", "table", "ALL");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, table_privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(table_privilege));
   ASSERT_OK(sentry_authz_provider_->AuthorizeAlterTable("db.table",
                                                         "new_db.new_table",
                                                         kTestUser));
@@ -618,38 +654,90 @@ TEST_F(SentryAuthzProviderTest, TestAuthorizeAlterTable) {
 
 TEST_F(SentryAuthzProviderTest, TestAuthorizeGetTableMetadata) {
   // Don't authorize delete table on a user without required privileges.
-  ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
+  ASSERT_OK(CreateRoleAndAddToGroups());
   Status s = sentry_authz_provider_->AuthorizeGetTableMetadata("db.table", kTestUser);
   ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
 
   // Authorize delete table on a user with proper privileges.
   TSentryPrivilege privilege = GetDatabasePrivilege("db", "SELECT");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   ASSERT_OK(sentry_authz_provider_->AuthorizeGetTableMetadata("db.table", kTestUser));
 }
 
-// Checks that the SentryAuthzProvider handles reconnecting to Sentry after a connection failure,
-// or service being too busy.
-TEST_F(SentryAuthzProviderTest, TestReconnect) {
+TEST_F(SentryAuthzProviderTest, TestInvalidAction) {
+  ASSERT_OK(CreateRoleAndAddToGroups());
+  TSentryPrivilege privilege = GetDatabasePrivilege("db", "invalid");
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
+  // User has privileges with invalid action cannot operate on the table.
+  Status s = sentry_authz_provider_->AuthorizeCreateTable("DB.table", kTestUser, kTestUser);
+  ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+}
 
-  // Restart SentryAuthzProvider with configured timeout to reduce the run time of this test.
+TEST_F(SentryAuthzProviderTest, TestInvalidAuthzScope) {
+  ASSERT_OK(CreateRoleAndAddToGroups());
+  TSentryPrivilege privilege = GetDatabasePrivilege("db", "ALL");
+  privilege.__set_privilegeScope("invalid");
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
+  // User has privileges with invalid authorizable scope cannot operate
+  // on the table.
+  Status s = sentry_authz_provider_->AuthorizeCreateTable("DB.table", kTestUser, kTestUser);
+  ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+}
+
+// Ensures Sentry privileges are case insensitive.
+TEST_F(SentryAuthzProviderTest, TestPrivilegeCaseSensitivity) {
+  ASSERT_OK(CreateRoleAndAddToGroups());
+  TSentryPrivilege privilege = GetDatabasePrivilege("db", "create");
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
+  ASSERT_OK(sentry_authz_provider_->AuthorizeCreateTable("DB.table", kTestUser, kTestUser));
+}
+
+// Whether the authz information received from Sentry is cached or not.
+enum class AuthzCaching {
+  Disabled,
+  Enabled,
+};
+
+// Tests to ensure SentryAuthzProvider enforces access restrictions as expected.
+// Parameterized by whether caching is enabled.
+class SentryAuthzProviderReconnectionTest :
+    public SentryAuthzProviderTest,
+    public ::testing::WithParamInterface<AuthzCaching> {
+ public:
+  bool CachingEnabled() const override {
+    return GetParam() == AuthzCaching::Enabled;
+  }
+};
+INSTANTIATE_TEST_CASE_P(
+    , SentryAuthzProviderReconnectionTest,
+    ::testing::Values(AuthzCaching::Disabled, AuthzCaching::Enabled));
+
+// Checks that the SentryAuthzProvider handles reconnecting to Sentry
+// after a connection failure, or service being too busy.
+TEST_P(SentryAuthzProviderReconnectionTest, ConnectionFailureOrTooBusy) {
+  // Restart SentryAuthzProvider with configured timeout to reduce the run time
+  // of this test.
   NO_FATALS(sentry_authz_provider_->Stop());
   FLAGS_sentry_service_rpc_addresses = sentry_->address().ToString();
   FLAGS_sentry_service_send_timeout_seconds = AllowSlowTests() ? 5 : 2;
   FLAGS_sentry_service_recv_timeout_seconds = AllowSlowTests() ? 5 : 2;
-  sentry_authz_provider_.reset(new SentryAuthzProvider());
+  sentry_authz_provider_.reset(new SentryAuthzProvider);
   ASSERT_OK(sentry_authz_provider_->Start());
 
-  ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
+  ASSERT_OK(CreateRoleAndAddToGroups());
   TSentryPrivilege privilege = GetDatabasePrivilege("db", "METADATA");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   ASSERT_OK(sentry_authz_provider_->AuthorizeGetTableMetadata("db.table", kTestUser));
 
   // Shutdown Sentry and try a few operations.
   ASSERT_OK(StopSentry());
 
   Status s = sentry_authz_provider_->AuthorizeDropTable("db.table", kTestUser);
-  EXPECT_TRUE(s.IsNetworkError()) << s.ToString();
+  if (CachingEnabled()) {
+    EXPECT_TRUE(s.IsNotAuthorized()) << s.ToString();
+  } else {
+    EXPECT_TRUE(s.IsNetworkError()) << s.ToString();
+  }
 
   s = sentry_authz_provider_->AuthorizeCreateTable("db.table", kTestUser, "diff-user");
   EXPECT_TRUE(s.IsNetworkError()) << s.ToString();
@@ -662,17 +750,25 @@ TEST_F(SentryAuthzProviderTest, TestReconnect) {
   });
 
   privilege = GetDatabasePrivilege("db", "DROP");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   ASSERT_OK(sentry_authz_provider_->AuthorizeDropTable("db.table", kTestUser));
 
   // Pause Sentry and try a few operations.
   ASSERT_OK(sentry_->Pause());
 
   s = sentry_authz_provider_->AuthorizeDropTable("db.table", kTestUser);
-  EXPECT_TRUE(s.IsTimedOut()) << s.ToString();
+  if (CachingEnabled()) {
+    EXPECT_TRUE(s.ok()) << s.ToString();
+  } else {
+    EXPECT_TRUE(s.IsTimedOut()) << s.ToString();
+  }
 
   s = sentry_authz_provider_->AuthorizeGetTableMetadata("db.table", kTestUser);
-  EXPECT_TRUE(s.IsTimedOut()) << s.ToString();
+  if (CachingEnabled()) {
+    EXPECT_TRUE(s.ok()) << s.ToString();
+  } else {
+    EXPECT_TRUE(s.IsTimedOut()) << s.ToString();
+  }
 
   // Resume Sentry and ensure that the same operations succeed.
   ASSERT_OK(sentry_->Resume());
@@ -682,41 +778,15 @@ TEST_F(SentryAuthzProviderTest, TestReconnect) {
   });
 }
 
-TEST_F(SentryAuthzProviderTest, TestInvalidAction) {
-  ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
-  TSentryPrivilege privilege = GetDatabasePrivilege("db", "invalid");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
-  // User has privileges with invalid action cannot operate on the table.
-  Status s = sentry_authz_provider_->AuthorizeCreateTable("DB.table", kTestUser, kTestUser);
-  ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
-}
-
-TEST_F(SentryAuthzProviderTest, TestInvalidAuthzScope) {
-  ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
-  TSentryPrivilege privilege = GetDatabasePrivilege("db", "ALL");
-  privilege.__set_privilegeScope("invalid");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
-  // User has privileges with invalid authorizable scope cannot operate
-  // on the table.
-  Status s = sentry_authz_provider_->AuthorizeCreateTable("DB.table", kTestUser, kTestUser);
-  ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
-}
-
-// Ensures Sentry privileges are case insensitive.
-TEST_F(SentryAuthzProviderTest, TestPrivilegeCaseSensitivity) {
-  ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
-  TSentryPrivilege privilege = GetDatabasePrivilege("db", "create");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
-  ASSERT_OK(sentry_authz_provider_->AuthorizeCreateTable("DB.table", kTestUser, kTestUser));
-}
-
 // Test to ensure the authorization hierarchy rule of SentryAuthzProvider
 // works as expected.
-class TestAuthzHierarchy : public SentryAuthzProviderTest,
-                           public ::testing::WithParamInterface<SentryAuthorizableScope::Scope> {};
+class TestAuthzHierarchy :
+    public SentryAuthzProviderTest,
+    public ::testing::WithParamInterface<SentryAuthorizableScope::Scope> {
+};
 
 TEST_P(TestAuthzHierarchy, TestAuthorizableScope) {
-  SentryAuthorizableScope::Scope scope = GetParam();
+  const SentryAuthorizableScope::Scope scope = GetParam();
   const string action = "ALL";
   const string db = "database";
   const string tbl = "table";
@@ -759,35 +829,44 @@ TEST_P(TestAuthzHierarchy, TestAuthorizableScope) {
   // Privilege with higher scope on the hierarchy can imply privileges
   // with lower scope on the hierarchy.
   for (const auto& privilege : higher_hierarchy_privs) {
-    ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
-    ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+    ASSERT_OK(CreateRoleAndAddToGroups());
+    ASSERT_OK(AlterRoleGrantPrivilege(privilege));
     ASSERT_OK(sentry_authz_provider_->Authorize(scope, SentryAction::Action::ALL,
                                                 Substitute("$0.$1", db, tbl), kTestUser));
-    ASSERT_OK(DropRole(sentry_client_.get(), kRoleName));
+    ASSERT_OK(DropRole());
   }
 
   // Privilege with lower scope on the hierarchy cannot imply privileges
   // with higher scope on the hierarchy.
   for (const auto& privilege : lower_hierarchy_privs) {
-    ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
-    ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+    ASSERT_OK(CreateRoleAndAddToGroups());
+    ASSERT_OK(AlterRoleGrantPrivilege(privilege));
     Status s = sentry_authz_provider_->Authorize(scope, SentryAction::Action::ALL,
                                                  Substitute("$0.$1", db, tbl), kTestUser);
     ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
-    ASSERT_OK(DropRole(sentry_client_.get(), kRoleName));
+    ASSERT_OK(DropRole());
   }
 }
 
 INSTANTIATE_TEST_CASE_P(AuthzCombinations, TestAuthzHierarchy,
-                       // Scope::COLUMN is excluded since column scope for table
-                       // authorizable doesn't make sense.
-                       ::testing::Values(SentryAuthorizableScope::Scope::SERVER,
-                                         SentryAuthorizableScope::Scope::DATABASE,
-                                         SentryAuthorizableScope::Scope::TABLE));
+    // Scope::COLUMN is excluded since column scope for table
+    // authorizable doesn't make sense.
+    ::testing::Values(SentryAuthorizableScope::Scope::SERVER,
+                      SentryAuthorizableScope::Scope::DATABASE,
+                      SentryAuthorizableScope::Scope::TABLE));
 
 // Test to verify the functionality of metrics in HA Sentry client used in
 // SentryAuthzProvider to communicate with Sentry.
-TEST_F(SentryAuthzProviderTest, TestSentryClientMetrics) {
+class TestSentryClientMetrics : public SentryAuthzProviderTest {
+ public:
+  bool CachingEnabled() const override {
+    // For simplicity, scenarios of this test doesn't use caching. The scenarios
+    // track updates of HaClient metrics upon issuing RPCs to Sentry.
+    return false;
+  }
+};
+
+TEST_F(TestSentryClientMetrics, Basic) {
   ASSERT_EQ(0, GetTasksSuccessful());
   ASSERT_EQ(0, GetTasksFailedFatal());
   ASSERT_EQ(0, GetTasksFailedNonFatal());
@@ -845,9 +924,9 @@ TEST_F(SentryAuthzProviderTest, TestSentryClientMetrics) {
   sentry_authz_provider_.reset(new SentryAuthzProvider(metric_entity_));
   ASSERT_OK(sentry_authz_provider_->Start());
 
-  ASSERT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kRoleName, kUserGroup));
+  ASSERT_OK(CreateRoleAndAddToGroups());
   const auto privilege = GetDatabasePrivilege("db", "create");
-  ASSERT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kRoleName, privilege));
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
 
   // Pause Sentry and try to send an RPC, expecting it to time out.
   ASSERT_OK(sentry_->Pause());
@@ -863,6 +942,126 @@ TEST_F(SentryAuthzProviderTest, TestSentryClientMetrics) {
   ASSERT_LE(5, hist->histogram()->TotalCount());
   ASSERT_LT(2000000, hist->histogram()->TotalSum());
 }
+
+enum class ThreadsNumPolicy {
+  CloseToCPUsNum,
+  MoreThanCPUsNum,
+};
+
+// Test to ensure concurrent requests to Sentry with the same set of parameters
+// are accumulated by SentryAuthzProvider, so in total there is less RPC
+// requests sent to Sentry than the total number of concurrent requests to
+// the provider (ideally, there should be just single request to Sentry).
+class TestConcurrentRequests :
+    public SentryAuthzProviderTest,
+    public ::testing::WithParamInterface<std::tuple<ThreadsNumPolicy,
+                                                    AuthzCaching>> {
+ public:
+  bool CachingEnabled() const override {
+    return std::get<1>(GetParam()) == AuthzCaching::Enabled;
+  }
+};
+
+// Verify how multiple concurrent requests are handled when Sentry responds
+// with success.
+TEST_P(TestConcurrentRequests, SuccessResponses) {
+  const auto kNumRequestThreads =
+      std::get<0>(GetParam()) == ThreadsNumPolicy::CloseToCPUsNum
+      ? std::min(base::NumCPUs(), 4) : base::NumCPUs() * 3;
+
+  ASSERT_OK(CreateRoleAndAddToGroups());
+  const auto privilege = GetDatabasePrivilege("db", "METADATA");
+  ASSERT_OK(AlterRoleGrantPrivilege(privilege));
+
+  Barrier barrier(kNumRequestThreads);
+
+  vector<thread> threads;
+  vector<Status> thread_status(kNumRequestThreads);
+  for (auto i = 0; i < kNumRequestThreads; ++i) {
+    const auto thread_idx = i;
+    threads.emplace_back([&, thread_idx] () {
+      barrier.Wait();
+      thread_status[thread_idx] = sentry_authz_provider_->
+          AuthorizeGetTableMetadata("db.table", kTestUser);
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (const auto& s : thread_status) {
+    ASSERT_TRUE(s.ok()) << s.ToString();
+  }
+
+  const auto sentry_rpcs_num = GetTasksSuccessful();
+  // Ideally all requests should result in a single RPC sent to Sentry, but some
+  // scheduling anomalies might occur so even the current threshold of maximum
+  // (kNumRequestThreads / 2) of actual RPC requests to Sentry might be reached
+  // and the assertion below would be triggered. For example, the OS scheduler
+  // might de-schedule the majority of the threads spawned above for a time
+  // greater than it takes to complete an RPC to Sentry, and the de-scheduling
+  // might happen exactly prior the point when the 'earlier-running' thread
+  // added itself into a queue record designed to track concurrent requests.
+  // Essentially, that's about 'freezing' all incoming requests just before the
+  // queueing point, and then awakening them one by one, so no more than one
+  // thread is registered in the queue at any time.
+  //
+  // However, those anomalies are expected to be exceptionally rare. In fact,
+  // (kNumRequestThreads / 2) seems to be a good enough threshold even for TSAN
+  // builds while running the test scenario with --stress_cpu_threads=16.
+  ASSERT_GE(kNumRequestThreads / 2, sentry_rpcs_num);
+
+  // Issue the same request once more. If caching is enabled, there should be
+  // no additional RPCs sent to Sentry.
+  ASSERT_OK(sentry_authz_provider_->AuthorizeGetTableMetadata(
+      "db.table", kTestUser));
+  ASSERT_EQ(CachingEnabled() ? sentry_rpcs_num : sentry_rpcs_num + 1,
+            GetTasksSuccessful());
+}
+
+// Verify how multiple concurrent requests are handled when Sentry responds
+// with errors.
+TEST_P(TestConcurrentRequests, FailureResponses) {
+  const auto kNumRequestThreads =
+      std::get<0>(GetParam()) == ThreadsNumPolicy::CloseToCPUsNum
+      ? std::min(base::NumCPUs(), 4) : base::NumCPUs() * 3;
+
+  Barrier barrier(kNumRequestThreads);
+
+  vector<thread> threads;
+  vector<Status> thread_status(kNumRequestThreads);
+  for (auto i = 0; i < kNumRequestThreads; ++i) {
+    const auto thread_idx = i;
+    threads.emplace_back([&, thread_idx] () {
+      barrier.Wait();
+      thread_status[thread_idx] = sentry_authz_provider_->
+          AuthorizeCreateTable("db.table", "nobody", "nobody");
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (const auto& s : thread_status) {
+    ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+  }
+  ASSERT_EQ(0, GetTasksSuccessful());
+  ASSERT_EQ(0, GetTasksFailedNonFatal());
+  const auto sentry_rpcs_num = GetTasksFailedFatal();
+  // See the TestConcurrentRequests.SuccessResponses scenario above for details
+  // on setting the threshold for 'sentry_rpcs_num'.
+  ASSERT_GE(kNumRequestThreads / 2, sentry_rpcs_num);
+
+  // The cache does not store negative responses/errors, so in both caching and
+  // non-caching case there should be one extra RPC sent to Sentry.
+  auto s = sentry_authz_provider_->AuthorizeCreateTable(
+      "db.table", "nobody", "nobody");
+  ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+  ASSERT_EQ(sentry_rpcs_num + 1, GetTasksFailedFatal());
+}
+INSTANTIATE_TEST_CASE_P(QueueingConcurrentRequests, TestConcurrentRequests,
+    ::testing::Combine(::testing::Values(ThreadsNumPolicy::CloseToCPUsNum,
+                                         ThreadsNumPolicy::MoreThanCPUsNum),
+                       ::testing::Values(AuthzCaching::Disabled,
+                                         AuthzCaching::Enabled)));
 
 } // namespace master
 } // namespace kudu

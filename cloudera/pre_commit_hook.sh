@@ -58,12 +58,10 @@ export DIST_TEST_MASTER=http://dist-test.cloudera.org/
 export DIST_TEST_USER='kudu-jobs'
 export DIST_TEST_PASSWORD='Beo3shei'
 
-export KUDU_FLAKY_TEST_ATTEMPS=3
-export BUILD_JAVA=1
-export BUILD_PYTHON=1
+export KUDU_FLAKY_TEST_ATTEMPTS=3
+export TEST_RESULT_SERVER=dist-test.cloudera.org:8080
 
-export JAVA_HOME=/usr/lib/jvm/java-1.8.0-openjdk-amd64
-export JAVA8_HOME=$JAVA_HOME
-export PATH=$JAVA_HOME/bin:$ROOT_DIR/isolate-bin:$PATH
+export JAVA8_HOME=/usr/lib/jvm/java-1.8.0-openjdk-amd64
+export PATH=$ROOT_DIR/isolate-bin:$PATH
 
 (cd "$ROOT_DIR" && build-support/jenkins/build-and-test.sh)

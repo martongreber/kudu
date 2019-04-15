@@ -16,18 +16,29 @@
 // under the License.
 #pragma once
 
-#include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "kudu/common/iterator.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
 class ColumnPredicate;
-class ColumnwiseIterator;
-class RowwiseIterator;
 class ScanSpec;
+
+// Encapsulates a rowwise-iterator along with the (encoded) lower and upper
+// bounds for the rowset that the iterator belongs to.
+//
+// The bounds are optional because some rowsets (e.g. MRS) don't have them.
+struct IterWithBounds {
+  std::unique_ptr<RowwiseIterator> iter;
+  boost::optional<std::pair<std::string, std::string>> encoded_bounds;
+};
 
 // Options struct for the MergeIterator.
 struct MergeIteratorOptions {
@@ -45,13 +56,12 @@ struct MergeIteratorOptions {
 // The iterators must have matching schemas and should not yet be initialized.
 std::unique_ptr<RowwiseIterator> NewMergeIterator(
     MergeIteratorOptions opts,
-    std::vector<std::unique_ptr<RowwiseIterator>> iters);
+    std::vector<IterWithBounds> iters);
 
 // Constructs a UnionIterator of the given iterators.
 //
 // The iterators must have matching schemas and should not yet be initialized.
-std::unique_ptr<RowwiseIterator> NewUnionIterator(
-    std::vector<std::unique_ptr<RowwiseIterator>> iters);
+std::unique_ptr<RowwiseIterator> NewUnionIterator(std::vector<IterWithBounds> iters);
 
 // Constructs a MaterializingIterator of the given ColumnwiseIterator.
 std::unique_ptr<RowwiseIterator> NewMaterializingIterator(
@@ -72,12 +82,6 @@ Status InitAndMaybeWrap(std::unique_ptr<RowwiseIterator>* base_iter,
 //
 // Only for use by tests.
 const std::vector<ColumnPredicate>& GetIteratorPredicatesForTests(
-    const std::unique_ptr<RowwiseIterator>& iter);
-
-// Gets the number of comparisons performed by a MergeIterator.
-//
-// Only for use by tests.
-int64_t GetMergeIteratorNumComparisonsForTests(
     const std::unique_ptr<RowwiseIterator>& iter);
 
 } // namespace kudu

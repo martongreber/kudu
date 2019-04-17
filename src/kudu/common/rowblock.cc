@@ -19,6 +19,7 @@
 #include <glog/logging.h>
 
 #include "kudu/gutil/bits.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/bitmap.h"
 
 namespace kudu {
@@ -29,19 +30,19 @@ SelectionVector::SelectionVector(size_t row_capacity)
     n_bytes_(bytes_capacity_),
     bitmap_(new uint8_t[n_bytes_]) {
   CHECK_GT(n_bytes_, 0);
+  PadExtraBitsWithZeroes();
 }
 
 void SelectionVector::Resize(size_t n_rows) {
+  if (PREDICT_FALSE(n_rows == n_rows_)) {
+    return;
+  }
+
   size_t new_bytes = BitmapSize(n_rows);
   CHECK_LE(new_bytes, bytes_capacity_);
   n_rows_ = n_rows;
   n_bytes_ = new_bytes;
-  // Pad with zeroes up to the next byte in order to give CountSelected()
-  // and AnySelected() the assumption that the size is an even byte
-  size_t bits_in_last_byte = n_rows & 7;
-  if (bits_in_last_byte > 0) {
-    BitmapChangeBits(&bitmap_[0], n_rows_, 8 - bits_in_last_byte, 0);
-  }
+  PadExtraBitsWithZeroes();
 }
 
 void SelectionVector::ClearToSelectAtMost(size_t max_rows) {
@@ -143,10 +144,14 @@ RowBlock::~RowBlock() {
   }
 }
 
-void RowBlock::Resize(size_t new_size) {
-  CHECK_LE(new_size, row_capacity_);
-  nrows_ = new_size;
-  sel_vec_.Resize(new_size);
+void RowBlock::Resize(size_t n_rows) {
+  if (PREDICT_FALSE(n_rows == nrows_)) {
+    return;
+  }
+
+  CHECK_LE(n_rows, row_capacity_);
+  nrows_ = n_rows;
+  sel_vec_.Resize(n_rows);
 }
 
 } // namespace kudu

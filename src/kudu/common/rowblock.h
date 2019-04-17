@@ -31,6 +31,7 @@
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/util/bitmap.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
@@ -110,15 +111,8 @@ class SelectionVector {
 
   // Set all bits in the bitmap to 1
   void SetAllTrue() {
-    // Initially all rows should be selected.
     memset(&bitmap_[0], 0xff, n_bytes_);
-    // the last byte in the bitmap may have a few extra bits - need to
-    // clear those
-
-    int trailer_bits = 8 - (n_rows_ % 8);
-    if (trailer_bits != 8) {
-      bitmap_[n_bytes_ - 1] >>= trailer_bits;
-    }
+    PadExtraBitsWithZeroes();
   }
 
   // Set all bits in the bitmap to 0
@@ -128,7 +122,46 @@ class SelectionVector {
 
   size_t nrows() const { return n_rows_; }
 
+  // Copies a range of bits between two SelectionVectors.
+  //
+  // The extent of the range is designated by 'src_row_off' and 'num_rows'. It
+  // is copied to 'dst' at 'dst_row_off'.
+  //
+  // Note: 'dst' will be resized if the copy causes it to grow (though this is
+  // just a "logical" resize; no reallocation takes place).
+  void CopyTo(SelectionVector* dst, size_t src_row_off,
+              size_t dst_row_off, size_t num_rows) const {
+    DCHECK_GE(n_rows_, src_row_off + num_rows);
+
+    size_t new_num_rows = dst_row_off + num_rows;
+    if (new_num_rows > dst->nrows()) {
+      // This will crash if 'dst' lacks adequate capacity.
+      dst->Resize(new_num_rows);
+    }
+
+    BitmapCopy(dst->mutable_bitmap(), dst_row_off,
+               bitmap_.get(), src_row_off, num_rows);
+  }
+
  private:
+
+  // Pads any non-byte-aligned bits at the end of the SelectionVector with zeroes.
+  //
+  // To improve performance, CountSelected() and AnySelected() evaluate the
+  // SelectionVector's bitmap in terms of bytes. As such, they consider all of
+  // the trailing bits, even if the bitmap's bit length is not byte-aligned and
+  // some trailing bits aren't part of the bitmap.
+  //
+  // To address this without sacrificing performance, we need to zero out all
+  // trailing bits at construction time, or after any operation that sets all
+  // bytes in bulk.
+  void PadExtraBitsWithZeroes() {
+    size_t bits_in_last_byte = n_rows_ & 7;
+    if (bits_in_last_byte > 0) {
+      BitmapChangeBits(&bitmap_[0], n_rows_, 8 - bits_in_last_byte, false);
+    }
+  }
+
   // The number of allocated bytes in bitmap_
   size_t bytes_capacity_;
 
@@ -275,6 +308,35 @@ class RowBlock {
 
   const SelectionVector* selection_vector() const {
     return &sel_vec_;
+  }
+
+  // Copies a range of rows between two RowBlocks.
+  //
+  // The extent of the range is designated by 'src_row_off' and 'num_rows'. It
+  // is copied to 'dst' at 'dst_row_off'.
+  //
+  // Note: 'dst' will be resized if the copy causes it to grow (though this is
+  // just a "logical" resize; no reallocation takes place).
+  Status CopyTo(RowBlock* dst, size_t src_row_off,
+                size_t dst_row_off, size_t num_rows) const {
+    DCHECK_SCHEMA_EQ(*schema_, *dst->schema());
+    DCHECK_GE(nrows_, src_row_off + num_rows);
+
+    size_t new_num_rows = dst_row_off + num_rows;
+    if (new_num_rows > dst->nrows()) {
+      // This will crash if 'dst' lacks adequate capacity.
+      dst->Resize(new_num_rows);
+    }
+
+    for (size_t col_idx = 0; col_idx < schema_->num_columns(); col_idx++) {
+      ColumnBlock src_cb(column_block(col_idx));
+      ColumnBlock dst_cb(dst->column_block(col_idx));
+      RETURN_NOT_OK(src_cb.CopyTo(sel_vec_, &dst_cb,
+                                  src_row_off, dst_row_off, num_rows));
+    }
+
+    sel_vec_.CopyTo(&dst->sel_vec_, src_row_off, dst_row_off, num_rows);
+    return Status::OK();
   }
 
  private:

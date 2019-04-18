@@ -234,3 +234,81 @@ HADOOP_SOURCE=$TP_SOURCE_DIR/$HADOOP_NAME
 SENTRY_VERSION=505b42e81a9d85c4ebe8db3f48ad7a6e824a5db5
 SENTRY_NAME=apache-sentry-$SENTRY_VERSION-bin
 SENTRY_SOURCE=$TP_SOURCE_DIR/$SENTRY_NAME
+
+# If opting to use the CDH ecosystem, pull the Hadoop ecosystem components
+# (e.g. Hadoop, Hive, Sentry) from the most recently published
+# 'impala-minicluster-tarballs' package.
+if [[ "$KUDU_USE_CDH_ECOSYSTEM" -ne 0 ]]; then
+  # This URL corresponds to Cloudera's CDH distribution.
+  CAULDRON_URL_PREFIX='http://cloudera-build-us-west-1.vpc.cloudera.com/s3/build'
+
+  # Get the CDH version from 'version.txt' and use it to query BuildDB for the
+  # latest Global Build Number (GBN) of that version.
+  VERSION_FILE="$TP_DIR/../version.txt"
+  if [[ -f $VERSION_FILE ]]; then
+    # Transform the full version number from version.txt into a CDH version
+    # useable by BuildDb queries. E.g.:
+    #   1.8.0-cdh6.x-SNAPSHOT --> 6.x
+    #   1.6.0-cdh6.0.x-SNAPSHOT --> 6.0.x
+    FULL_VERSION=$(cat $VERSION_FILE | cut -d'-' -f2)
+    if [[ $FULL_VERSION == cdh* ]]; then
+      CDH_VERSION=${FULL_VERSION#"cdh"}
+    fi
+  fi
+  if [[ -z "$CDH_VERSION" ]]; then
+    echo "Error: failed to fetch CDH version number"
+    exit 1
+  fi
+
+  # Fetch the latest GBN for given version.
+  BUILDDB_QUERY='http://builddb.infra.cloudera.com/query?product=cdh;tag=impala-minicluster-tarballs,official;version='"${CDH_VERSION}"
+  KUDU_CDH_GBN=$(curl -L --fail --retry 3 -s -S "${BUILDDB_QUERY}")
+  if [[ -z "$KUDU_CDH_GBN" ]]; then
+    echo "Error: failed to fetch CDH global build number"
+    exit 1
+  fi
+
+  CDH_TARBALL_URL="${CAULDRON_URL_PREFIX}/${KUDU_CDH_GBN}/impala-minicluster-tarballs"
+  TARBALL_FILES=$(curl -L --fail --retry 3 -s -S "${CDH_TARBALL_URL}/index.txt")
+  # Pull out the artifacts of interest from the list of tarballs, e.g.:
+  #   hadoop-3.0.0-cdh6.x-1041528.tar.gz
+  #   hbase-2.1.0-cdh6.x-1041528.tar.gz
+  #   hive-2.1.1-cdh6.x-1041528.tar.gz
+  #   kudu-1.10.0-cdh6.x-1041528-debian8.tar.gz
+  #   kudu-1.10.0-cdh6.x-1041528-redhat6.tar.gz
+  #   kudu-1.10.0-cdh6.x-1041528-redhat7.tar.gz
+  #   kudu-1.10.0-cdh6.x-1041528-sles12.tar.gz
+  #   kudu-1.10.0-cdh6.x-1041528-ubuntu1604.tar.gz
+  #   kudu-1.10.0-cdh6.x-1041528-ubuntu1804.tar.gz
+  #   sentry-2.1.0-cdh6.x-1041528.tar.gz
+  while read line; do
+    if [[ $line == hive* ]]; then
+      HIVE_NUMBER=$(echo $line | cut -d'-' -f2)
+    fi
+    if [[ $line == sentry* ]]; then
+      SENTRY_NUMBER=$(echo $line | cut -d'-' -f2)
+    fi
+    if [[ $line == hadoop* ]]; then
+      HADOOP_NUMBER=$(echo $line | cut -d'-' -f2)
+    fi
+  done <<< "$TARBALL_FILES"
+
+  if [[ -z "$HIVE_NUMBER" ]] || [[ -z "$SENTRY_NUMBER" ]] || [[ -z "$HADOOP_NUMBER" ]]; then
+    echo "Error: failed to fetch version numbers"
+    echo "Hive: ${HIVE_NUMBER}, Sentry: ${SENTRY_NUMBER}, Hadoop: ${HADOOP_NUMBER}"
+    echo "Files list: ${TARBALL_FILES}"
+    exit 1
+  fi
+
+  HIVE_VERSION="${HIVE_NUMBER}-cdh${CDH_VERSION}"
+  HIVE_NAME="hive-${HIVE_VERSION}-${KUDU_CDH_GBN}"
+  HIVE_SOURCE="$TP_SOURCE_DIR/$HIVE_NAME"
+
+  HADOOP_VERSION="${HADOOP_NUMBER}-cdh${CDH_VERSION}"
+  HADOOP_NAME="hadoop-${HADOOP_VERSION}-${KUDU_CDH_GBN}"
+  HADOOP_SOURCE="$TP_SOURCE_DIR/$HADOOP_NAME"
+
+  SENTRY_VERSION="${SENTRY_NUMBER}-cdh${CDH_VERSION}"
+  SENTRY_NAME="sentry-${SENTRY_VERSION}-${KUDU_CDH_GBN}"
+  SENTRY_SOURCE="$TP_SOURCE_DIR/$SENTRY_NAME"
+fi

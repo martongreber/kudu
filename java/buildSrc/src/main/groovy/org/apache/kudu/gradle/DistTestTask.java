@@ -74,8 +74,7 @@ public class DistTestTask extends DefaultTask {
   private boolean collectTmpDir = false;
 
   /**
-   * Called by the build file to add test tasks to be considered for
-   * dist-tests.
+   * Called by build.gradle to add test tasks to be considered for dist-tests.
    */
   public void addTestTask(Test t) {
     testTasks.add(t);
@@ -85,7 +84,7 @@ public class DistTestTask extends DefaultTask {
           description = "Sets test class to be included, '*' is supported.")
   public DistTestTask setClassPattern(List<String> classPattern) {
     for (Test t : testTasks) {
-      // TODO: this is currently requiring a glob like **/*Foo* instead of just *Foo*
+      // TODO: this requires a glob like **/*Foo* instead of just *Foo*
       t.setIncludes(classPattern);
     }
     return this;
@@ -110,7 +109,7 @@ public class DistTestTask extends DefaultTask {
 
   @InputFiles
   public FileCollection getInputClasses() {
-    FileCollection fc = getProject().files(); // Create and empty FileCollection.
+    FileCollection fc = getProject().files(); // Create an empty FileCollection.
     for (Test t : testTasks) {
       fc = fc.plus(t.getCandidateClassFiles());
     }
@@ -149,7 +148,7 @@ public class DistTestTask extends DefaultTask {
    *
    * Note: This currently fails OSX because dump_base_deps use ldd.
    */
-  List<String> getBaseDeps() throws IOException {
+  private List<String> getBaseDeps() throws IOException {
     Process proc = new ProcessBuilder(distTestBin,
         "internal",
         "dump_base_deps")
@@ -160,6 +159,35 @@ public class DistTestTask extends DefaultTask {
       return new Gson().fromJson(new InputStreamReader(is, UTF_8),
           new TypeToken<List<String>>(){}.getType());
     }
+  }
+
+  /**
+   * @return all test result reporting environment variables and their values,
+   *         in a format suitable for consumption by run_dist_test.py.
+   */
+  private List<String> getTestResultReportingEnvironmentVariables() {
+    ImmutableList.Builder<String> args = new ImmutableList.Builder<>();
+    String enabled = System.getenv("KUDU_REPORT_TEST_RESULTS");
+    if (enabled != null && Integer.parseInt(enabled) > 0) {
+      for (String ev : ImmutableList.of("KUDU_REPORT_TEST_RESULTS",
+                                        "BUILD_CONFIG",
+                                        "BUILD_TAG",
+                                        "GIT_REVISION",
+                                        "TEST_RESULT_SERVER")) {
+        String evValue = System.getenv(ev);
+        if (evValue == null || evValue.isEmpty()) {
+          if (ev.equals("TEST_RESULT_SERVER")) {
+            // This one is optional.
+            continue;
+          }
+          throw new RuntimeException(
+              String.format("Required env variable %s is missing", ev));
+        }
+        args.add("-e");
+        args.add(String.format("%s=%s", ev, evValue));
+      }
+    }
+    return args.build();
   }
 
   private String genIsolate(Path isolateFileDir, Test test, String testClass,
@@ -200,8 +228,9 @@ public class DistTestTask extends DefaultTask {
     if (collectTmpDir) {
       cmd.add("--collect-tmpdir");
     }
-    cmd.add("--test-language=java",
-            "--",
+    cmd.add("--test-language=java");
+    cmd.addAll(getTestResultReportingEnvironmentVariables());
+    cmd.add("--",
             "-ea",
             "-cp",
             Joiner.on(":").join(classpath));

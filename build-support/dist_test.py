@@ -59,6 +59,9 @@ MAX_TASKS_PER_JOB=10000
 # of retries, so we have to subtract 1.
 FLAKY_TEST_RETRIES = int(os.environ.get('KUDU_FLAKY_TEST_ATTEMPTS', 1)) - 1
 
+# Whether to only run flaky tests or to run all tests.
+RUN_FLAKY_ONLY = int(os.environ.get('RUN_FLAKY_ONLY', 0))
+
 # Whether to retry all failed C++ tests, rather than just known flaky tests.
 # Since Java flaky tests are not reported by the test server, Java tests are
 # always retried, regardless of this value.
@@ -83,6 +86,7 @@ TEST_SHARD_RE = re.compile("\.\d+$")
 
 DEPS_FOR_ALL = \
     ["build-support/stacktrace_addr2line.pl",
+     "build-support/report-test.sh",
      "build-support/run-test.sh",
      "build-support/run_dist_test.py",
      "build-support/java-home-candidates.txt",
@@ -273,6 +277,20 @@ def copy_system_library(lib):
     shutil.copy2(rel_to_abs(lib), dst)
   return dst
 
+def forward_env_var(command_list, var_name, is_required=True):
+  """
+  Extends 'command_list' with the name and value of the environment variable
+  given by 'var_name'.
+
+  Does nothing if the environment variable isn't set or is empty, unless
+  'is_required' is True, in which case an exception is raised.
+  """
+  if not var_name in os.environ or not os.environ.get(var_name):
+    if is_required:
+      raise Exception("required env variable %s is missing" % (var_name,))
+    return
+  command_list.extend(["-e", "%s=%s" % (var_name, os.environ.get(var_name))])
+
 def create_archive_input(staging, execution, dep_extractor,
                          collect_tmpdir=False):
   """
@@ -323,6 +341,15 @@ def create_archive_input(staging, execution, dep_extractor,
       # underlying test timeout are coordinated.
       continue
     command.extend(['-e', '%s=%s' % (k, v)])
+
+  # If test result reporting was requested, forward all relevant environment
+  # variables into the test process so as to enable reporting.
+  if os.environ.get('KUDU_REPORT_TEST_RESULTS', 0):
+    forward_env_var(command, 'KUDU_REPORT_TEST_RESULTS')
+    forward_env_var(command, 'BUILD_CONFIG')
+    forward_env_var(command, 'BUILD_TAG')
+    forward_env_var(command, 'GIT_REVISION')
+    forward_env_var(command, 'TEST_RESULT_SERVER', is_required=False)
 
   if collect_tmpdir:
     command += ["--collect-tmpdir"]
@@ -454,9 +481,16 @@ def run_tests(parser, options):
   Gets all of the test command lines from 'ctest', isolates them,
   creates a task list, and submits the tasks to the testing service.
   """
-  executions = get_test_executions(options.tests_regex)
+  flakies = get_flakies()
+  if RUN_FLAKY_ONLY:
+    if options.tests_regex:
+      raise Exception("Cannot use RUN_FLAKY_ONLY with --tests-regex")
+    tests_regex = "|".join(["^" + re.escape(f) for f in flakies])
+  else:
+    tests_regex = options.tests_regex
+  executions = get_test_executions(tests_regex)
   if not executions:
-    raise Exception("No matching tests found for pattern %s" % options.tests_regex)
+    raise Exception("No matching tests found for pattern %s" % tests_regex)
   if options.extra_args:
     if options.extra_args[0] == '--':
       del options.extra_args[0]
@@ -470,7 +504,7 @@ def run_tests(parser, options):
   run_isolate(staging)
   retry_all = RETRY_ALL_TESTS > 0
   create_task_json(staging,
-                   flaky_test_set=get_flakies(),
+                   flaky_test_set=flakies,
                    replicate_tasks=options.num_instances,
                    retry_all_tests=retry_all)
   submit_tasks(staging, options)
@@ -567,13 +601,21 @@ def get_gradle_cmd_line(options):
   return cmd
 
 def run_java_tests(parser, options):
-  subprocess.check_call(get_gradle_cmd_line(options),
-                        cwd=rel_to_abs("java"))
+  flakies = get_flakies()
+  cmd = get_gradle_cmd_line(options)
+  if RUN_FLAKY_ONLY:
+    for f in flakies:
+      # As per the Gradle docs[1], test classes are included by filename, so we
+      # need to convert the class names into file paths.
+      #
+      # 1. https://docs.gradle.org/current/javadoc/org/gradle/api/tasks/testing/Test.html
+      cmd.extend([ "--classes", "%s.class" % f.replace(".", "/") ])
+  subprocess.check_call(cmd, cwd=rel_to_abs("java"))
   staging = StagingDir(rel_to_abs("java/build/dist-test"))
   run_isolate(staging)
   retry_all = RETRY_ALL_TESTS > 0
   create_task_json(staging,
-                   flaky_test_set=get_flakies(),
+                   flaky_test_set=flakies,
                    replicate_tasks=1,
                    retry_all_tests=retry_all)
   submit_tasks(staging, options)
@@ -585,7 +627,9 @@ def loop_java_test(parser, options):
   if options.num_instances < 1:
     parser.error("--num-instances must be >= 1")
   cmd = get_gradle_cmd_line(options)
-  cmd.extend([ "--classes", "**/%s" % options.pattern ])
+  # Test classes are matched by filename, so unless we convert dots into forward
+  # slashes, package name prefixes will never match anything.
+  cmd.extend([ "--classes", "**/%s.class" % options.pattern.replace(".", "/") ])
   subprocess.check_call(cmd, cwd=rel_to_abs("java"))
   staging = StagingDir(rel_to_abs("java/build/dist-test"))
   run_isolate(staging)

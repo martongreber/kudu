@@ -16,8 +16,7 @@
 // under the License.
 package org.apache.kudu.backup
 
-import java.nio.file.Path
-
+import org.apache.hadoop.fs.Path
 import org.apache.kudu.backup.Backup.TableMetadataPB
 import org.apache.yetus.audience.InterfaceAudience
 import org.apache.yetus.audience.InterfaceStability
@@ -166,7 +165,6 @@ case class BackupNode(path: Path, metadata: TableMetadataPB) {
    */
   def weight: Int = {
     // Full backups have a weight of 0 and partial backups have a weight of 1.
-    // TODO: Use the size of a partial backup to contribute to weight.
     if (metadata.getFromMs == 0) 0 else 1
   }
 }

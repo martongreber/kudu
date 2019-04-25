@@ -98,6 +98,15 @@ else
   done
 fi
 
+# If using the CDH ecosystem, we want to always pull the latest bits; make sure
+# the proceeding build reflects that.
+if [[ "$KUDU_USE_CDH_ECOSYSTEM" -ne 0 ]]; then
+  GROUP="common"
+  if [[ $NEEDS_BUILD != *"$GROUP"* ]]; then
+    NEEDS_BUILD="$NEEDS_BUILD $GROUP"
+  fi
+fi
+
 if [ -z "$NEEDS_BUILD" ]; then
   echo "Not rebuilding thirdparty. No changes since last build."
   exit 0

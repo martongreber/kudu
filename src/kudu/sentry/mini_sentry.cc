@@ -177,6 +177,10 @@ Status MiniSentry::Resume() {
 
 Status MiniSentry::CreateSentryConfigs(const string& tmp_dir) const {
 
+  // - sentry.db.explicit.grants.permitted
+  //    List of Sentry privileges that are permitted to be granted by Sentry DB
+  //    clients.
+  //
   // - sentry.store.jdbc.url
   // - sentry.store.jdbc.password
   //     Configures Sentry to use a local in-process Derby instance with a dummy
@@ -223,6 +227,11 @@ Status MiniSentry::CreateSentryConfigs(const string& tmp_dir) const {
   //    master's flag 'server_name'.
   static const string kFileTemplate = R"(
 <configuration>
+
+  <property>
+    <name>sentry.db.explicit.grants.permitted</name>
+    <value>CREATE,REFRESH,SELECT,INSERT,ALL,*,METADATA,ALTER,DROP,UPDATE,DELETE,OWNER</value>
+  </property>
 
   <property>
     <name>sentry.service.security.mode</name>

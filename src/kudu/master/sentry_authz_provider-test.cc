@@ -365,8 +365,9 @@ class SentryAuthzProviderFilterPrivilegesTest : public SentryAuthzProviderTest {
     DCHECK(!full_authorizable.server.empty() && !full_authorizable.db.empty() &&
            !full_authorizable.table.empty() && !full_authorizable.column.empty());
     TSentryPrivilege privilege;
+    // REFRESH is not a valid Kudu privilege.
     privilege.__set_action(invalid_privilege == InvalidPrivilege::INCORRECT_ACTION ?
-                           "foobar" : ActionToString(action.action()));
+                           "refresh" : ActionToString(action.action()));
     privilege.__set_privilegeScope(invalid_privilege == InvalidPrivilege::INCORRECT_SCOPE ?
                                    "foobar" : ScopeToString(scope.scope()));
 
@@ -701,7 +702,8 @@ TEST_F(SentryAuthzProviderTest, TestAuthorizeGetTableMetadata) {
 
 TEST_F(SentryAuthzProviderTest, TestInvalidAction) {
   ASSERT_OK(CreateRoleAndAddToGroups());
-  TSentryPrivilege privilege = GetDatabasePrivilege("db", "invalid");
+  // REFRESH is not a valid Kudu privilege.
+  TSentryPrivilege privilege = GetDatabasePrivilege("db", "refresh");
   ASSERT_OK(AlterRoleGrantPrivilege(privilege));
   // User has privileges with invalid action cannot operate on the table.
   Status s = sentry_authz_provider_->AuthorizeCreateTable("DB.table", kTestUser, kTestUser);

@@ -48,6 +48,7 @@
 #include "kudu/thrift/ha_client_metrics.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/flag_validators.h"
 #include "kudu/util/malloc.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -128,7 +129,23 @@ DEFINE_uint32(sentry_privileges_cache_ttl_factor, 10,
               "defines the TTL of entries in the authz cache.");
 TAG_FLAG(sentry_privileges_cache_ttl_factor, advanced);
 
+DEFINE_uint32(sentry_privileges_cache_scrubbing_period_sec, 20,
+              "The interval to run the periodic task that scrubs the "
+              "privileges cache of expired entries. A value of 0 means expired "
+              "entries are only evicted when inserting new entries into a full "
+              "cache.");
+TAG_FLAG(sentry_privileges_cache_scrubbing_period_sec, advanced);
+
+DEFINE_uint32(sentry_privileges_cache_max_scrubbed_entries_per_pass, 32,
+              "Maximum number of entries in the privileges cache to process "
+              "in one pass of the periodic scrubbing task. A value of 0 means "
+              "there is no limit, i.e. all expired entries, if any, "
+              "are invalidated every time the scrubbing task runs. Note "
+              "that the cache is locked while the scrubbing task is running.");
+TAG_FLAG(sentry_privileges_cache_max_scrubbed_entries_per_pass, advanced);
+
 DECLARE_int64(authz_token_validity_seconds);
+DECLARE_string(hive_metastore_uris);
 DECLARE_string(kudu_service_name);
 DECLARE_string(server_name);
 
@@ -164,6 +181,29 @@ static bool ValidateAddresses(const char* flag_name, const string& addresses) {
   return s.ok();
 }
 DEFINE_validator(sentry_service_rpc_addresses, &ValidateAddresses);
+
+// This group flag validator enforces the logical dependency of the Sentry+Kudu
+// fine-grain authz scheme on the integration with HMS catalog.
+//
+// The validator makes it necessary to set the --hive_metastore_uris flag
+// if the --sentry_service_rpc_addresses flag is set.
+//
+// Even if Kudu could successfully fetch information on granted privileges from
+// Sentry to allow or deny commencing DML operations on already existing
+// tables, the information on privileges in Sentry would become inconsistent
+// after DDL operations (e.g., renaming a table).
+bool ValidateSentryServiceRpcAddresses() {
+  if (!FLAGS_sentry_service_rpc_addresses.empty() &&
+      FLAGS_hive_metastore_uris.empty()) {
+    LOG(ERROR) << "Hive Metastore catalog is required (--hive_metastore_uris) "
+                  "to run Kudu with Sentry-backed authorization scheme "
+                  "(--sentry_service_rpc_addresses).";
+    return false;
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(sentry_service_rpc_addresses,
+                     ValidateSentryServiceRpcAddresses);
 
 namespace {
 
@@ -514,10 +554,20 @@ Status SentryPrivilegesFetcher::ResetCache() {
       FLAGS_sentry_privileges_cache_capacity_mb * 1024 * 1024;
   shared_ptr<AuthzInfoCache> new_cache;
   if (cache_capacity_bytes != 0) {
-    const auto ttl_sec = FLAGS_authz_token_validity_seconds *
-        FLAGS_sentry_privileges_cache_ttl_factor;
+    const auto cache_entry_ttl = MonoDelta::FromSeconds(
+        FLAGS_authz_token_validity_seconds *
+        FLAGS_sentry_privileges_cache_ttl_factor);
+
+    MonoDelta cache_scrubbing_period;  // explicitly non-initialized variable
+    if (FLAGS_sentry_privileges_cache_scrubbing_period_sec > 0) {
+      cache_scrubbing_period = std::min(cache_entry_ttl, MonoDelta::FromSeconds(
+          FLAGS_sentry_privileges_cache_scrubbing_period_sec));
+    }
+
     new_cache = make_shared<AuthzInfoCache>(
-        cache_capacity_bytes, MonoDelta::FromSeconds(ttl_sec));
+        cache_capacity_bytes, cache_entry_ttl, cache_scrubbing_period,
+        FLAGS_sentry_privileges_cache_max_scrubbed_entries_per_pass,
+        "sentry-privileges-ttl-cache");
     if (metric_entity_) {
       unique_ptr<SentryPrivilegesCacheMetrics> metrics(
           new SentryPrivilegesCacheMetrics(metric_entity_));

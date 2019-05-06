@@ -19,7 +19,6 @@ package org.apache.kudu.backup
 import org.apache.kudu.backup.Backup.TableMetadataPB
 import org.apache.kudu.client.AlterTableOptions
 import org.apache.kudu.client.KuduPartitioner
-import org.apache.kudu.client.NonCoveredRangeException
 import org.apache.kudu.client.Partition
 import org.apache.kudu.client.SessionConfiguration.FlushMode
 import org.apache.kudu.spark.kudu.KuduContext
@@ -50,17 +49,26 @@ object KuduRestore {
       )
     val io = new SessionIO(session, options)
 
+    // Read the required backup metadata.
+    val backupGraphs = io.readBackupGraphsByTableName(options.tables, options.timestampMs)
+    // Key the backupMap by the last table name.
+    val backupMap = backupGraphs
+      .groupBy(_.restorePath.tableName)
+      .mapValues(_.maxBy(_.restorePath.toMs))
+
     // TODO (KUDU-2786): Make parallel so each table isn't processed serially.
     // TODO (KUDU-2787): Handle single table failures.
     options.tables.foreach { tableName =>
-      val graph = io.readBackupGraph(tableName).filterByTime(options.timestampMs)
+      if (!backupMap.contains(tableName)) {
+        throw new RuntimeException(s"No valid backups found for table: $tableName")
+      }
+      val graph = backupMap(tableName)
       val lastMetadata = graph.restorePath.backups.last.metadata
+      val restoreName = s"${lastMetadata.getTableName}${options.tableSuffix}"
       graph.restorePath.backups.foreach { backup =>
         log.info(s"Restoring table $tableName from path: ${backup.path}")
         val metadata = backup.metadata
         val isFullRestore = metadata.getFromMs == 0
-        val restoreName = s"${metadata.getTableName}${options.tableSuffix}"
-
         // TODO (KUDU-2788): Store the full metadata to compare/validate for each applied partial.
 
         // On the full restore we may need to create the table.
@@ -123,12 +131,20 @@ object KuduRestore {
             session.close()
           }
           // Fail the task if there are any errors.
-          val errorCount = session.getPendingErrors.getRowErrors.length
-          if (errorCount > 0) {
-            val errors =
-              session.getPendingErrors.getRowErrors.take(5).map(_.getErrorStatus).mkString
-            throw new RuntimeException(
-              s"failed to write $errorCount rows from DataFrame to Kudu; sample errors: $errors")
+          // It is important to capture all of the errors via getRowErrors and then check
+          // the length because each call to session.getPendingErrors clears the ErrorCollector.
+          val pendingErrors = session.getPendingErrors
+          if (pendingErrors.getRowErrors.nonEmpty) {
+            val errors = pendingErrors.getRowErrors
+            val sample = errors.take(5).map(_.getErrorStatus).mkString
+            if (pendingErrors.isOverflowed) {
+              throw new RuntimeException(
+                s"PendingErrors overflowed. Failed to write at least ${errors.length} rows " +
+                  s"to Kudu; Sample errors: $sample")
+            } else {
+              throw new RuntimeException(
+                s"Failed to write ${errors.length} rows to Kudu; Sample errors: $sample")
+            }
           }
         }
       }

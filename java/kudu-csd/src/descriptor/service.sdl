@@ -512,8 +512,17 @@
           "pathType" : "serviceSpecific",
           "required" : "true",
           "default" : "/var/log/kudu"
+        },
+        {
+          "name" : "tablet_history_max_age_sec",
+          "label" : "Tablet History Max Age"
+          "description" : "The maximum amount of time, in seconds, to preserve tablet data history, including history required to perform diff scans and incremental backups. The duration defined by this parameter is also the maximum amount of time it is possible to wait after a full or incremental backup before performing the next incremental backup. Setting the value to -1 disables history removal."
+          "required" : "true",
+          "type" : "long",
+          "min" : -1,
+          "unit" : "seconds"
+          "default" : 604800,
         }
-
       ],
       "sslServer": {
          "keystoreFormat" : "pem",

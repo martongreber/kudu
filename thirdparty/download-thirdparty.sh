@@ -446,5 +446,11 @@ fetch_with_url_and_patch \
  $SENTRY_PATCHLEVEL \
  $ECOSYSTEM_URL
 
+YAML_PATCHLEVEL=0
+fetch_and_patch \
+ $YAML_NAME.tar.gz \
+ $YAML_SOURCE \
+ $YAML_PATCHLEVEL
+
 echo "---------------"
 echo "Thirdparty dependencies downloaded successfully"

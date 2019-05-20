@@ -15,23 +15,52 @@
 // specific language governing permissions and limitations
 // under the License.
 
+apply plugin: "scala"
+apply from: "$rootDir/gradle/protobuf.gradle"
 apply from: "$rootDir/gradle/shadow.gradle"
 
-dependencies {
-  compile project(":kudu-mapreduce")
-  compile libs.guava
+// Mark this as a tool jar so shadow doesn't exclude any dependencies.
+shadow {
+  isToolJar = true
+}
 
-  provided libs.hadoopMRClientCommon
-  provided libs.hadoopCommon
-  provided libs.parquetHadoop
-  provided libs.slf4jApi
+dependencies {
+  compile project(path: ":kudu-client", configuration: "shadow")
+  compile libs.protobufJava
+  compile (libs.protobufJavaUtil) {
+    // Make sure wrong Guava version is not pulled in.
+    exclude group: "com.google.guava", module: "guava"
+  }
+  compile libs.hadoopCommon
+  compile (libs.scopt)  {
+    // Make sure wrong Scala version is not pulled in.
+    exclude group: "org.scala-lang", module: "scala-library"
+  }
+  compile libs.scalaLibrary
+  compile libs.slf4jApi
 
   optional libs.yetusAnnotations
 
   testCompile project(path: ":kudu-test-utils", configuration: "shadow")
-  testCompile project(path: ":kudu-mapreduce", configuration: "test")
-  testCompile libs.commonsIo
   testCompile libs.junit
   testCompile libs.log4j
   testCompile libs.log4jSlf4jImpl
+  testCompile libs.scalatest
 }
+
+// Add protobuf files to the proto source set.
+sourceSets {
+  main {
+    proto {
+      srcDir "src/main/protobuf"
+    }
+  }
+}
+
+// kudu-backup-tools has no public Javadoc.
+javadoc {
+  enabled = false
+}
+
+// Skip publishing kudu-backup-tools until it's ready to be supported long-term.
+uploadArchives.enabled = false

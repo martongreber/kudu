@@ -23,8 +23,8 @@ repositories {
   maven { url "http://maven.jenkins.cloudera.com:8081/artifactory/cloudera-mirrors" }
   mavenCentral()
   jcenter()
-  maven { url "http://clojars.org/repo" } // Only used for the clojure plugin below.
-  maven { url "http://repo.spring.io/plugins-release" } // Only used for the propdeps plugin below.
+  maven { url "https://clojars.org/repo" } // Only used for the clojure plugin below.
+  maven { url "https://repo.spring.io/plugins-release" } // Only used for the propdeps plugin below.
   maven { url "https://plugins.gradle.org/m2/" }
 }
 

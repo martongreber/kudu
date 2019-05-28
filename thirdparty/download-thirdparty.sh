@@ -304,12 +304,11 @@ fetch_and_patch \
  $CRCUTIL_PATCHLEVEL \
  "patch -p0 < $TP_DIR/patches/crcutil-fix-libtoolize-on-osx.patch"
 
-LIBUNWIND_PATCHLEVEL=2
+LIBUNWIND_PATCHLEVEL=1
 fetch_and_patch \
  libunwind-${LIBUNWIND_VERSION}.tar.gz \
  $LIBUNWIND_SOURCE \
  $LIBUNWIND_PATCHLEVEL \
- "patch -p1 < $TP_DIR/patches/libunwind-Use-syscall-directly-in-write_validate-to-avoid-ASAN.patch" \
  "patch -p1 < $TP_DIR/patches/libunwind-trace-cache-destructor.patch"
 
 PYTHON_PATCHLEVEL=0
@@ -349,11 +348,20 @@ fetch_and_patch \
  $TRACE_VIEWER_SOURCE \
  $TRACE_VIEWER_PATCHLEVEL
 
-NVML_PATCHLEVEL=0
+NUMACTL_PATCHLEVEL=0
 fetch_and_patch \
- nvml-${NVML_VERSION}.tar.gz \
- $NVML_SOURCE \
- $NVML_PATCHLEVEL
+ numactl-${NUMACTL_VERSION}.tar.gz \
+ $NUMACTL_SOURCE \
+ $NUMACTL_PATCHLEVEL
+
+MEMKIND_PATCHLEVEL=3
+fetch_and_patch \
+ memkind-${MEMKIND_VERSION}.tar.gz \
+ $MEMKIND_SOURCE \
+ $MEMKIND_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/memkind-fix-jemalloc-build-with-old-autoconf.patch" \
+ "patch -p1 < $TP_DIR/patches/memkind-fix-build-with-old-autoconf.patch" \
+ "patch -p1 < $TP_DIR/patches/memkind-fix-build-with-old-glibc.patch"
 
 BOOST_PATCHLEVEL=1
 fetch_and_patch \

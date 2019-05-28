@@ -15,18 +15,24 @@
 # specific language governing permissions and limitations
 # under the License.
 
-status = error
-name = PropertiesConfig
-appenders = console
+# - Find required memkind libraries
+# This module defines
+#  MEMKIND_INCLUDE_DIR, directory containing headers
+#  MEMKIND_STATIC_LIB, path to *.a
+#  MEMKIND_SHARED_LIB, path to *.so shared library
 
-appender.console.type = Console
-appender.console.name = STDOUT
-appender.console.layout.type = PatternLayout
-appender.console.layout.pattern = %d{HH:mm:ss.SSS} [%p - %t] (%F:%L) %m%n
+find_path(MEMKIND_INCLUDE_DIR memkind.h
+  NO_CMAKE_SYSTEM_PATH
+  NO_SYSTEM_ENVIRONMENT_PATH)
+find_library(MEMKIND_SHARED_LIB memkind
+  NO_CMAKE_SYSTEM_PATH
+  NO_SYSTEM_ENVIRONMENT_PATH)
+find_library(MEMKIND_STATIC_LIB libmemkind.a
+  NO_CMAKE_SYSTEM_PATH
+  NO_SYSTEM_ENVIRONMENT_PATH)
 
-rootLogger.level = info
-rootLogger.appenderRefs = stdout
-rootLogger.appenderRef.stdout.ref = STDOUT
-
-logger.kudu.name = org.apache.kudu
-logger.kudu.level = debug
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(MEMKIND REQUIRED_VARS
+  MEMKIND_SHARED_LIB MEMKIND_STATIC_LIB
+  MEMKIND_INCLUDE_DIR
+)

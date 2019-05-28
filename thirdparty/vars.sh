@@ -28,7 +28,7 @@ TP_BUILD_DIR="$TP_DIR/build"
 # This URL corresponds to the CloudFront Distribution for the S3
 # bucket cloudera-thirdparty-libs which is directly accessible at
 # http://cloudera-thirdparty-libs.s3.amazonaws.com/
-CLOUDFRONT_URL_PREFIX=http://d3dr9sfxru4sde.cloudfront.net
+CLOUDFRONT_URL_PREFIX=https://d3dr9sfxru4sde.cloudfront.net
 
 # Third party dependency downloading URL, default to the CloudFront
 # Distribution URL.
@@ -138,7 +138,7 @@ CRCUTIL_VERSION=42148a6df6986a257ab21c80f8eca2e54544ac4d
 CRCUTIL_NAME=crcutil-$CRCUTIL_VERSION
 CRCUTIL_SOURCE=$TP_SOURCE_DIR/$CRCUTIL_NAME
 
-LIBUNWIND_VERSION=1.3-rc1
+LIBUNWIND_VERSION=1.3.1
 LIBUNWIND_NAME=libunwind-$LIBUNWIND_VERSION
 LIBUNWIND_SOURCE=$TP_SOURCE_DIR/$LIBUNWIND_NAME
 
@@ -166,9 +166,14 @@ TRACE_VIEWER_VERSION=21d76f8350fea2da2aa25cb6fd512703497d0c11
 TRACE_VIEWER_NAME=kudu-trace-viewer-$TRACE_VIEWER_VERSION
 TRACE_VIEWER_SOURCE=$TP_SOURCE_DIR/$TRACE_VIEWER_NAME
 
-NVML_VERSION=1.1
-NVML_NAME=nvml-$NVML_VERSION
-NVML_SOURCE=$TP_SOURCE_DIR/$NVML_NAME
+# numactl 2.0.12 is required to build memkind library.
+NUMACTL_VERSION=2.0.12
+NUMACTL_NAME=numactl-$NUMACTL_VERSION
+NUMACTL_SOURCE=$TP_SOURCE_DIR/$NUMACTL_NAME
+
+MEMKIND_VERSION=1.9.0
+MEMKIND_NAME=memkind-$MEMKIND_VERSION
+MEMKIND_SOURCE=$TP_SOURCE_DIR/$MEMKIND_NAME
 
 BOOST_VERSION=1_61_0
 BOOST_NAME=boost_$BOOST_VERSION

@@ -22,6 +22,7 @@ import java.util.Map;
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.metastore.MetaStoreEventListener;
+import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.Table;
@@ -46,7 +47,7 @@ import org.apache.hadoop.hive.metastore.events.ListenerEvent;
  * }
  * </pre>
  *
- * The plugin enforces that Kudu table entries in the HMS always contain
+ * The plugin enforces that managed Kudu table entries in the HMS always contain
  * two properties: a Kudu table ID and the Kudu master addresses. It also
  * enforces that non-Kudu tables do not have these properties (except cases
  * when upgrading tables with legacy Kudu storage handler to be Kudu tables
@@ -57,8 +58,11 @@ import org.apache.hadoop.hive.metastore.events.ListenerEvent;
  * environment containing a Kudu table ID, that event only applies
  * to the specified Kudu table. This provides some amount of concurrency
  * safety, so that the Kudu Master can ensure it is operating on the correct
- * table entry. Note that such validation does not apply to tables with
- * legacy Kudu storage handler.
+ * table entry.
+ *
+ * Note that such validation does not apply to tables with legacy Kudu
+ * storage handler and will be skipped if system env KUDU_SKIP_HMS_PLUGIN_VALIDATION
+ * is set to non-zero.
  */
 public class KuduMetastorePlugin extends MetaStoreEventListener {
 
@@ -69,11 +73,14 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
   @VisibleForTesting
   static final String KUDU_TABLE_ID_KEY = "kudu.table_id";
   @VisibleForTesting
-  static final String LEGACY_KUDU_TABLE_NAME = "kudu.table_name";
+  static final String KUDU_TABLE_NAME = "kudu.table_name";
   @VisibleForTesting
   static final String KUDU_MASTER_ADDRS_KEY = "kudu.master_addresses";
   @VisibleForTesting
   static final String KUDU_MASTER_EVENT = "kudu.master_event";
+
+  // System env to track if the HMS plugin validation should be skipped.
+  static final String SKIP_VALIDATION_ENV = "KUDU_SKIP_HMS_PLUGIN_VALIDATION";
 
   public KuduMetastorePlugin(Configuration config) {
     super(config);
@@ -82,7 +89,17 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
   @Override
   public void onCreateTable(CreateTableEvent tableEvent) throws MetaException {
     super.onCreateTable(tableEvent);
+
+    if (skipsValidation()) {
+      return;
+    }
+
     Table table = tableEvent.getTable();
+
+    // Only validate managed tables. Kudu only synchronizes managed tables.
+    if (!TableType.MANAGED_TABLE.name().equals(table.getTableType())) {
+      return;
+    }
 
     // Allow non-Kudu tables to be created.
     if (!isKuduTable(table)) {
@@ -101,6 +118,16 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
   @Override
   public void onDropTable(DropTableEvent tableEvent) throws MetaException {
     super.onDropTable(tableEvent);
+    Table table = tableEvent.getTable();
+
+    if (skipsValidation()) {
+      return;
+    }
+
+    // Only validate managed tables. Kudu only synchronizes managed tables.
+    if (!TableType.MANAGED_TABLE.name().equals(table.getTableType())) {
+      return;
+    }
 
     EnvironmentContext environmentContext = tableEvent.getEnvironmentContext();
     String targetTableId = environmentContext == null ? null :
@@ -113,8 +140,6 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
 
     // The kudu.master_event property isn't checked, because the kudu.table_id
     // property already implies this event is coming from a Kudu Master.
-
-    Table table = tableEvent.getTable();
 
     // Check that the table being dropped is a Kudu table.
     if (!isKuduTable(table)) {
@@ -131,8 +156,31 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
   public void onAlterTable(AlterTableEvent tableEvent) throws MetaException {
     super.onAlterTable(tableEvent);
 
+    if (skipsValidation()) {
+      return;
+    }
+
     Table oldTable = tableEvent.getOldTable();
     Table newTable = tableEvent.getNewTable();
+
+    // Prevent altering the table type (managed/external) of Kudu tables.
+    // This can cause orphaned tables and the Sentry integration depends on
+    // having a managed table for each Kudu table to prevent security issues
+    // due to overlapping names with Kudu tables and tables in the HMS.
+    // Note: This doesn't prevent altering the table type for legacy tables
+    // because they should continue to work as they always have primarily for
+    // migration purposes.
+    String oldTableType = oldTable.getTableType();
+    if (isKuduTable(oldTable) &&
+        oldTableType != null && !oldTableType.equals(newTable.getTableType())) {
+      throw new MetaException("Kudu table type may not be altered");
+    }
+
+    // Only validate managed tables.
+    // Kudu only synchronizes managed tables.
+    if (!TableType.MANAGED_TABLE.name().equals(oldTableType)) {
+      return;
+    }
 
     if (isLegacyKuduTable(oldTable)) {
       if (isKuduTable(newTable)) {
@@ -265,5 +313,17 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
     }
 
     return Boolean.parseBoolean(properties.get(KUDU_MASTER_EVENT));
+  }
+
+  /**
+   * Returns true if the system env is set to skip validation.
+   */
+  private static boolean skipsValidation() {
+    String skipValidation = System.getenv(SKIP_VALIDATION_ENV);
+    if (skipValidation == null || skipValidation.isEmpty() ||
+        Integer.parseInt(skipValidation) == 0) {
+      return false;
+    }
+    return true;
   }
 }

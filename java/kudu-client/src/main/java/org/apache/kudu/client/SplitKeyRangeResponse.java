@@ -15,16 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-= How to run Apache RAT on a release tarball
+package org.apache.kudu.client;
 
-Kudu has a script and an excludes file to allow for running RAT on a release
-artifact. You can use the following steps to verify a source tarball.
+import java.util.List;
 
-1. Download a binary artifact of RAT:
-   `wget -O apache-rat-0.13.jar https://search.maven.org/remotecontent?filepath=org/apache/rat/apache-rat/0.13/apache-rat-0.13.jar`
-2. Run RAT:
-   `java -jar apache-rat-0.13.jar -x apache-kudu-X.Y.Z.tar.gz > rat-report.xml`
-3. Run the report checker:
-   `./build-support/release/check-rat-report.py build-support/release/rat_exclude_files.txt rat-report.xml`
+import org.apache.kudu.Common.KeyRangePB;
+import org.apache.yetus.audience.InterfaceAudience;
 
-The above steps are automatically performed as part of the `build-support/build_source_release.py` script.
+/**
+ * Response type for SplitKeyRangeRequest.
+ */
+@InterfaceAudience.Private
+public class SplitKeyRangeResponse extends KuduRpcResponse {
+
+  private List<KeyRangePB> keyRanges;
+
+  SplitKeyRangeResponse(long elapsedMillis, String tsUUID, List<KeyRangePB> keyRanges) {
+    super(elapsedMillis, tsUUID);
+    this.keyRanges = keyRanges;
+  }
+
+  /**
+   * Get the list of primary key ranges key as specified in the request.
+   * @return a list of key ranges
+   */
+  public List<KeyRangePB> getKeyRanges() {
+    return keyRanges;
+  }
+}
+

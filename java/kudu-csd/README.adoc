@@ -40,18 +40,12 @@ changes in Kudu 6.2.0. To perform the fork, take the following steps:
 . Copy the `kudu-csd` folder with its contents to a new folder named
   `kudu-csd-{highest version covered}`, so in this example the folder
   would be named `kudu-csd-6.1`.
-. Edit the root `pom.xml` for the Java project:
-  * Add the new CSD as a module by adding the line
-    `<module>kudu-csd-{major}.{minor}</module>` to the `<modules>` element of
-    the `buildCSD` profile. In this example, the line would be
-    `<module>kudu-csd-6.1</module>`.
-. Edit `kudu-csd-6.1/pom.xml`:
-  * Change the `artifactId` from `KUDU` to `KUDU{major}_{minor}`, so in this
-    example the `artifactId` should be `KUDU6_1`.
-  * Change the `name` to `Kudu CSD for CDH {major}.{minor}`, so in this example
-    the `name` should be `Kudu CSD for CDH 6.1`.
-  * Delete the `execution` that generates the MDL. It should be preceded by a
-    comment containing the text `Generate the MDL`.
+. Edit the `settings.gradle` for the Java project:
+  * Add the new CSD by adding the line `include "kudu-csd-{major}-{minor}"`
+. Edit `kudu-csd-6.1/build.gradle`:
+  * Change the `archivesBaseName` from `KUDU` to `KUDU{major}_{minor}`, so in
+    this example the `archivesBaseName` would be `KUDU6_1`.
+  * Delete the `generateMdl` task that generates the MDL.
 . Edit `kudu-csd-6.1/src/descriptor/service.sdl`:
   * Adjust the `min` and `max` keys of the `cdhVersion` object near the top of
     the SDL. The value of the `min` key should be the first version supported by
@@ -93,7 +87,7 @@ $ ./generate_mdl.py > src/descriptor/service.mdl
 +
 [source,bash]
 ----
-$ mvn -DskipTests -PbuildCSD verify
+$ ./gradlew -PbuildCSD :kudu-csd:assemble
 ----
 . Test the CSD:
   * Set up a cluster with CM on the latest version and CDH on the first

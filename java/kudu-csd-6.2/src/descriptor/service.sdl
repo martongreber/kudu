@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 {
-  "name" : "KUDU",
+  "name" : "KUDU6_2",
   "label" : "Kudu",
   "description" : "Kudu is a true column store for the Hadoop ecosystem.",
   "version" : "6.x.0",

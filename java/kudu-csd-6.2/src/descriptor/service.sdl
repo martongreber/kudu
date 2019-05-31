@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 {
-  "name" : "KUDU6_2",
+  "name" : "KUDU",
   "label" : "Kudu",
   "description" : "Kudu is a true column store for the Hadoop ecosystem.",
   "version" : "6.x.0",
   "compatibility" : {
     "generation" : 1,
     "cdhVersion" : {
-      "min" : "6.2.0"
+      "min" : "6.2.0",
       "max" : "6.3.0"
     }
   },

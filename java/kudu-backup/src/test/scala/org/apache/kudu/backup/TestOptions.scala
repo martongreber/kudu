@@ -38,6 +38,7 @@ class TestOptions extends KuduTestSuite {
         |                           Sets how long in milliseconds each scan request to a server can last. Default: 30000
         |  --keepAlivePeriodMs <value>
         |                           Sets the period at which to send keep-alive requests to the tablet server to ensure that scanners do not time out. Default: 15000
+        |  --failOnFirstError       Whether to fail the backup job as soon as a single table backup fails. Default: false
         |  --help                   prints this usage text
         |  <table>...               A list of tables to be backed up.""".stripMargin
     assertEquals(expectedStr, BackupOptions.parser.renderTwoColumnsUsage)
@@ -54,6 +55,7 @@ class TestOptions extends KuduTestSuite {
         |  --createTables <value>   If true, create the tables during restore. Set to false if the target tables already exist. Default: true
         |  --tableSuffix <value>    If set, the suffix to add to the restored table names. Only used when createTables is true.
         |  --timestampMs <value>    A UNIX timestamp in milliseconds that defines the latest time to use when selecting restore candidates. Default: `System.currentTimeMillis()`
+        |  --failOnFirstError       Whether to fail the restore job as soon as a single table restore fails. Default: false
         |  --help                   prints this usage text
         |  <table>...               A list of tables to be restored.""".stripMargin
     assertEquals(expectedStr, RestoreOptions.parser.renderTwoColumnsUsage)

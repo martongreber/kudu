@@ -37,7 +37,9 @@ case class BackupOptions(
     scanRequestTimeoutMs: Long = BackupOptions.DefaultScanRequestTimeoutMs,
     scanLeaderOnly: Boolean = BackupOptions.DefaultScanLeaderOnly,
     scanPrefetching: Boolean = BackupOptions.DefaultScanPrefetching,
-    keepAlivePeriodMs: Long = BackupOptions.DefaultKeepAlivePeriodMs)
+    keepAlivePeriodMs: Long = BackupOptions.DefaultKeepAlivePeriodMs,
+    failOnFirstError: Boolean = BackupOptions.DefaultFailOnFirstError,
+    numParallelBackups: Int = BackupOptions.DefaultNumParallelBackups)
 
 object BackupOptions {
   val DefaultForceFull: Boolean = false
@@ -50,6 +52,8 @@ object BackupOptions {
   // TODO (KUDU-1260): Add a test and enable by default?
   val DefaultScanPrefetching: Boolean = false
   val DefaultKeepAlivePeriodMs: Long = AsyncKuduClient.DEFAULT_KEEP_ALIVE_PERIOD_MS
+  val DefaultFailOnFirstError: Boolean = false
+  val DefaultNumParallelBackups = 1
 
   // We use the program name to make the help output show a the spark invocation required.
   val ClassName: String = KuduBackup.getClass.getCanonicalName.dropRight(1) // Remove trailing `$`
@@ -127,6 +131,21 @@ object BackupOptions {
         .hidden()
         .optional()
 
+      opt[Unit]("failOnFirstError")
+        .action((_, o) => o.copy(failOnFirstError = true))
+        .text("Whether to fail the backup job as soon as a single table backup fails. " +
+          "Default: " + DefaultFailOnFirstError)
+        .optional()
+
+      opt[Int]("numParallelBackups")
+        .action((v, o) => o.copy(numParallelBackups = v))
+        .text(
+          "The number of tables to back up in parallel. Backup leaves it to Spark to manage " +
+            "the resources of parallel jobs. Overrides --failOnFirstError. This option is " +
+            "experimental. Default: " + DefaultNumParallelBackups)
+        .hidden()
+        .optional()
+
       help("help").text("prints this usage text")
 
       arg[String]("<table>...")
@@ -157,10 +176,14 @@ case class RestoreOptions(
     kuduMasterAddresses: String = InetAddress.getLocalHost.getCanonicalHostName,
     tableSuffix: String = "",
     createTables: Boolean = RestoreOptions.DefaultCreateTables,
-    timestampMs: Long = System.currentTimeMillis())
+    timestampMs: Long = System.currentTimeMillis(),
+    failOnFirstError: Boolean = RestoreOptions.DefaultFailOnFirstError,
+    numParallelRestores: Int = RestoreOptions.DefaultNumParallelRestores)
 
 object RestoreOptions {
   val DefaultCreateTables: Boolean = true
+  val DefaultFailOnFirstError = false
+  val DefaultNumParallelRestores = 1
 
   val ClassName: String = KuduRestore.getClass.getCanonicalName.dropRight(1) // Remove trailing `$`
   val ProgramName: String = "spark-submit --class " + ClassName + " [spark-options] " +
@@ -194,6 +217,21 @@ object RestoreOptions {
         .action((v, o) => o.copy(timestampMs = v))
         .text("A UNIX timestamp in milliseconds that defines the latest time to use when " +
           "selecting restore candidates. Default: `System.currentTimeMillis()`")
+        .optional()
+
+      opt[Unit]("failOnFirstError")
+        .action((v, o) => o.copy(failOnFirstError = true))
+        .text("Whether to fail the restore job as soon as a single table restore fails. " +
+          "Default: " + DefaultFailOnFirstError)
+        .optional()
+
+      opt[Int]("numParallelRestores")
+        .action((v, o) => o.copy(numParallelRestores = v))
+        .text(
+          "The number of tables to restore in parallel. Restore leaves it to Spark to manage " +
+            "the resources of parallel jobs. Overrides --failOnFirstError. This option is " +
+            "experimental. Default: " + DefaultNumParallelRestores)
+        .hidden()
         .optional()
 
       help("help").text("prints this usage text")

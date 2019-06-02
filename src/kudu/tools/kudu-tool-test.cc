@@ -950,6 +950,7 @@ TEST_F(ToolTest, TestTopLevelHelp) {
       "cluster.*Kudu cluster",
       "diagnose.*Diagnostic tools.*",
       "fs.*Kudu filesystem",
+      "hms.*Hive Metastores",
       "local_replica.*tablet replicas",
       "master.*Kudu Master",
       "pbc.*protobuf container",
@@ -968,6 +969,18 @@ TEST_F(ToolTest, TestTopLevelHelp) {
 }
 
 TEST_F(ToolTest, TestModeHelp) {
+  {
+    const vector<string> kFsModeRegexes = {
+        "check.*Check metadata consistency",
+        "downgrade.*Downgrade the metadata",
+        "fix.*Fix automatically-repairable metadata",
+        "list.*List the Kudu table HMS entries",
+        "precheck.*Check that the Kudu cluster is prepared",
+    };
+    NO_FATALS(RunTestHelp("hms", kFsModeRegexes));
+    NO_FATALS(RunTestHelp("hms not_a_mode", kFsModeRegexes,
+                          Status::InvalidArgument("unknown command 'not_a_mode'")));
+  }
   {
     const vector<string> kFsModeRegexes = {
         "check.*Kudu filesystem for inconsistencies",
@@ -3447,7 +3460,8 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   ASSERT_OK(CreateKuduTable(kudu_client, "default.inconsistent_master_addrs"));
   ASSERT_OK(kudu_client->OpenTable("default.inconsistent_master_addrs",
         &inconsistent_master_addrs));
-  HmsCatalog invalid_hms_catalog("invalid-master-addrs");
+  HmsCatalog invalid_hms_catalog(Substitute("$0,extra_masters",
+      cluster_->master_rpc_addrs()[0].ToString()));
   ASSERT_OK(invalid_hms_catalog.Start());
   ASSERT_OK(invalid_hms_catalog.CreateTable(
         inconsistent_master_addrs->id(), inconsistent_master_addrs->name(), kUsername,
@@ -3778,6 +3792,105 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
   }), kudu_tables);
 }
 
+namespace {
+
+// Rewrites the specified HMS table, replacing the given parameters with the
+// given value.
+Status AlterHmsWithReplacedParam(HmsClient* hms_client,
+                                 const string& db, const string& table,
+                                 const string& param, const string& val) {
+  hive::Table updated_hms_table;
+  RETURN_NOT_OK(hms_client->GetTable(db, table, &updated_hms_table));
+  updated_hms_table.parameters[param] = val;
+  return hms_client->AlterTable(db, table, updated_hms_table);
+}
+
+} // anonymous namespace
+
+TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
+  ExternalMiniClusterOptions opts;
+  opts.num_masters = 2;
+  opts.hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+
+  thrift::ClientOptions hms_opts;
+  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
+  ASSERT_OK(hms_client.Start());
+
+  shared_ptr<KuduClient> kudu_client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &kudu_client));
+
+  // Create a Kudu table.
+  ASSERT_OK(CreateKuduTable(kudu_client, "default.table"));
+  vector<string> master_addrs;
+  for (const auto& hp : cluster_->master_rpc_addrs()) {
+    master_addrs.emplace_back(hp.ToString());
+  }
+  const string master_addrs_str = JoinStrings(master_addrs, ",");
+  // Do a sanity check that the tool is fine with the existing table.
+  // Note: In the happy case, the tool will not log to stdout or stderr.
+  NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
+
+  // Check that the tool will be OK with the addresses in the HMS being
+  // reordered.
+  {
+    std::reverse(master_addrs.begin(), master_addrs.end());
+    hive::Table hms_table_reversed_masters;
+    ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+        HmsClient::kKuduMasterAddrsKey, JoinStrings(master_addrs, ",")));
+    NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
+  }
+
+  string out;
+  string err;
+  // Check that the tool will flag cases where the HMS contains masters that
+  // aren't quite right that overlap with the correct set of masters (e.g. in
+  // the case of a multi-master migration).
+  // Try with an extra master.
+  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+      HmsClient::kKuduMasterAddrsKey, Substitute("$0,other_master_addr", master_addrs_str)));
+  Status s = RunActionStdoutStderrString(
+      Substitute("hms check $0", master_addrs_str), &out, &err);
+  ASSERT_STR_CONTAINS(out, "default.table");
+  NO_FATALS(RunActionStdoutNone(Substitute("hms fix $0", master_addrs_str)));
+  NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
+
+  // And with a missing master.
+  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+      HmsClient::kKuduMasterAddrsKey, cluster_->master_rpc_addrs()[0].ToString()));
+  s = RunActionStdoutStderrString(Substitute("hms check $0", master_addrs_str), &out, &err);
+  ASSERT_STR_CONTAINS(out, "default.table");
+  NO_FATALS(RunActionStdoutNone(Substitute("hms fix $0", master_addrs_str)));
+  NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
+
+  // Set the masters to point to an entirely different set of masters.
+  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+      HmsClient::kKuduMasterAddrsKey, "other_master_addrs"));
+
+  // The check tool will ignore the HMS metadata from the other cluster, and
+  // view the Kudu table as orphaned.
+  s = RunActionStdoutStderrString(
+      Substitute("hms check $0", master_addrs_str), &out, &err);
+  ASSERT_STR_CONTAINS(out, "default.table");
+
+  // Attempting to fix this orphaned Kudu table will lead the tool to attempt
+  // to create an HMS table entry, though one already exists.
+  s = RunActionStdoutStderrString(
+      Substitute("hms fix $0", master_addrs_str), &out, &err);
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
+  ASSERT_STR_CONTAINS(err, "table already exists");
+
+  // And when specifying the right flag, it shouldn't ignore the other masters,
+  // and should be able to fix the master addresses.
+  s = RunActionStdoutStderrString(
+      Substitute("hms check $0 --noignore-other-clusters", master_addrs_str), &out, &err);
+  ASSERT_STR_CONTAINS(out, "default.table");
+  NO_FATALS(RunActionStdoutNone(
+      Substitute("hms fix $0 --noignore-other-clusters", master_addrs_str)));
+  NO_FATALS(RunActionStdoutNone(
+      Substitute("hms check $0 --noignore-other-clusters", master_addrs_str)));
+}
+
 TEST_F(ToolTest, TestHmsPrecheck) {
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
@@ -3847,6 +3960,68 @@ TEST_F(ToolTest, TestHmsPrecheck) {
       "foo.bar3",
       "fuzz",
   }), tables);
+}
+
+TEST_F(ToolTest, TestHmsList) {
+  ExternalMiniClusterOptions opts;
+  opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
+  opts.enable_kerberos = EnableKerberos();
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  thrift::ClientOptions hms_opts;
+  hms_opts.enable_kerberos = EnableKerberos();
+  hms_opts.service_principal = "hive";
+  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
+  ASSERT_OK(hms_client.Start());
+  ASSERT_TRUE(hms_client.IsConnected());
+
+  FLAGS_hive_metastore_uris = cluster_->hms()->uris();
+  FLAGS_hive_metastore_sasl_enabled = EnableKerberos();
+  HmsCatalog hms_catalog(master_addr);
+  ASSERT_OK(hms_catalog.Start());
+
+  shared_ptr<KuduClient> kudu_client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &kudu_client));
+
+  // Create a simple Kudu table so we can use the schema.
+  shared_ptr<KuduTable> simple_table;
+  ASSERT_OK(CreateKuduTable(kudu_client, "default.simple"));
+  ASSERT_OK(kudu_client->OpenTable("default.simple", &simple_table));
+
+  string kUsername = "alice";
+  ASSERT_OK(hms_catalog.CreateTable(
+      "1", "default.table1", kUsername, KuduSchema::ToSchema(simple_table->schema()),
+          hms::HmsClient::kManagedTable));
+  ASSERT_OK(hms_catalog.CreateTable(
+      "2", "default.table2", boost::none, KuduSchema::ToSchema(simple_table->schema()),
+      hms::HmsClient::kExternalTable));
+
+  // Test the output when HMS integration is disabled.
+  string err;
+  RunActionStderrString(Substitute("hms list $0", master_addr), &err);
+  ASSERT_STR_CONTAINS(err,
+      "Configuration error: the Kudu leader master is not configured with "
+      "the Hive Metastore integration");
+
+  // Enable the HMS integration.
+  cluster_->ShutdownNodes(cluster::ClusterNodes::MASTERS_ONLY);
+  cluster_->EnableMetastoreIntegration();
+  ASSERT_OK(cluster_->Restart());
+
+  // Run the list tool with the defaults. atabase,table,type,$0
+  string out;
+  RunActionStdoutString(Substitute("hms list $0", master_addr), &out);
+  ASSERT_STR_CONTAINS(out,
+      "default  | table1 | MANAGED_TABLE  | default.table1");
+  ASSERT_STR_CONTAINS(out,
+      "default  | table2 | EXTERNAL_TABLE | default.table2");
+
+  // Run the list tool filtering columns and using a different format.
+  RunActionStdoutString(Substitute("hms list --columns table,owner,kudu.table_id, --format=csv $0",
+                                   master_addr), &out);
+  ASSERT_STR_CONTAINS(out, "table1,alice,1");
+  ASSERT_STR_CONTAINS(out, "table2,,");
 }
 
 // This test is parameterized on the serialization mode and Kerberos.

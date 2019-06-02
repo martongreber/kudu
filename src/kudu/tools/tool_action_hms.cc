@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <gflags/gflags_declare.h>
@@ -35,6 +39,7 @@
 #include "kudu/common/schema.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/hms/hive_metastore_types.h"
 #include "kudu/hms/hms_catalog.h"
@@ -45,6 +50,7 @@
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
+DECLARE_string(columns);
 DECLARE_bool(force);
 DECLARE_bool(hive_metastore_sasl_enabled);
 DECLARE_int64(timeout_ms);
@@ -63,6 +69,9 @@ DEFINE_bool(fix_inconsistent_tables, true,
 DEFINE_bool(upgrade_hms_tables, true,
     "Upgrade Hive Metastore tables from the legacy Impala metadata format to the "
     "new Kudu metadata format.");
+DEFINE_bool(ignore_other_clusters, true,
+    "Whether to ignore entirely separate Kudu clusters, as indicated by a "
+    "different set of master addresses.");
 
 namespace kudu {
 
@@ -81,6 +90,7 @@ using std::endl;
 using std::make_pair;
 using std::ostream;
 using std::pair;
+using std::set;
 using std::string;
 using std::unique_ptr;
 using std::unordered_map;
@@ -156,15 +166,22 @@ Status HmsDowngrade(const RunnerContext& context) {
   return Status::OK();
 }
 
-// Given a kudu table and a hms table, checks if their metadata is in sync.
-bool IsSynced(const string& master_addresses,
+// Given a Kudu table and a HMS table, checks if their metadata is in sync.
+bool IsSynced(const set<string>& master_addresses,
               const KuduTable& kudu_table,
               const hive::Table& hms_table) {
+  DCHECK(!master_addresses.empty());
   auto schema = KuduSchema::ToSchema(kudu_table.schema());
   hive::Table hms_table_copy(hms_table);
   // TODO(ghenke): Get the owner from Kudu?
+  const string* hms_masters_field = FindOrNull(hms_table.parameters,
+                                               HmsClient::kKuduMasterAddrsKey);
+  if (!hms_masters_field ||
+      master_addresses != static_cast<set<string>>(Split(*hms_masters_field, ","))) {
+    return false;
+  }
   Status s = HmsCatalog::PopulateTable(kudu_table.id(), kudu_table.name(), hms_table.owner, schema,
-                                       master_addresses, hms_table.tableType, &hms_table_copy);
+                                       *hms_masters_field, hms_table.tableType, &hms_table_copy);
   return s.ok() && hms_table_copy == hms_table;
 }
 
@@ -198,10 +215,10 @@ Status PrintTables(const string& master_addrs,
       "HMS database",
       "HMS table",
       "HMS table type",
-      Substitute("HMS $0", HmsClient::kStorageHandlerKey),
       Substitute("HMS $0", HmsClient::kKuduTableNameKey),
       Substitute("HMS $0", HmsClient::kKuduTableIdKey),
       Substitute("HMS $0", HmsClient::kKuduMasterAddrsKey),
+      Substitute("HMS $0", HmsClient::kStorageHandlerKey),
   });
   for (auto& pair : tables) {
     vector<string> row;
@@ -218,14 +235,59 @@ Status PrintTables(const string& master_addrs,
       row.emplace_back(hms_table.dbName);
       row.emplace_back(hms_table.tableName);
       row.emplace_back(hms_table.tableType);
-      row.emplace_back(hms_table.parameters[HmsClient::kStorageHandlerKey]);
       row.emplace_back(hms_table.parameters[HmsClient::kKuduTableNameKey]);
       row.emplace_back(hms_table.parameters[HmsClient::kKuduTableIdKey]);
       row.emplace_back(hms_table.parameters[HmsClient::kKuduMasterAddrsKey]);
+      row.emplace_back(hms_table.parameters[HmsClient::kStorageHandlerKey]);
     } else {
       row.resize(10);
     }
     table.AddRow(std::move(row));
+  }
+  return table.PrintTo(out);
+}
+
+// Prints catalog information about Kudu HMS tables in data table format to 'out'.
+Status PrintHMSTables(vector<hive::Table> tables, ostream& out) {
+  DataTable table({});
+  for (const auto& column : strings::Split(FLAGS_columns, ",", strings::SkipEmpty())) {
+    vector<string> values;
+    if (boost::iequals(column, "database")) {
+      for (auto& hms_table : tables) {
+        values.emplace_back(hms_table.dbName);
+      }
+    } else if (boost::iequals(column, "table")) {
+      for (auto& hms_table : tables) {
+        values.emplace_back(hms_table.tableName);
+      }
+    } else if (boost::iequals(column, "type")) {
+      for (auto& hms_table : tables) {
+        values.emplace_back(hms_table.tableType);
+      }
+    } else if (boost::iequals(column, "owner")) {
+      for (auto& hms_table : tables) {
+        values.emplace_back(hms_table.owner);
+      }
+    } else if (boost::iequals(column, HmsClient::kKuduTableNameKey)) {
+      for (auto& hms_table : tables) {
+        values.emplace_back(hms_table.parameters[HmsClient::kKuduTableNameKey]);
+      }
+    } else if (boost::iequals(column, HmsClient::kKuduTableIdKey)) {
+      for (auto& hms_table : tables) {
+        values.emplace_back(hms_table.parameters[HmsClient::kKuduTableIdKey]);
+      }
+    } else if (boost::iequals(column, HmsClient::kKuduMasterAddrsKey)) {
+      for (auto& hms_table : tables) {
+        values.emplace_back(hms_table.parameters[HmsClient::kKuduMasterAddrsKey]);
+      }
+    } else if (boost::iequals(column, HmsClient::kStorageHandlerKey)) {
+      for (auto& hms_table : tables) {
+        values.emplace_back(hms_table.parameters[HmsClient::kStorageHandlerKey]);
+      }
+    } else {
+      return Status::InvalidArgument("unknown column (--columns)", column);
+    }
+    table.AddColumn(column.ToString(), std::move(values));
   }
   return table.PrintTo(out);
 }
@@ -298,6 +360,7 @@ Status AnalyzeCatalogs(const string& master_addrs,
   // Step 2: retrieve all Kudu table entries in the HMS, filter all orphaned
   // entries which reference non-existent Kudu tables, and group the rest by
   // table type and table ID.
+  const set<string> kudu_master_addrs = Split(master_addrs, ",");
   vector<hive::Table> orphan_hms_tables;
   unordered_map<string, vector<hive::Table>> managed_hms_tables_by_id;
   unordered_map<string, vector<hive::Table>> external_hms_tables_by_id;
@@ -305,6 +368,27 @@ Status AnalyzeCatalogs(const string& master_addrs,
     vector<hive::Table> hms_tables;
     RETURN_NOT_OK(hms_catalog->GetKuduTables(&hms_tables));
     for (hive::Table& hms_table : hms_tables) {
+      // If the addresses in the HMS entry don't overlap at all with the
+      // expected addresses, the entry is likely from another Kudu cluster.
+      // Ignore it if appropriate.
+      if (FLAGS_ignore_other_clusters) {
+        const string* hms_masters_field = FindOrNull(hms_table.parameters,
+                                                    HmsClient::kKuduMasterAddrsKey);
+        vector<string> master_intersection;
+        if (hms_masters_field) {
+          const set<string> hms_master_addrs = Split(*hms_masters_field, ",");
+          std::set_intersection(hms_master_addrs.begin(), hms_master_addrs.end(),
+                                kudu_master_addrs.begin(), kudu_master_addrs.end(),
+                                std::back_inserter(master_intersection));
+        }
+        if (master_intersection.empty()) {
+          LOG(INFO) << Substitute("Skipping HMS table $0.$1 with different "
+              "masters specified: $2", hms_table.dbName, hms_table.tableName,
+              hms_masters_field ? *hms_masters_field : "<none>");
+          continue;
+        }
+      }
+
       // If this is a non-legacy, managed table, we expect a table ID to exist
       // in the HMS entry; look up the Kudu table by ID. Otherwise, look it up
       // by table name.
@@ -366,7 +450,7 @@ Status AnalyzeCatalogs(const string& master_addrs,
       hive::Table& hms_table = (*hms_tables)[0];
       const string& storage_handler = hms_table.parameters[HmsClient::kStorageHandlerKey];
       if (storage_handler == HmsClient::kKuduStorageHandler &&
-          !IsSynced(master_addrs, *kudu_table, hms_table)) {
+          !IsSynced(kudu_master_addrs, *kudu_table, hms_table)) {
         stale_tables.emplace_back(make_pair(std::move(kudu_table), std::move(hms_table)));
       } else if (storage_handler == HmsClient::kLegacyKuduStorageHandler) {
         legacy_tables.emplace_back(make_pair(std::move(kudu_table), std::move(hms_table)));
@@ -681,6 +765,18 @@ Status FixHmsMetadata(const RunnerContext& context) {
   return Status::RuntimeError("Failed to fix some catalog metadata inconsistencies");
 }
 
+Status List(const RunnerContext& context) {
+  shared_ptr<KuduClient> kudu_client;
+  unique_ptr<HmsCatalog> hms_catalog;
+  string master_addrs;
+  RETURN_NOT_OK(Init(context, &kudu_client, &hms_catalog, &master_addrs));
+
+  vector<hive::Table> hms_tables;
+  RETURN_NOT_OK(hms_catalog->GetKuduTables(&hms_tables));
+
+  return PrintHMSTables(hms_tables, cout);
+}
+
 Status Precheck(const RunnerContext& context) {
   string master_addrs;
   RETURN_NOT_OK(ParseMasterAddressesStr(context, &master_addrs));
@@ -735,7 +831,6 @@ Status Precheck(const RunnerContext& context) {
   return Status::IllegalState("found tables in Kudu with case-conflicting names");
 }
 
-// TODO(ghenke): Add dump tool that prints the Kudu HMS entries.
 unique_ptr<Mode> BuildHmsMode() {
   const string kHmsUrisDesc =
     "Address of the Hive Metastore instance(s). If not set, the configuration "
@@ -758,6 +853,7 @@ unique_ptr<Mode> BuildHmsMode() {
           .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
           .AddOptionalParameter("hive_metastore_sasl_enabled", boost::none, kHmsSaslEnabledDesc)
           .AddOptionalParameter("hive_metastore_uris", boost::none, kHmsUrisDesc)
+          .AddOptionalParameter("ignore_other_clusters")
           .Build();
 
   unique_ptr<Action> hms_downgrade =
@@ -780,7 +876,25 @@ unique_ptr<Mode> BuildHmsMode() {
         .AddOptionalParameter("upgrade_hms_tables")
         .AddOptionalParameter("hive_metastore_sasl_enabled", boost::none, kHmsSaslEnabledDesc)
         .AddOptionalParameter("hive_metastore_uris", boost::none, kHmsUrisDesc)
+        .AddOptionalParameter("ignore_other_clusters")
         .Build();
+
+  unique_ptr<Action> hms_list =
+      ActionBuilder("list", &List)
+          .Description("List the Kudu table HMS entries")
+          .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
+          .AddOptionalParameter("columns",
+                                Substitute("database,table,type,$0",
+                                                  HmsClient::kKuduTableNameKey),
+                                Substitute("Comma-separated list of HMS entry fields to "
+                                           "include in output.\nPossible values: database, "
+                                           "table, type, owner, $0, $1, $2, $3",
+                                           HmsClient::kKuduTableNameKey,
+                                           HmsClient::kKuduTableIdKey,
+                                           HmsClient::kKuduMasterAddrsKey,
+                                           HmsClient::kStorageHandlerKey))
+          .AddOptionalParameter("format")
+          .Build();
 
   unique_ptr<Action> hms_precheck =
     ActionBuilder("precheck", &Precheck)
@@ -793,6 +907,7 @@ unique_ptr<Mode> BuildHmsMode() {
                            .AddAction(std::move(hms_check))
                            .AddAction(std::move(hms_downgrade))
                            .AddAction(std::move(hms_fix))
+                           .AddAction(std::move(hms_list))
                            .AddAction(std::move(hms_precheck))
                            .Build();
 }

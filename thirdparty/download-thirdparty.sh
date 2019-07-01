@@ -317,7 +317,7 @@ fetch_and_patch \
  $PYTHON_SOURCE \
  $PYTHON_PATCHLEVEL
 
-LLVM_PATCHLEVEL=2
+LLVM_PATCHLEVEL=3
 fetch_and_patch \
  llvm-${LLVM_VERSION}-iwyu-${IWYU_VERSION}.src.tar.gz \
  $LLVM_SOURCE \
@@ -327,7 +327,8 @@ fetch_and_patch \
   "patch -p1 < $TP_DIR/patches/llvm-iwyu-nocurses.patch" \
   "patch -p1 < $TP_DIR/patches/llvm-iwyu-include-picker.patch" \
   "patch -d tools/clang/tools/include-what-you-use -p1 < $TP_DIR/patches/llvm-iwyu-llvm-6-compat.patch" \
-  "patch -d projects/compiler-rt -p1 < $TP_DIR/patches/llvm-tsan-disable-trace-switching-after-multithreaded-for.patch"
+  "patch -d projects/compiler-rt -p1 < $TP_DIR/patches/llvm-tsan-disable-trace-switching-after-multithreaded-for.patch" \
+  "patch -d projects -p1 < $TP_DIR/patches/llvm-ustat-removal.patch"
 
 LZ4_PATCHLEVEL=1
 fetch_and_patch \
@@ -409,16 +410,13 @@ fetch_and_patch \
  $THRIFT_SOURCE \
  $THRIFT_PATCHLEVEL
 
-BISON_PATCHLEVEL=1
+BISON_PATCHLEVEL=0
 fetch_and_patch \
  $BISON_NAME.tar.gz \
  $BISON_SOURCE \
- $BISON_PATCHLEVEL \
- "patch -p0 < $TP_DIR/patches/bison-fix-high-sierra-compilation-issue.patch"
- # Fix compilation issue in macOS High Sierra
- # See: https://github.com/spack/spack/issues/5521
+ $BISON_PATCHLEVEL
  # This would normally call autoreconf, but it does not succeed with
- # autoreconf 2.69 (RHEL 7): "autoreconf: 'configure.ac' or 'configure.in' is required".
+ # autoreconf 2.69-11 (RHEL 7): "autoreconf: 'configure.ac' or 'configure.in' is required".
 
 
 # For upstream Hive and Hadoop, we've stripped extraneous JARs. This isn't the

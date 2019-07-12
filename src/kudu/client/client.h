@@ -2431,9 +2431,11 @@ class KUDU_EXPORT KuduScanTokenBuilder {
   /// @copydoc KuduScanner::SetSnapshotRaw
   Status SetSnapshotRaw(uint64_t snapshot_timestamp) WARN_UNUSED_RESULT;
 
+  /// @cond PRIVATE_API
   /// @copydoc KuduScanner::SetDiffScan
   Status SetDiffScan(uint64_t start_timestamp, uint64_t end_timestamp)
       WARN_UNUSED_RESULT KUDU_NO_EXPORT;
+  /// @endcond
 
   /// @copydoc KuduScanner::SetTimeoutMillis
   Status SetTimeoutMillis(int millis) WARN_UNUSED_RESULT;

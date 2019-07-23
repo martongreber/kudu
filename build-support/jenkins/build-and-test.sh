@@ -24,7 +24,7 @@
 #   BUILD_TYPE: Default: DEBUG
 #     Maybe be one of ASAN|TSAN|DEBUG|RELEASE|COVERAGE|LINT|IWYU|TIDY
 #
-#   KUDU_USE_CDH_ECOSYSTEM  Default: 1
+#   KUDU_USE_CDH_ECOSYSTEM  Default: 0
 #     If non-zero, use the CDH packages for Hadoop ecosystem components
 #     (e.g. Hadoop, Hive, Sentry).
 #
@@ -116,7 +116,7 @@ if [ "$BUILD_TYPE" = "TSAN" ]; then
   export KUDU_USE_TSAN=1
 fi
 
-export KUDU_USE_CDH_ECOSYSTEM=${KUDU_USE_CDH_ECOSYSTEM:-1}
+export KUDU_USE_CDH_ECOSYSTEM=${KUDU_USE_CDH_ECOSYSTEM:-0}
 export KUDU_FLAKY_TEST_ATTEMPTS=${KUDU_FLAKY_TEST_ATTEMPTS:-1}
 export KUDU_ALLOW_SLOW_TESTS=${KUDU_ALLOW_SLOW_TESTS:-$DEFAULT_ALLOW_SLOW_TESTS}
 export KUDU_COMPRESS_TEST_OUTPUT=${KUDU_COMPRESS_TEST_OUTPUT:-1}

@@ -19,6 +19,8 @@
 #include <iosfwd>
 #include <string>
 
+#include <boost/optional/optional.hpp>
+
 #include "kudu/gutil/port.h"
 #include "kudu/util/status.h"
 
@@ -26,9 +28,9 @@ namespace kudu {
 
 // A struct representing a parsed version. Versions are expected to look like
 //
-//  <major>.<minor>.<maintenance>[-<extra>]
+//  <major>.<minor>.<maintenance>[[.-]<extra>]
 //
-// e.g. 1.6.0, 1.7.1-SNAPSHOT, 1.8.0-RC1-SNAPSHOT, etc.
+// e.g. 1.6.0, 1.7.1-SNAPSHOT, 1.8.0-RC1-SNAPSHOT, 1.11.0.7.0.0.0-SNAPSHOT, etc.
 //
 // This struct can be used with versions reported by ksck to determine if and
 // how certain tools should function depending on what versions are running in
@@ -49,6 +51,12 @@ struct Version {
   int major;
   int minor;
   int maintenance;
+
+  // The character separating the maintenance version from the extra component.
+  //
+  // Even if there was a delimiter, this will be boost::none unless there was
+  // a non-empty extra component.
+  boost::optional<char> extra_delimiter;
 
   // The extra component. Empty if there was no extra component.
   std::string extra;

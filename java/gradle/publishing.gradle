@@ -44,28 +44,19 @@ ext {
 
 uploadArchives {
   repositories {
-    signing {
-      required { shouldSign }
-      // Check if we are going to sign, because CI environments may not have
-      // gpg on their path and useGpgCmd evaluates eagerly.
-      if (shouldSign) {
-        useGpgCmd() // Use gpg-agent to sign
+    mavenDeployer {
+      beforeDeployment { MavenDeployment deployment -> signing.signPom(deployment) }
+      repository(url: "${mavenPublishUrl}") {
+        authentication(userName: "${mavenUsername}", password: "${mavenPassword}")
       }
-      sign configurations.archives
-      mavenDeployer {
-        beforeDeployment { MavenDeployment deployment -> signing.signPom(deployment) }
-        repository(url: "${mavenPublishUrl}") {
-          authentication(userName: "${mavenUsername}", password: "${mavenPassword}")
-        }
-        afterEvaluate {
-          pom.project {
-            url = "$url"
-            licenses {
-              license {
-                name = "The Apache Software License, Version 2.0"
-                url = "http://www.apache.org/licenses/LICENSE-2.0.txt"
-                distribution = "repo"
-              }
+      afterEvaluate {
+        pom.project {
+          url = "$url"
+          licenses {
+            license {
+              name = "The Apache Software License, Version 2.0"
+              url = "http://www.apache.org/licenses/LICENSE-2.0.txt"
+              distribution = "repo"
             }
           }
         }

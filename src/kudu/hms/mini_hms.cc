@@ -123,8 +123,12 @@ Status MiniHms::Start() {
 
   // Comma-separated list of additional jars to add to the HMS classpath, including
   // the HMS plugins of Kudu and Sentry.
-  string aux_jars = Substitute("$0/hms-plugin.jar,$1/hcatalog/share/hcatalog/*,$2/lib/*",
-                               bin_dir, hive_home, sentry_home);
+  // NOTE: Sentry tests are disabled to allow upgrading to Hive 3.
+  // The Sentry lib jars are removed from the MiniHMS because of compatibility issues with Hive 3.
+  //string aux_jars = Substitute("$0/hms-plugin.jar,$1/hcatalog/share/hcatalog/*,$2/lib/*",
+  //                             bin_dir, hive_home, sentry_home);
+  string aux_jars = Substitute("$0/hms-plugin.jar,$1/hcatalog/share/hcatalog/*",
+                               bin_dir, hive_home);
 
   // List of JVM environment options to pass to the HMS.
   string java_options =

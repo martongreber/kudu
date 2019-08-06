@@ -175,7 +175,8 @@ INSTANTIATE_TEST_CASE_P(HmsSentryConfigurations, MasterFailoverTest, ::testing::
     vector<pair<HmsMode, SentryMode>> {
       { HmsMode::NONE, SentryMode::DISABLED },
       { HmsMode::ENABLE_METASTORE_INTEGRATION, SentryMode::DISABLED },
-      { HmsMode::ENABLE_METASTORE_INTEGRATION, SentryMode::ENABLED },
+      // NOTE: Sentry tests are disabled to allow upgrading to Hive 3.
+      //{ HmsMode::ENABLE_METASTORE_INTEGRATION, SentryMode::ENABLED },
   }
 ));
 

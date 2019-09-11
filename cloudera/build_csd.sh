@@ -1,10 +1,14 @@
-#/bin/bash
-#
-# Script that builds Kudu CSDs.
+#!/usr/bin/env bash
+##########################################################
+# Script called during the the `[[install_cmd]]` section
+# of the components.ini file in the CDPD build that
+# builds the Kudu CSDs.
+##########################################################
 
 set -ex
 
 CSD_BUILD_DIR=${1:-"./build/csds"}
+VERSION=$(cat version.txt)
 
 pushd java
 
@@ -31,4 +35,7 @@ for JAR in kudu-csd*/build/libs/*.jar; do
 done
 popd
 
-
+# Tar the published CSD jars.
+# Note: The final file should match the definition in the `[[artifacts]]`
+# section of the components.ini file in the CDPD build.
+tar -czf kudu-csd-${VERSION}.tar.gz -C ${CSD_BUILD_DIR} ./

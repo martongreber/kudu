@@ -1111,6 +1111,17 @@ void CatalogManager::PrepareForLeadershipTask() {
       }
     }
 
+    static const char* const kTServerStatesDescription =
+        "Initializing in-progress tserver states";
+    LOG(INFO) << kTServerStatesDescription << "...";
+    LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kTServerStatesDescription) {
+      if (!check(std::bind(&TSManager::ReloadTServerStates, master_->ts_manager(),
+                           sys_catalog_.get()),
+                 *consensus, term, kTServerStatesDescription).ok()) {
+        return;
+      }
+    }
+
     if (hms_catalog_) {
       static const char* const kNotificationLogEventIdDescription =
           "Loading latest processed Hive Metastore notification log event ID";
@@ -1563,7 +1574,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // Verify that the number of replicas isn't larger than the number of live tablet
   // servers.
   TSDescriptorVector ts_descs;
-  master_->ts_manager()->GetAllLiveDescriptors(&ts_descs);
+  master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
   const auto num_live_tservers = ts_descs.size();
   if (FLAGS_catalog_manager_check_ts_count_for_create_table && num_replicas > num_live_tservers) {
     // Note: this error message is matched against in master-stress-test.
@@ -3755,7 +3766,7 @@ bool AsyncAddReplicaTask::SendRequest(int attempt) {
     }
 
     TSDescriptorVector ts_descs;
-    master_->ts_manager()->GetAllLiveDescriptors(&ts_descs);
+    master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
 
     // Get the dimension of the tablet. Otherwise, it will be none.
     optional<string> dimension = none;
@@ -4638,7 +4649,7 @@ Status CatalogManager::ProcessPendingAssignments(
   // For those tablets which need to be created in this round, assign replicas.
   {
     TSDescriptorVector ts_descs;
-    master_->ts_manager()->GetAllLiveDescriptors(&ts_descs);
+    master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
     PlacementPolicy policy(std::move(ts_descs), &rng_);
     for (auto& tablet : deferred.needs_create_rpc) {
       // NOTE: if we fail to select replicas on the first pass (due to
@@ -5270,6 +5281,7 @@ INITTED_OR_RESPOND(ConnectToMasterResponsePB);
 INITTED_OR_RESPOND(GetMasterRegistrationResponsePB);
 INITTED_OR_RESPOND(TSHeartbeatResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(AlterTableResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(ChangeTServerStateResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(CreateTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(DeleteTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(IsAlterTableDoneResponsePB);

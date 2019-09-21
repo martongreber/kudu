@@ -340,6 +340,7 @@ class CounterPrototype;
 class Histogram;
 class HistogramPrototype;
 class HistogramSnapshotPB;
+class MeanGauge;
 class Metric;
 class MetricEntity;
 class MetricEntityPrototype;
@@ -617,6 +618,8 @@ class MetricEntity : public RefCountedThreadSafe<MetricEntity> {
   scoped_refptr<AtomicGauge<T> > FindOrCreateGauge(const GaugePrototype<T>* proto,
                                                    const T& initial_value);
 
+  scoped_refptr<MeanGauge> FindOrCreateMeanGauge(const GaugePrototype<double>* proto);
+
   template<typename T>
   scoped_refptr<FunctionGauge<T> > FindOrCreateFunctionGauge(const GaugePrototype<T>* proto,
                                                              const Callback<T()>& function);
@@ -746,9 +749,8 @@ class Metric : public RefCountedThreadSafe<Metric> {
   static void IncrementEpoch();
 
   // Merges 'other' into this Metric object.
-  // Return false if any error occurs, otherwise return true.
-  // NOTE: If merge with self, do nothing and return true directly.
-  virtual bool MergeFrom(const scoped_refptr<Metric>& other) = 0;
+  // NOTE: If merge with self, do nothing.
+  virtual void MergeFrom(const scoped_refptr<Metric>& other) = 0;
 
  protected:
   explicit Metric(const MetricPrototype* prototype);
@@ -896,6 +898,11 @@ class GaugePrototype : public MetricPrototype {
     return entity->FindOrCreateGauge(this, initial_value);
   }
 
+  scoped_refptr<MeanGauge> InstantiateMeanGauge(
+      const scoped_refptr<MetricEntity>& entity) const {
+    return entity->FindOrCreateMeanGauge(this);
+  }
+
   // Instantiate a gauge that is backed by the given callback.
   scoped_refptr<FunctionGauge<T> > InstantiateFunctionGauge(
       const scoped_refptr<MetricEntity>& entity,
@@ -954,7 +961,7 @@ class StringGauge : public Gauge {
   virtual bool IsUntouched() const override {
     return false;
   }
-  bool MergeFrom(const scoped_refptr<Metric>& other) OVERRIDE;
+  void MergeFrom(const scoped_refptr<Metric>& other) OVERRIDE;
 
  protected:
   FRIEND_TEST(MetricsTest, SimpleStringGaugeForMergeTest);
@@ -966,6 +973,33 @@ class StringGauge : public Gauge {
   std::unordered_set<std::string> unique_values_;
   mutable simple_spinlock lock_;  // Guards value_ and unique_values_
   DISALLOW_COPY_AND_ASSIGN(StringGauge);
+};
+
+// Gauge implementation for mean that uses locks to ensure thread safety.
+class MeanGauge : public Gauge {
+ public:
+  explicit MeanGauge(const GaugePrototype<double>* proto)
+    : Gauge(proto),
+      total_sum_(0.0),
+      total_count_(0.0) {
+  }
+  scoped_refptr<Metric> snapshot() const override;
+  double value() const;
+  double total_count() const;
+  double total_sum() const;
+  void set_value(double total_sum, double total_count);
+  virtual bool IsUntouched() const override {
+    return false;
+  }
+  void MergeFrom(const scoped_refptr<Metric>& other) override;
+
+ protected:
+  virtual void WriteValue(JsonWriter* writer) const override;
+ private:
+  double total_sum_;
+  double total_count_;
+  mutable simple_spinlock lock_;  // Guards total_sum_ and total_count_
+  DISALLOW_COPY_AND_ASSIGN(MeanGauge);
 };
 
 // Lock-free implementation for types that are convertible to/from int64_t.
@@ -1004,11 +1038,10 @@ class AtomicGauge : public Gauge {
   virtual bool IsUntouched() const override {
     return false;
   }
-  bool MergeFrom(const scoped_refptr<Metric>& other) override {
+  void MergeFrom(const scoped_refptr<Metric>& other) override {
     if (PREDICT_TRUE(this != other.get())) {
       IncrementBy(down_cast<AtomicGauge<T>*>(other.get())->value());
     }
-    return true;
   }
  protected:
   virtual void WriteValue(JsonWriter* writer) const OVERRIDE {
@@ -1140,11 +1173,10 @@ class FunctionGauge : public Gauge {
   }
 
   // value() will be constant after MergeFrom()
-  bool MergeFrom(const scoped_refptr<Metric>& other) override {
+  void MergeFrom(const scoped_refptr<Metric>& other) override {
     if (PREDICT_TRUE(this != other.get())) {
       DetachToConstant(value() + down_cast<FunctionGauge<T>*>(other.get())->value());
     }
-    return true;
   }
 
  private:
@@ -1203,11 +1235,10 @@ class Counter : public Metric {
     return value() == 0;
   }
 
-  bool MergeFrom(const scoped_refptr<Metric>& other) override {
+  void MergeFrom(const scoped_refptr<Metric>& other) override {
     if (PREDICT_TRUE(this != other.get())) {
       IncrementBy(down_cast<Counter*>(other.get())->value());
     }
-    return true;
   }
 
  private:
@@ -1278,11 +1309,10 @@ class Histogram : public Metric {
     return TotalCount() == 0;
   }
 
-  bool MergeFrom(const scoped_refptr<Metric>& other) override {
+  void MergeFrom(const scoped_refptr<Metric>& other) override {
     if (PREDICT_TRUE(this != other.get())) {
       histogram_->MergeFrom(*(down_cast<Histogram*>(other.get())->histogram()));
     }
-    return true;
   }
 
  private:
@@ -1349,6 +1379,19 @@ inline scoped_refptr<AtomicGauge<T> > MetricEntity::FindOrCreateGauge(
       FindPtrOrNull(metric_map_, proto).get());
   if (!m) {
     m = new AtomicGauge<T>(proto, initial_value);
+    InsertOrDie(&metric_map_, proto, m);
+  }
+  return m;
+}
+
+inline scoped_refptr<MeanGauge> MetricEntity::FindOrCreateMeanGauge(
+    const GaugePrototype<double>* proto) {
+  CheckInstantiation(proto);
+  std::lock_guard<simple_spinlock> l(lock_);
+  scoped_refptr<MeanGauge> m = down_cast<MeanGauge*>(
+      FindPtrOrNull(metric_map_, proto).get());
+  if (!m) {
+    m = new MeanGauge(proto);
     InsertOrDie(&metric_map_, proto, m);
   }
   return m;

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -167,10 +168,19 @@ Status ExternalMiniCluster::AddNtpFlags(std::vector<std::string>* flags) {
       const auto& opt = server->options();
       ntp_endpoints.emplace_back(HostPort(opt.bindaddress, opt.port).ToString());
     }
+    // Point the built-in NTP client to the test NTP server running as a part
+    // of the cluster.
     flags->emplace_back(Substitute("--builtin_ntp_servers=$0",
                                    JoinStrings(ntp_endpoints, ",")));
+    // The chronyd server supports very short polling interval: let's use this
+    // feature for faster clock synchronisation at startup and to keep the
+    // estimated clock error of the built-in NTP client smaller.
     flags->emplace_back(Substitute("--builtin_ntp_poll_interval_ms=100"));
-    flags->emplace_back(Substitute("--ntp_initial_sync_wait_secs=2"));
+    // Wait up to 10 seconds to let the built-in NTP client to synchronize its
+    // time with the test NTP server.
+    flags->emplace_back(Substitute("--ntp_initial_sync_wait_secs=10"));
+    // Switch the clock to use the built-in NTP client which clock is
+    // synchronized with the test NTP server.
     flags->emplace_back("--time_source=builtin");
   }
   return Status::OK();
@@ -606,8 +616,10 @@ Status ExternalMiniCluster::AddTabletServer() {
     opts.perf_record_filename =
         Substitute("$0/perf-$1.data", opts.log_dir, daemon_id);
   }
-  auto extra_flags = SubstituteInFlags(opts_.extra_tserver_flags, idx);
+  vector<string> extra_flags;
   RETURN_NOT_OK(AddNtpFlags(&extra_flags));
+  auto flags = SubstituteInFlags(opts_.extra_tserver_flags, idx);
+  std::copy(flags.begin(), flags.end(), std::back_inserter(extra_flags));
   opts.extra_flags = extra_flags;
   opts.start_process_timeout = opts_.start_process_timeout;
   opts.rpc_bind_address = HostPort(bind_host, 0);
@@ -628,6 +640,8 @@ Status ExternalMiniCluster::AddTabletServer() {
 Status ExternalMiniCluster::AddNtpServer(const Sockaddr& addr) {
   clock::MiniChronydOptions options;
   options.index = ntp_servers_.size();
+  options.data_root = JoinPathSegments(cluster_root(),
+                                       Substitute("chrony.$0", options.index));
   options.bindaddress = addr.host();
   options.port = static_cast<uint16_t>(addr.port());
   unique_ptr<MiniChronyd> chrony(new MiniChronyd(std::move(options)));

@@ -17,7 +17,7 @@
 {
   "name" : "KUDU",
   "label" : "Kudu",
-  "description" : "Kudu is a true column store for the Hadoop ecosystem.",
+  "description" : "Apache Kudu is a data store that enables real-time analytics on fast changing data.",
   "version" : "7.x.0",
   "compatibility" : {
     "generation" : 1,

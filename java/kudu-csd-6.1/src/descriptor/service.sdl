@@ -36,6 +36,7 @@
     "requiredTags" : [ "kudu" ]
   },
   "icon" : "images/icon.png",
+  "svgIcon" : "images/icon.svg",
   "kerberos" : "${enable_security}",
   "commands" : [
     {

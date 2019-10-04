@@ -36,6 +36,7 @@
     "requiredTags" : [ "kudu" ]
   },
   "icon" : "images/icon.png",
+  "svgIcon" : "images/icon.svg",
   "parameters" : [
     {
       "name" : "enable_core_dump",

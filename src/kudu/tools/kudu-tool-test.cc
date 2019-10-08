@@ -91,6 +91,10 @@
 #include "kudu/integration-tests/cluster_verifier.h"
 #include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/test_workload.h"
+#include "kudu/master/master.h"
+#include "kudu/master/master.pb.h"
+#include "kudu/master/mini_master.h"
+#include "kudu/master/ts_manager.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/mini-cluster/mini_cluster.h"
@@ -176,6 +180,9 @@ using kudu::itest::MiniClusterFsInspector;
 using kudu::itest::TServerDetails;
 using kudu::log::Log;
 using kudu::log::LogOptions;
+using kudu::master::MiniMaster;
+using kudu::master::TServerStatePB;
+using kudu::master::TSManager;
 using kudu::rpc::RpcController;
 using kudu::tablet::LocalTabletWriter;
 using kudu::tablet::Tablet;
@@ -1141,11 +1148,19 @@ TEST_F(ToolTest, TestModeHelp) {
         "dump_memtrackers.*Dump the memtrackers",
         "get_flags.*Get the gflags",
         "set_flag.*Change a gflag value",
+        "state.*Operate on the state",
         "status.*Get the status",
         "timestamp.*Get the current timestamp",
         "list.*List tablet servers"
     };
     NO_FATALS(RunTestHelp("tserver", kTServerModeRegexes));
+  }
+  {
+    const vector<string> kTServerSetStateModeRegexes = {
+        "enter_maintenance.*Begin maintenance on the Tablet Server",
+        "exit_maintenance.*End maintenance of the Tablet Server",
+    };
+    NO_FATALS(RunTestHelp("tserver state", kTServerSetStateModeRegexes));
   }
   {
     const vector<string> kWalModeRegexes = {
@@ -2898,6 +2913,55 @@ TEST_F(ToolTest, TestTserverListLocationNotAssigned) {
         Substitute("tserver list $0 --columns=uuid,location --format=csv", master_addr), &out));
 
   ASSERT_STR_CONTAINS(out, cluster_->tablet_server(0)->uuid() + ",<none>");
+}
+
+TEST_F(ToolTest, TestTServerListState) {
+  NO_FATALS(StartExternalMiniCluster());
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  const string ts_uuid = cluster_->tablet_server(0)->uuid();
+
+  // First, set some tserver state.
+  NO_FATALS(RunActionStdoutNone(Substitute("tserver state enter_maintenance $0 $1",
+                                           master_addr, ts_uuid)));
+
+  // If the state isn't requested, we shouldn't see any.
+  string out;
+  NO_FATALS(RunActionStdoutString(
+        Substitute("tserver list $0 --columns=uuid --format=csv", master_addr), &out));
+  ASSERT_STR_NOT_CONTAINS(out, Substitute("$0,$1", ts_uuid, "MAINTENANCE_MODE"));
+
+  // If it is requested, we should see the state.
+  NO_FATALS(RunActionStdoutString(
+        Substitute("tserver list $0 --columns=uuid,state --format=csv", master_addr), &out));
+  ASSERT_STR_CONTAINS(out, Substitute("$0,$1", ts_uuid, "MAINTENANCE_MODE"));
+
+  // We should still see the state if the tserver hasn't been registered.
+  // "Unregister" the server by restarting the cluster and only bringing up the
+  // master, and verify that we still see the tserver in maintenance mode.
+  cluster_->Shutdown();
+  ASSERT_OK(cluster_->master()->Restart());
+  master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  NO_FATALS(RunActionStdoutString(
+        Substitute("tserver list $0 --columns=uuid,state --format=csv", master_addr), &out));
+  ASSERT_STR_CONTAINS(out, Substitute("$0,$1", ts_uuid, "MAINTENANCE_MODE"));
+
+  NO_FATALS(RunActionStdoutNone(Substitute("tserver state exit_maintenance $0 $1",
+                                           master_addr, ts_uuid)));
+
+  // Once removed, we should see none.
+  // Since the tserver hasn't registered, there should be no output at all.
+  NO_FATALS(RunActionStdoutString(
+        Substitute("tserver list $0 --columns=uuid,state --format=csv", master_addr), &out));
+  ASSERT_EQ("", out);
+
+  // And once the tserver has registered, we should see no state. Assert
+  // eventually to give the tserver some time to register.
+  ASSERT_OK(cluster_->tablet_server(0)->Restart());
+  ASSERT_EVENTUALLY([&] {
+    NO_FATALS(RunActionStdoutString(
+          Substitute("tserver list $0 --columns=uuid,state --format=csv", master_addr), &out));
+    ASSERT_STR_CONTAINS(out, Substitute("$0,$1", ts_uuid, "NONE"));
+  });
 }
 
 TEST_F(ToolTest, TestMasterList) {
@@ -4747,6 +4811,66 @@ TEST_F(ToolTest, TestFsSwappingDirectoriesFailsGracefully) {
   NO_FATALS(RunActionStdoutNone(Substitute(
       "fs update_dirs --fs_wal_dir=$0 --fs_data_dirs=$1",
       wal_root, JoinStrings(new_data_roots, ","))));
+}
+
+TEST_F(ToolTest, TestStartEndMaintenanceMode) {
+  NO_FATALS(StartMiniCluster());
+  // Perform the steps on a tserver that exists and one that doesn't.
+  const string& kDummyUuid = "foobaruuid";
+  MiniMaster* mini_master = mini_cluster_->mini_master();
+  const string& ts_uuid = mini_cluster_->mini_tablet_server(0)->uuid();
+  TSManager* ts_manager = mini_master->master()->ts_manager();
+
+  // First, do a sanity check that our tservers have no state at first.
+  ASSERT_EQ(TServerStatePB::NONE, ts_manager->GetTServerState(ts_uuid));
+  ASSERT_EQ(TServerStatePB::NONE, ts_manager->GetTServerState(kDummyUuid));
+
+  // Enter maintenance mode twice. The second time should no-op.
+  for (int i = 0; i < 2; i++) {
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("tserver state enter_maintenance $0 $1",
+                  mini_master->bound_rpc_addr().ToString(), ts_uuid)));
+    ASSERT_EQ(TServerStatePB::MAINTENANCE_MODE, ts_manager->GetTServerState(ts_uuid));
+    ASSERT_EQ(TServerStatePB::NONE, ts_manager->GetTServerState(kDummyUuid));
+  }
+
+  // When entering maintenance mode on a tserver that doesn't exist, we should
+  // get an error.
+  string stderr;
+  ASSERT_TRUE(RunActionStderrString(
+      Substitute("tserver state enter_maintenance $0 $1",
+                 mini_master->bound_rpc_addr().ToString(), kDummyUuid), &stderr).IsRuntimeError());
+  ASSERT_STR_CONTAINS(stderr, "has not been registered");
+  ASSERT_EQ(TServerStatePB::MAINTENANCE_MODE, ts_manager->GetTServerState(ts_uuid));
+  ASSERT_EQ(TServerStatePB::NONE, ts_manager->GetTServerState(kDummyUuid));
+
+  // But operators are able to specify a flag to force the maintenance mode,
+  // despite the tserver not being registered.
+  NO_FATALS(RunActionStdoutNone(
+      Substitute("tserver state enter_maintenance $0 $1 --allow_missing_tserver",
+                 mini_master->bound_rpc_addr().ToString(), kDummyUuid)));
+  ASSERT_EQ(TServerStatePB::MAINTENANCE_MODE, ts_manager->GetTServerState(ts_uuid));
+  ASSERT_EQ(TServerStatePB::MAINTENANCE_MODE, ts_manager->GetTServerState(kDummyUuid));
+
+  // Exit maintenance mode twice. The second time should no-op.
+  for (int i = 0; i < 2; i++) {
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("tserver state exit_maintenance $0 $1",
+                  mini_master->bound_rpc_addr().ToString(), ts_uuid)));
+    ASSERT_EQ(TServerStatePB::NONE, ts_manager->GetTServerState(ts_uuid));
+    ASSERT_EQ(TServerStatePB::MAINTENANCE_MODE, ts_manager->GetTServerState(kDummyUuid));
+  }
+
+  // No flag is necessary to remove the state of a tserver that hasn't been
+  // registered. The second time should no-op as well, even though the dummy
+  // tserver doesn't exist.
+  for (int i = 0; i < 2; i++) {
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("tserver state exit_maintenance $0 $1",
+                  mini_master->bound_rpc_addr().ToString(), kDummyUuid)));
+    ASSERT_EQ(TServerStatePB::NONE, ts_manager->GetTServerState(ts_uuid));
+    ASSERT_EQ(TServerStatePB::NONE, ts_manager->GetTServerState(kDummyUuid));
+  }
 }
 
 TEST_F(ToolTest, TestFsRemoveDataDirWithTombstone) {

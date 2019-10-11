@@ -95,7 +95,7 @@ ADD_KUDU_TEST(master_replication-itest)
 # NOTE: Sentry tests are disabled to allow upgrading to Hive 3.
 #ADD_KUDU_TEST(master_sentry-itest RUN_SERIAL true NUM_SHARDS 8 PROCESSORS 4)
 ADD_KUDU_TEST(master-stress-test RUN_SERIAL true NUM_SHARDS 3)
-if (TCMALLOC_ENABLED)
+if(${KUDU_TCMALLOC_AVAILABLE})
   ADD_KUDU_TEST(memory_gc-itest)
 endif()
 ADD_KUDU_TEST(multidir_cluster-itest)

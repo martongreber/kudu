@@ -46,6 +46,22 @@ function readconf {
   IFS='=' read key value <<< "$conf"
 }
 
+function tserver_enter_maintenance {
+  # Get the UUID from the local FS.
+  ts_uuid=$(kudu fs dump uuid --flagfile=$GFLAG_FILE)
+
+  # Set maintenance mode for the given UUID.
+  exec kudu tserver state enter_maintenance "$1" "$ts_uuid"
+}
+
+function tserver_exit_maintenance {
+  # Get the UUID from the local FS.
+  ts_uuid=$(kudu fs dump uuid --flagfile=$GFLAG_FILE)
+
+  # Exit maintenance mode for the given UUID.
+  exec kudu tserver state exit_maintenance "$1" "$ts_uuid"
+}
+
 # Runs the rebalancer tool, if it's available.
 function run_rebalancer_tool {
   # Heuristic to determine if the rebalance tool is available.
@@ -174,6 +190,10 @@ elif [ "$CMD" = "ksck" ]; then
   exec kudu cluster ksck "$MASTER_IPS"
 elif [ "$CMD" = "rebalance_tool" ]; then
   run_rebalancer_tool "$MASTER_IPS"
+elif [ "$CMD" = "tserver_enter_maintenance" ]; then
+  tserver_enter_maintenance "$MASTER_IPS"
+elif [ "$CMD" = "tserver_exit_maintenance" ]; then
+  tserver_exit_maintenance "$MASTER_IPS"
 else
   log "Unknown command: $CMD"
   exit 2

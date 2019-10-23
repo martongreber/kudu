@@ -129,21 +129,22 @@
 	"percentGreenForGreen" : 80.1,
 	"percentYellowGreenForYellow" : 60.0
       },
-      "healthTests" : [
-        {
-          "type" : "metric",
-          "name" : "FULL_DATA_DIRS",
-          "label" : "Full Data Directories",
-          "description" : "Test for whether any Kudu data directories are full.",
-          "metric" : "kudu_data_dirs_full",
-          "timeWindowSec" : 60,
-          "comparisonOperator" : "gt",
-          "aggregationFunction" : "last",
-          "greenMessage" : "There are no full Kudu data directories.",
-          "redThreshold" : 0,
-          "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
-        }
-      ],
+      // Uncomment when OPSAPS-51086 is fixed.
+      // "healthTests" : [
+      //   {
+      //     "type" : "metric",
+      //     "name" : "FULL_DATA_DIRS",
+      //     "label" : "Full Data Directories",
+      //     "description" : "Test for whether any Kudu data directories are full.",
+      //     "metric" : "kudu_data_dirs_full",
+      //     "timeWindowSec" : 60,
+      //     "comparisonOperator" : "gt",
+      //     "aggregationFunction" : "last",
+      //     "greenMessage" : "There are no full Kudu data directories.",
+      //     "redThreshold" : 0,
+      //     "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
+      //   }
+      // ],
       "commands" : [
         {
           "name" : "kudu_master_ksck_cmd",
@@ -318,21 +319,22 @@
 	"percentGreenForGreen" : 75.0,
 	"percentYellowGreenForYellow" : 50.0
       },
-      "healthTests" : [
-        {
-          "type" : "metric",
-          "name" : "FULL_DATA_DIRS",
-          "label" : "Full Data Directories",
-          "description" : "Test for whether any Kudu data directories are full.",
-          "metric" : "kudu_data_dirs_full",
-          "timeWindowSec" : 60,
-          "comparisonOperator" : "gt",
-          "aggregationFunction" : "last",
-          "greenMessage" : "There are no full Kudu data directories.",
-          "redThreshold" : 0,
-          "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
-        }
-      ],
+      // Uncomment when OPSAPS-51086 is fixed.
+      // "healthTests" : [
+      //   {
+      //     "type" : "metric",
+      //     "name" : "FULL_DATA_DIRS",
+      //     "label" : "Full Data Directories",
+      //     "description" : "Test for whether any Kudu data directories are full.",
+      //     "metric" : "kudu_data_dirs_full",
+      //     "timeWindowSec" : 60,
+      //     "comparisonOperator" : "gt",
+      //     "aggregationFunction" : "last",
+      //     "greenMessage" : "There are no full Kudu data directories.",
+      //     "redThreshold" : 0,
+      //     "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
+      //   }
+      // ],
       "parameters" : [
         {
           "name" : "webserver_interface",

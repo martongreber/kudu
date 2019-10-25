@@ -59,8 +59,60 @@
       "roleName" : "KUDU_MASTER",
       "roleCommand" : "kudu_master_rebalance_tool_cmd",
       "runMode" : "single"
+    },
+    {
+      "name" : "kudu_svc_tserver_enter_maintenance",
+      "label" : "Disable Re-replication on Tablet Server(s)",
+      "description" : "Begin maintenance on the Kudu Tablet Servers. While in maintenance, downtime of the Tablet Server(s) will not directly trigger re-replication any affected replicas",
+      "roleName" : "KUDU_TSERVER",
+      "roleCommand" : "kudu_tserver_enter_maintenance",
+      "runMode" : "target"
+    },
+    {
+      "name" : "kudu_svc_tserver_exit_maintenance",
+      "label" : "Re-enable Re-replication on Tablet Server(s)",
+      "description" : "End maintenance on the Kudu Tablet Server(s)",
+      "roleName" : "KUDU_TSERVER",
+      "roleCommand" : "kudu_tserver_exit_maintenance",
+      "runMode" : "target"
+    },
+    {
+      "name" : "kudu_svc_tserver_quiesce",
+      "label" : "Quiesce the Kudu Tablet Server(s)",
+      "description" : "Quiesce the Kudu Tablet Servers. While quiescing, a Tablet Server will stop hosting Tablet leaders and stop accepting new scans. This will wait for the Tablet Servers to become fully quiesced, hosting no Tablet leaders and no active scanners. Thus, care should be taken to ensure a majority of Tablet replicas are not hosted on concurrently quiescing Tablet Servers",
+      "roleName" : "KUDU_TSERVER",
+      "roleCommand" : "kudu_tserver_quiesce",
+      "runMode" : "target"
+    },
+    {
+      "name" : "kudu_svc_tserver_stop_quiescing",
+      "label" : "Stop Quiecing the Kudu Tablet Server(s)",
+      "description" : "Stop quiescing the Kudu Tablet Servers. If a specified Tablet Server is not currently quiescing, this does not change the state of that Tablet Server",
+      "roleName" : "KUDU_TSERVER",
+      "roleCommand" : "kudu_tserver_stop_quiescing",
+      "runMode" : "target"
+    },
+    {
+      "name" : "kudu_svc_wait_until_healthy",
+      "label" : "Wait until the Kudu cluster is healthy",
+      "description" : "Waits for Kudu to become healthy",
+      "roleName" : "KUDU_MASTER",
+      "roleCommand" : "kudu_master_wait_until_healthy",
+      "runMode" : "single"
     }
   ],
+  "rollingRestart" : {
+    "nonWorkerSteps" : [{
+      "roleName" : "KUDU_MASTER",
+      "bringDownCommands" : [ "Stop" ],
+      "bringUpCommands" : [ "Start" ]
+    }],
+    "workerSteps" : {
+      "roleName" : "KUDU_TSERVER",
+      "bringDownCommands" : [ "kudu_svc_tserver_enter_maintenance", "kudu_svc_tserver_quiesce", "Stop" ],
+      "bringUpCommands" : [ "Start", "kudu_svc_wait_until_healthy", "kudu_svc_tserver_exit_maintenance" ]
+    }
+  },
   "parameters" : [
     {
       "name" : "enable_core_dump",
@@ -119,6 +171,22 @@
       "required" : false,
       "type" : "long",
       "default" : 300
+    },
+    {
+      "name" : "rr_health_check_interval_sec",
+      "label" : "Rolling Restart Health Check Interval",
+      "description" : "Interval in seconds with which to check the health of a cluster in waiting for a server or batch of servers to come back online, before moving onto the next server or batch of servers during a rolling restart.",
+      "required" : false,
+      "type" : "long",
+      "default" : 60
+    },
+    {
+      "name" : "rr_batch_time_limit_sec",
+      "label" : "Maximum Allowed Runtime to Rolling Restart a Batch of Servers",
+      "description" : "Maximum time to allow for the restart of a batch of servers during a rolling restart. If this period elapses without the cluster becoming healthy, the rolling restart will exit indicating failure. This may happen if there is a persistent problem with the cluster.",
+      "required" : false,
+      "type" : "long",
+      "default" : 1800
     }
   ],
   "rolesWithExternalLinks" : [
@@ -206,6 +274,21 @@
           "commandRunner" : {
             "program" : "scripts/kudu.sh",
             "args" : ["ksck"]
+          }
+        },
+        {
+          "name" : "kudu_master_wait_until_healthy",
+          "label" : "Wait until the Kudu cluster is healthy",
+          "description" : "Waits for Kudu to become healthy",
+          "expectedExitCodes" : [0],
+          "requiredRoleState" : "running",
+          "commandRunner" : {
+            "program" : "scripts/kudu.sh",
+            "args" : ["wait_until_healthy"],
+            "environmentVariables" : {
+              "RR_HEALTH_CHECK_INTERVAL_SEC" : "${rr_health_check_interval_sec}",
+              "RR_BATCH_TIME_LIMIT_SEC" : "${rr_batch_time_limit_sec}"
+            }
           }
         },
         {
@@ -455,6 +538,34 @@
             "program" : "scripts/kudu.sh",
             "args" : ["tserver_exit_maintenance"]
           }
+        },
+        {
+          "name" : "kudu_tserver_quiesce",
+          "label" : "Quiesce the Kudu Tablet Server",
+          "description" : "Quiesce the Kudu Tablet Server. While quiescing, the Tablet Server will stop hosting Tablet leaders and stop accepting new scans. This will wait for the Tablet Server to become fully quiesced, hosting no Tablet leaders and no active scanners",
+          "expectedExitCodes" : [0],
+          "commandRunner" : {
+            "program" : "scripts/kudu.sh",
+            "args" : ["tserver_quiesce"],
+            "environmentVariables" : {
+              "TS_QUIESCING_TIME_LIMIT_SEC" : "${ts_quiescing_time_limit_sec}",
+              "TS_QUIESCING_RETRY_INTERVAL_SEC" : "${ts_quiescing_retry_interval_sec}",
+              "TS_QUIESCING_HOST" : "${host}"
+            }
+          }
+        },
+        {
+          "name" : "kudu_tserver_stop_quiescing",
+          "label" : "Stop Quiescing the Kudu Tablet Server",
+          "description" : "Stop quiescing the Kudu Tablet Server. If the Tablet Server is not currently quiescing, this does not change the state of the Tablet Server",
+          "expectedExitCodes" : [0],
+          "commandRunner" : {
+            "program" : "scripts/kudu.sh",
+            "args" : ["tserver_stop_quiescing"],
+            "environmentVariables" : {
+              "TS_QUIESCING_HOST" : "${host}"
+            }
+          }
         }
       ],
       "parameters" : [
@@ -557,6 +668,22 @@
           "min" : -1,
           "unit" : "seconds",
           "default" : 604800
+        },
+        {
+          "name" : "ts_quiescing_time_limit_sec",
+          "label" : "Maximum Allowed Runtime to Quiesce a Tablet Server",
+          "description" : "Maximum time to wait for a Tablet Server to fully quiesce, relinquishing leadership of all Tablets and completion of all active scans.",
+          "required" : false,
+          "type" : "long",
+          "default" : 1800
+        },
+        {
+          "name" : "ts_quiescing_retry_interval_sec",
+          "label" : "Tablet Server Quiescing Interval",
+          "description" : "Interval in seconds with which to check whether a Tablet Server has fully quiesced",
+          "required" : false,
+          "type" : "long",
+          "default" : 30
         }
       ],
       "sslServer": {

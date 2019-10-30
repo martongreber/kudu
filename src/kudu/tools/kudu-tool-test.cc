@@ -3415,7 +3415,7 @@ TEST_F(ToolTest, TestAlterColumn) {
   // Test invalid compression type.
   NO_FATALS(check_bad_input("column_set_compression",
                             "UNKNOWN_COMPRESSION_TYPE",
-                            "Failed to parse compression type"));
+                            "compression type UNKNOWN_COMPRESSION_TYPE is not supported"));
 
   // Alter encoding type for a column.
   NO_FATALS(RunActionStdoutNone(Substitute("table column_set_encoding $0 $1 $2 $3",
@@ -3428,7 +3428,7 @@ TEST_F(ToolTest, TestAlterColumn) {
   // Test invalid encoding type.
   NO_FATALS(check_bad_input("column_set_encoding",
                             "UNKNOWN_ENCODING_TYPE",
-                            "Failed to parse encoding type"));
+                            "encoding type UNKNOWN_ENCODING_TYPE is not supported"));
 
   // Alter block_size for a column.
   NO_FATALS(RunActionStdoutNone(Substitute("table column_set_block_size $0 $1 $2 $3",
@@ -5234,6 +5234,36 @@ TEST_F(ToolTest, TestGetFlags) {
     ASSERT_STR_CONTAINS(out, "help,false,true");
     ASSERT_STR_NOT_MATCHES(out, "logemaillevel,*");
     ASSERT_STR_CONTAINS(out, Substitute("fs_wal_dir,$0,false", wal_dir));
+
+    // Check that we get flags with -flags.
+    out.clear();
+    NO_FATALS(RunActionStdoutString(
+        Substitute("$0 get_flags $1 -format=csv -flags=fs_wal_dir,logemaillevel",
+                   daemon_type, daemon_addr),
+        &out));
+    ASSERT_STR_NOT_MATCHES(out, "help*");
+    ASSERT_STR_CONTAINS(out, "logemaillevel,999,true");
+    ASSERT_STR_CONTAINS(out, Substitute("fs_wal_dir,$0,false", wal_dir));
+
+    // Check -flags will ignore -all_flags.
+    out.clear();
+    NO_FATALS(RunActionStdoutString(
+        Substitute("$0 get_flags $1 -format=csv -all_flags -flags=logemaillevel",
+                   daemon_type, daemon_addr),
+        &out));
+    ASSERT_STR_NOT_MATCHES(out, "help*");
+    ASSERT_STR_CONTAINS(out, "logemaillevel,999,true");
+    ASSERT_STR_NOT_MATCHES(out, "fs_wal_dir*");
+
+    // Check -flag_tags filter to matching tags with -flags.
+    out.clear();
+    NO_FATALS(RunActionStdoutString(
+        Substitute("$0 get_flags $1 -format=csv -flags=logemaillevel -flag_tags=stable",
+                   daemon_type, daemon_addr),
+        &out));
+    ASSERT_STR_NOT_MATCHES(out, "help*");
+    ASSERT_STR_NOT_MATCHES(out, "logemaillevel,*");
+    ASSERT_STR_NOT_MATCHES(out, "fs_wal_dir*");
   }
 }
 

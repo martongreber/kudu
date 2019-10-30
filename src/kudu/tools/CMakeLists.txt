@@ -40,7 +40,6 @@ target_link_libraries(tool_proto
 
 add_library(kudu_tools_util
   color.cc
-  data_gen_util.cc
   diagnostics_log_parser.cc
   table_scanner.cc
   tool_action.cc
@@ -170,6 +169,10 @@ SET_KUDU_TEST_LINK_LIBS(
   kudu_tools_test_util
   kudu_tools_util
   mini_cluster)
+ADD_KUDU_TEST(create-table-tool-test
+  NUM_SHARDS 4 PROCESSORS 3)
+ADD_KUDU_TEST_DEPENDENCIES(create-table-tool-test
+  kudu)
 ADD_KUDU_TEST(diagnostics_log_parser-test)
 ADD_KUDU_TEST(ksck-test)
 ADD_KUDU_TEST(ksck_remote-test

@@ -60,6 +60,8 @@ class MetaCacheEntry;
 class WriteRpc;
 } // namespace internal
 
+class KuduColumnSchema;
+class KuduColumnSpec;
 class KuduSchema;
 class KuduValue;
 
@@ -82,6 +84,12 @@ class KUDU_EXPORT KuduColumnTypeAttributes {
   ///   The scale of a decimal column.
   KuduColumnTypeAttributes(int8_t precision, int8_t scale);
 
+  /// Create a KuduColumnTypeAttributes object
+  ///
+  /// @param [in] length
+  ///   The maximum length of a VARCHAR column in characters.
+  explicit KuduColumnTypeAttributes(uint16_t length);
+
   ~KuduColumnTypeAttributes();
 
   /// @name Assign/copy KuduColumnTypeAttributes.
@@ -100,7 +108,16 @@ class KUDU_EXPORT KuduColumnTypeAttributes {
   /// @return Scale for the column type.
   int8_t scale() const;
 
+  /// @return Length for the column type.
+  uint16_t length() const;
+
  private:
+  friend class KuduColumnSchema;
+  friend class KuduColumnSpec;
+  friend class KuduSchema;
+
+  KuduColumnTypeAttributes(int8_t precision, int8_t scale, uint16_t length);
+
   class KUDU_NO_EXPORT Data;
   // Owned.
   Data* data_;
@@ -167,6 +184,24 @@ class KUDU_EXPORT KuduColumnStorageAttributes {
   /// @return String representation of the storage attributes.
   std::string ToString() const;
 
+  /// @param [in] encoding
+  ///   String representation of the column encoding type
+  /// @param [out] type
+  ///   Enum representation of the column encoding type,
+  ///   Converted from string format.
+  /// @return Operation result status.
+  static Status StringToEncodingType(const std::string& encoding,
+      EncodingType* type);
+
+  /// @param [in] compression
+  ///   String representation of the column compression type
+  /// @param [out] type
+  ///   Enum representation of the column compression type,
+  ///   Converted from string format.
+  /// @return Operation result status.
+  static Status StringToCompressionType(const std::string& compression,
+      CompressionType* type);
+
  private:
   EncodingType encoding_;
   CompressionType compression_;
@@ -189,6 +224,7 @@ class KUDU_EXPORT KuduColumnSchema {
     BINARY = 8,
     UNIXTIME_MICROS = 9,
     DECIMAL = 10,
+    VARCHAR = 11,
     TIMESTAMP = UNIXTIME_MICROS //!< deprecated, use UNIXTIME_MICROS
   };
 
@@ -196,6 +232,13 @@ class KUDU_EXPORT KuduColumnSchema {
   ///   Column data type.
   /// @return String representation of the column data type.
   static std::string DataTypeToString(DataType type);
+
+  /// @param [in] type_str
+  ///   String representation of the column data type
+  /// @param [out] type
+  ///   Enum representation of the column data type, Converted from string format.
+  /// @return Operation result status.
+  static Status StringToDataType(const std::string& type_str, DataType* type);
 
   /// Construct KuduColumnSchema object as a copy of another object.
   ///
@@ -380,6 +423,24 @@ class KUDU_EXPORT KuduColumnSpec {
   ///   Desired scale to set.
   /// @return Pointer to the modified object.
   KuduColumnSpec* Scale(int8_t scale);
+  ///@}
+
+  /// @name Operation only relevant for VARCHAR columns.
+  ///
+  ///@{
+  /// Set the length for a column.
+  ///
+  /// Clients can specify a length for VARCHAR columns.
+  /// Length represents the maximum length of a VARCHAR column in
+  /// characters.
+  ///
+  /// The length must be greater than 0 and less than 65536.
+  /// If no length is provided a default length of 65535 is used.
+  ///
+  /// @param [in] length
+  ///   Desired length to set.
+  /// @return Pointer to the modified object.
+  KuduColumnSpec* Length(uint16_t length);
   ///@}
 
   /// @name Operations only relevant for Create Table
@@ -577,7 +638,7 @@ class KUDU_EXPORT KuduSchema {
 
   /// @param [in] col_name
   ///   Column name.
-  /// @param [out] col_schema.
+  /// @param [out] col_schema
   ///   Schema for the specified column.
   /// @return @c true iff the specified column exists.
   bool HasColumn(const std::string& col_name, KuduColumnSchema* col_schema) const;

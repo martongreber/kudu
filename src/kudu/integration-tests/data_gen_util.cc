@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/tools/data_gen_util.h"
+#include "kudu/integration-tests/data_gen_util.h"
 
 #include <ostream>
 
@@ -28,7 +28,6 @@
 #include "kudu/util/status.h"
 
 namespace kudu {
-namespace tools {
 
 void WriteValueToColumn(const client::KuduSchema& schema,
                         int col_idx,
@@ -91,6 +90,12 @@ void GenerateDataForRow(const client::KuduSchema& schema, uint64_t record_id,
   }
 }
 
+template <class RNG>
+void GenerateDataForRow(const client::KuduSchema& schema,
+                        RNG* random, KuduPartialRow* row) {
+  GenerateDataForRow(schema, random->Next64(), random, row);
+}
+
 // Explicit specialization for callers outside this compilation unit.
 template
 void GenerateDataForRow(const client::KuduSchema& schema, uint64_t record_id,
@@ -98,6 +103,11 @@ void GenerateDataForRow(const client::KuduSchema& schema, uint64_t record_id,
 template
 void GenerateDataForRow(const client::KuduSchema& schema, uint64_t record_id,
                         ThreadSafeRandom* random, KuduPartialRow* row);
+template
+void GenerateDataForRow(const client::KuduSchema& schema,
+                        Random* random, KuduPartialRow* row);
+template
+void GenerateDataForRow(const client::KuduSchema& schema,
+                        ThreadSafeRandom* random, KuduPartialRow* row);
 
-} // namespace tools
 } // namespace kudu

@@ -42,6 +42,7 @@
 namespace kudu {
 class ColumnSchema;
 namespace client {
+class ClientTest_TestProjectionPredicatesFuzz_Test;
 class KuduWriteOperation;
 template<typename KeyTypeWrapper> struct SliceKeysTestSetup;// IWYU pragma: keep
 template<typename KeyTypeWrapper> struct IntKeysTestSetup;  // IWYU pragma: keep
@@ -166,10 +167,23 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetString(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
   ///@}
 
+  /// @name Setters for varchar columns by name (copying).
+  ///
+  /// Set the varchar value for a column by name, copying the
+  /// specified data immediately.
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  Status SetVarchar(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
+
   /// @name Setters for binary/string columns by index (copying).
   ///
-  /// Set the binary/string value for a column by index, copying the specified
-  /// data immediately.
+  /// Set the binary/string value for a column by index, copying
+  /// the specified data immediately.
   ///
   /// These setters are the same as the corresponding column-name-based setters,
   /// but with numeric column indexes. These are faster since they avoid
@@ -191,6 +205,24 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetBinary(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
   Status SetString(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
   ///@}
+
+  /// @name Setter for varchar columns by index (copying).
+  ///
+  /// Set the varchar value for a column by index, copying
+  /// the specified data immediately.
+  ///
+  /// These setters are the same as the corresponding column-name-based setters,
+  /// but with numeric column indexes. These are faster since they avoid
+  /// hashmap lookups, so should be preferred in performance-sensitive code
+  /// (e.g. bulk loaders).
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  Status SetVarchar(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
 
   /// @name Setters for binary/string columns by name (copying).
   ///
@@ -250,6 +282,30 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetStringNoCopy(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
   ///@}
 
+  /// @name [Advanced][Unstable] Setter for varchar columns by name (non-copying).
+  ///
+  /// Set the varchar value for a column by name, not copying the
+  /// specified data.
+  ///
+  /// This method expects the values to be truncated already and they only do a
+  /// basic validation that the data is not larger than the maximum column
+  /// length (as indicated by the schema) multiplied by 4, as that's the upper
+  /// limit if only 4-byte UTF8 characters are used. This is subject to change in
+  /// the future.
+  ///
+  /// @note The specified data must remain valid until the corresponding
+  ///   RPC calls are completed to be able to access error buffers,
+  ///   if any errors happened (the errors can be fetched using the
+  ///   KuduSession::GetPendingErrors() method).
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  Status SetVarcharNoCopyUnsafe(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
+
   /// @name Setters for binary/string columns by index (non-copying).
   ///
   /// Set the binary/string value for a column by index, not copying the
@@ -275,6 +331,34 @@ class KUDU_EXPORT KuduPartialRow {
   Status SetBinaryNoCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
   Status SetStringNoCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
   ///@}
+
+  /// @name [Advanced][Unstable] Setter for varchar columns by index (non-copying).
+  ///
+  /// Set the varchar value for a column by index, not copying the specified data.
+  ///
+  /// This method expects the values to be truncated already and they only do a
+  /// basic validation that the data is not larger than the maximum column
+  /// length (as indicated by the schema) multiplied by 4, as that's the upper
+  /// limit if only 4-byte UTF8 characters are used. This is subject to change in
+  /// the future.
+  ///
+  /// This setter is the same as the corresponding column-name-based setter,
+  /// but with numeric column indexes. This is faster since it avoids
+  /// hashmap lookups, so should be preferred in performance-sensitive code
+  /// (e.g. bulk loaders).
+  ///
+  /// @note The specified data must remain valid until the corresponding
+  ///   RPC calls are completed to be able to access error buffers,
+  ///   if any errors happened (the errors can be fetched using the
+  ///   KuduSession::GetPendingErrors() method).
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  Status SetVarcharNoCopyUnsafe(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
 
   /// Set column value to @c NULL; the column is identified by its name.
   ///
@@ -406,9 +490,9 @@ class KUDU_EXPORT KuduPartialRow {
 #endif
   ///@}
 
-  /// @name Getters for string/binary column by column name.
+  /// @name Getters for string/binary/varchar column by column name.
   ///
-  /// Get the string/binary value for a column by its name.
+  /// Get the string/binary/varchar value for a column by its name.
   ///
   /// @param [in] col_name
   ///   Name of the column.
@@ -425,11 +509,12 @@ class KUDU_EXPORT KuduPartialRow {
   ///@{
   Status GetString(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
   Status GetBinary(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
+  Status GetVarchar(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
   ///@}
 
-  /// @name Getters for string/binary column by column index.
+  /// @name Getters for string/binary/varchar column by column index.
   ///
-  /// Get the string/binary value for a column by its index.
+  /// Get the string/binary/varchar value for a column by its index.
   ///
   /// These methods are faster than their name-based counterparts
   /// since they use indices to avoid hashmap lookups, so index-based getters
@@ -450,6 +535,7 @@ class KUDU_EXPORT KuduPartialRow {
   ///@{
   Status GetString(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
   Status GetBinary(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
+  Status GetVarchar(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
   ///@}
 
   //------------------------------------------------------------
@@ -510,6 +596,7 @@ class KUDU_EXPORT KuduPartialRow {
   template<typename KeyTypeWrapper> friend struct client::IntKeysTestSetup;
   template<typename KeyTypeWrapper> friend struct tablet::SliceTypeRowOps;
   template<typename KeyTypeWrapper> friend struct tablet::NumTypeRowOps;
+  FRIEND_TEST(client::ClientTest, TestProjectionPredicatesFuzz);
   FRIEND_TEST(KeyUtilTest, TestIncrementInt128PrimaryKey);
   FRIEND_TEST(PartitionPrunerTest, TestIntPartialPrimaryKeyRangePruning);
   FRIEND_TEST(PartitionPrunerTest, TestPartialPrimaryKeyRangePruning);

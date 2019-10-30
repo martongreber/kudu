@@ -42,7 +42,6 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/quorum_util.h"
-#include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stringprintf.h"
@@ -111,7 +110,7 @@ MasterPathHandlers::~MasterPathHandlers() {
 
 void MasterPathHandlers::HandleTabletServers(const Webserver::WebRequest& /*req*/,
                                              Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   vector<shared_ptr<TSDescriptor>> descs;
   master_->ts_manager()->GetAllDescriptors(&descs);
 
@@ -234,7 +233,7 @@ int ExtractRedirectsFromRequest(const Webserver::WebRequest& req) {
 
 void MasterPathHandlers::HandleCatalogManager(const Webserver::WebRequest& req,
                                               Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
   if (!l.catalog_status().ok()) {
     (*output)["error"] = Substitute("Master is not ready: $0",  l.catalog_status().ToString());
@@ -306,7 +305,7 @@ bool CompareByRole(const pair<TabletDetailPeerInfo, RaftPeerPB::Role>& a,
 
 void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
                                          Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   // Parse argument.
   string table_id;
   if (!FindCopy(req.parsed_args, "id", &table_id)) {
@@ -494,9 +493,8 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
     // But the value of disk size will never be negative.
     (*output)["table_disk_size"] =
         HumanReadableNumBytes::ToString(table_metrics->on_disk_size->value());
-    int64 live_row_count = table_metrics->live_row_count->value();
-    if (live_row_count >= 0) {
-      (*output)["table_live_row_count"] = live_row_count;
+    if (table_metrics->TableSupportsLiveRowCount()) {
+      (*output)["table_live_row_count"] = table_metrics->live_row_count->value();
     } else {
       (*output)["table_live_row_count"] = "N/A";
     }
@@ -542,7 +540,7 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
 
 void MasterPathHandlers::HandleMasters(const Webserver::WebRequest& /*req*/,
                                        Webserver::WebResponse* resp) {
-  EasyJson* output = resp->output;
+  EasyJson* output = &resp->output;
   vector<ServerEntryPB> masters;
   Status s = master_->ListMasters(&masters);
   if (!s.ok()) {
@@ -688,7 +686,7 @@ void JsonError(const Status& s, ostringstream* out) {
 
 void MasterPathHandlers::HandleDumpEntities(const Webserver::WebRequest& /*req*/,
                                             Webserver::PrerenderedWebResponse* resp) {
-  ostringstream* output = resp->output;
+  ostringstream* output = &resp->output;
   Status s = master_->catalog_manager()->CheckOnline();
   if (!s.ok()) {
     JsonError(s, output);

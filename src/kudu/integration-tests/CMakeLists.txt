@@ -23,6 +23,7 @@ endif()
 set(INTEGRATION_TESTS_SRCS
   cluster_itest_util.cc
   cluster_verifier.cc
+  data_gen_util.cc
   external_mini_cluster-itest-base.cc
   hms_itest-base.cc
   internal_mini_cluster-itest-base.cc
@@ -62,6 +63,7 @@ ADD_KUDU_TEST(alter_table-test PROCESSORS 3)
 ADD_KUDU_TEST(auth_token_expire-itest)
 ADD_KUDU_TEST(authz_token-itest PROCESSORS 2)
 ADD_KUDU_TEST(catalog_manager_tsk-itest PROCESSORS 2)
+ADD_KUDU_TEST(varchar-itest)
 ADD_KUDU_TEST(client_failover-itest)
 ADD_KUDU_TEST(client-negotiation-failover-itest)
 ADD_KUDU_TEST(client-stress-test

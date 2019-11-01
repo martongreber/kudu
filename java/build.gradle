@@ -33,6 +33,7 @@ allprojects {
   // These are common to all projects, including this
   // top level parent project.
   repositories {
+    maven { url gbnUrl }
     maven { url repositoryUrl }
     mavenCentral()
     mavenLocal()

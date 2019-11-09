@@ -645,7 +645,7 @@ build_mustache() {
   mkdir -p $MUSTACHE_BDIR
   pushd $MUSTACHE_BDIR
   # We add $PREFIX/include for boost and $PREFIX_COMMON/include for rapidjson.
-  ${CXX:-g++} $EXTRA_CXXFLAGS -I$PREFIX/include -I$PREFIX_COMMON/include -O3 -DNDEBUG -fPIC -c "$MUSTACHE_SOURCE/mustache.cc"
+  ${CXX:-g++} -std=c++11 $EXTRA_CXXFLAGS -I$PREFIX/include -I$PREFIX_COMMON/include -O3 -DNDEBUG -fPIC -c "$MUSTACHE_SOURCE/mustache.cc"
   ar rs libmustache.a mustache.o
   cp libmustache.a $PREFIX/lib/
   cp $MUSTACHE_SOURCE/mustache.h $PREFIX/include/
@@ -974,5 +974,37 @@ build_chrony() {
     --disable-sechash
 
   make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  popd
+}
+
+build_gumbo_parser() {
+  GUMBO_PARSER_BDIR=$TP_BUILD_DIR/$GUMBO_PARSER_NAME$MODE_SUFFIX
+  mkdir -p $GUMBO_PARSER_BDIR
+  pushd $GUMBO_PARSER_BDIR
+  CFLAGS="$EXTRA_CFLAGS" \
+    CXXFLAGS="$EXTRA_CXXFLAGS" \
+    LDFLAGS="$EXTRA_LDFLAGS" \
+    LIBS="$EXTRA_LIBS" \
+    $GUMBO_PARSER_SOURCE/configure \
+    --prefix=$PREFIX
+  make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  popd
+}
+
+build_gumbo_query() {
+  GUMBO_QUERY_BDIR=$TP_BUILD_DIR/$GUMBO_QUERY_NAME$MODE_SUFFIX
+  mkdir -p $GUMBO_QUERY_BDIR
+  pushd $GUMBO_QUERY_BDIR
+  rm -Rf CMakeCache.txt CMakeFiles/
+  cmake \
+    -DCMAKE_BUILD_TYPE=release \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
+    -DCMAKE_MODULE_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS -L$PREFIX/lib -Wl,-rpath,$PREFIX/lib" \
+    $EXTRA_CMAKE_FLAGS \
+    $GUMBO_QUERY_SOURCE
+  ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }

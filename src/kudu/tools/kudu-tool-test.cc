@@ -1198,7 +1198,7 @@ TEST_F(ToolTest, TestFsCheck) {
 
   // Create a local replica, flush some rows a few times, and collect all
   // of the created block IDs.
-  vector<BlockId> block_ids;
+  BlockIdContainer block_ids;
   {
     TabletHarness::Options opts(kTestDir);
     opts.tablet_id = kTabletId;
@@ -1235,8 +1235,11 @@ TEST_F(ToolTest, TestFsCheck) {
     ASSERT_OK(fs.Open(&report));
     std::shared_ptr<BlockDeletionTransaction> deletion_transaction =
         fs.block_manager()->NewDeletionTransaction();
-    for (int i = 0; i < block_ids.size(); i += 2) {
-      deletion_transaction->AddDeletedBlock(block_ids[i]);
+    int index = 0;
+    for (const auto& block_id : block_ids) {
+      if (index++ % 2 == 0) {
+        deletion_transaction->AddDeletedBlock(block_id);
+      }
     }
     deletion_transaction->CommitDeletedBlocks(&missing_ids);
   }
@@ -4728,6 +4731,70 @@ TEST_P(ControlShellToolTest, TestControlShell) {
     ControlShellResponsePB resp;
     req.mutable_start_cluster();
     ASSERT_OK(SendReceive(req, &resp));
+  }
+
+  // Set flag.
+  {
+    ControlShellRequestPB req;
+    ControlShellResponsePB resp;
+    auto* r = req.mutable_set_daemon_flag();
+    *r->mutable_id() = tservers[0].id();
+    r->set_flag("rpc_negotiation_timeout_ms");
+    r->set_value("5000");
+    ASSERT_OK(SendReceive(req, &resp));
+  }
+
+  // Try to set a non-existent flag: this should fail.
+  {
+    ControlShellRequestPB req;
+    ControlShellResponsePB resp;
+    auto* r = req.mutable_set_daemon_flag();
+    *r->mutable_id() = masters[0].id();
+    r->set_flag("__foo_bar_flag__");
+    r->set_value("__value__");
+    ASSERT_OK(proto_->SendMessage(req));
+    ASSERT_OK(proto_->ReceiveMessage(&resp));
+    ASSERT_TRUE(resp.has_error());
+    auto s = StatusFromPB(resp.error());
+    ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "failed to set flag: result: NO_SUCH_FLAG");
+  }
+
+  // Try to set a flag on a non-existent daemon: this should fail.
+  {
+    ControlShellRequestPB req;
+    ControlShellResponsePB resp;
+    auto* r = req.mutable_set_daemon_flag();
+    r->mutable_id()->set_index(1000);
+    r->mutable_id()->set_type(MASTER);
+    r->set_flag("flag");
+    r->set_value("value");
+    ASSERT_OK(proto_->SendMessage(req));
+    ASSERT_OK(proto_->ReceiveMessage(&resp));
+    ASSERT_TRUE(resp.has_error());
+    auto s = StatusFromPB(resp.error());
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "no master with index 1000");
+  }
+
+  // Try to set a flag on a KDC: this should fail since mini-KDC doesn't support
+  // SetFlag() call.
+  {
+    ControlShellRequestPB req;
+    ControlShellResponsePB resp;
+    auto* r = req.mutable_set_daemon_flag();
+    r->mutable_id()->set_index(0);
+    r->mutable_id()->set_type(KDC);
+    r->set_flag("flag");
+    r->set_value("value");
+    ASSERT_OK(proto_->SendMessage(req));
+    ASSERT_OK(proto_->ReceiveMessage(&resp));
+    ASSERT_TRUE(resp.has_error());
+    auto s = StatusFromPB(resp.error());
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "mini-KDC doesn't support SetFlag()");
   }
 
   if (enable_kerberos()) {

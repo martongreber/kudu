@@ -14,9 +14,24 @@ function do_make_build() {
   mkdir -p build/${BUILD_TYPE}
   pushd build/${BUILD_TYPE}
   rm -rf CMakeCache.txt CMakeFiles/
+
+  # 'make install' is configured to only install the client library and
+  # headers because the binaries are copied en masse into the staging directory.
+  #
+  # We could install the binaries too, but that'd require updating
+  # install_kudu.sh to expect them in a different part of the tree, and this
+  # works just as well.
+  #
+  # Note: KUDU_CLIENT_INSTALL is a misnomer as it refers to the CLI tool, not
+  # the client library/headers.
   ../../build-support/enable_devtoolset.sh \
     ../../thirdparty/installed/common/bin/cmake \
-    -DKUDU_LINK=static -DNO_TESTS=1 -DKUDU_GIT_HASH="$GIT_HASH" \
+    -DKUDU_LINK=static \
+    -DNO_TESTS=1 \
+    -DKUDU_GIT_HASH="$GIT_HASH" \
+    -DKUDU_CLIENT_INSTALL=OFF \
+    -DKUDU_MASTER_INSTALL=OFF \
+    -DKUDU_TSERVER_INSTALL=OFF \
     -DCMAKE_BUILD_TYPE=${BUILD_TYPE} ../..
   make -j$(nproc)
   make -j$(nproc) install DESTDIR=$(pwd)/client
@@ -57,8 +72,10 @@ ccache -p || true
 build-support/enable_devtoolset.sh thirdparty/build-if-necessary.sh
 
 # Build a release and fastdebug build.
-do_make_build release
-do_make_build fastdebug
+BUILD_TYPES="release fastdebug"
+for BT in $BUILD_TYPES; do
+  do_make_build $BT
+done
 
 # Build the java modules.
 pushd java
@@ -66,8 +83,20 @@ pushd java
 popd
 
 # Copy the published artifacts to a versioned staging directory.
-mkdir -p ../kudu-${VERSION}/java ../kudu-${VERSION}/thirdparty
-cp -rpf build ../kudu-${VERSION}/
+mkdir -p ../kudu-${VERSION}/java
+mkdir -p ../kudu-${VERSION}/thirdparty
+BINARIES="kudu kudu-master kudu-tserver"
+for BT in $BUILD_TYPES; do
+  # Rather than copy the entire build tree, let's just copy the binaries we
+  # need and the client library bundle.
+  SRC_DIR=build/$BT
+  DST_DIR=../kudu-${VERSION}/build/$BT
+  for B in $BINARIES; do
+    mkdir -p $DST_DIR/bin
+    cp -pf $SRC_DIR/bin/$B $DST_DIR/bin
+  done
+  cp -rpf $SRC_DIR/client $DST_DIR
+done
 cp -rpf java/*/build/libs/*.jar ../kudu-${VERSION}/java/
 cp -rpf www ../kudu-${VERSION}/
 cp -pf NOTICE.txt LICENSE.txt ../kudu-${VERSION}/

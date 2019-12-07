@@ -155,6 +155,7 @@ string Indent(int indent) {
 Status FsInit(unique_ptr<FsManager>* fs_manager) {
   FsManagerOpts fs_opts;
   fs_opts.read_only = true;
+  fs_opts.update_instances = fs::UpdateInstanceBehavior::DONT_UPDATE;
   unique_ptr<FsManager> fs_ptr(new FsManager(Env::Default(), fs_opts));
   RETURN_NOT_OK(fs_ptr->Open());
   fs_manager->swap(fs_ptr);
@@ -188,7 +189,7 @@ Status FindLastLoggedOpId(FsManager* fs, const string& tablet_id,
   RETURN_NOT_OK(LogReader::Open(fs, scoped_refptr<log::LogIndex>(), tablet_id,
                                 scoped_refptr<MetricEntity>(), &reader));
   SegmentSequence segs;
-  RETURN_NOT_OK(reader->GetSegmentsSnapshot(&segs));
+  reader->GetSegmentsSnapshot(&segs);
   // Reverse iterate the segments to find the 'last replicated' entry quickly.
   // Note that we still read the entries within a segment in sequential
   // fashion, so the last entry within the first 'found' segment will
@@ -251,7 +252,7 @@ Status BackupConsensusMetadata(FsManager* fs_manager,
   string cmeta_filename = fs_manager->GetConsensusMetadataPath(tablet_id);
   string backup_filename = Substitute("$0.pre_rewrite.$1", cmeta_filename, env->NowMicros());
   WritableFileOptions opts;
-  opts.mode = Env::CREATE_NON_EXISTING;
+  opts.mode = Env::MUST_CREATE;
   opts.sync_on_close = true;
   RETURN_NOT_OK(env_util::CopyFile(env, cmeta_filename, backup_filename, opts));
   LOG(INFO) << "Backed up old consensus metadata to " << backup_filename;
@@ -526,7 +527,7 @@ Status DumpWals(const RunnerContext& context) {
                                 &reader));
 
   SegmentSequence segments;
-  RETURN_NOT_OK(reader->GetSegmentsSnapshot(&segments));
+  reader->GetSegmentsSnapshot(&segments);
 
   for (const scoped_refptr<ReadableLogSegment>& segment : segments) {
     RETURN_NOT_OK(PrintSegment(segment));

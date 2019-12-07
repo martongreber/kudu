@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdint.h>
-
+#include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -138,7 +139,7 @@ class TimestampAdvancementITest : public MiniClusterITestBase {
 
     // Flush the current log batch and roll over to get a fresh WAL segment.
     ASSERT_OK(tablet_replica->log()->WaitUntilAllFlushed());
-    ASSERT_OK(tablet_replica->log()->AllocateSegmentAndRollOver());
+    ASSERT_OK(tablet_replica->log()->AllocateSegmentAndRollOverForTests());
 
     // Also flush the MRS so we're free to GC the WAL segment we just wrote.
     ASSERT_OK(tablet_replica->tablet()->Flush());
@@ -184,7 +185,7 @@ class TimestampAdvancementITest : public MiniClusterITestBase {
        scoped_refptr<log::LogIndex>(), tablet_id,
        scoped_refptr<MetricEntity>(), &reader));
     log::SegmentSequence segs;
-    RETURN_NOT_OK(reader->GetSegmentsSnapshot(&segs));
+    reader->GetSegmentsSnapshot(&segs);
     unique_ptr<log::LogEntryPB> entry;
     for (const auto& seg : segs) {
       log::LogEntryReader reader(seg.get());

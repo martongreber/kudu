@@ -72,8 +72,8 @@
     },
     {
       "name" : "enable_security",
-      "label" : "Enable Secure Authentication And Encryption",
-      "description" : "Enable secure authentication and encryption between all Kudu clients and servers as well as between individual servers. Kerberos must be configured.",
+      "label" : "Enable Secure Authentication, Encryption, And Web UI",
+      "description" : "Enable secure authentication and encryption between all Kudu clients and servers as well as between individual servers. Also enables secure authentication in every Kudu server's web UI. Kerberos must be configured.",
       "type" : "boolean",
       "required" : "true",
       "default" : "false"
@@ -157,6 +157,11 @@
         {
           "name" : "kudu_principal",
           "primary" : "${principal}",
+          "instance" : "${host}"
+        },
+        {
+          "name" : "spnego_principal",
+          "primary" : "HTTP",
           "instance" : "${host}"
         }
       ],
@@ -392,6 +397,11 @@
         {
           "name" : "kudu_principal",
           "primary" : "${principal}",
+          "instance" : "${host}"
+        },
+        {
+          "name" : "spnego_principal",
+          "primary" : "HTTP",
           "instance" : "${host}"
         }
       ],

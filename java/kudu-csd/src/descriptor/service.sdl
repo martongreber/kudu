@@ -222,6 +222,12 @@
       ],
       "parameters" : [
         {
+          "name" : "webserver_interface",
+          "label" : "Kudu Master Web UI Interface",
+          "description" : "The interface of the Kudu Master Web UI. If blank, binds to 0.0.0.0.",
+          "type" : "string"
+        },
+        {
           "name" : "webserver_port",
           "label" : "Kudu Master Web UI Port",
           "description" : "The port of the Kudu Master Web UI.",
@@ -230,10 +236,12 @@
           "default" : 8051
         },
         {
-          "name" : "webserver_interface",
-          "label" : "Kudu Master Web UI Interface",
-          "description" : "The interface of the Kudu Master Web UI. If blank, binds to 0.0.0.0.",
-          "type" : "string"
+          "name" : "metrics_url_parameters",
+          "label" : "Kudu Metrics URL Parameters",
+          "description" : "The URL query parameters to append to the `/metrics` URL when collecting Kudu metrics.",
+          "type" : "string",
+          "required" : "true",
+          "default" : "compact=1&level=info"
         },
         {
           "name" : "master_address",
@@ -311,6 +319,7 @@
               "enable_security",
               "master_address",
               "master_core_dump_directory",
+              "metrics_url_parameters",
               "ssl_enabled",
               "rb_max_moves_per_server",
               "rb_max_run_time_sec",
@@ -323,7 +332,8 @@
             "includedParams" : [
               "webserver_interface",
               "webserver_port",
-              "ssl_enabled"
+              "ssl_enabled",
+              "metrics_url_parameters"
             ]
           }
         ],
@@ -447,6 +457,14 @@
           "default" : 8050
         },
         {
+          "name" : "metrics_url_parameters",
+          "label" : "Kudu Metrics URL Parameters",
+          "description" : "The URL query parameters to append to the `/metrics` URL when collecting Kudu metrics.",
+          "type" : "string",
+          "required" : "true",
+          "default" : "compact=1&level=info"
+        },
+        {
           "name" : "fs_wal_dir",
           "label" : "Kudu Tablet Server WAL Directory",
           "description" : "Directory where Kudu tablet servers will store write-ahead logs. It can be the same as one of the data directories, but not a sub-directory of a data directory. Master and tablet servers must use different directories when co-located on the same machine.",
@@ -554,6 +572,7 @@
               "enable_core_dump",
               "enable_security",
               "tserver_core_dump_directory",
+              "metrics_url_parameters",
               "ssl_enabled",
               "rb_max_moves_per_server",
               "rb_max_run_time_sec",
@@ -566,7 +585,8 @@
             "includedParams" : [
               "webserver_interface",
               "webserver_port",
-              "ssl_enabled"
+              "ssl_enabled",
+              "metrics_url_parameters"
             ]
           }
         ],

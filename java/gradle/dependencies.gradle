@@ -38,7 +38,7 @@ versions += [
     hadoop : "3.1.1.7.1.0.0-SNAPSHOT",
     hamcrest       : "2.2",
     hdrhistogram   : "2.1.11",
-    hive : "3.1.2000.7.1.0.0-SNAPSHOT",
+    hive : "3.1.3000.7.1.0.0-SNAPSHOT",
     httpClient     : "4.5.10",
     jepsen         : "0.1.5",
     jetty          : "9.4.22.v20191022",

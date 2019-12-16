@@ -334,6 +334,12 @@
               "webserver_port",
               "ssl_enabled",
               "metrics_url_parameters"
+            ],
+            "additionalConfigs" : [
+              {
+                "key" : "host",
+                "value" : "${host}"
+              }
             ]
           }
         ],
@@ -587,6 +593,12 @@
               "webserver_port",
               "ssl_enabled",
               "metrics_url_parameters"
+            ],
+            "additionalConfigs" : [
+              {
+                "key" : "host",
+                "value" : "${host}"
+              }
             ]
           }
         ],

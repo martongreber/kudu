@@ -485,7 +485,7 @@ TEST_F(TabletCopyServiceTest, TestFetchLog) {
   int64_t size = segment->file_size();
   scratch.resize(size);
   Slice slice(scratch.data(), size);
-  ASSERT_OK(segment->readable_file()->Read(0, slice));
+  ASSERT_OK(segment->file()->Read(0, slice));
 
   AssertDataEqual(slice.data(), slice.size(), resp.chunk());
 }
@@ -510,7 +510,7 @@ TEST_F(TabletCopyServiceTest, TestSessionTimeout) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(1)); // 1 ms
-  } while (MonoTime::Now().GetDeltaSince(start_time).ToSeconds() < 10);
+  } while ((MonoTime::Now() - start_time).ToSeconds() < 10);
 
   ASSERT_FALSE(resp.session_is_active()) << "Tablet Copy session did not time out!";
 }

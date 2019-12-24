@@ -227,7 +227,6 @@ set(UTIL_SRCS
   throttler.cc
   trace.cc
   trace_metrics.cc
-  ttl_cache_test_metrics.cc
   user.cc
   url-coding.cc
   version_info.cc
@@ -250,7 +249,6 @@ execute_process(
   OUTPUT_VARIABLE AVX2_SUPPORT
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-message("AVX2_SUPPORT=${AVX2_SUPPORT}")
 
 # block_bloom_filter_avx2.cc uses AVX2 operations.
 if (AVX2_SUPPORT)
@@ -261,6 +259,9 @@ if (AVX2_SUPPORT)
   # instead of relying on __AVX2__ defined by compiler with -mavx2.
   set_source_files_properties(block_bloom_filter_avx2.cc block_bloom_filter.cc
                               PROPERTIES COMPILE_DEFINITIONS "USE_AVX2=1")
+  message("Compiler supports AVX2")
+else()
+  message("Compiler does not support AVX2")
 endif()
 
 set(UTIL_LIBS

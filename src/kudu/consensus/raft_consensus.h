@@ -82,6 +82,10 @@ struct ElectionResult;
 // Context containing resources shared by the Raft consensus instances on a
 // single server.
 struct ServerContext {
+  // Shared boolean that indicates whether the server is quiescing, in which
+  // case this replica should not attempt to become leader.
+  std::atomic<bool>* quiescing;
+
   // Gauge indicating how many Raft tablet leaders are hosted on the server.
   scoped_refptr<AtomicGauge<int32_t>> num_leaders;
 
@@ -927,8 +931,6 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // The number of times Update() has been called, used for some test assertions.
   AtomicInt<int32_t> update_calls_for_tests_;
 
-  FunctionGaugeDetacher metric_detacher_;
-
   // The wrapping into std::atomic<> is to simplify the synchronization between
   // consensus-related writers and readers of the attached metric gauge.
   std::atomic<int64_t> last_leader_communication_time_micros_;
@@ -936,6 +938,10 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   scoped_refptr<Counter> follower_memory_pressure_rejections_;
   scoped_refptr<AtomicGauge<int64_t>> term_metric_;
   scoped_refptr<AtomicGauge<int64_t>> num_failed_elections_metric_;
+
+  // NOTE: it's important that this is the first member to be destructed. This
+  // ensures we do not attempt to collect metrics while calling the destructor.
+  FunctionGaugeDetacher metric_detacher_;
 
   DISALLOW_COPY_AND_ASSIGN(RaftConsensus);
 };

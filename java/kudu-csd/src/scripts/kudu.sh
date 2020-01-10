@@ -153,6 +153,7 @@ if [ "$ENABLE_SECURITY" == "true" ]; then
   KUDU_ARGS="$KUDU_ARGS \
              --rpc_authentication=required \
              --rpc_encryption=required \
+             --webserver_require_spnego=true \
              --keytab_file=$CONF_DIR/kudu.keytab"
 fi
 

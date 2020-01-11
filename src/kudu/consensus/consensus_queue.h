@@ -14,9 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-#ifndef KUDU_CONSENSUS_CONSENSUS_QUEUE_H_
-#define KUDU_CONSENSUS_CONSENSUS_QUEUE_H_
+#pragma once
 
 #include <cstdint>
 #include <functional>
@@ -184,7 +182,7 @@ class PeerMessageQueue {
 
   PeerMessageQueue(const scoped_refptr<MetricEntity>& metric_entity,
                    scoped_refptr<log::Log> log,
-                   scoped_refptr<TimeManager> time_manager,
+                   TimeManager* time_manager,
                    RaftPeerPB local_peer_pb,
                    std::string tablet_id,
                    std::unique_ptr<ThreadPoolToken> raft_pool_observers_token,
@@ -571,7 +569,7 @@ class PeerMessageQueue {
 
   Metrics metrics_;
 
-  scoped_refptr<TimeManager> time_manager_;
+  TimeManager* time_manager_;
 };
 
 // The interface between RaftConsensus and the PeerMessageQueue.
@@ -606,5 +604,3 @@ class PeerMessageQueueObserver {
 
 }  // namespace consensus
 }  // namespace kudu
-
-#endif /* KUDU_CONSENSUS_CONSENSUS_QUEUE_H_ */

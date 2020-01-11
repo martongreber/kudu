@@ -97,17 +97,15 @@ class ConsensusQueueTest : public KuduTest {
     ASSERT_OK(clock_->Init());
 
     ASSERT_OK(ThreadPoolBuilder("raft").Build(&raft_pool_));
+    time_manager_.reset(new TimeManager(clock_.get(), Timestamp::kMin));
     CloseAndReopenQueue(MinimumOpId(), MinimumOpId());
   }
 
   void CloseAndReopenQueue(const OpId& replicated_opid, const OpId& committed_opid) {
-    scoped_refptr<clock::Clock> clock(new clock::HybridClock());
-    ASSERT_OK(clock->Init());
-    scoped_refptr<TimeManager> time_manager(new TimeManager(clock, Timestamp::kMin));
     queue_.reset(new PeerMessageQueue(
         metric_entity_,
         log_.get(),
-        time_manager,
+        time_manager_.get(),
         FakeRaftPeerPB(kLeaderUuid),
         kTestTablet,
         raft_pool_->NewToken(ThreadPool::ExecutionMode::SERIAL),
@@ -231,9 +229,10 @@ class ConsensusQueueTest : public KuduTest {
   scoped_refptr<MetricEntity> metric_entity_;
   scoped_refptr<log::Log> log_;
   unique_ptr<ThreadPool> raft_pool_;
+  unique_ptr<TimeManager> time_manager_;
   gscoped_ptr<PeerMessageQueue> queue_;
   scoped_refptr<log::LogAnchorRegistry> registry_;
-  scoped_refptr<clock::Clock> clock_;
+  unique_ptr<clock::Clock> clock_;
 };
 
 // Tests that the queue is able to track a peer when it starts tracking a peer
@@ -242,7 +241,7 @@ class ConsensusQueueTest : public KuduTest {
 // falls in the middle of the current messages in the queue.
 TEST_F(ConsensusQueueTest, TestStartTrackingAfterStart) {
   queue_->SetLeaderMode(kMinimumOpIdIndex, kMinimumTerm, BuildRaftConfigPBForTests(2));
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, 100);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, 100);
 
   ConsensusRequestPB request;
   ConsensusResponsePB response;
@@ -318,7 +317,7 @@ TEST_F(ConsensusQueueTest, TestGetPagedMessages) {
   // Append the messages after the queue is tracked. Otherwise the ops might
   // get evicted from the cache immediately and the requests below would
   // result in async log reads instead of cache hits.
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, 100);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, 100);
 
   OpId last;
   for (int i = 0; i < 11; i++) {
@@ -350,7 +349,7 @@ TEST_F(ConsensusQueueTest, TestGetPagedMessages) {
 
 TEST_F(ConsensusQueueTest, TestPeersDontAckBeyondWatermarks) {
   queue_->SetLeaderMode(kMinimumOpIdIndex, kMinimumTerm, BuildRaftConfigPBForTests(3));
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, 100);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, 100);
 
   // Wait for the local peer to append all messages
   WaitForLocalPeerToAckIndex(100);
@@ -382,7 +381,7 @@ TEST_F(ConsensusQueueTest, TestPeersDontAckBeyondWatermarks) {
   ASSERT_FALSE(needs_tablet_copy);
   ASSERT_EQ(50, request.ops_size());
 
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 101, 100);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 101, 100);
 
   SetLastReceivedAndLastCommitted(&response, request.ops(49).id());
   response.set_responder_term(28);
@@ -424,7 +423,7 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
 
   // Append 10 messages to the queue.
   // This should add messages 0.1 -> 0.7, 1.8 -> 1.10 to the queue.
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, 10);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, 10);
   WaitForLocalPeerToAckIndex(10);
 
   // Since only the local log has ACKed at this point,
@@ -509,7 +508,7 @@ TEST_F(ConsensusQueueTest, TestNonVoterAcksDontCountTowardMajority) {
   // Append 10 messages to the queue.
   // This should add messages 0.1 -> 0.7, 1.8 -> 1.10 to the queue.
   const int kNumMessages = 10;
-  AppendReplicateMessagesToQueue(queue_.get(), clock_,
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(),
                                  /*first=*/ 1, /*count=*/ kNumMessages);
   WaitForLocalPeerToAckIndex(kNumMessages);
 
@@ -560,7 +559,7 @@ TEST_F(ConsensusQueueTest, TestQueueLoadsOperationsForPeer) {
 
   const int kOpsToAppend = 100;
   for (int i = 1; i <= kOpsToAppend; i++) {
-    ASSERT_OK(log::AppendNoOpToLogSync(clock_, log_.get(), &opid));
+    ASSERT_OK(log::AppendNoOpToLogSync(clock_.get(), log_.get(), &opid));
     // Roll the log every 10 ops
     if (i % 10 == 0) {
       ASSERT_OK(log_->AllocateSegmentAndRollOverForTests());
@@ -623,7 +622,7 @@ TEST_F(ConsensusQueueTest, TestQueueHandlesOperationOverwriting) {
   OpId opid = MakeOpId(1, 1);
   // Append 10 messages in term 1 to the log.
   for (int i = 1; i <= 10; i++) {
-    ASSERT_OK(log::AppendNoOpToLogSync(clock_, log_.get(), &opid));
+    ASSERT_OK(log::AppendNoOpToLogSync(clock_.get(), log_.get(), &opid));
     // Roll the log every 3 ops
     if (i % 3 == 0) {
       ASSERT_OK(log_->AllocateSegmentAndRollOverForTests());
@@ -633,7 +632,7 @@ TEST_F(ConsensusQueueTest, TestQueueHandlesOperationOverwriting) {
   opid = MakeOpId(2, 11);
   // Now append 10 more messages in term 2.
   for (int i = 11; i <= 20; i++) {
-    ASSERT_OK(log::AppendNoOpToLogSync(clock_, log_.get(), &opid));
+    ASSERT_OK(log::AppendNoOpToLogSync(clock_.get(), log_.get(), &opid));
     // Roll the log every 3 ops
     if (i % 3 == 0) {
       ASSERT_OK(log_->AllocateSegmentAndRollOverForTests());
@@ -729,7 +728,7 @@ TEST_F(ConsensusQueueTest, TestQueueMovesWatermarksBackward) {
   queue_->SetNonLeaderMode(BuildRaftConfigPBForTests(3));
   // Append a bunch of messages and update as if they were also appeneded to the leader.
   queue_->UpdateLastIndexAppendedToLeader(10);
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, 10);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, 10);
   log_->WaitUntilAllFlushed();
 
   // Now rewrite some of the operations and wait for the log to append.
@@ -889,7 +888,7 @@ TEST_F(ConsensusQueueTest, TestOnlyAdvancesWatermarkWhenPeerHasAPrefixOfOurLog) 
 // Test that Tablet Copy is triggered when a "tablet not found" error occurs.
 TEST_F(ConsensusQueueTest, TestTriggerTabletCopyIfTabletNotFound) {
   queue_->SetLeaderMode(kMinimumOpIdIndex, kMinimumTerm, BuildRaftConfigPBForTests(3));
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, 100);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, 100);
 
   ConsensusRequestPB request;
   ConsensusResponsePB response;
@@ -926,7 +925,7 @@ TEST_F(ConsensusQueueTest, TestFollowerCommittedIndexAndMetrics) {
 
   // Emulate a follower sending a request to replicate 10 messages.
   queue_->UpdateLastIndexAppendedToLeader(10);
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, 10);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, 10);
   WaitForLocalPeerToAckIndex(10);
 
   // The committed_index should be MinimumOpId() since UpdateFollowerCommittedIndex

@@ -28,7 +28,6 @@
 
 #include <glog/logging.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/consensus/consensus.pb.h"
@@ -38,6 +37,7 @@
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/raft_consensus.h"
+#include "kudu/consensus/time_manager.h"
 #include "kudu/fs/data_dirs.h"
 #include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/bind.h"
@@ -170,7 +170,7 @@ Status TabletReplica::Init(ServerContext server_ctx) {
 
 Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
                             shared_ptr<Tablet> tablet,
-                            scoped_refptr<clock::Clock> clock,
+                            clock::Clock* clock,
                             shared_ptr<Messenger> messenger,
                             scoped_refptr<ResultTracker> result_tracker,
                             scoped_refptr<Log> log,
@@ -184,13 +184,13 @@ Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
 
     scoped_refptr<MetricEntity> metric_entity;
     unique_ptr<PeerProxyFactory> peer_proxy_factory;
-    scoped_refptr<TimeManager> time_manager;
+    unique_ptr<TimeManager> time_manager;
     {
       std::lock_guard<simple_spinlock> l(lock_);
       CHECK_EQ(BOOTSTRAPPING, state_);
 
       tablet_ = DCHECK_NOTNULL(std::move(tablet));
-      clock_ = DCHECK_NOTNULL(std::move(clock));
+      clock_ = DCHECK_NOTNULL(clock);
       messenger_ = DCHECK_NOTNULL(std::move(messenger));
       result_tracker_ = std::move(result_tracker); // Passed null in tablet_replica-test
       log_ = DCHECK_NOTNULL(log); // Not moved because it's passed to RaftConsensus::Start() below.

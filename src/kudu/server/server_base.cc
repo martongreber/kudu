@@ -21,7 +21,6 @@
 #include <functional>
 #include <sstream>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -384,7 +383,7 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
   fs_manager_.reset(new FsManager(options.env, std::move(fs_opts)));
 
   if (FLAGS_use_hybrid_clock) {
-    clock_ = new clock::HybridClock();
+    clock_.reset(new clock::HybridClock);
   } else {
     clock_ = clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp);
   }
@@ -630,7 +629,7 @@ Status ServerBase::DumpServerInfo(const string& path,
   return Status::OK();
 }
 
-Status ServerBase::RegisterService(gscoped_ptr<rpc::ServiceIf> rpc_impl) {
+Status ServerBase::RegisterService(unique_ptr<rpc::ServiceIf> rpc_impl) {
   return rpc_server_->RegisterService(std::move(rpc_impl));
 }
 
@@ -701,8 +700,8 @@ std::string ServerBase::FooterHtml() const {
 Status ServerBase::Start() {
   GenerateInstanceID();
 
-  RETURN_NOT_OK(RegisterService(make_gscoped_ptr<rpc::ServiceIf>(
-                                  new GenericServiceImpl(this))));
+  RETURN_NOT_OK(RegisterService(
+      unique_ptr<rpc::ServiceIf>(new GenericServiceImpl(this))));
   RETURN_NOT_OK(rpc_server_->Start());
 
   if (web_server_) {

@@ -21,10 +21,8 @@
 
 #include <gtest/gtest_prod.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/timestamp.h"
-#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
@@ -32,6 +30,9 @@
 namespace kudu {
 
 class CountDownLatch;
+namespace clock {
+class Clock;
+}  // namespace clock
 
 namespace consensus {
 class ReplicateMsg;
@@ -69,11 +70,11 @@ class ReplicateMsg;
 //       This anomaly can cause non-repeatable reads in certain conditions.
 //
 // This class is thread safe.
-class TimeManager : public RefCountedThreadSafe<TimeManager> {
+class TimeManager {
  public:
 
   // Constructs a TimeManager in non-leader mode.
-  TimeManager(scoped_refptr<clock::Clock> clock,  Timestamp initial_safe_time);
+  TimeManager(clock::Clock* clock, Timestamp initial_safe_time);
 
   // Sets this TimeManager to leader mode.
   void SetLeaderMode();
@@ -211,7 +212,7 @@ class TimeManager : public RefCountedThreadSafe<TimeManager> {
   // The current mode of the TimeManager.
   Mode mode_;
 
-  const scoped_refptr<clock::Clock> clock_;
+  clock::Clock* clock_;
   const std::string local_peer_uuid_;
 };
 

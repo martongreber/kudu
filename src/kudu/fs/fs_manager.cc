@@ -140,7 +140,8 @@ FsManagerOpts::FsManagerOpts()
     metadata_root(FLAGS_fs_metadata_dir),
     block_manager_type(FLAGS_block_manager),
     read_only(false),
-    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES) {
+    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES),
+    file_cache(nullptr) {
   data_roots = strings::Split(FLAGS_fs_data_dirs, ",", strings::SkipEmpty());
 }
 
@@ -149,21 +150,16 @@ FsManagerOpts::FsManagerOpts(const string& root)
     data_roots({ root }),
     block_manager_type(FLAGS_block_manager),
     read_only(false),
-    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES) {}
-
-FsManager::FsManager(Env* env, const string& root_path)
-  : env_(DCHECK_NOTNULL(env)),
-    opts_(FsManagerOpts(root_path)),
-    error_manager_(new FsErrorManager()),
-    initted_(false) {}
+    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES),
+    file_cache(nullptr) {}
 
 FsManager::FsManager(Env* env, FsManagerOpts opts)
   : env_(DCHECK_NOTNULL(env)),
     opts_(std::move(opts)),
     error_manager_(new FsErrorManager()),
     initted_(false) {
-DCHECK(opts_.update_instances == UpdateInstanceBehavior::DONT_UPDATE ||
-       !opts_.read_only) << "FsManager can only be for updated if not in read-only mode";
+  DCHECK(opts_.update_instances == UpdateInstanceBehavior::DONT_UPDATE ||
+         !opts_.read_only) << "FsManager can only be for updated if not in read-only mode";
 }
 
 FsManager::~FsManager() {}
@@ -305,10 +301,10 @@ void FsManager::InitBlockManager() {
   bm_opts.read_only = opts_.read_only;
   if (opts_.block_manager_type == "file") {
     block_manager_.reset(new FileBlockManager(
-        env_, dd_manager_.get(), error_manager_.get(), std::move(bm_opts)));
+        env_, dd_manager_.get(), error_manager_.get(), opts_.file_cache, std::move(bm_opts)));
   } else {
     block_manager_.reset(new LogBlockManager(
-        env_, dd_manager_.get(), error_manager_.get(), std::move(bm_opts)));
+        env_, dd_manager_.get(), error_manager_.get(), opts_.file_cache, std::move(bm_opts)));
   }
 }
 

@@ -44,6 +44,7 @@ DECLARE_bool(enable_data_block_fsync);
 namespace kudu {
 
 class BlockId;
+class FileCache;
 class InstanceMetadataPB;
 class MemTracker;
 
@@ -72,6 +73,7 @@ namespace tserver {
 class MiniTabletServerTest_TestFsLayoutEndToEnd_Test;
 } // namespace tserver
 
+// Options that control the behavior of FsManager.
 struct FsManagerOpts {
   // Creates a new FsManagerOpts with default values.
   FsManagerOpts();
@@ -122,6 +124,12 @@ struct FsManagerOpts {
   //
   // Defaults to UPDATE_AND_IGNORE_FAILURES.
   fs::UpdateInstanceBehavior update_instances;
+
+  // The file cache to be used for long-lived opened files (e.g. in the block
+  // manager). If null, opened files will not be cached.
+  //
+  // Defaults to null.
+  FileCache* file_cache;
 };
 
 // FsManager provides helpers to read data and metadata files,
@@ -138,9 +146,6 @@ class FsManager {
  public:
   static const char *kWalFileNamePrefix;
   static const char *kWalsRecoveryDirSuffix;
-
-  // Only for unit tests.
-  FsManager(Env* env, const std::string& root_path);
 
   FsManager(Env* env, FsManagerOpts opts);
   ~FsManager();

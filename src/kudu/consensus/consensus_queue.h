@@ -16,6 +16,7 @@
 // under the License.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <ostream>
@@ -166,6 +167,10 @@ class PeerMessageQueue {
     // the local peer's WAL.
     bool wal_catchup_possible;
 
+    // Whether the peer's server is quiescing, which dictates whether the peer
+    // is a candidate for leadership successor.
+    bool remote_server_quiescing;
+
     // The peer's latest overall health status.
     HealthReportPB::HealthStatus last_overall_health_status;
 
@@ -186,6 +191,7 @@ class PeerMessageQueue {
                    RaftPeerPB local_peer_pb,
                    std::string tablet_id,
                    std::unique_ptr<ThreadPoolToken> raft_pool_observers_token,
+                   const std::atomic<bool>* server_quiescing,
                    OpId last_locally_replicated,
                    const OpId& last_locally_committed);
 
@@ -544,6 +550,10 @@ class PeerMessageQueue {
 
   // The pool token which executes observer notifications.
   std::unique_ptr<ThreadPoolToken> raft_pool_observers_token_;
+
+  // Shared boolean that indicates whether the server is quiescing, in which
+  // case leadership should be transferred away from this peer.
+  const std::atomic<bool>* server_quiescing_;
 
   // PB containing identifying information about the local peer.
   const RaftPeerPB local_peer_pb_;

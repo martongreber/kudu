@@ -33,11 +33,7 @@ dependencies {
   optional libs.yetusAnnotations
 
   testCompile project(path: ":kudu-test-utils", configuration: "shadow")
-  // TODO: Remove once CDPD-6473 is resolved.
-  // testCompile libs.hadoopMiniCluster
-  testCompile (libs.hadoopMiniCluster) {
-    exclude group: "org.apache.curator", module: "curator-framework"
-  }
+  testCompile libs.hadoopMiniCluster
   testCompile libs.junit
   testCompile libs.scalatest
 }

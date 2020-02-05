@@ -62,6 +62,23 @@ function tserver_exit_maintenance {
   exec kudu tserver state exit_maintenance "$1" "$ts_uuid"
 }
 
+function run_until_success {
+  timeout_sec="$1"
+  retry_interval_sec="$2"
+  cmd="$3"
+  start_time=$(date +%s)
+  deadline=$((start_time + timeout_sec))
+  while [[ $deadline -gt $(date +%s) ]]; do
+    if [[ $(cmd) -eq 0 ]]; then
+      exit 0;
+    fi
+    echo "Sleeping for $retry_interval_sec seconds..."
+    sleep $retry_interval_sec
+  done
+  echo "Timed out: $cmd did not succeed within $timeout_sec seconds..."
+  exit 1
+}
+
 # Runs the rebalancer tool, if it's available.
 function run_rebalancer_tool {
   # Heuristic to determine if the rebalance tool is available.
@@ -191,10 +208,18 @@ elif [ "$CMD" = "ksck" ]; then
   exec kudu cluster ksck "$MASTER_IPS"
 elif [ "$CMD" = "rebalance_tool" ]; then
   run_rebalancer_tool "$MASTER_IPS"
+elif [ "$CMD" = "wait_until_healthy" ]; then
+  run_until_success $RR_BATCH_TIME_LIMIT_ESC $RR_HEALTH_CHECK_INTERVAL_SEC \
+      "kudu cluster ksck $MASTER_IPS"
 elif [ "$CMD" = "tserver_enter_maintenance" ]; then
   tserver_enter_maintenance "$MASTER_IPS"
 elif [ "$CMD" = "tserver_exit_maintenance" ]; then
   tserver_exit_maintenance "$MASTER_IPS"
+elif [ "$CMD" = "tserver_quiesce" ]; then
+  run_until_success $TS_QUIESCING_TIME_LIMIT_SEC $TS_QUIESCING_RETRY_INTERVAL_SEC \
+      "kudu tserver quiesce start $TS_QUIESCING_HOST --error_if_not_fully_quiesced"
+elif [ "$CMD" = "tserver_stop_quiescing" ]; then
+  exec kudu tserver quiesce stop $TS_QUIESCING_HOST
 else
   log "Unknown command: $CMD"
   exit 2

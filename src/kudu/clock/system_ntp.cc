@@ -47,41 +47,47 @@ using strings::Substitute;
 namespace kudu {
 namespace clock {
 
-const double SystemNtp::kAdjtimexScalingFactor = 65536;
-const uint64_t SystemNtp::kMicrosPerSec = 1000000;
-
 namespace {
 
-// Returns the current time/max error and checks if the clock is synchronized.
-Status CallAdjTime(timex* tx) {
-  // Set mode to 0 to query the current time.
-  tx->modes = 0;
-  int rc = ntp_adjtime(tx);
-  if (PREDICT_FALSE(FLAGS_inject_unsync_time_errors)) {
-    rc = TIME_ERROR;
-  }
+// Convert the clock state returned by ntp_gettime() into Status.
+Status NtpStateToStatus(int rc) {
+  // According to http://man7.org/linux/man-pages/man3/ntp_gettime.3.html,
+  // ntp_gettime() never fails if given correct pointer to the output argument.
+  PCHECK(rc >= 0);
   switch (rc) {
     case TIME_OK:
       return Status::OK();
-    case -1: // generic error
-      // From 'man 2 adjtimex', ntp_adjtime failure implies an improper 'tx'.
-      return Status::InvalidArgument("Error reading clock. ntp_adjtime() failed",
-                                     ErrnoToString(errno));
     case TIME_ERROR:
       return Status::ServiceUnavailable(
-          PREDICT_FALSE(FLAGS_inject_unsync_time_errors) ?
-          "Injected clock unsync error" :
-          "Error reading clock. Clock considered unsynchronized");
+          PREDICT_FALSE(FLAGS_inject_unsync_time_errors)
+          ? "Injected clock unsync error"
+          : "Error reading clock. Clock considered unsynchronized");
     default:
-      // TODO what to do about leap seconds? see KUDU-146
-      KLOG_FIRST_N(ERROR, 1) << "Server undergoing leap second. This may cause consistency issues "
-        << "(rc=" << rc << ")";
+      // TODO(dralves): what to do about leap seconds? see KUDU-146
+      KLOG_FIRST_N(ERROR, 1)
+          << "Server undergoing leap second. This may cause consistency issues "
+          << "(rc=" << rc << ")";
       return Status::OK();
   }
 }
 
+// Check if the specified code corresponds to an error returned by ntp_adjtime()
+// and convert it into Status.
+Status CheckForNtpAdjtimeError(int rc) {
+  // From http://man7.org/linux/man-pages/man2/adjtimex.2.html,
+  // the failure implies invalid pointer for its output parameter of the 'timex'
+  // type. It cannot be the case in the code below. However, there were reports
+  // that with old version of Docker it might return EPERM even if 'tx.mode'
+  // is set to 0; see KUDU-2000 for details.
+  if (PREDICT_FALSE(rc == -1)) {
+    int err = errno;
+    return Status::RuntimeError("ntp_adjtime() failed", ErrnoToString(err));
+  }
+  return Status::OK();
+}
+
 void TryRun(vector<string> cmd, vector<string>* log) {
-  string exe, out, err;
+  string exe;
   Status s = FindExecutable(cmd[0], {"/sbin", "/usr/sbin/"}, &exe);
   if (!s.ok()) {
     LOG_STRING(WARNING, log) << "could not find executable: " << cmd[0];
@@ -89,6 +95,8 @@ void TryRun(vector<string> cmd, vector<string>* log) {
   }
 
   cmd[0] = exe;
+  string out;
+  string err;
   s = Subprocess::Call(cmd, "", &out, &err);
   // Subprocess::Call() returns RuntimeError in the case that the process returns
   // a non-zero exit code, but that might still generate useful err.
@@ -102,7 +110,6 @@ void TryRun(vector<string> cmd, vector<string>* log) {
   } else {
     LOG_STRING(WARNING, log) << "failed to run executable: " << cmd[0];
   }
-
 }
 
 } // anonymous namespace
@@ -111,22 +118,45 @@ SystemNtp::SystemNtp()
     : skew_ppm_(std::numeric_limits<int64_t>::max()) {
 }
 
+Status SystemNtp::Init() {
+  timex t;
+  t.modes = 0; // set mode to 0 for read-only query
+  RETURN_NOT_OK(CheckForNtpAdjtimeError(ntp_adjtime(&t)));
+
+  // The unit of the reported tolerance is ppm with 16-bit fractional part:
+  // 65536 is 1 ppm (see http://man7.org/linux/man-pages/man3/ntp_adjtime.3.html
+  // for details).
+  skew_ppm_ = t.tolerance / 65536;
+  VLOG(1) << "ntp_adjtime(): tolerance is " << t.tolerance;
+
+  return Status::OK();
+}
+
 Status SystemNtp::WalltimeWithError(uint64_t* now_usec, uint64_t* error_usec) {
-  // Read the time. This will return an error if the clock is not synchronized.
-  timex tx;
-  RETURN_NOT_OK(CallAdjTime(&tx));
-
-  // Calculate the sleep skew adjustment according to the max tolerance of the clock.
-  // Tolerance comes in parts per million but needs to be applied a scaling factor.
-  skew_ppm_ = tx.tolerance / kAdjtimexScalingFactor;
-
-  if (tx.status & STA_NANO) {
-    tx.time.tv_usec /= 1000;
+  if (PREDICT_FALSE(FLAGS_inject_unsync_time_errors)) {
+    return NtpStateToStatus(TIME_ERROR);
   }
-  DCHECK_LE(tx.time.tv_usec, 1e6);
-
-  *now_usec = tx.time.tv_sec * kMicrosPerSec + tx.time.tv_usec;
-  *error_usec = tx.maxerror;
+  // Read the clock and convert its state into status. This will return an error
+  // if the clock is not synchronized.
+#ifdef __APPLE__
+  ntptimeval t;
+  RETURN_NOT_OK(NtpStateToStatus(ntp_gettime(&t)));
+  uint64_t now = static_cast<uint64_t>(t.time.tv_sec) * 1000000 +
+      t.time.tv_nsec / 1000;
+#else
+  timex t;
+  t.modes = 0; // set mode to 0 for read-only query
+  const int rc = ntp_adjtime(&t);
+  RETURN_NOT_OK(CheckForNtpAdjtimeError(rc));
+  RETURN_NOT_OK(NtpStateToStatus(rc));
+  if (t.status & STA_NANO) {
+    t.time.tv_usec /= 1000;
+  }
+  uint64_t now = static_cast<uint64_t>(t.time.tv_sec) * 1000000 +
+      t.time.tv_usec;
+#endif
+  *error_usec = t.maxerror;
+  *now_usec = now;
   return Status::OK();
 }
 

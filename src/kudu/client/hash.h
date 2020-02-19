@@ -14,15 +14,20 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-syntax = "proto2";
-package kudu;
+#ifndef KUDU_CLIENT_HASH_H
+#define KUDU_CLIENT_HASH_H
 
-option java_package = "org.apache.kudu";
+namespace kudu {
+namespace client {
 
-// Implemented hash algorithms.
+/// @brief: Hash algorithm types.
 enum HashAlgorithm {
-  UNKNOWN_HASH = 0;
-  MURMUR_HASH_2 = 1;
-  CITY_HASH = 2;
-  FAST_HASH = 3;
-}
+  UNKNOWN_HASH = 0,
+  MURMUR_HASH_2 = 1,
+  CITY_HASH = 2,
+  FAST_HASH = 3
+};
+
+} // namespace client
+} // namespace kudu
+#endif // KUDU_CLIENT_HASH_H

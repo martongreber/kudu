@@ -14,15 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-syntax = "proto2";
-package kudu;
 
-option java_package = "org.apache.kudu";
+#pragma once
 
-// Implemented hash algorithms.
-enum HashAlgorithm {
-  UNKNOWN_HASH = 0;
-  MURMUR_HASH_2 = 1;
-  CITY_HASH = 2;
-  FAST_HASH = 3;
-}
+#include "kudu/client/hash.h"
+#include "kudu/util/hash.pb.h"
+
+namespace kudu {
+namespace client {
+
+// Helper functions to convert hash algorithm between client-facing and internal PB enums.
+kudu::HashAlgorithm ToInternalHashAlgorithm(HashAlgorithm hash_algorithm);
+HashAlgorithm FromInternalHashAlgorithm(kudu::HashAlgorithm hash_algorithm);
+
+} // namespace client
+} // namespace kudu

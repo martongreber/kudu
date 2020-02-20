@@ -149,6 +149,32 @@
       "conformRegex" : "(|\\*|([^,!@#$%*=+'\\\"\\s-][^,]*,?)*)$"
     },
     {
+      "name" : "time_source",
+      "label" : "Time Source",
+      "description" : "Time source for HybridClock timestamps. If set to 'auto', Kudu selects the best available time source for the environment: for particular public cloud types, Kudu uses the dedicated NTP server available from within a public cloud instance, otherwise, Kudu relies on the local system clock to be synchronized by NTP. If set to 'builtin', Kudu masters and tablet servers use the built-in NTP client, where the set of servers is configured as specified by the 'Servers for Built-in NTP Client' configuration property (--builtin_ntp_servers flag). If set to 'system', Kudu relies on the local system clock to be synchronized by NTP, where the synchronization by NTP is a requirement.",
+      "type" : "string_enum",
+      "required" : "true",
+      "default" : "system",
+      "validValues" : [
+        "auto",
+        "builtin",
+        "system"
+      ]
+    },
+    {
+      "name" : "builtin_ntp_servers",
+      "label" : "Time Servers for Built-In NTP Client",
+      "description" : "Comma-separated list of NTP servers to use for the built-in NTP client, in format <FQDN|IPv4>[:PORT]. These are only used if the 'builtin' Time Source is selected.",
+      "required" : "false",
+      "type" : "string",
+      "default" : "0.pool.ntp.org,1.pool.ntp.org,2.pool.ntp.org,3.pool.ntp.org",
+      // The regex below validates an input string, where the components are DNS
+      // names (FQDN) or IPv4 addresses with optional ':port' suffix. This is
+      // not a strict but rather a lax regex to prevent invalid input
+      // on the best-effort basis.
+      "conformRegex" : "^(([0-9a-zA-Z-]+\\.)+([0-9a-zA-Z-]+)(:[1-9][0-9]*)?[,]?)+$"
+    },
+    {
       "name" : "rb_max_moves_per_server",
       "label" : "Maximum Number of Per-tablet-server Replica Moves",
       "description" : "Maximum number of replica moves to perform concurrently on one tablet server: moves of replicas to the server and moves of replicas off of the server count against this limit.",

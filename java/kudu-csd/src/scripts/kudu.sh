@@ -19,6 +19,9 @@
 
 set -x
 
+# Import some common CM functions, like acquire_kerberos_tgt().
+. $COMMON_SCRIPT
+
 # Time marker for both stderr and stdout
 date 1>&2
 
@@ -69,7 +72,8 @@ function run_until_success {
   start_time=$(date +%s)
   deadline=$((start_time + timeout_sec))
   while [[ $deadline -gt $(date +%s) ]]; do
-    if [[ $(cmd) -eq 0 ]]; then
+    $cmd
+    if [[ $? -eq 0 ]]; then
       exit 0;
     fi
     echo "Sleeping for $retry_interval_sec seconds..."
@@ -196,7 +200,16 @@ elif [ "$CMD" = "tserver" ]; then
   exec "$KUDU_HOME/sbin/kudu-tserver" \
     $KUDU_ARGS \
     --flagfile="$GFLAG_FILE"
-elif [ "$CMD" = "diagnostics-master" ]; then
+else
+  # If we're not running a server, we need to ensure we have Kerberos
+  # credentials cached. This will point our KRB5CCNAME at a file specific to
+  # this process and kinit.
+  # NOTE: $kudu_principal is populated by CM when security is enabled, and this
+  # command will no-op if it is empty.
+  acquire_kerberos_tgt kudu.keytab "$kudu_principal"
+fi
+
+if [ "$CMD" = "diagnostics-master" ]; then
   LOG_DIR=$1
   shift 1
   python scripts/gather_diagnostics.py "master" "$LOG_DIR" "$PWD" "$MASTER_IPS"
@@ -209,7 +222,7 @@ elif [ "$CMD" = "ksck" ]; then
 elif [ "$CMD" = "rebalance_tool" ]; then
   run_rebalancer_tool "$MASTER_IPS"
 elif [ "$CMD" = "wait_until_healthy" ]; then
-  run_until_success $RR_BATCH_TIME_LIMIT_ESC $RR_HEALTH_CHECK_INTERVAL_SEC \
+  run_until_success $RR_BATCH_TIME_LIMIT_SEC $RR_HEALTH_CHECK_INTERVAL_SEC \
       "kudu cluster ksck $MASTER_IPS"
 elif [ "$CMD" = "tserver_enter_maintenance" ]; then
   tserver_enter_maintenance "$MASTER_IPS"

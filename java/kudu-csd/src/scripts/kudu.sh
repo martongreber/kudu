@@ -178,6 +178,43 @@ if [ "$ENABLE_SECURITY" == "true" ]; then
              --keytab_file=$CONF_DIR/kudu.keytab"
 fi
 
+# If Ranger service is selected as dependency, add Ranger Kudu plugin specific parameters
+if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
+  # Populate the required field for 'ranger-kudu-security.xml'
+  RANGER_KUDU_PLUGIN_SSL_FILE="${CONF_DIR}/ranger-kudu-policymgr-ssl.xml"
+  perl -pi -e "s#\{\{RANGER_KUDU_PLUGIN_SSL_FILE}}#${RANGER_KUDU_PLUGIN_SSL_FILE}#g" "${CONF_DIR}"/ranger-kudu-security.xml
+
+  # Populate the required fields for 'ranger-kudu-policymgr-ssl.xml'. Disable printing
+  # the commands as they are sensitive fields.
+  set +x
+  if [ -n "${KUDU_TRUSTSTORE_LOCATION}" ] && [ -n "${KUDU_TRUSTORE_PASSWORD}" ]; then
+    perl -pi -e "s#\{\{RANGER_PLUGIN_TRUSTSTORE}}#${KUDU_TRUSTSTORE_LOCATION}#g" "${CONF_DIR}"/ranger-kudu-policymgr-ssl.xml
+    RANGER_PLUGIN_TRUSTSTORE_CRED_FILE="jceks://file${CONF_DIR}/rangerpluginssl.jceks"
+
+    # Use jars from Ranger admin package to generate the trsustore credential file.
+    RANGER_ADMIN_CRED_LIB="${PARCELS_ROOT}/${PARCEL_DIRNAMES}/lib/ranger-admin/cred/lib/"
+    export JAVA_HOME=${JAVA_HOME};"${JAVA_HOME}"/bin/java -cp "${RANGER_ADMIN_CRED_LIB}/*" org.apache.ranger.credentialapi.buildks create sslTrustStore -value "${KUDU_TRUSTORE_PASSWORD}" -provider "${RANGER_PLUGIN_TRUSTSTORE_CRED_FILE}"
+    perl -pi -e "s#\{\{RANGER_PLUGIN_TRUSTSTORE_CRED_FILE}}#${RANGER_PLUGIN_TRUSTSTORE_CRED_FILE}#g" "${CONF_DIR}"/ranger-kudu-policymgr-ssl.xml
+  else
+    perl -pi -e "s#\{\{RANGER_PLUGIN_TRUSTSTORE}}##g" ${CONF_DIR}/ranger-kudu-policymgr-ssl.xml
+    perl -pi -e "s#\{\{RANGER_PLUGIN_TRUSTSTORE_CRED_FILE}}##g" ${CONF_DIR}/ranger-kudu-policymgr-ssl.xml
+  fi
+  set -x
+
+  # Populate the required fields for 'ranger-kudu-audit.xml'
+  KEYTAB_FILE="${CONF_DIR}/kudu.keytab"
+  perl -pi -e "s#\{\{KEYTAB_FILE}}#${KEYTAB_FILE}#g" ${CONF_DIR}/ranger-kudu-audit.xml
+  if [[ "${RANGER_KUDU_HDFS_AUDIT_DIR}" == *"{ranger_base_audit_url}"* ]]; then
+    RANGER_KUDU_HDFS_AUDIT_PATH=$(echo ${RANGER_KUDU_HDFS_AUDIT_DIR} | sed -e "s/\${ranger_base_audit_url}//g")
+    RANGER_KUDU_HDFS_AUDIT_PATH="${RANGER_AUDIT_BASE_PATH}${RANGER_KUDU_HDFS_AUDIT_PATH}"
+  else
+    RANGER_KUDU_HDFS_AUDIT_PATH=${RANGER_KUDU_HDFS_AUDIT_DIR}
+  fi
+  sed -i "s#{{RANGER_KUDU_HDFS_AUDIT_PATH}}#${RANGER_KUDU_HDFS_AUDIT_PATH}#g" "${CONF_DIR}"/ranger-kudu-audit.xml
+
+  cp -f ${CONF_DIR}/hadoop-conf/core-site.xml ${CONF_DIR}/
+fi
+
 if [ "$CMD" = "master" ]; then
   # Only pass --master_addresses if there's more than one master.
   #

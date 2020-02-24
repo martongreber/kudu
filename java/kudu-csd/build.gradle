@@ -69,13 +69,13 @@ jar.dependsOn("generateMdl")
 task validateMdl(type: JavaExec, dependsOn: [generateMdl]) {
   classpath configurations.validator
   main = "com.cloudera.cli.validator.Main"
-  args "-mdl", "$buildDir/descriptor/service.mdl", "-strict-mode"
+  args "-mdl", "$buildDir/descriptor/service.mdl", "-strict-mode", "-service-type-list", "RANGER"
 }
 
 task validateSdl(type: JavaExec) {
   classpath configurations.validator
   main = "com.cloudera.cli.validator.Main"
-  args "-sdl", "$projectDir/src/descriptor/service.sdl", "-strict-mode"
+  args "-sdl", "$projectDir/src/descriptor/service.sdl", "-strict-mode", "-service-type-list", "RANGER"
 }
 
 // Create an aggregate validator task.

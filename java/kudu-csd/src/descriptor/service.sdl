@@ -40,9 +40,41 @@
     {
       "name": "SENTRY",
       "required": "false"
+    },
+    {
+      "name": "RANGER",
+      "required": "false"
+    },
+    {
+      "name": "HDFS",
+      "required": "false"
+    }
+  ],
+  "hdfsDirs": [
+    {
+      "name": "CreateRangerKuduPluginAuditDirCommand",
+      "label": "Create Ranger Kudu Plugin Audit Directory",
+      "description": "The HDFS path on which Ranger audits are written.",
+      "directoryDescription" : "Ranger Kudu Plugin HDFS Audit directory.",
+      "path" : "${ranger_kudu_plugin_hdfs_audit_directory}",
+      "permissions" : "0755"
+    }
+  ],
+  "dependencyExtensions": [
+    {
+      "type" : "rangerPlugin",
+      "extensionId": "ranger_plugin",
+      "pluginType": "KUDU"
     }
   ],
   "kerberos" : "${enable_security}",
+  "serviceInit": {
+    "preStartSteps": [
+      {
+        "commandName": "CreateRangerKuduPluginAuditDirCommand"
+      }
+    ]
+  },
   "commands" : [
     {
       "name" : "kudu_svc_ksck_cmd",
@@ -213,6 +245,13 @@
       "required" : false,
       "type" : "long",
       "default" : 1800
+    },
+    {
+      "name": "ranger_kudu_plugin_hdfs_audit_directory",
+      "label": "Ranger Kudu Plugin Hdfs Audit Directory",
+      "description": "The HDFS path on which Ranger audits are written.",
+      "default": "${ranger_base_audit_url}/kudu",
+      "type": "string"
     }
   ],
   "rolesWithExternalLinks" : [
@@ -232,7 +271,12 @@
         "environmentVariables" : {
           "ENABLE_CORE_DUMP" : "${enable_core_dump}",
           "ENABLE_SECURITY" : "${enable_security}",
-          "CORE_DUMP_DIRECTORY" : "${master_core_dump_directory}"
+          "CORE_DUMP_DIRECTORY" : "${master_core_dump_directory}",
+          "KUDU_TRUSTSTORE_LOCATION": "${ssl_client_truststore_location}",
+          "KUDU_TRUSTORE_PASSWORD": "${ssl_client_truststore_password}",
+          "RANGER_SERVICE": "${dependency:RANGER}",
+          "RANGER_AUDIT_BASE_PATH": "${ranger_base_audit_url}",
+          "RANGER_KUDU_HDFS_AUDIT_DIR": "${ranger_kudu_plugin_hdfs_audit_directory}"
         }
       },
       "logging" : {
@@ -410,6 +454,54 @@
           "pathType" : "serviceSpecific",
           "required" : "true",
           "default" : "/var/log/kudu"
+        },
+        {
+          "name": "ranger_kudu_plugin_policy_cache_directory",
+          "label": "Ranger Kudu Plugin Policy Cache Directory Path",
+          "description": "The directory where Ranger security policies are cached locally.",
+          "configName": "ranger.plugin.kudu.policy.cache.dir",
+          "type": "path",
+          "pathType": "localDataDir",
+          "default": "/var/lib/ranger/kudu/policy-cache",
+          "required": "true",
+          "mode": "0740"
+        },
+        {
+          "name": "ranger_kudu_plugin_use_x_forwarded_for_ipaddress",
+          "label": "Ranger Plugin Use X-Forwarded For IP Address",
+          "description": "The parameter is used for identifying the originating IP address of a user connecting to a component through proxy for audit logs.",
+          "configName": "ranger.plugin.kudu.use.x-forwarded-for.ipaddress",
+          "type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "ranger_kudu_plugin_trusted_proxy_ipaddress",
+          "label": "Ranger Plugin Trusted Proxy IP Address",
+          "description": "Accepts a list of IP addresses of proxy servers for trusting.",
+          "configName": "ranger.plugin.kudu.trusted.proxy.ipaddress",
+          "type": "string"
+        },
+        {
+          "name": "ranger_kudu_plugin_hdfs_audit_spool_directory",
+          "label": "Ranger Kudu Plugin Audit HDFS Spool Directory Path",
+          "description": "Spool directory for Ranger audits being written to DFS.",
+          "configName": "xasecure.audit.destination.hdfs.batch.filespool.dir",
+          "type": "path",
+          "pathType": "localDataDir",
+          "default": "/var/log/kudu/audit/hdfs/spool",
+          "required": "true",
+          "mode": "0740"
+        },
+        {
+          "name": "ranger_kudu_plugin_solr_audit_spool_directory",
+          "label": "Ranger Kudu Plugin Audit Solr Spool Directory Path",
+          "description": "Spool directory for Ranger audits being written to Solr.",
+          "configName": "xasecure.audit.destination.solr.batch.filespool.dir",
+          "type": "path",
+          "pathType": "localDataDir",
+          "default": "/var/log/kudu/audit/solr/spool",
+          "required": "true",
+          "mode": "0740"
         }
       ],
       "supportBundle" : {
@@ -437,7 +529,13 @@
               "ssl_enabled",
               "rb_max_moves_per_server",
               "rb_max_run_time_sec",
-              "rb_max_staleness_interval_sec"
+              "rb_max_staleness_interval_sec",
+              "ranger_kudu_plugin_hdfs_audit_directory",
+              "ranger_kudu_plugin_policy_cache_directory",
+              "ranger_kudu_plugin_use_x_forwarded_for_ipaddress",
+              "ranger_kudu_plugin_trusted_proxy_ipaddress",
+              "ranger_kudu_plugin_hdfs_audit_spool_directory",
+              "ranger_kudu_plugin_solr_audit_spool_directory"
             ]
           },
           {
@@ -453,6 +551,129 @@
               {
                 "key" : "host",
                 "value" : "${host}"
+              }
+            ]
+          },
+          {
+            "filename": "ranger-kudu-security.xml",
+            "configFormat": "hadoop_xml",
+            "includedParams": [
+              "ranger_kudu_plugin_policy_cache_directory",
+              "ranger_kudu_plugin_use_x_forwarded_for_ipaddress",
+              "ranger_kudu_plugin_trusted_proxy_ipaddress"
+            ],
+            "additionalConfigs": [
+              {
+                "key": "ranger.plugin.kudu.policy.rest.url",
+                "value": "${ranger_rest_url}"
+              },
+              {
+                "key": "ranger.plugin.kudu.service.name",
+                "value": "cm_kudu"
+              },
+              {
+                "key": "ranger.plugin.kudu.policy.source.impl",
+                "value": "org.apache.ranger.admin.client.RangerAdminRESTClient"
+              },
+              {
+                "key": "ranger.plugin.kudu.policy.rest.ssl.config.file",
+                "value": "{{RANGER_KUDU_PLUGIN_SSL_FILE}}"
+              },
+              {
+                "key": "ranger.plugin.kudu.policy.pollIntervalMs",
+                "value": "30000"
+              },
+              {
+                "key": "ranger.plugin.kudu.access.cluster.name",
+                "value": "${cluster_display_name}"
+              },
+              {
+                "key": "ranger.plugin.kudu.disable.cache.if.servicenotfound",
+                "value": "false"
+              }
+            ]
+          },
+          {
+            "filename": "ranger-kudu-policymgr-ssl.xml",
+            "configFormat": "hadoop_xml",
+            "includedParams": [],
+            "additionalConfigs": [
+              {
+                "key": "xasecure.policymgr.clientssl.truststore",
+                "value": "{{RANGER_PLUGIN_TRUSTSTORE}}"
+              },
+              {
+                "key": "xasecure.policymgr.clientssl.truststore.credential.file",
+                "value": "{{RANGER_PLUGIN_TRUSTSTORE_CRED_FILE}}"
+              }
+            ]
+          },
+          {
+            "filename": "ranger-kudu-audit.xml",
+            "configFormat": "hadoop_xml",
+            "kerberosPrincipals": [
+              {
+                "principalName": "kudu_principal",
+                "propertyName": "xasecure.audit.jaas.Client.option.principal",
+                "instanceWildcard": "_HOST"
+              }
+            ],
+            "includedParams": [
+              "ranger_kudu_plugin_hdfs_audit_spool_directory",
+              "ranger_kudu_plugin_solr_audit_spool_directory"
+            ],
+            "additionalConfigs": [
+              {
+                "key": "xasecure.audit.is.enabled",
+                "value": "true"
+              },
+              {
+                "key": "xasecure.audit.destination.hdfs",
+                "value": "true"
+              },
+              {
+                "key": "xasecure.audit.destination.hdfs.dir",
+                "value": "{{RANGER_KUDU_HDFS_AUDIT_PATH}}"
+              },
+              {
+                "key": "xasecure.audit.destination.solr",
+                "value": "true"
+              },
+              {
+                "key": "xasecure.audit.destination.solr.zookeepers",
+                "value": "${solr_audit_collection}"
+              },
+              {
+                "key": "xasecure.audit.provider.summary.enabled",
+                "value": "true"
+              },
+              {
+                "key": "xasecure.audit.jaas.Client.loginModuleName",
+                "value": "com.sun.security.auth.module.Krb5LoginModule"
+              },
+              {
+                "key": "xasecure.audit.jaas.Client.loginModuleControlFlag",
+                "value": "required"
+              },
+              {
+                "key": "xasecure.audit.jaas.Client.option.useKeyTab",
+                "value": "true"
+              },
+              {
+                "key": "xasecure.audit.jaas.Client.option.storeKey",
+                "value": "false"
+              },
+              {
+                "key": "xasecure.audit.jaas.Client.option.serviceName",
+                "value": "solr"
+              },
+              {
+                "key": "xasecure.audit.destination.solr.force.use.inmemory.jaas.config",
+                "value": "true"
+              },
+              {
+                "key": "xasecure.audit.jaas.Client.option.keyTab",
+                "value": "{{KEYTAB_FILE}}"
               }
             ]
           }
@@ -473,6 +694,14 @@
          "privateKeyPasswordConfigName" : "webserver_private_key_password_cmd",
          "privateKeyPasswordScriptBased" : "true",
          "autoTlsMode" : "auto"
+      },
+      // This is required for connecting to the Ranger service when SSL
+      // is enabled.
+      "sslClient" : {
+        "truststoreLocationConfigName" : "kudu.ssl.truststore.location",
+        "truststorePasswordConfigName" : "kudu.ssl.truststore.password",
+        "truststoreFormat": "jks",
+        "autoTlsMode" : "auto"
       }
     },
     {
@@ -745,7 +974,8 @@
               "ssl_enabled",
               "rb_max_moves_per_server",
               "rb_max_run_time_sec",
-              "rb_max_staleness_interval_sec"
+              "rb_max_staleness_interval_sec",
+              "ranger_kudu_plugin_hdfs_audit_directory"
             ]
           },
           {

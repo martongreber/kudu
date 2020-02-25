@@ -118,20 +118,27 @@ METRIC_DEFINE_gauge_int64(server, builtin_ntp_local_clock_delta,
                           "2^63-1 when true time is not tracked",
                           kudu::MetricLevel::kInfo);
 
-METRIC_DEFINE_gauge_int64(server, builtin_ntp_walltime,
-                          "Built-in NTP Wall-Clock Time",
+METRIC_DEFINE_gauge_int64(server, builtin_ntp_time,
+                          "Built-in NTP Time",
                           kudu::MetricUnit::kMicroseconds,
-                          "Latest wall-clock time as tracked by "
+                          "Latest true time as tracked by "
                           "built-in NTP client",
                           kudu::MetricLevel::kDebug);
 
+METRIC_DEFINE_gauge_int64(server, builtin_ntp_error,
+                          "Built-in NTP Latest Maximum Time Error",
+                          kudu::MetricUnit::kMicroseconds,
+                          "Latest maximum time error as tracked by "
+                          "built-in NTP client",
+                          kudu::MetricLevel::kInfo);
+
 METRIC_DEFINE_histogram(server, builtin_ntp_max_errors,
-                        "Built-In NTP Maximum Errors",
-                        kudu::MetricUnit::kMilliseconds,
+                        "Built-In NTP Maximum Time Errors",
+                        kudu::MetricUnit::kMicroseconds,
                         "Statistics on the maximum true time error computed by "
                         "built-in NTP client",
                          kudu::MetricLevel::kDebug,
-                        20000, 3);
+                        10000000, 1);
 
 using kudu::clock::internal::Interval;
 using kudu::clock::internal::kIntervalNone;
@@ -187,6 +194,7 @@ DEFINE_validator(builtin_ntp_client_bind_address,
 //   http://support.ntp.org/bin/view/Support/NTPRelatedDefinitions
 //
 // Revelant RFC references:
+//   https://tools.ietf.org/html/rfc7822 (updates RFC 5905)
 //   https://tools.ietf.org/html/rfc5905
 //   https://tools.ietf.org/html/rfc4330 (obsoleted by RFC 5905)
 struct BuiltInNtp::NtpPacket {
@@ -727,8 +735,22 @@ bool BuiltInNtp::TryReceivePacket() {
     p->server->InvalidatePacket();
   });
 
-  if (resp.version_number() < kMinNtpVersion ||
-      resp.version_number() > kNtpVersion) {
+  // Basic validation on the NTP version (VN field): it should not be less than
+  // 1 as per RFC 4330, Section 5. SNTP Client Operations:
+  //
+  //   NTP and SNTP clients set the mode field to 3 (client) for unicast and
+  //   manycast requests.  They set the VN field to any version number that
+  //   is supported by the server, selected by configuration or discovery,
+  //   and that can interoperate with all previous version NTP and SNTP
+  //   servers.  Servers reply with the same version as the request, so the
+  //   VN field of the request also specifies the VN field of the reply.  A
+  //   prudent SNTP client can specify the earliest acceptable version on
+  //   the expectation that any server of that or a later version will
+  //   respond.  NTP Version 3 (RFC 1305) and Version 2 (RFC 1119) servers
+  //   accept all previous versions, including Version 1 (RFC 1059).  Note
+  //   that Version 0 (RFC 959) is no longer supported by current and future
+  //   NTP and SNTP servers.
+  if (resp.version_number() < kMinNtpVersion) {
     VLOG(1) << Substitute("$0: unexpected protocol version in response packet "
                           "from NTP server at $1",
                           resp.version_number(), from_server.ToString());
@@ -1068,7 +1090,7 @@ Status BuiltInNtp::CombineClocks() {
     last_computed_.error = compute_error;
 
     // Update stats on the computed error.
-    max_errors_histogram_->Increment(compute_error / 1000);
+    max_errors_histogram_->Increment(compute_error);
   }
   VLOG(2) << Substitute("combined clocks: $0 $1 $2",
                         now, compute_wall, compute_error);
@@ -1089,9 +1111,13 @@ void BuiltInNtp::RegisterMetrics(const scoped_refptr<MetricEntity>& entity) {
       entity,
       Bind(&BuiltInNtp::LocalClockDeltaForMetrics, Unretained(this)))->
           AutoDetachToLastValue(&metric_detacher_);
-  METRIC_builtin_ntp_walltime.InstantiateFunctionGauge(
+  METRIC_builtin_ntp_time.InstantiateFunctionGauge(
       entity,
       Bind(&BuiltInNtp::WalltimeForMetrics, Unretained(this)))->
+          AutoDetachToLastValue(&metric_detacher_);
+  METRIC_builtin_ntp_error.InstantiateFunctionGauge(
+      entity,
+      Bind(&BuiltInNtp::MaxErrorForMetrics, Unretained(this)))->
           AutoDetachToLastValue(&metric_detacher_);
   max_errors_histogram_ =
       METRIC_builtin_ntp_max_errors.Instantiate(entity);
@@ -1116,6 +1142,11 @@ int64_t BuiltInNtp::LocalClockDeltaForMetrics() {
 int64_t BuiltInNtp::WalltimeForMetrics() {
   shared_lock<rw_spinlock> l(last_computed_lock_);
   return last_computed_.wall;
+}
+
+int64_t BuiltInNtp::MaxErrorForMetrics() {
+  shared_lock<rw_spinlock> l(last_computed_lock_);
+  return last_computed_.error;
 }
 
 } // namespace clock

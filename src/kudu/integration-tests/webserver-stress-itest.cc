@@ -16,34 +16,30 @@
 // under the License.
 
 #include <memory>
-#include <ostream>
 #include <string>
 #include <vector>
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/integration-tests/linked_list-test-util.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/mini-cluster/webui_checker.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
-namespace kudu {
-
-using cluster::ExternalMiniCluster;
-using cluster::ExternalMiniClusterOptions;
+using kudu::cluster::ExternalMiniCluster;
+using kudu::cluster::ExternalMiniClusterOptions;
 using std::string;
 using std::unique_ptr;
 using std::vector;
 
+namespace kudu {
+
 // Tests that pounding the web UI doesn't cause any crashes.
 TEST_F(KuduTest, TestWebUIDoesNotCrashCluster) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
 #if defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)
   // When using a sanitizer, checkers place a lot of load on the cluster.

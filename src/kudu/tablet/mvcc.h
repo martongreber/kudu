@@ -189,12 +189,91 @@ class MvccManager {
   // Returns an error if the current snapshot has not been adjusted past its
   // initial state. While in this state, it is unsafe for the MvccManager to
   // serve information about already-applied transactions.
-  Status CheckIsSafeTimeInitialized() const;
+  Status CheckIsCleanTimeInitialized() const;
+
+  // Adjusts the new lower bound on new transactions, provided 'timestamp' is
+  // higher than the current lower bound. This also updates the clean time,
+  // which may also now be 'timestamp' (see AdjustCleanTimeUnlocked() for more
+  // details).
+  //
+  // This must only called when we are guaranteed that there won't be new
+  // transactions started at or below the given timestamp, e.g. the
+  // transactions is consensus committed and we're beginning to apply it.
+  //
+  // TODO(dralves): Until leader leases is implemented this should only be
+  // called with the timestamps of consensus committed transactions, not with
+  // the safe time received from the leader (which can go back without leader
+  // leases).
+  void AdjustNewTransactionLowerBound(Timestamp timestamp);
+
+  // Take a snapshot of the MVCC state at 'timestamp' (i.e which includes
+  // all transactions which have a lower timestamp)
+  //
+  // If there are any in-flight transactions at a lower timestamp, waits for
+  // them to complete before returning.
+  //
+  // If 'timestamp' was marked safe before the call to this method (e.g. by TimeManager)
+  // then the returned snapshot is repeatable.
+  Status WaitForSnapshotWithAllCommitted(Timestamp timestamp,
+                                         MvccSnapshot* snapshot,
+                                         const MonoTime& deadline) const WARN_UNUSED_RESULT;
+
+  // Wait for all operations that are currently APPLYING to commit.
+  //
+  // NOTE: this does _not_ guarantee that no transactions are APPLYING upon
+  // return -- just that those that were APPLYING at call time are finished
+  // upon return.
+  //
+  // Returns Status::Aborted() if MVCC closed while waiting.
+  Status WaitForApplyingTransactionsToCommit() const WARN_UNUSED_RESULT;
+
+  // Returns the earliest possible timestamp for an uncommitted transaction.
+  // All timestamps before this one are guaranteed to be committed.
+  Timestamp GetCleanTimestamp() const;
+
+  // Return the timestamps of all transactions which are currently 'APPLYING'
+  // (i.e. those which have started to apply their operations to in-memory data
+  // structures). Other transactions may have reserved their timestamps via
+  // StartTransaction() but not yet begun applying.
+  //
+  // These transactions are guaranteed to eventually Commit() -- i.e. they will
+  // never Abort().
+  void GetApplyingTransactionsTimestamps(std::vector<Timestamp>* timestamps) const;
+
+  // Closes the MVCC manager. New transactions will not start, in-flight
+  // transactions will exit early on a best-effort basis, and waiting threads
+  // will return Status::Aborted().
+  void Close();
+
+  ~MvccManager();
+
+  bool AreAllTransactionsCommittedForTests(Timestamp ts) const {
+    std::lock_guard<LockType> l(lock_);
+    return AreAllTransactionsCommittedUnlocked(ts);
+  }
+
+  int GetNumWaitersForTests() const {
+    std::lock_guard<simple_spinlock> l(lock_);
+    return waiters_.size();
+  }
+
+ private:
+  friend class MvccSnapshot;
+  friend class MvccTest;
+  friend class ScopedTransaction;
+  FRIEND_TEST(MvccTest, TestAutomaticCleanTimeMoveToSafeTimeOnCommit);
+  FRIEND_TEST(MvccTest, TestIllegalStateTransitionsCrash);
+  FRIEND_TEST(MvccTest, TestTxnAbort);
+
+  enum TxnState {
+    RESERVED,
+    APPLYING
+  };
 
   // Begins a new transaction, which is assigned the provided timestamp.
   //
-  // Requires that 'timestamp' is not committed.
-  // Requires that 'timestamp' is greater than 'safe_time'.
+  // Requires that 'timestamp' is not committed is greater than
+  // 'new_txn_timstamp_exc_lower_bound_'.
   void StartTransaction(Timestamp timestamp);
 
   // Mark that the transaction with the given timestamp is starting to apply
@@ -225,85 +304,9 @@ class MvccManager {
   // StartApplyingTransaction(), or else this logs a FATAL error.
   void CommitTransaction(Timestamp timestamp);
 
-  // Adjusts the safe time so that the MvccManager can trim state, provided
-  // 'safe_time' is higher than the current safe time.
-  //
-  // This must only be called when there is a guarantee that there won't be
-  // any more transactions with timestamps equal to or lower than 'safe_time'.
-  //
-  // TODO(dralves) Until leader leases is implemented this should only be called
-  // with the timestamps of consensus committed transactions, not with the safe
-  // time received from the leader (which can go back without leader leases).
-  void AdjustSafeTime(Timestamp safe_time);
-
   // Take a snapshot of the current MVCC state, which indicates which
   // transactions have been committed at the time of this call.
   void TakeSnapshot(MvccSnapshot *snapshot) const;
-
-  // Take a snapshot of the MVCC state at 'timestamp' (i.e which includes
-  // all transactions which have a lower timestamp)
-  //
-  // If there are any in-flight transactions at a lower timestamp, waits for
-  // them to complete before returning.
-  //
-  // If 'timestamp' was marked safe before the call to this method (e.g. by TimeManager)
-  // then the returned snapshot is repeatable.
-  Status WaitForSnapshotWithAllCommitted(Timestamp timestamp,
-                                         MvccSnapshot* snapshot,
-                                         const MonoTime& deadline) const WARN_UNUSED_RESULT;
-
-  // Wait for all operations that are currently APPLYING to commit.
-  //
-  // NOTE: this does _not_ guarantee that no transactions are APPLYING upon
-  // return -- just that those that were APPLYING at call time are finished
-  // upon return.
-  //
-  // Returns Status::Aborted() if MVCC closed while waiting.
-  Status WaitForApplyingTransactionsToCommit() const WARN_UNUSED_RESULT;
-
-  bool AreAllTransactionsCommitted(Timestamp ts) const;
-
-  // Return the number of transactions in flight..
-  int CountTransactionsInFlight() const;
-
-  // Returns the earliest possible timestamp for an uncommitted transaction.
-  // All timestamps before this one are guaranteed to be committed.
-  Timestamp GetCleanTimestamp() const;
-
-  // Return the timestamps of all transactions which are currently 'APPLYING'
-  // (i.e. those which have started to apply their operations to in-memory data
-  // structures). Other transactions may have reserved their timestamps via
-  // StartTransaction() but not yet been applied.
-  //
-  // These transactions are guaranteed to eventually Commit() -- i.e. they will
-  // never Abort().
-  void GetApplyingTransactionsTimestamps(std::vector<Timestamp>* timestamps) const;
-
-  // Closes the MVCC manager. New transactions will not start, in-flight
-  // transactions will exit early on a best-effort basis, and waiting threads
-  // will return Status::Aborted().
-  void Close();
-
-  // Returns whether MVCC is open and available to manage transactions.
-  bool is_open() const {
-    return open_.load();
-  }
-
-  ~MvccManager();
-
- private:
-  friend class MvccTest;
-  FRIEND_TEST(MvccTest, TestAreAllTransactionsCommitted);
-  FRIEND_TEST(MvccTest, TestTxnAbort);
-  FRIEND_TEST(MvccTest, TestAutomaticCleanTimeMoveToSafeTimeOnCommit);
-  FRIEND_TEST(MvccTest, TestWaitForApplyingTransactionsToCommit);
-  FRIEND_TEST(MvccTest, WaitForCleanSnapshotSnapAfterSafeTimeWithInFlights);
-  FRIEND_TEST(MvccTest, TestDontWaitAfterClose);
-
-  enum TxnState {
-    RESERVED,
-    APPLYING
-  };
 
   bool InitTransactionUnlocked(const Timestamp& timestamp);
 
@@ -353,7 +356,8 @@ class MvccManager {
 
   // Adjusts the clean time, i.e. the timestamp such that all transactions with
   // lower timestamps are committed or aborted, based on which transactions are
-  // currently in flight and on what is the latest value of 'safe_time_'.
+  // currently in flight and on what is the latest value of
+  // 'new_txn_timestamp_exc_lower_bound_'.
   //
   // Must be called with lock_ held.
   void AdjustCleanTimeUnlocked();
@@ -362,11 +366,6 @@ class MvccManager {
   // currently in-flight. Usually called when the previous earliest transaction
   // commits or aborts.
   void AdvanceEarliestInFlightTimestamp();
-
-  int GetNumWaitersForTests() const {
-    std::lock_guard<simple_spinlock> l(lock_);
-    return waiters_.size();
-  }
 
   typedef simple_spinlock LockType;
   mutable LockType lock_;
@@ -377,10 +376,13 @@ class MvccManager {
   typedef std::unordered_map<Timestamp::val_type, TxnState> InFlightMap;
   InFlightMap timestamps_in_flight_;
 
-  // A transaction timestamp below which all transactions are either committed or in-flight,
-  // meaning no new transactions will be started with a timestamp that is equal
-  // to or lower than this one.
-  Timestamp safe_time_;
+  // A transaction timestamp at and below which no new transactions can be
+  // initialized.
+  //
+  // We must apply transactions in timestamp order, so if we've begun applying
+  // a transaction at a given timestamp, we must not initialize a transaction
+  // at or below that timestamp.
+  Timestamp new_txn_timestamp_exc_lower_bound_;
 
   // The minimum timestamp in timestamps_in_flight_, or Timestamp::kMax
   // if that set is empty. This is cached in order to avoid having to iterate

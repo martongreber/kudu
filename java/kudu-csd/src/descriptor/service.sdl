@@ -64,7 +64,8 @@
     {
       "type" : "rangerPlugin",
       "extensionId": "ranger_plugin",
-      "pluginType": "KUDU"
+      "pluginType": "KUDU",
+      "repositoryStrategy" : "uniquePerService"
     }
   ],
   "kerberos" : "${enable_security}",
@@ -276,7 +277,11 @@
           "KUDU_TRUSTORE_PASSWORD": "${ssl_client_truststore_password}",
           "RANGER_SERVICE": "${dependency:RANGER}",
           "RANGER_AUDIT_BASE_PATH": "${ranger_base_audit_url}",
-          "RANGER_KUDU_HDFS_AUDIT_DIR": "${ranger_kudu_plugin_hdfs_audit_directory}"
+          "RANGER_KUDU_HDFS_AUDIT_DIR": "${ranger_kudu_plugin_hdfs_audit_directory}",
+          "RANGER_KUDU_SERVICE_NAME": "${ranger_kudu_plugin_service_name}",
+          "RANGER_REST_URL" : "${ranger_rest_url}",
+          "CLUSTER_NAME" : "${cluster_name}",
+          "RANGER_REPO_NAME" : "${ranger_repo_name}"
         }
       },
       "logging" : {
@@ -482,6 +487,15 @@
           "type": "string"
         },
         {
+          "name": "ranger_kudu_plugin_service_name",
+          "label": "Ranger service name for this Kudu service",
+          "description": "Name of the Kudu Ranger service, that is used for authorization by this Kudu service. If this parameter is set to the placeholder value '{{GENERATED_RANGER_SERVICE_NAME}}', a generated service name will be used, and if necessary, created. The generated service name will refer to the name of the cluster and the name of this Kudu service. The name can consist of alphanumeric and '_' characters.",
+          "configName": "ranger.plugin.kudu.service.name",
+          "conformRegex" : "[\\p{Alnum}_\\{\\}]+",
+          "default": "cm_kudu",
+          "type": "string"
+        },
+        {
           "name": "ranger_kudu_plugin_hdfs_audit_spool_directory",
           "label": "Ranger Kudu Plugin Audit HDFS Spool Directory Path",
           "description": "Spool directory for Ranger audits being written to DFS.",
@@ -560,16 +574,13 @@
             "includedParams": [
               "ranger_kudu_plugin_policy_cache_directory",
               "ranger_kudu_plugin_use_x_forwarded_for_ipaddress",
-              "ranger_kudu_plugin_trusted_proxy_ipaddress"
+              "ranger_kudu_plugin_trusted_proxy_ipaddress",
+              "ranger_kudu_plugin_service_name"
             ],
             "additionalConfigs": [
               {
                 "key": "ranger.plugin.kudu.policy.rest.url",
                 "value": "${ranger_rest_url}"
-              },
-              {
-                "key": "ranger.plugin.kudu.service.name",
-                "value": "cm_kudu"
               },
               {
                 "key": "ranger.plugin.kudu.policy.source.impl",

@@ -83,8 +83,8 @@ class SubprocessServerTest : public KuduTest {
   // Resets the subprocess server to account for any new configuration.
   Status ResetSubprocessServer(int java_queue_size = 0,
                                int java_parser_threads = 0) {
-    // Set up a subprocess server pointing at the kudu-subprocess-echo.jar that
-    // contains an echo server.
+    // Set up a subprocess server pointing at the kudu-subprocess.jar that
+    // contains an echo handler and call EchoSubprocessMain.
     string exe;
     RETURN_NOT_OK(env_->GetExecutablePath(&exe));
     const string bin_dir = DirName(exe);
@@ -92,7 +92,8 @@ class SubprocessServerTest : public KuduTest {
     RETURN_NOT_OK(FindHomeDir("java", bin_dir, &java_home));
     vector<string> argv = {
       Substitute("$0/bin/java", java_home),
-      "-jar", Substitute("$0/kudu-subprocess-echo.jar", bin_dir)
+      "-cp", Substitute("$0/kudu-subprocess.jar", bin_dir),
+      "org.apache.kudu.subprocess.echo.EchoSubprocessMain"
     };
     if (java_queue_size > 0) {
       argv.emplace_back("q");
@@ -176,7 +177,7 @@ TEST_F(SubprocessServerTest, TestTimeoutBeforeQueueing) {
   SubprocessResponsePB response;
   Status s = server_->Execute(&request, &response);
   ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
-  ASSERT_STR_CONTAINS(s.ToString(), "timed out before queueing call");
+  ASSERT_STR_CONTAINS(s.ToString(), "couldn't enqueue call");
 }
 
 // Test when we try sending too many requests at once.
@@ -213,7 +214,7 @@ TEST_F(SubprocessServerTest, TestTimeoutWhileQueueingCalls) {
   bool has_timeout_when_queueing = false;
   for (const auto& s : results) {
     if (s.IsTimedOut() &&
-        s.ToString().find("timed out trying to queue call") != string::npos) {
+        s.ToString().find("couldn't enqueue call") != string::npos) {
       has_timeout_when_queueing = true;
     }
   }

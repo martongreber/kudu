@@ -30,7 +30,6 @@ include "kudu-mapreduce"
 include "kudu-spark"
 include "kudu-spark-tools"
 include "kudu-subprocess"
-include "kudu-subprocess-echo"
 include "kudu-test-utils"
 
 include "kudu-csd"

@@ -281,6 +281,21 @@ else
   CLANG=$(pwd)/thirdparty/clang-toolchain/bin/clang
 fi
 
+# Some portions of the C++ build may depend on Java code, so we may run Gradle
+# while building. Pass in some flags suitable for automated builds; these will
+# also be used in the Java build.
+# These should be set before CMAKE so that the Gradle command in the
+# generated make file has the correct flags.
+export EXTRA_GRADLE_FLAGS="--console=plain"
+EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --no-daemon"
+EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --continue"
+# KUDU-2524: temporarily disable scalafmt until we can work out its JDK
+# incompatibility issue.
+EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DskipFormat"
+# Include the downstream CSD modules.
+EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -PbuildCSD"
+EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS $GRADLE_FLAGS"
+
 # Assemble the cmake command line, starting with environment variables.
 
 # There's absolutely no reason to rebuild the thirdparty tree; we just ran
@@ -378,19 +393,6 @@ fi
 if [ -d "$TEST_TMPDIR" ]; then
   rm -Rf $TEST_TMPDIR/*
 fi
-
-# Some portions of the C++ build may depend on Java code, so we may run Gradle
-# while building. Pass in some flags suitable for automated builds; these will
-# also be used in the Java build.
-export EXTRA_GRADLE_FLAGS="--console=plain"
-EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --no-daemon"
-EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --continue"
-# KUDU-2524: temporarily disable scalafmt until we can work out its JDK
-# incompatibility issue.
-EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DskipFormat"
-# Include the downstream CSD modules.
-EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -PbuildCSD"
-EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS $GRADLE_FLAGS"
 
 # actually do the build
 echo

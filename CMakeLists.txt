@@ -22,6 +22,8 @@
 # 1. https://gitlab.kitware.com/cmake/cmake/issues/17938
 cmake_minimum_required(VERSION 3.11.2)
 
+project(Kudu)
+
 # Prevent builds from the top-level source directory. This ensures that build
 # output is well isolated from the source tree.
 #
@@ -1181,7 +1183,7 @@ ADD_THIRDPARTY_LIB(boost_date_time
 # in the libc++ library for some reason.
 if (APPLE)
   get_filename_component(SIZED_DEALLOCATION_TEST_TCMALLOC_LIBDIR
-    ${TCMALLOC_STATIC_LIB} DIRECTORY)
+    "${TCMALLOC_STATIC_LIB}" DIRECTORY)
   execute_process(
     COMMAND printf
       "#include <new>\nint main(){(::operator delete)(0,256);return 0;}\n"

@@ -83,13 +83,14 @@ using strings::Substitute;
 namespace kudu {
 namespace subprocess {
 
-SubprocessServer::SubprocessServer(vector<string> subprocess_argv)
+SubprocessServer::SubprocessServer(vector<string> subprocess_argv, SubprocessMetrics metrics)
     : call_timeout_(MonoDelta::FromSeconds(FLAGS_subprocess_timeout_secs)),
       next_id_(1),
       closing_(1),
       process_(make_shared<Subprocess>(std::move(subprocess_argv))),
       outbound_call_queue_(FLAGS_subprocess_request_queue_size_bytes),
-      inbound_response_queue_(FLAGS_subprocess_response_queue_size_bytes) {
+      inbound_response_queue_(FLAGS_subprocess_response_queue_size_bytes),
+      metrics_(std::move(metrics)) {
   process_->ShareParentStdin(false);
   process_->ShareParentStdout(false);
 }
@@ -137,22 +138,35 @@ Status SubprocessServer::Execute(SubprocessRequestPB* req,
 
 void SubprocessServer::Shutdown() {
   // Stop further work from happening by killing the subprocess and shutting
-  // down the queues.
+ // down the queues.
   if (!closing_.CountDown()) {
     // We may shut down out-of-band in tests; if we've already shut down,
     // there's nothing left to do.
     return;
   }
   // NOTE: ordering isn't too important as long as we shut everything down.
-  WARN_NOT_OK(process_->KillAndWait(SIGTERM), "failed to stop subprocess");
+  //
+  // Normally the process_ should be started before we reach Shutdown() and the
+  // threads below should be running too, except in mock servers because we
+  // don't init there. Shutdown() is still called in this case from the
+  // destructor though so these checks are necessary.
+  if (process_->IsStarted()) {
+    WARN_NOT_OK(process_->KillAndWait(SIGTERM), "failed to stop subprocess");
+  }
   inbound_response_queue_.Shutdown();
   outbound_call_queue_.Shutdown();
 
   // We should be able to clean up our threads; they'll see that we're closing,
   // the pipe has been closed, or the queues have been shut down.
-  write_thread_->Join();
-  read_thread_->Join();
-  deadline_checker_->Join();
+  if (write_thread_) {
+    write_thread_->Join();
+  }
+  if (read_thread_) {
+    read_thread_->Join();
+  }
+  if (deadline_checker_) {
+    deadline_checker_->Join();
+  }
   for (const auto& t : responder_threads_) {
     t->Join();
   }
@@ -207,6 +221,16 @@ void SubprocessServer::ResponderThread() {
       if (!resp.has_id()) {
         LOG(FATAL) << Substitute("Received invalid response: $0",
                                  pb_util::SecureDebugString(resp));
+      }
+      // Regardless of whether this call succeeded or not, parse the returned
+      // metrics.
+      if (PREDICT_TRUE(resp.has_metrics())) {
+        const auto& pb = resp.metrics();
+        metrics_.inbound_queue_length->Increment(pb.inbound_queue_length());
+        metrics_.outbound_queue_length->Increment(pb.outbound_queue_length());
+        metrics_.inbound_queue_time_ms->Increment(pb.inbound_queue_time_ms());
+        metrics_.outbound_queue_time_ms->Increment(pb.outbound_queue_time_ms());
+        metrics_.execution_time_ms->Increment(pb.execution_time_ms());
       }
     }
     vector<pair<shared_ptr<SubprocessCall>, SubprocessResponsePB>> calls_and_resps;

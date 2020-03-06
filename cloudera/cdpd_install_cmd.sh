@@ -8,7 +8,7 @@ set -ex
 
 VERSION=$(cat version.txt)
 GIT_HASH=$(git rev-parse HEAD)
-
+BUILD_THREADS=${BUILD_THREADS:-$(nproc)}
 function do_make_build() {
   local BUILD_TYPE=$1
   mkdir -p build/${BUILD_TYPE}
@@ -33,8 +33,8 @@ function do_make_build() {
     -DKUDU_MASTER_INSTALL=OFF \
     -DKUDU_TSERVER_INSTALL=OFF \
     -DCMAKE_BUILD_TYPE=${BUILD_TYPE} ../..
-  make -j$(nproc)
-  make -j$(nproc) install DESTDIR=$(pwd)/client
+  make -j${BUILD_THREADS}
+  make -j${BUILD_THREADS} install DESTDIR=$(pwd)/client
   popd
 
   # Show the ccache stats.

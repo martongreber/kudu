@@ -180,6 +180,9 @@ fi
 
 # If Ranger service is selected as dependency, add Ranger Kudu plugin specific parameters
 if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
+  # Emit the parameter to the gflagfile.
+  KUDU_ARGS="$KUDU_ARGS --ranger_config_path=$CONF_DIR"
+
   # Populate the required field for 'ranger-kudu-security.xml'
   RANGER_KUDU_PLUGIN_SSL_FILE="${CONF_DIR}/ranger-kudu-policymgr-ssl.xml"
   perl -pi -e "s#\{\{RANGER_KUDU_PLUGIN_SSL_FILE}}#${RANGER_KUDU_PLUGIN_SSL_FILE}#g" "${CONF_DIR}"/ranger-kudu-security.xml

@@ -221,7 +221,7 @@ if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
   "${CONF_DIR}"/scripts/ranger_init.sh -c create -s "${RANGER_KUDU_SERVICE_NAME}"
 
   # Slurp up sanitized Ranger Kudu service name. And use it to interpolate the non-sanitized one.
-  . "${CONF_DIR}/scripts/vars.sh"
+  . "${CONF_DIR}/scripts/ranger_vars.sh"
   perl -pi -e "s#\Q${RANGER_KUDU_SERVICE_NAME}\E#${SANITIZED_RANGER_KUDU_SERVICE_NAME}#g" ${CONF_DIR}/ranger-kudu-security.xml
 fi
 

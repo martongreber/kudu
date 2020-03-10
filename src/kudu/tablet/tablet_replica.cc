@@ -23,7 +23,6 @@
 #include <mutex>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 #include <glog/logging.h>
@@ -256,9 +255,6 @@ Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
     set_state(RUNNING);
   }
 
-  // Because we changed the tablet state, we need to re-report the tablet to the master.
-  mark_dirty_clbk_.Run("Started TabletReplica");
-
   return Status::OK();
 }
 
@@ -431,10 +427,10 @@ Status TabletReplica::SubmitWrite(unique_ptr<WriteTransactionState> state) {
   RETURN_NOT_OK(CheckRunning());
 
   state->SetResultTracker(result_tracker_);
-  gscoped_ptr<WriteTransaction> transaction(new WriteTransaction(std::move(state),
+  unique_ptr<WriteTransaction> transaction(new WriteTransaction(std::move(state),
                                                                  consensus::LEADER));
   scoped_refptr<TransactionDriver> driver;
-  RETURN_NOT_OK(NewLeaderTransactionDriver(transaction.PassAs<Transaction>(),
+  RETURN_NOT_OK(NewLeaderTransactionDriver(std::move(transaction),
                                            &driver));
   return driver->ExecuteAsync();
 }
@@ -442,10 +438,10 @@ Status TabletReplica::SubmitWrite(unique_ptr<WriteTransactionState> state) {
 Status TabletReplica::SubmitAlterSchema(unique_ptr<AlterSchemaTransactionState> state) {
   RETURN_NOT_OK(CheckRunning());
 
-  gscoped_ptr<AlterSchemaTransaction> transaction(
+  unique_ptr<AlterSchemaTransaction> transaction(
       new AlterSchemaTransaction(std::move(state), consensus::LEADER));
   scoped_refptr<TransactionDriver> driver;
-  RETURN_NOT_OK(NewLeaderTransactionDriver(transaction.PassAs<Transaction>(), &driver));
+  RETURN_NOT_OK(NewLeaderTransactionDriver(std::move(transaction), &driver));
   return driver->ExecuteAsync();
 }
 
@@ -621,7 +617,7 @@ Status TabletReplica::StartFollowerTransaction(const scoped_refptr<ConsensusRoun
 
   consensus::ReplicateMsg* replicate_msg = round->replicate_msg();
   DCHECK(replicate_msg->has_timestamp());
-  gscoped_ptr<Transaction> transaction;
+  unique_ptr<Transaction> transaction;
   switch (replicate_msg->op_type()) {
     case WRITE_OP:
     {
@@ -706,7 +702,7 @@ void TabletReplica::FinishConsensusOnlyRound(ConsensusRound* round) {
   }
 }
 
-Status TabletReplica::NewLeaderTransactionDriver(gscoped_ptr<Transaction> transaction,
+Status TabletReplica::NewLeaderTransactionDriver(unique_ptr<Transaction> transaction,
                                                  scoped_refptr<TransactionDriver>* driver) {
   scoped_refptr<TransactionDriver> tx_driver = new TransactionDriver(
     &txn_tracker_,
@@ -716,12 +712,12 @@ Status TabletReplica::NewLeaderTransactionDriver(gscoped_ptr<Transaction> transa
     apply_pool_,
     &txn_order_verifier_);
   RETURN_NOT_OK(tx_driver->Init(std::move(transaction), consensus::LEADER));
-  driver->swap(tx_driver);
+  *driver = std::move(tx_driver);
 
   return Status::OK();
 }
 
-Status TabletReplica::NewReplicaTransactionDriver(gscoped_ptr<Transaction> transaction,
+Status TabletReplica::NewReplicaTransactionDriver(unique_ptr<Transaction> transaction,
                                                   scoped_refptr<TransactionDriver>* driver) {
   scoped_refptr<TransactionDriver> tx_driver = new TransactionDriver(
     &txn_tracker_,
@@ -731,7 +727,7 @@ Status TabletReplica::NewReplicaTransactionDriver(gscoped_ptr<Transaction> trans
     apply_pool_,
     &txn_order_verifier_);
   RETURN_NOT_OK(tx_driver->Init(std::move(transaction), consensus::REPLICA));
-  driver->swap(tx_driver);
+  *driver = std::move(tx_driver);
 
   return Status::OK();
 }
@@ -749,15 +745,15 @@ void TabletReplica::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
 
   vector<MaintenanceOp*> maintenance_ops;
 
-  gscoped_ptr<MaintenanceOp> mrs_flush_op(new FlushMRSOp(this));
+  unique_ptr<MaintenanceOp> mrs_flush_op(new FlushMRSOp(this));
   maint_mgr->RegisterOp(mrs_flush_op.get());
   maintenance_ops.push_back(mrs_flush_op.release());
 
-  gscoped_ptr<MaintenanceOp> dms_flush_op(new FlushDeltaMemStoresOp(this));
+  unique_ptr<MaintenanceOp> dms_flush_op(new FlushDeltaMemStoresOp(this));
   maint_mgr->RegisterOp(dms_flush_op.get());
   maintenance_ops.push_back(dms_flush_op.release());
 
-  gscoped_ptr<MaintenanceOp> log_gc(new LogGCOp(this));
+  unique_ptr<MaintenanceOp> log_gc(new LogGCOp(this));
   maint_mgr->RegisterOp(log_gc.get());
   maintenance_ops.push_back(log_gc.release());
 
@@ -765,7 +761,7 @@ void TabletReplica::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
   {
     std::lock_guard<simple_spinlock> l(lock_);
     DCHECK(maintenance_ops_.empty());
-    maintenance_ops_.swap(maintenance_ops);
+    maintenance_ops_ = std::move(maintenance_ops);
     tablet = tablet_;
   }
   tablet->RegisterMaintenanceOps(maint_mgr);
@@ -783,7 +779,7 @@ void TabletReplica::UnregisterMaintenanceOps() {
   vector<MaintenanceOp*> maintenance_ops;
   {
     std::lock_guard<simple_spinlock> l(lock_);
-    maintenance_ops.swap(maintenance_ops_);
+    maintenance_ops = std::move(maintenance_ops_);
   }
   for (MaintenanceOp* op : maintenance_ops) {
     op->Unregister();
@@ -860,7 +856,7 @@ void TabletReplica::UpdateTabletStats(vector<string>* dirty_tablets) {
     if (consensus::RaftPeerPB_Role_LEADER == role) {
       dirty_tablets->emplace_back(tablet_id());
     }
-    stats_pb_.Swap(&pb);
+    stats_pb_ = std::move(pb);
   }
 }
 

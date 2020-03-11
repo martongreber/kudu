@@ -32,6 +32,7 @@
 
 #include "kudu/util/hash.pb.h"
 #include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -112,6 +113,21 @@ TEST_F(BlockBloomFilterTest, InvalidSpace) {
   ASSERT_TRUE(s.IsInvalidArgument());
   ASSERT_STR_CONTAINS(s.ToString(), "Bloom filter too large");
   bf.Close();
+}
+
+// Simple Arena allocator based test that would sometimes trigger
+// SIGSEGV due to misalignment of the "directory_" ptr on AVX operations
+// before adding support for 32/64 byte alignment in Arena allocator.
+// It simulates the allocation pattern in wire-protocol.cc.
+TEST_F(BlockBloomFilterTest, ArenaAligned) {
+  Arena a(64);
+  auto* allocator = a.NewObject<ArenaBlockBloomFilterBufferAllocator>(&a);
+  auto* bf = a.NewObject<BlockBloomFilter>(allocator);
+  bf->Init(6, FAST_HASH, 0);
+  bool key = true;
+  Slice s(reinterpret_cast<const uint8_t*>(&key), sizeof(key));
+  bf->Insert(s);
+  ASSERT_TRUE(bf->Find(s));
 }
 
 TEST_F(BlockBloomFilterTest, InvalidHashAlgorithm) {
@@ -269,5 +285,38 @@ TEST_F(BlockBloomFilterTest, MinSpaceForFpp) {
       // log space at which we can guarantee the requested fpp.
     }
   }
+}
+
+TEST_F(BlockBloomFilterTest, Or) {
+  BlockBloomFilter* bf1 = CreateBloomFilter(BlockBloomFilter::MinLogSpace(100, 0.01));
+  BlockBloomFilter* bf2 = CreateBloomFilter(BlockBloomFilter::MinLogSpace(100, 0.01));
+
+  for (int i = 60; i < 80; ++i) bf2->Insert(i);
+  for (int i = 0; i < 10; ++i) bf1->Insert(i);
+
+  ASSERT_OK(bf1->Or(*bf2));
+  for (int i = 0; i < 10; ++i) ASSERT_TRUE(bf1->Find(i)) << i;
+  for (int i = 60; i < 80; ++i) ASSERT_TRUE(bf1->Find(i)) << i;
+
+  // Insert another value to aggregated BloomFilter.
+  for (int i = 11; i < 50; ++i) bf1->Insert(i);
+
+  for (int i = 11; i < 50; ++i) ASSERT_TRUE(bf1->Find(i)) << i;
+  ASSERT_FALSE(bf1->Find(81));
+
+  // Check that AlwaysFalse() is updated correctly.
+  BlockBloomFilter* bf3 = CreateBloomFilter(BlockBloomFilter::MinLogSpace(100, 0.01));
+  BlockBloomFilter* always_false = CreateBloomFilter(BlockBloomFilter::MinLogSpace(100, 0.01));
+  ASSERT_OK(bf3->Or(*always_false));
+  EXPECT_TRUE(bf3->AlwaysFalse());
+  ASSERT_OK(bf3->Or(*bf2));
+  EXPECT_FALSE(bf3->AlwaysFalse());
+
+  // Invalid argument test cases.
+  BlockBloomFilter* bf4 = CreateBloomFilter(BlockBloomFilter::MinLogSpace(100, 0.01));
+  BlockBloomFilter* bf5 = CreateBloomFilter(BlockBloomFilter::MinLogSpace(100000, 0.01));
+  Status s = bf4->Or(*bf5);
+  ASSERT_TRUE(s.IsInvalidArgument());
+  ASSERT_STR_CONTAINS(s.ToString(), "Directory size don't match");
 }
 }  // namespace kudu

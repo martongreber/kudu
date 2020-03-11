@@ -121,17 +121,19 @@ static const char* kUnauthorizedAction = "Unauthorized action";
 static const char* kDenyNonRangerTableTemplate = "Denying action on table with invalid name $0. "
                                                  "Use 'kudu table rename_table' to rename it to "
                                                  "a Ranger-compatible name.";
-const char* kMainClass = "org.apache.kudu.ranger.RangerSubprocessMain";
+const char* kMainClass = "org.apache.kudu.subprocess.ranger.RangerSubprocessMain";
 
 #define HISTINIT(member, x) member = METRIC_##x.Instantiate(entity)
 RangerSubprocessMetrics::RangerSubprocessMetrics(const scoped_refptr<MetricEntity>& entity) {
   HISTINIT(sp_inbound_queue_length, ranger_subprocess_inbound_queue_length);
-  HISTINIT(sp_outbound_queue_length, ranger_subprocess_outbound_queue_length);
   HISTINIT(sp_inbound_queue_time_ms, ranger_subprocess_inbound_queue_time_ms);
+  HISTINIT(sp_outbound_queue_length, ranger_subprocess_outbound_queue_length);
   HISTINIT(sp_outbound_queue_time_ms, ranger_subprocess_outbound_queue_time_ms);
   HISTINIT(sp_execution_time_ms, ranger_subprocess_execution_time_ms);
-  HISTINIT(server_outbound_queue_time_ms, ranger_server_outbound_queue_time_ms);
+  HISTINIT(server_inbound_queue_size_bytes, ranger_server_inbound_queue_size_bytes);
   HISTINIT(server_inbound_queue_time_ms, ranger_server_inbound_queue_time_ms);
+  HISTINIT(server_outbound_queue_size_bytes, ranger_server_outbound_queue_size_bytes);
+  HISTINIT(server_outbound_queue_time_ms, ranger_server_outbound_queue_time_ms);
 }
 #undef HISTINIT
 

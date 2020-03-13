@@ -54,7 +54,7 @@ versions += [
     ranger         : "2.0.0",
     scala          : "2.11.12",
     scalatest      : "3.0.8",
-    schemaValidator: "6.2.0",
+    schemaValidator: "7.x.0",
     scopt          : "3.7.1",
     slf4j : "1.7.25",
     spark : "2.4.0.7.1.1.0-SNAPSHOT",

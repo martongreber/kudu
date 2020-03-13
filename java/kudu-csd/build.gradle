@@ -77,6 +77,8 @@ task validateSdl(type: JavaExec) {
   main = "com.cloudera.cli.validator.Main"
   args "-sdl", "$projectDir/src/descriptor/service.sdl", "-strict-mode", "-service-type-list", "RANGER"
 }
+// TODO(ghenke): Re-enable validateSdl when a validator that supports `dependencyExtensions` is available.
+validateSdl.enabled = false
 
 // Create an aggregate validator task.
 // This simplifies running the validations on all the csd files by only

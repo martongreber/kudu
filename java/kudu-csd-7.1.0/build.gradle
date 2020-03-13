@@ -44,34 +44,6 @@ sourcesJar.enabled = false
 testSourcesJar.enabled = false
 javadocJar.enabled = false
 
-configurations {
-  validator
-}
-
-dependencies {
-  validator libs.schemaValidator
-}
-
-task validateMdl(type: JavaExec) {
-  classpath configurations.validator
-  main = "com.cloudera.cli.validator.Main"
-  args "-mdl", "$buildDir/descriptor/service.mdl", "-strict-mode"
-}
-
-task validateSdl(type: JavaExec) {
-  classpath configurations.validator
-  main = "com.cloudera.cli.validator.Main"
-  args "-sdl", "$projectDir/src/descriptor/service.sdl", "-strict-mode"
-}
-
-// Create an aggregate validator task.
-// This simplifies running the validations on all the csd files by only
-// needing one task instead of multiple in your command.
-task validate(dependsOn: [validateMdl, validateSdl], group: "Verification") {
-  description = "Run the CSD validator."
-}
-check.dependsOn(validate)
-
 // Generate a pom file for use when installing when packaging (see do-component-build).
 task generatePom {
   doLast {

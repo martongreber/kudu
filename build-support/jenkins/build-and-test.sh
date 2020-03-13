@@ -60,6 +60,9 @@
 #
 #   BUILD_JAVA        Default: 1
 #     Build and test java code if this is set to 1.
+#     Note: The Java code required for the C++ code and tests to run,
+#     such as the HMS plugin and the Java subprocess, will still be built
+#     even if set to 0.
 #
 #   BUILD_PYTHON       Default: 1
 #     Build and test the Python wrapper of the client API.
@@ -281,6 +284,10 @@ else
   CLANG=$(pwd)/thirdparty/clang-toolchain/bin/clang
 fi
 
+# Make sure we use JDK8
+export JAVA_HOME=$JAVA8_HOME
+export PATH=$JAVA_HOME/bin:$PATH
+
 # Some portions of the C++ build may depend on Java code, so we may run Gradle
 # while building. Pass in some flags suitable for automated builds; these will
 # also be used in the Java build.
@@ -293,7 +300,11 @@ EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --continue"
 # incompatibility issue.
 EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DskipFormat"
 # Include the downstream CSD modules.
-EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -PbuildCSD"
+# We don't include the CSD modules for LINT builds because they require
+# a built binary and the LINT build does not build the Kudu binaries.
+if [ "$BUILD_TYPE" != "LINT" ]; then
+  EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -PbuildCSD"
+fi
 EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS $GRADLE_FLAGS"
 
 # Assemble the cmake command line, starting with environment variables.
@@ -364,8 +375,35 @@ fi
 
 # Short circuit for LINT builds.
 if [ "$BUILD_TYPE" = "LINT" ]; then
-  make lint | tee $TEST_LOGDIR/lint.log
-  exit $?
+  LINT_FAILURES=""
+  LINT_RESULT=0
+
+  if [ "$BUILD_JAVA" == "1" ]; then
+    pushd $SOURCE_ROOT/java
+    if ! ./gradlew $EXTRA_GRADLE_FLAGS clean check -x test $EXTRA_GRADLE_TEST_FLAGS; then
+      LINT_RESULT=1
+      LINT_FAILURES="$LINT_FAILURES"$'Java Gradle check failed\n'
+    fi
+    popd
+  fi
+
+  if ! make lint | tee $TEST_LOGDIR/lint.log; then
+    LINT_RESULT=1
+    LINT_FAILURES="$LINT_FAILURES"$'make lint failed\n'
+  fi
+
+  if [ -n "$LINT_FAILURES" ]; then
+    echo
+    echo
+    echo ======================================================================
+    echo Lint Failure summary
+    echo ======================================================================
+    echo $LINT_FAILURES
+    echo
+    echo
+  fi
+
+  exit $LINT_RESULT
 fi
 
 # Short circuit for IWYU builds: run the include-what-you-use tool on the files
@@ -450,9 +488,6 @@ if [ "$BUILD_JAVA" == "1" ]; then
   echo Building and testing java...
   echo ------------------------------------------------------------
 
-  # Make sure we use JDK8
-  export JAVA_HOME=$JAVA8_HOME
-  export PATH=$JAVA_HOME/bin:$PATH
   pushd $SOURCE_ROOT/java
   set -x
 

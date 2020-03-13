@@ -46,6 +46,7 @@ changes in Kudu 6.2.0. To perform the fork, take the following steps:
   * Change the `archivesBaseName` from `KUDU` to `KUDU{major}_{minor}`, so in
     this example the `archivesBaseName` would be `KUDU6_1`.
   * Delete the `generateMdl` task that generates the MDL.
+  * Delete the `validator` configuration and all the validation tasks that validate the MDL.
 . Edit `kudu-csd-6.1/src/descriptor/service.sdl`:
   * Adjust the `min` and `max` keys of the `cdhVersion` object near the top of
     the SDL. The value of the `min` key should be the first version supported by

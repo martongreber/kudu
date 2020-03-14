@@ -180,13 +180,16 @@ fi
 
 # If Ranger service is selected as dependency, add Ranger Kudu plugin specific parameters
 if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
-  # Emit the parameter to the gflagfile.
-  KUDU_ARGS="$KUDU_ARGS \
-             --ranger_config_path=$CONF_DIR \
-             --trusted_user_acl=impala,hive,kudu"
-
   # TODO(Hao): remove once ranger related gflag is no longer experimental.
   KUDU_ARGS="$KUDU_ARGS --unlock_experimental_flags=true"
+
+  # Emit the required parameters for enabling Ranger integration to the gflagfile.
+  KUDU_ARGS="$KUDU_ARGS \
+             --ranger_config_path=$CONF_DIR \
+             --trusted_user_acl=impala,hive,kudu \
+             --ranger_java_path=$JAVA_HOME/bin/java \
+             --ranger_jar_path=$KUDU_HOME/kudu-subprocess.jar \
+             --tserver_enforce_access_control=true"
 
   # Populate the required field for 'ranger-kudu-security.xml'
   RANGER_KUDU_PLUGIN_SSL_FILE="${CONF_DIR}/ranger-kudu-policymgr-ssl.xml"

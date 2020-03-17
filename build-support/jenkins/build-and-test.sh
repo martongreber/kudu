@@ -285,8 +285,10 @@ else
 fi
 
 # Make sure we use JDK8
-export JAVA_HOME=$JAVA8_HOME
-export PATH=$JAVA_HOME/bin:$PATH
+if [ -n "$JAVA8_HOME" ]; then
+  export JAVA_HOME="$JAVA8_HOME"
+  export PATH="$JAVA_HOME/bin:$PATH"
+fi
 
 # Some portions of the C++ build may depend on Java code, so we may run Gradle
 # while building. Pass in some flags suitable for automated builds; these will
@@ -296,6 +298,8 @@ export PATH=$JAVA_HOME/bin:$PATH
 export EXTRA_GRADLE_FLAGS="--console=plain"
 EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --no-daemon"
 EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --continue"
+# Temporarily disable parallel builds for automated builds.
+EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --no-parallel"
 # KUDU-2524: temporarily disable scalafmt until we can work out its JDK
 # incompatibility issue.
 EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DskipFormat"

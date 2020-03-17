@@ -33,7 +33,7 @@ versions += [
     commonsIo      : "2.6",
     errorProne     : "2.3.3",
     errorProneJavac: "9+181-r4173-1",
-    gradle         : "5.6.4",
+    gradle         : "6.2.2",
     guava          : "28.2-jre",
     hadoop : "3.1.1.7.1.1.0-SNAPSHOT",
     hamcrest       : "2.2",

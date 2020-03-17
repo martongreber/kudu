@@ -183,6 +183,9 @@ if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
   # Emit the parameter to the gflagfile.
   KUDU_ARGS="$KUDU_ARGS --ranger_config_path=$CONF_DIR"
 
+  # TODO(Hao): remove once ranger related gflag is no longer experimental.
+  KUDU_ARGS="$KUDU_ARGS --unlock_experimental_flags=true"
+
   # Populate the required field for 'ranger-kudu-security.xml'
   RANGER_KUDU_PLUGIN_SSL_FILE="${CONF_DIR}/ranger-kudu-policymgr-ssl.xml"
   perl -pi -e "s#\{\{RANGER_KUDU_PLUGIN_SSL_FILE}}#${RANGER_KUDU_PLUGIN_SSL_FILE}#g" "${CONF_DIR}"/ranger-kudu-security.xml

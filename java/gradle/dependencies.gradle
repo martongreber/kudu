@@ -51,7 +51,7 @@ versions += [
     osdetector     : "1.6.2",
     parquet : "1.10.99.7.1.1.0-SNAPSHOT",
     protobuf       : "3.11.3",
-    ranger         : "2.0.0",
+    ranger : "2.0.0.7.1.1.0-SNAPSHOT",
     scala          : "2.11.12",
     scalatest      : "3.0.8",
     schemaValidator: "7.x.0",

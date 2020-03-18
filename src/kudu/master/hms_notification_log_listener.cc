@@ -92,7 +92,7 @@ HmsNotificationLogListenerTask::~HmsNotificationLogListenerTask() {
 Status HmsNotificationLogListenerTask::Init() {
   CHECK(!thread_) << "HmsNotificationLogListenerTask is already initialized";
   return kudu::Thread::Create("catalog manager", "hms-notification-log-listener",
-                              &HmsNotificationLogListenerTask::RunLoop, this, &thread_);
+                              [this]() { this->RunLoop(); }, &thread_);
 }
 
 void HmsNotificationLogListenerTask::Shutdown() {
@@ -133,6 +133,7 @@ void HmsNotificationLogListenerTask::RunLoop() {
     for (auto& cb : callback_batch) {
       cb.Run(s);
     }
+    callback_batch.clear();
 
     {
       std::lock_guard<Mutex> l(lock_);
@@ -152,7 +153,7 @@ void HmsNotificationLogListenerTask::RunLoop() {
 
       // Swap the current queue of callbacks, so they can be completed after
       // polling next iteration.
-      callback_batch = std::move(catch_up_callbacks_);
+      callback_batch.swap(catch_up_callbacks_);
 
       // Check if shutdown was signaled while waiting.
       if (closing_) {

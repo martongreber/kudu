@@ -181,7 +181,9 @@ fi
 # If Ranger service is selected as dependency, add Ranger Kudu plugin specific parameters
 if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
   # Emit the parameter to the gflagfile.
-  KUDU_ARGS="$KUDU_ARGS --ranger_config_path=$CONF_DIR"
+  KUDU_ARGS="$KUDU_ARGS \
+             --ranger_config_path=$CONF_DIR \
+             --trusted_user_acl=impala,hive,kudu"
 
   # TODO(Hao): remove once ranger related gflag is no longer experimental.
   KUDU_ARGS="$KUDU_ARGS --unlock_experimental_flags=true"

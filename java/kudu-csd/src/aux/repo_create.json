@@ -3,8 +3,7 @@
   "type": "kudu",
   "configs": {
     "policy.download.auth.users": "kudu",
-    "tag.download.auth.users": "kudu",
-    "default.policy.users": "kudu"
+    "tag.download.auth.users": "kudu"
   },
   "name": "${SANITIZED_RANGER_KUDU_SERVICE_NAME}",
   "description": "Kudu service for ${CLUSTER_NAME}"

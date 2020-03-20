@@ -823,6 +823,10 @@ KuduSchema::KuduSchema(const Schema& schema)
   : schema_(new Schema(schema)) {
 }
 
+KuduSchema::KuduSchema(Schema&& schema)
+  : schema_(new Schema(schema)) {
+}
+
 KuduSchema::~KuduSchema() {
   delete schema_;
 }
@@ -859,7 +863,7 @@ bool KuduSchema::Equals(const KuduSchema& other) const {
 }
 
 KuduColumnSchema KuduSchema::Column(size_t idx) const {
-  ColumnSchema col(schema_->column(idx));
+  const ColumnSchema& col = schema_->column(idx);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   KuduColumnStorageAttributes attrs(FromInternalEncodingType(col.attributes().encoding),

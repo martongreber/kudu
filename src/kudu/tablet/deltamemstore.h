@@ -19,10 +19,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+
 #include "kudu/common/rowid.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/macros.h"
@@ -31,6 +35,7 @@
 #include "kudu/tablet/delta_stats.h"
 #include "kudu/tablet/delta_store.h"
 #include "kudu/util/atomic.h"
+#include "kudu/util/locks.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/status.h"
 
@@ -42,7 +47,6 @@ class MemoryTrackingBufferAllocator;
 class RowChangeList;
 class ScanSpec;
 class SelectionVector;
-class Timestamp;
 struct ColumnId;
 
 namespace consensus {
@@ -77,7 +81,7 @@ class DeltaMemStore : public DeltaStore,
 
   virtual Status Init(const fs::IOContext* io_context) OVERRIDE;
 
-  virtual bool Initted() OVERRIDE {
+  virtual bool Initted() const OVERRIDE {
     return true;
   }
 
@@ -101,9 +105,7 @@ class DeltaMemStore : public DeltaStore,
   void DebugPrint() const;
 
   // Flush the DMS to the given file writer.
-  // Returns statistics in *stats.
-  Status FlushToFile(DeltaFileWriter *dfw,
-                     std::unique_ptr<DeltaStats>* stats);
+  Status FlushToFile(DeltaFileWriter* dfw);
 
   // Create an iterator for applying deltas from this DMS.
   //
@@ -148,6 +150,14 @@ class DeltaMemStore : public DeltaStore,
   // Returns the number of deleted rows in this DMS.
   int64_t deleted_row_count() const;
 
+  // Returns the highest timestamp of any updates applied to this DMS. Returns
+  // 'none' if no updates have been applied.
+  boost::optional<Timestamp> highest_timestamp() const {
+    std::lock_guard<simple_spinlock> l(ts_lock_);
+    return highest_timestamp_ == Timestamp::kMin ?
+        boost::none : boost::make_optional(highest_timestamp_);
+  }
+
  private:
   friend class DMSIterator;
 
@@ -162,6 +172,9 @@ class DeltaMemStore : public DeltaStore,
 
   const int64_t id_;    // DeltaMemStore ID.
   const int64_t rs_id_; // Rowset ID.
+
+  mutable simple_spinlock ts_lock_;
+  Timestamp highest_timestamp_;
 
   std::shared_ptr<MemoryTrackingBufferAllocator> allocator_;
 

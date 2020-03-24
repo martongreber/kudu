@@ -51,6 +51,7 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/subprocess.h"
@@ -436,6 +437,18 @@ Status HostPortFromSockaddrReplaceWildcard(const Sockaddr& addr, HostPort* hp) {
   return Status::OK();
 }
 
+Status GetRandomPort(uint16_t* port) {
+  Sockaddr address;
+  address.ParseString("127.0.0.1", 0);
+  Socket listener;
+  RETURN_NOT_OK(listener.Init(0));
+  RETURN_NOT_OK(listener.Bind(address));
+  Sockaddr listen_address;
+  RETURN_NOT_OK(listener.GetSocketAddress(&listen_address));
+  *port = listen_address.port();
+  return Status::OK();
+}
+
 void TryRunLsof(const Sockaddr& addr, vector<string>* log) {
 #if defined(__APPLE__)
   string cmd = strings::Substitute(
@@ -479,11 +492,16 @@ string GetBindIpForDaemon(int index, BindMode bind_mode) {
   CHECK(0 < index && index <= kServersMaxNum) << Substitute(
       "server index $0 is not in range ($1, $2]", index, 0, kServersMaxNum);
 
+  static constexpr uint32_t kMaxPid = 1 << kPidBits;
   switch (bind_mode) {
     case BindMode::UNIQUE_LOOPBACK: {
       uint32_t pid = getpid();
-      CHECK_LT(pid, 1 << kPidBits) << Substitute(
-          "PID $0 is more than $1 bits wide", pid, kPidBits);
+      if (pid >= kMaxPid) {
+        LOG(INFO) << Substitute(
+            "PID $0 is more than $1 bits wide, substituted with $2",
+            pid, kPidBits, pid % kMaxPid);
+        pid %= kMaxPid;
+      }
       uint32_t ip = (pid << kServerIdxBits) | static_cast<uint32_t>(index);
       uint8_t octets[] = {
           static_cast<uint8_t>((ip >> 16) & 0xff),

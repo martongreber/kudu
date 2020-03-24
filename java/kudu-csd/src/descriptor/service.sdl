@@ -309,35 +309,41 @@
       ],
       "usesRackAssignments" : true,
       "topology" : { "minInstances" : 1 },
-      // Uncomment when OPSAPS-51086 is fixed.
-      // "healthTests" : [
-      //   {
-      //     "type" : "metric",
-      //     "name" : "FULL_DATA_DIRS",
-      //     "label" : "Full Data Directories",
-      //     "description" : "Test for whether any Kudu data directories are full.",
-      //     "metric" : "kudu_data_dirs_full",
-      //     "timeWindowSec" : 300,
-      //     "comparisonOperator" : "gt",
-      //     "aggregationFunction" : "last",
-      //     "greenMessage" : "There are no full Kudu data directories.",
-      //     "redThreshold" : 0,
-      //     "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
-      //   },
-      //   {
-      //     "type" : "metric",
-      //     "name" : "FAILED_DATA_DIRS",
-      //     "label" : "Failed Data Directories",
-      //     "description" : "Test for whether any Kudu data directories have failed. This is usually a sign of a disk problem. For details and information about recovery, see https://www.cloudera.com/documentation/enterprise/latest/topics/kudu_administration_cli.html#disk_failure.",
-      //     "metric" : "kudu_data_dirs_failed",
-      //     "timeWindowSec" : 300,
-      //     "comparisonOperator" : "gt",
-      //     "aggregationFunction" : "last",
-      //     "greenMessage" : "There are no failed Kudu data directories.",
-      //     "redThreshold" : 0,
-      //     "redMessage" : "There are ${metric.value} failed Kudu data directories on this host."
-      //   }
-      // ],
+      // With 3 masters, this means 1 down (66% green) would be yellow and 2 down (33%) would be red.
+      // With 5 masters, this means 1 down (80% green) would be yellow and 2 down (60%) would be red.
+      "healthAggregation" : {
+        "type" : "nonSingleton",
+        "percentGreenForGreen" : 80.1,
+        "percentYellowGreenForYellow" : 60.0
+      },
+      "healthTests" : [
+        {
+          "type" : "metric",
+          "name" : "FULL_DATA_DIRS",
+          "label" : "Full Data Directories",
+          "description" : "Test for whether any Kudu data directories are full.",
+          "metric" : "kudu_data_dirs_full",
+          "timeWindowSec" : 300,
+          "comparisonOperator" : "gt",
+          "aggregationFunction" : "last",
+          "greenMessage" : "There are no full Kudu data directories.",
+          "redThreshold" : 0,
+          "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
+        },
+        {
+          "type" : "metric",
+          "name" : "FAILED_DATA_DIRS",
+          "label" : "Failed Data Directories",
+          "description" : "Test for whether any Kudu data directories have failed. This is usually a sign of a disk problem. For details and information about recovery, see https://www.cloudera.com/documentation/enterprise/latest/topics/kudu_administration_cli.html#disk_failure.",
+          "metric" : "kudu_data_dirs_failed",
+          "timeWindowSec" : 300,
+          "comparisonOperator" : "gt",
+          "aggregationFunction" : "last",
+          "greenMessage" : "There are no failed Kudu data directories.",
+          "redThreshold" : 0,
+          "redMessage" : "There are ${metric.value} failed Kudu data directories on this host."
+        }
+      ],
       "commands" : [
         {
           "name" : "kudu_master_ksck_cmd",
@@ -755,35 +761,41 @@
         }
       ],
       "topology" : { "minInstances" : 1 },
-      // Uncomment when OPSAPS-51086 is fixed.
-      // "healthTests" : [
-      //   {
-      //     "type" : "metric",
-      //     "name" : "FULL_DATA_DIRS",
-      //     "label" : "Full Data Directories",
-      //     "description" : "Test for whether any Kudu data directories are full.",
-      //     "metric" : "kudu_data_dirs_full",
-      //     "timeWindowSec" : 60,
-      //     "comparisonOperator" : "gt",
-      //     "aggregationFunction" : "last",
-      //     "greenMessage" : "There are no full Kudu data directories.",
-      //     "redThreshold" : 0,
-      //     "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
-      //   },
-      //   {
-      //     "type" : "metric",
-      //     "name" : "FAILED_DATA_DIRS",
-      //     "label" : "Failed Data Directories",
-      //     "description" : "Test for whether any Kudu data directories have failed. This is usually a sign of a disk problem. For details and information about recovery, see https://www.cloudera.com/documentation/enterprise/latest/topics/kudu_administration_cli.html#disk_failure.",
-      //     "metric" : "kudu_data_dirs_failed",
-      //     "timeWindowSec" : 60,
-      //     "comparisonOperator" : "gt",
-      //     "aggregationFunction" : "last",
-      //     "greenMessage" : "There are no failed Kudu data directories.",
-      //     "redThreshold" : 0,
-      //     "redMessage" : "There are ${metric.value} failed Kudu data directories on this host."
-      //   }
-      // ],
+      // With 4 tservers, this means 1 down (75% green) would be yellow and 2 down (50% green) would be red.
+      // With 10 tservers, this means 3 down (70% green) would be yellow and 5 down (50% green) would be red.
+      "healthAggregation" : {
+        "type" : "nonSingleton",
+        "percentGreenForGreen" : 75.0,
+        "percentYellowGreenForYellow" : 50.0
+      },
+      "healthTests" : [
+        {
+          "type" : "metric",
+          "name" : "FULL_DATA_DIRS",
+          "label" : "Full Data Directories",
+          "description" : "Test for whether any Kudu data directories are full.",
+          "metric" : "kudu_data_dirs_full",
+          "timeWindowSec" : 300,
+          "comparisonOperator" : "gt",
+          "aggregationFunction" : "last",
+          "greenMessage" : "There are no full Kudu data directories.",
+          "redThreshold" : 0,
+          "redMessage" : "There are ${metric.value} full Kudu data directories on this host."
+        },
+        {
+          "type" : "metric",
+          "name" : "FAILED_DATA_DIRS",
+          "label" : "Failed Data Directories",
+          "description" : "Test for whether any Kudu data directories have failed. This is usually a sign of a disk problem. For details and information about recovery, see https://www.cloudera.com/documentation/enterprise/latest/topics/kudu_administration_cli.html#disk_failure.",
+          "metric" : "kudu_data_dirs_failed",
+          "timeWindowSec" : 300,
+          "comparisonOperator" : "gt",
+          "aggregationFunction" : "last",
+          "greenMessage" : "There are no failed Kudu data directories.",
+          "redThreshold" : 0,
+          "redMessage" : "There are ${metric.value} failed Kudu data directories on this host."
+        }
+      ],
       "commands" : [
         {
           "name" : "kudu_tserver_enter_maintenance",

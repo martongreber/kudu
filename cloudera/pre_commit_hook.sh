@@ -63,5 +63,7 @@ export TEST_RESULT_SERVER=dist-test.cloudera.org:8080
 
 export JAVA8_HOME=/usr/lib/jvm/java-1.8.0-openjdk-amd64
 export PATH=$ROOT_DIR/isolate-bin:$PATH
+# Pre-commits are always run on 4 CPU core YCloud instance.
+export PARALLEL=4
 
 (cd "$ROOT_DIR" && build-support/jenkins/build-and-test.sh)

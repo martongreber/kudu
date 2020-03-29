@@ -320,14 +320,13 @@ fetch_and_patch \
  $PYTHON_SOURCE \
  $PYTHON_PATCHLEVEL
 
-LLVM_PATCHLEVEL=5
+LLVM_PATCHLEVEL=4
 fetch_and_patch \
  llvm-${LLVM_VERSION}-iwyu-${IWYU_VERSION}.src.tar.gz \
  $LLVM_SOURCE \
  $LLVM_PATCHLEVEL \
   "patch -p1 < $TP_DIR/patches/llvm-add-iwyu.patch" \
-  "patch -p1 < $TP_DIR/patches/llvm-iwyu-include-picker.patch" \
-  "patch -p0 < $TP_DIR/patches/llvm-iwyu-sized-deallocation.patch"
+  "patch -p1 < $TP_DIR/patches/llvm-iwyu-include-picker.patch"
 
 LZ4_PATCHLEVEL=0
 fetch_and_patch \

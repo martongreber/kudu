@@ -84,8 +84,6 @@
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
@@ -787,7 +785,8 @@ CatalogManager::CatalogManager(Master* master)
   if (SentryAuthzProvider::IsEnabled()) {
     authz_provider_.reset(new SentryAuthzProvider(master_->metric_entity()));
   } else if (RangerAuthzProvider::IsEnabled()) {
-    authz_provider_.reset(new RangerAuthzProvider(master_->metric_entity()));
+    authz_provider_.reset(new RangerAuthzProvider(master_->fs_manager()->env(),
+                                                  master_->metric_entity()));
   } else {
     authz_provider_.reset(new DefaultAuthzProvider);
   }
@@ -1304,7 +1303,7 @@ Status CatalogManager::VisitTablesAndTablets() {
 Status CatalogManager::InitSysCatalogAsync(bool is_first_run) {
   std::lock_guard<LockType> l(lock_);
   unique_ptr<SysCatalogTable> new_catalog(new SysCatalogTable(
-      master_, Bind(&CatalogManager::ElectedAsLeaderCb, Unretained(this))));
+      master_, [this]() -> Status { return this->ElectedAsLeaderCb(); }));
   if (is_first_run) {
     RETURN_NOT_OK(new_catalog->CreateNew(master_->fs_manager()));
   } else {

@@ -18,6 +18,7 @@
 #include "kudu/fs/file_block_manager.h"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -36,7 +37,6 @@
 #include "kudu/fs/dir_manager.h"
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/fs_report.h"
-#include "kudu/gutil/bind.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/map-util.h"
@@ -921,11 +921,14 @@ Status GetAllBlockIdsForDataDirCb(Dir* dd,
 }
 
 void GetAllBlockIdsForDir(Env* env,
-                              Dir* dd,
-                              vector<BlockId>* block_ids,
-                              Status* status) {
-  *status = env->Walk(dd->dir(), Env::PRE_ORDER,
-                      Bind(&GetAllBlockIdsForDataDirCb, dd, block_ids));
+                          Dir* dd,
+                          vector<BlockId>* block_ids,
+                          Status* status) {
+  *status = env->Walk(
+      dd->dir(), Env::PRE_ORDER,
+      [dd, block_ids](Env::FileType type, const string& dirname, const string& basename) {
+        return GetAllBlockIdsForDataDirCb(dd, block_ids, type, dirname, basename);
+      });
 }
 
 } // anonymous namespace
@@ -939,11 +942,12 @@ Status FileBlockManager::GetAllBlockIds(vector<BlockId>* block_ids) {
   vector<vector<BlockId>> block_id_vecs(dds.size());
   vector<Status> statuses(dds.size());
   for (int i = 0; i < dds.size(); i++) {
-    dds[i]->ExecClosure(Bind(&GetAllBlockIdsForDir,
-                             env_,
-                             dds[i].get(),
-                             &block_id_vecs[i],
-                             &statuses[i]));
+    auto* dd = dds[i].get();
+    auto* bid_vec = &block_id_vecs[i];
+    auto* s = &statuses[i];
+    dds[i]->ExecClosure([this, dd, bid_vec, s]() {
+      GetAllBlockIdsForDir(this->env_, dd, bid_vec, s);
+    });
   }
   for (const auto& dd : dd_manager_->dirs()) {
     dd->WaitOnClosures();

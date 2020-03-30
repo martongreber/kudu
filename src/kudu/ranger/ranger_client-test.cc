@@ -33,6 +33,7 @@
 #include "kudu/ranger/ranger.pb.h"
 #include "kudu/subprocess/server.h"
 #include "kudu/subprocess/subprocess.pb.h"
+#include "kudu/util/env.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -93,7 +94,7 @@ class MockSubprocessServer : public SubprocessServer {
   ~MockSubprocessServer() override {}
 
   MockSubprocessServer()
-      : SubprocessServer({"mock"}, SubprocessMetrics()) {}
+      : SubprocessServer(Env::Default(), "", {"mock"}, SubprocessMetrics()) {}
 
   Status Execute(SubprocessRequestPB* req,
                  SubprocessResponsePB* resp) override {
@@ -123,7 +124,7 @@ class MockSubprocessServer : public SubprocessServer {
 class RangerClientTest : public KuduTest {
  public:
   RangerClientTest() :
-    client_(METRIC_ENTITY_server.Instantiate(&metric_registry_, "ranger_client-test")) {}
+    client_(env_, METRIC_ENTITY_server.Instantiate(&metric_registry_, "ranger_client-test")) {}
 
   void SetUp() override {
     std::unique_ptr<MockSubprocessServer> server(new MockSubprocessServer());
@@ -160,6 +161,12 @@ TEST_F(RangerClientTest, TestAuthorizeCreateTableAuthorized) {
 }
 
 TEST_F(RangerClientTest, TestAuthorizeListNoTables) {
+  unordered_set<string> tables;
+  ASSERT_OK(client_.AuthorizeActionMultipleTables("jdoe", ActionPB::METADATA, &tables));
+  ASSERT_EQ(0, tables.size());
+}
+
+TEST_F(RangerClientTest, TestAuthorizeListNoTablesAuthorized) {
   unordered_set<string> tables;
   tables.emplace("foo.bar");
   tables.emplace("foo.baz");

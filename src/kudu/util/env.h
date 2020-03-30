@@ -9,25 +9,24 @@
 //
 // All Env implementations are safe for concurrent access from
 // multiple threads without any external synchronization.
-
-#ifndef STORAGE_LEVELDB_INCLUDE_ENV_H_
-#define STORAGE_LEVELDB_INCLUDE_ENV_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "kudu/gutil/callback_forward.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
 class faststring;
+class Fifo;
 class FileLock;
 class RandomAccessFile;
 class RWFile;
@@ -142,11 +141,15 @@ class Env {
                            const std::string& fname,
                            std::unique_ptr<RWFile>* result) = 0;
 
-  // Same as abovoe for NewTempWritableFile(), but for an RWFile.
+  // Same as above for NewTempWritableFile(), but for an RWFile.
   virtual Status NewTempRWFile(const RWFileOptions& opts,
                                const std::string& name_template,
                                std::string* created_filename,
                                std::unique_ptr<RWFile>* res) = 0;
+
+  // Creates a new fifo.
+  virtual Status NewFifo(const std::string& fname,
+                         std::unique_ptr<Fifo>* fifo) = 0;
 
   // Returns true iff the named file exists.
   virtual bool FileExists(const std::string& fname) = 0;
@@ -273,7 +276,7 @@ class Env {
   //
   // Returning an error won't halt the walk, but it will cause it to return
   // with an error status when it's done.
-  typedef Callback<Status(FileType, const std::string&, const std::string&)> WalkCallback;
+  typedef std::function<Status(FileType, const std::string&, const std::string&)> WalkCallback;
 
   // Whether to walk directories in pre-order or post-order.
   enum DirectoryOrder {
@@ -381,6 +384,26 @@ class File {
 
   // Returns the filename provided at construction time.
   virtual const std::string& filename() const = 0;
+};
+
+// A simple fifo abstraction.
+class Fifo : public File {
+ public:
+  // Opens the fifo for reads. This will wait until the fifo has also been
+  // opened for writes.
+  virtual Status OpenForReads() = 0;
+
+  // Opens the fifo for writes. This will wait until the fifo has also been
+  // opened for reads.
+  virtual Status OpenForWrites() = 0;
+
+  // Returns the read fd, set when opened for reads. The fifo must have been
+  // opened for reads before calling.
+  virtual int read_fd() const = 0;
+
+  // Returns the write fd, set when opened for writes. The fifo must have been
+  // opened for writes before calling.
+  virtual int write_fd() const = 0;
 };
 
 // A file abstraction for reading sequentially through a file
@@ -677,5 +700,3 @@ extern Status ReadFileToString(Env* env, const std::string& fname,
 std::ostream& operator<<(std::ostream& o, Env::ResourceLimitType t);
 
 }  // namespace kudu
-
-#endif  // STORAGE_LEVELDB_INCLUDE_ENV_H_

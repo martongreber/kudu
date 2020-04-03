@@ -70,7 +70,9 @@ Status MiniPostgres::Start() {
 
     // Postgres doesn't support binding to 0 so we need to get a random unused
     // port and persist that to the config file.
-    RETURN_NOT_OK(GetRandomPort(&port_));
+    if (port_ == 0) {
+      RETURN_NOT_OK(GetRandomPort(host_, &port_));
+    }
     RETURN_NOT_OK(CreateConfigs());
   }
 
@@ -84,16 +86,16 @@ Status MiniPostgres::Start() {
   });
   RETURN_NOT_OK(process_->Start());
 
-  const string ip = "127.0.0.1";
-  Status wait = WaitForTcpBind(process_->pid(), &port_, ip,
+  Status wait = WaitForTcpBind(process_->pid(), &port_, host_,
                                MonoDelta::FromMilliseconds(kPgStartTimeoutMs));
   if (!wait.ok()) {
     // TODO(abukor): implement retry with a different port if it can't bind
     WARN_NOT_OK(process_->Kill(SIGINT), "failed to send SIGINT to Postgres");
-  } else {
-    LOG(INFO) << "Postgres bound to " << port_;
+    return wait;
   }
-  return wait;
+
+  LOG(INFO) << "Postgres bound to " << port_;
+  return WaitForReady();
 }
 
 Status MiniPostgres::Stop() {
@@ -110,6 +112,7 @@ Status MiniPostgres::AddUser(const string& user, bool super) {
     user,
     Substitute("--$0superuser", super ? "" : "no-"),
     "-p", SimpleItoa(port_),
+    "-h", host_,
   });
   RETURN_NOT_OK(add.Start());
   return add.WaitAndCheckExitCode();
@@ -120,6 +123,7 @@ Status MiniPostgres::CreateDb(const string& db, const string& owner) {
     JoinPathSegments(bin_dir_, "postgres/createdb"),
     "-O", owner, db,
     "-p", SimpleItoa(port_),
+    "-h", host_,
   });
   RETURN_NOT_OK(createdb.Start());
   return createdb.WaitAndCheckExitCode();
@@ -132,11 +136,31 @@ Status MiniPostgres::CreateConfigs() {
   string config_file = JoinPathSegments(pg_root(), "postgresql.conf");
   faststring config;
   ReadFileToString(env, config_file, &config);
-  config.append(Substitute("\nport=$0\n", port_));
+  config.append(Substitute("\nlisten_addresses = '$0'\nport = $1\n", host_, port_));
   unique_ptr<WritableFile> file;
   RETURN_NOT_OK(env->NewWritableFile(config_file, &file));
   RETURN_NOT_OK(file->Append(config));
   return file->Close();
+}
+
+Status MiniPostgres::WaitForReady() const {
+  Status s;
+  MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(5);
+  while (MonoTime::Now() < deadline) {
+    Subprocess psql({
+        JoinPathSegments(bin_dir_, "postgres/pg_isready"),
+        "-p", SimpleItoa(port_),
+        "-h", host_,
+    });
+    RETURN_NOT_OK(psql.Start());
+    s = psql.WaitAndCheckExitCode();
+    if (s.ok()) {
+      return s;
+    }
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+
+  return Status::TimedOut(s.ToString());
 }
 
 } // namespace postgres

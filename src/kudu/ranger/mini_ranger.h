@@ -63,14 +63,16 @@ struct AuthorizationPolicy {
 // Wrapper around Apache Ranger to be used in integration tests.
 class MiniRanger {
  public:
-  MiniRanger()
-    : MiniRanger(GetTestDataDirectory()) {}
+  explicit MiniRanger(std::string host)
+    : MiniRanger(GetTestDataDirectory(), std::move(host)) {}
 
   ~MiniRanger();
 
-  explicit MiniRanger(std::string data_root)
+  MiniRanger(std::string data_root, std::string host)
     : data_root_(std::move(data_root)),
-      mini_pg_(data_root_),
+      host_(std::move(host)),
+      mini_pg_(data_root_, host_),
+      kerberos_(false),
       env_(Env::Default()) {
         curl_.set_auth(CurlAuthType::BASIC, "admin", "admin");
       }
@@ -84,6 +86,24 @@ class MiniRanger {
   // Adds a new policy to Ranger.
   Status AddPolicy(AuthorizationPolicy policy) WARN_UNUSED_RESULT;
 
+  // Creates the client configs files in client_config_path.
+  Status CreateClientConfig(const std::string& client_config_path) WARN_UNUSED_RESULT;
+
+  void EnableKerberos(std::string krb5_config,
+                      std::string admin_ktpath,
+                      std::string lookup_ktpath,
+                      std::string spnego_ktpath) {
+    kerberos_ = true;
+    krb5_config_ = std::move(krb5_config);
+    admin_ktpath_ = std::move(admin_ktpath);
+    lookup_ktpath_ = std::move(lookup_ktpath);
+    spnego_ktpath_ = std::move(spnego_ktpath);
+  }
+
+  void set_policy_poll_interval_ms(uint32_t policy_poll_interval_ms) {
+    policy_poll_interval_ms_ = policy_poll_interval_ms;
+  }
+
  private:
   // Starts the Ranger service.
   Status StartRanger() WARN_UNUSED_RESULT;
@@ -95,7 +115,7 @@ class MiniRanger {
     WARN_UNUSED_RESULT;
 
   // Creates configuration files.
-  Status CreateConfigs(const std::string& fqdn) WARN_UNUSED_RESULT;
+  Status CreateConfigs() WARN_UNUSED_RESULT;
 
   // Initializes Ranger's database.
   Status DbSetup(const std::string& admin_home, const std::string& ews_dir,
@@ -130,6 +150,7 @@ class MiniRanger {
 
   // Directory in which to put all our stuff.
   const std::string data_root_;
+  const std::string host_;
 
   postgres::MiniPostgres mini_pg_;
   std::unique_ptr<Subprocess> process_;
@@ -144,10 +165,21 @@ class MiniRanger {
   std::string ranger_home_;
   std::string java_home_;
 
+  bool kerberos_;
+  std::string admin_ktpath_;
+  std::string lookup_ktpath_;
+  std::string spnego_ktpath_;
+  std::string krb5_config_;
+
   Env* env_;
   EasyCurl curl_;
 
-  uint16_t ranger_port_;
+  uint16_t port_ = 0;
+
+  // Determines how frequently clients fetch policies from the server. The
+  // default is 200ms so that tests don't have to wait too long until freshly
+  // created policies can be used.
+  uint32_t policy_poll_interval_ms_ = 200;
 };
 
 } // namespace ranger

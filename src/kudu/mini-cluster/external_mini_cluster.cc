@@ -335,8 +335,39 @@ Status ExternalMiniCluster::Start() {
   }
 
   if (opts_.enable_ranger) {
-    ranger_.reset(new ranger::MiniRanger(cluster_root()));
+    string host = GetBindIpForExternalServer(0);
+    ranger_.reset(new ranger::MiniRanger(cluster_root(), host));
+    // We're using the same service index as Sentry as they can't be both
+    // started at the same time.
+    if (opts_.enable_kerberos) {
+
+      // The SPNs match the ones defined in mini_ranger_configs.h.
+      string admin_keytab;
+      RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(
+            Substitute("rangeradmin/$0@KRBTEST.COM", host),
+            &admin_keytab),
+          "could not create rangeradmin keytab");
+
+      string lookup_keytab;
+      RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(
+            Substitute("rangerlookup/$0@KRBTEST.COM", host),
+            &lookup_keytab),
+          "could not create rangerlookup keytab");
+
+      string spnego_keytab;
+      RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(
+            Substitute("HTTP/$0@KRBTEST.COM", host),
+            &spnego_keytab),
+          "could not create ranger HTTP keytab");
+
+      ranger_->EnableKerberos(kdc_->GetEnvVars()["KRB5_CONFIG"], admin_keytab,
+                              lookup_keytab, spnego_keytab);
+    }
+
     RETURN_NOT_OK_PREPEND(ranger_->Start(), "Failed to start the Ranger service");
+    RETURN_NOT_OK_PREPEND(ranger_->CreateClientConfig(JoinPathSegments(cluster_root(),
+                                                                       "ranger-client")),
+                          "Failed to write Ranger client config");
   }
 
   // Start the HMS.
@@ -609,6 +640,10 @@ Status ExternalMiniCluster::StartMasters() {
       if (!opts_.enable_kerberos) {
         opts.extra_flags.emplace_back("--sentry_service_security_mode=none");
       }
+    } else if (opts_.enable_ranger) {
+      opts.extra_flags.emplace_back(Substitute("--ranger_config_path=$0",
+                                               JoinPathSegments(cluster_root(),
+                                                                "ranger-client")));
     }
     opts.logtostderr = opts_.logtostderr;
 

@@ -726,7 +726,8 @@
         "environmentVariables" : {
           "ENABLE_CORE_DUMP" : "${enable_core_dump}",
           "ENABLE_SECURITY" : "${enable_security}",
-          "CORE_DUMP_DIRECTORY" : "${tserver_core_dump_directory}"
+          "CORE_DUMP_DIRECTORY" : "${tserver_core_dump_directory}",
+          "RANGER_SERVICE": "${dependency:RANGER}"
         }
       },
       "logging" : {

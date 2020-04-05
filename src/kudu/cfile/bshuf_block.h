@@ -174,7 +174,7 @@ class BShufBlockBuilder final : public BlockBuilder {
   }
 
   Slice Finish(rowid_t ordinal_pos, int final_size_of_type) {
-    data_.resize(kHeaderSize + final_size_of_type * count_);
+    data_.resize(final_size_of_type * count_);
 
     // Do padding so that the input num of element is multiple of 8.
     int num_elems_after_padding = KUDU_ALIGN_UP(count_, 8);
@@ -183,6 +183,7 @@ class BShufBlockBuilder final : public BlockBuilder {
     for (int i = 0; i < padding_bytes; i++) {
       data_.push_back(0);
     }
+    DCHECK_EQ(0, data_.length() % 8);
 
     buffer_.resize(kHeaderSize +
                    bitshuffle::compress_lz4_bound(num_elems_after_padding, final_size_of_type, 0));

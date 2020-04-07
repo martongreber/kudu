@@ -180,9 +180,6 @@ fi
 
 # If Ranger service is selected as dependency, add Ranger Kudu plugin specific parameters
 if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
-  # TODO(Hao): remove once ranger related gflag is no longer experimental.
-  KUDU_ARGS="$KUDU_ARGS --unlock_experimental_flags=true"
-
   # Emit the required parameters for enabling Ranger integration to the gflagfile
   # in master and tserver.
   if [ "$CMD" = "master" ]; then

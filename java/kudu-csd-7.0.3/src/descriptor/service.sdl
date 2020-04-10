@@ -222,12 +222,6 @@
       ],
       "parameters" : [
         {
-          "name" : "webserver_interface",
-          "label" : "Kudu Master Web UI Interface",
-          "description" : "The interface of the Kudu Master Web UI. If blank, binds to 0.0.0.0.",
-          "type" : "string"
-        },
-        {
           "name" : "webserver_port",
           "label" : "Kudu Master Web UI Port",
           "description" : "The port of the Kudu Master Web UI.",
@@ -236,12 +230,10 @@
           "default" : 8051
         },
         {
-          "name" : "metrics_url_parameters",
-          "label" : "Kudu Metrics URL Parameters",
-          "description" : "The URL query parameters to append to the `/metrics` URL when collecting Kudu metrics.",
-          "type" : "string",
-          "required" : "true",
-          "default" : "compact=1&level=info"
+          "name" : "webserver_interface",
+          "label" : "Kudu Master Web UI Interface",
+          "description" : "The interface of the Kudu Master Web UI. If blank, binds to 0.0.0.0.",
+          "type" : "string"
         },
         {
           "name" : "master_address",
@@ -319,7 +311,6 @@
               "enable_security",
               "master_address",
               "master_core_dump_directory",
-              "metrics_url_parameters",
               "ssl_enabled",
               "rb_max_moves_per_server",
               "rb_max_run_time_sec",
@@ -332,14 +323,7 @@
             "includedParams" : [
               "webserver_interface",
               "webserver_port",
-              "ssl_enabled",
-              "metrics_url_parameters"
-            ],
-            "additionalConfigs" : [
-              {
-                "key" : "host",
-                "value" : "${host}"
-              }
+              "ssl_enabled"
             ]
           }
         ],
@@ -441,14 +425,6 @@
           "default" : 8050
         },
         {
-          "name" : "metrics_url_parameters",
-          "label" : "Kudu Metrics URL Parameters",
-          "description" : "The URL query parameters to append to the `/metrics` URL when collecting Kudu metrics.",
-          "type" : "string",
-          "required" : "true",
-          "default" : "compact=1&level=info"
-        },
-        {
           "name" : "fs_wal_dir",
           "label" : "Kudu Tablet Server WAL Directory",
           "description" : "Directory where Kudu tablet servers will store write-ahead logs. It can be the same as one of the data directories, but not a sub-directory of a data directory. Master and tablet servers must use different directories when co-located on the same machine.",
@@ -515,16 +491,6 @@
           "pathType" : "serviceSpecific",
           "required" : "true",
           "default" : "/var/log/kudu"
-        },
-        {
-          "name" : "tablet_history_max_age_sec",
-          "label" : "Tablet History Max Age",
-          "description" : "The maximum amount of time, in seconds, to preserve tablet data history, including history required to perform diff scans and incremental backups. The duration defined by this parameter is also the maximum amount of time it is possible to wait after a full or incremental backup before performing the next incremental backup. Setting the value to -1 disables history removal.",
-          "required" : "true",
-          "type" : "long",
-          "min" : -1,
-          "unit" : "seconds",
-          "default" : 604800
         }
       ],
       "sslServer": {
@@ -556,7 +522,6 @@
               "enable_core_dump",
               "enable_security",
               "tserver_core_dump_directory",
-              "metrics_url_parameters",
               "ssl_enabled",
               "rb_max_moves_per_server",
               "rb_max_run_time_sec",
@@ -569,14 +534,7 @@
             "includedParams" : [
               "webserver_interface",
               "webserver_port",
-              "ssl_enabled",
-              "metrics_url_parameters"
-            ],
-            "additionalConfigs" : [
-              {
-                "key" : "host",
-                "value" : "${host}"
-              }
+              "ssl_enabled"
             ]
           }
         ],

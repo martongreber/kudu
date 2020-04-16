@@ -57,6 +57,7 @@ if [[ -f "/usr/bin/yum" ]]; then
     pkgconfig \
     redhat-lsb-core \
     rsync \
+    sudo \
     unzip \
     vim-common \
     which \
@@ -139,6 +140,7 @@ elif [[ -f "/usr/bin/apt-get" ]]; then
     pkg-config \
     python \
     rsync \
+    sudo \
     unzip \
     vim-common \
     wget

@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -30,8 +31,30 @@ class Schema;
 
 // A pending batch of serialized rows, suitable for easy conversion
 // into the protobuf representation and a set of sidecars.
-struct ColumnarSerializedBatch {
+class ColumnarSerializedBatch {
+ public:
+  // 'rowblock_schema': the schema of the RowBlocks that will be passed to
+  //                    AddRowBlock().
+  //
+  // 'client_schema': the schema to be returned to the client, which may
+  //                  contain a subset of columns
+  //
+  // 'expected_batch_size_bytes':
+  //      the batch size at which the caller expects to stop adding new rows to
+  //      this batch. This is is only a hint and does not affect correctness.
+  ColumnarSerializedBatch(const Schema& rowblock_schema,
+                          const Schema& client_schema,
+                          int expected_batch_size_bytes);
+
+  // Append the data in 'block' into this columnar batch.
+  //
+  // Returns the number of selected rows serialized.
+  int AddRowBlock(const RowBlock& block);
+
   struct Column {
+    // The index of the column in the schema of the RowBlocks to be appended.
+    int rowblock_schema_col_idx;
+
     // Underlying column data.
     faststring data;
 
@@ -41,17 +64,19 @@ struct ColumnarSerializedBatch {
     // Each bit is set when a value is non-null
     boost::optional<faststring> non_null_bitmap;
   };
-  std::vector<Column> columns;
-};
 
-// Serialize the data in 'block' into the columnar batch 'out', appending to
-// any data already serialized to the same batch.
-//
-// Returns the number of selected rows serialized.
-int SerializeRowBlockColumnar(
-    const RowBlock& block,
-    const Schema* projection_schema,
-    ColumnarSerializedBatch* out);
+  const std::vector<Column>& columns() const {
+    return columns_;
+  }
+
+  std::vector<Column> TakeColumns() && {
+    return std::move(columns_);
+  }
+
+ private:
+  friend class WireProtocolTest;
+  std::vector<Column> columns_;
+};
 
 
 ////////////////////////////////////////////////////////////

@@ -825,13 +825,11 @@ Status CatalogManager::Init(bool is_first_run) {
     auto_rebalancer_ = std::move(task);
   }
 
+  RETURN_NOT_OK(master_->GetMasterHostPorts(&master_addresses_));
   if (hms::HmsCatalog::IsEnabled()) {
-    vector<HostPortPB> master_addrs_pb;
-    RETURN_NOT_OK(master_->GetMasterHostPorts(&master_addrs_pb));
-
     string master_addresses = JoinMapped(
-      master_addrs_pb,
-      [] (const HostPortPB& hostport) {
+      master_addresses_,
+      [] (const HostPort& hostport) {
         return Substitute("$0:$1", hostport.host(), hostport.port());
       },
       ",");
@@ -4942,6 +4940,9 @@ Status CatalogManager::BuildLocationsForTablet(
         ServerRegistrationPB reg;
         ts_desc->GetRegistration(&reg);
         tsinfo_pb->mutable_rpc_addresses()->Swap(reg.mutable_rpc_addresses());
+        if (reg.has_unix_domain_socket_path()) {
+          tsinfo_pb->set_unix_domain_socket_path(reg.unix_domain_socket_path());
+        }
         if (ts_desc->location()) tsinfo_pb->set_location(*(ts_desc->location()));
       } else {
         // If we've never received a heartbeat from the tserver, we'll fall back
@@ -5316,12 +5317,16 @@ CatalogManager::ScopedLeaderSharedLock::ScopedLeaderSharedLock(
       initial_term_(-1) {
 
   // Check if the catalog manager is running.
-  std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
-  if (PREDICT_FALSE(catalog_->state_ != kRunning)) {
-    catalog_status_ = Status::ServiceUnavailable(
-        Substitute("Catalog manager is not initialized. State: $0",
-                   StateToString(catalog_->state_)));
-    return;
+  int64_t leader_ready_term;
+  {
+    std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
+    if (PREDICT_FALSE(catalog_->state_ != kRunning)) {
+      catalog_status_ = Status::ServiceUnavailable(
+          Substitute("Catalog manager is not initialized. State: $0",
+                     StateToString(catalog_->state_)));
+      return;
+    }
+    leader_ready_term = catalog_->leader_ready_term_;
   }
 
   ConsensusStatePB cstate;
@@ -5343,7 +5348,7 @@ CatalogManager::ScopedLeaderSharedLock::ScopedLeaderSharedLock(
                    uuid, SecureShortDebugString(cstate)));
     return;
   }
-  if (PREDICT_FALSE(catalog_->leader_ready_term_ != cstate.current_term() ||
+  if (PREDICT_FALSE(leader_ready_term != initial_term_ ||
                     !leader_shared_lock_.owns_lock())) {
     leader_status_ = Status::ServiceUnavailable(
         "Leader not yet ready to serve requests");

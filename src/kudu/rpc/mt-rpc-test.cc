@@ -209,7 +209,7 @@ TEST_F(MultiThreadedRpcTest, TestBlowOutServiceQueue) {
   CHECK_OK(bld.Build(&server_messenger_));
 
   shared_ptr<AcceptorPool> pool;
-  ASSERT_OK(server_messenger_->AddAcceptorPool(Sockaddr(), &pool));
+  ASSERT_OK(server_messenger_->AddAcceptorPool(Sockaddr::Wildcard(), &pool));
   ASSERT_OK(pool->Start(kMaxConcurrency));
   Sockaddr server_addr = pool->bind_address();
 
@@ -266,7 +266,7 @@ TEST_F(MultiThreadedRpcTest, TestBlowOutServiceQueue) {
 static void HammerServerWithTCPConns(const Sockaddr& addr) {
   while (true) {
     Socket socket;
-    CHECK_OK(socket.Init(0));
+    CHECK_OK(socket.Init(addr.family(), 0));
     Status s;
     LOG_SLOW_EXECUTION(INFO, 100, "Connect took long") {
       s = socket.Connect(addr);

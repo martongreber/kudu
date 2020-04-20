@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/util/net/net_util.h"
+
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <ostream>
@@ -26,9 +30,8 @@
 
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/util.h"
-#include "kudu/util/net/net_util.h"
-#include "kudu/util/net/socket.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -40,10 +43,10 @@ namespace kudu {
 
 class NetUtilTest : public KuduTest {
  protected:
-  Status DoParseBindAddresses(const string& input, string* result) {
+  static Status DoParseBindAddresses(const string& input, string* result) {
     vector<Sockaddr> addrs;
     RETURN_NOT_OK(ParseAddressList(input, kDefaultPort, &addrs));
-    std::sort(addrs.begin(), addrs.end());
+    std::sort(addrs.begin(), addrs.end(), Sockaddr::BytewiseLess);
 
     vector<string> addr_strs;
     for (const Sockaddr& addr : addrs) {
@@ -185,10 +188,10 @@ TEST_F(NetUtilTest, TestReverseLookup) {
 }
 
 TEST_F(NetUtilTest, TestLsof) {
+  Sockaddr addr = Sockaddr::Wildcard();
   Socket s;
-  ASSERT_OK(s.Init(0));
+  ASSERT_OK(s.Init(addr.family(), 0));
 
-  Sockaddr addr; // wildcard
   ASSERT_OK(s.BindAndListen(addr, 1));
 
   ASSERT_OK(s.GetSocketAddress(&addr));
@@ -211,6 +214,67 @@ TEST_F(NetUtilTest, TestGetRandomPort) {
   uint16_t port;
   ASSERT_OK(GetRandomPort("127.0.0.1", &port));
   LOG(INFO) << "Random port is " << port;
+}
+
+TEST_F(NetUtilTest, TestSockaddr) {
+  auto addr1 = Sockaddr::Wildcard();
+  addr1.set_port(1000);
+  auto addr2 = Sockaddr::Wildcard();
+  addr2.set_port(2000);
+  ASSERT_EQ(1000, addr1.port());
+  ASSERT_EQ(2000, addr2.port());
+  ASSERT_EQ(string("0.0.0.0:1000"), addr1.ToString());
+  ASSERT_EQ(string("0.0.0.0:2000"), addr2.ToString());
+  Sockaddr addr3(addr1);
+  ASSERT_EQ(string("0.0.0.0:1000"), addr3.ToString());
+}
+
+TEST_F(NetUtilTest, TestSockaddrEquality) {
+  Sockaddr uninitialized_1;
+  Sockaddr uninitialized_2;
+  ASSERT_TRUE(uninitialized_1 == uninitialized_2);
+
+  Sockaddr wildcard = Sockaddr::Wildcard();
+  ASSERT_FALSE(wildcard == uninitialized_1);
+  ASSERT_FALSE(uninitialized_1 == wildcard);
+
+  Sockaddr wildcard_2 = Sockaddr::Wildcard();
+  ASSERT_TRUE(wildcard == wildcard_2);
+  ASSERT_TRUE(wildcard_2 == wildcard);
+
+  Sockaddr ip_port;
+  ASSERT_OK(ip_port.ParseString("127.0.0.1:12345", 0));
+  ASSERT_FALSE(ip_port == uninitialized_1);
+  ASSERT_FALSE(ip_port == wildcard);
+  ASSERT_TRUE(ip_port == ip_port);
+
+  Sockaddr copy = ip_port;
+  ASSERT_TRUE(ip_port == copy);
+}
+
+TEST_F(NetUtilTest, TestUnixSockaddr) {
+  Sockaddr addr;
+  ASSERT_OK(addr.ParseUnixDomainPath("/foo/bar"));
+  ASSERT_EQ(addr.family(), AF_UNIX);
+  ASSERT_EQ(addr.UnixDomainPath(), "/foo/bar");
+  ASSERT_EQ(addr.ToString(), "unix:/foo/bar");
+  ASSERT_EQ(Sockaddr::UnixAddressType::kPath, addr.unix_address_type());
+
+  Sockaddr addr2;
+  ASSERT_OK(addr2.ParseUnixDomainPath("@my-abstract"));
+  ASSERT_EQ(addr2.family(), AF_UNIX);
+  ASSERT_EQ(addr2.UnixDomainPath(), "@my-abstract");
+  ASSERT_EQ(addr2.ToString(), "unix:@my-abstract");
+  ASSERT_EQ(Sockaddr::UnixAddressType::kAbstractNamespace, addr2.unix_address_type());
+
+  ASSERT_TRUE(addr == addr);
+  ASSERT_TRUE(addr2 == addr2);
+  ASSERT_FALSE(addr == addr2);
+  ASSERT_FALSE(addr2 == addr);
+  ASSERT_FALSE(addr == Sockaddr::Wildcard());
+  ASSERT_FALSE(Sockaddr::Wildcard() == addr);
+  ASSERT_FALSE(addr == Sockaddr());
+  ASSERT_FALSE(Sockaddr() == addr);
 }
 
 } // namespace kudu

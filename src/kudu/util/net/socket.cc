@@ -73,6 +73,10 @@ Socket::Socket(int fd)
   : fd_(fd) {
 }
 
+Socket::Socket(Socket&& other) noexcept
+  : fd_(other.Release()) {
+}
+
 void Socket::Reset(int fd) {
   ignore_result(Close());
   fd_ = fd;
@@ -130,9 +134,9 @@ bool Socket::IsTemporarySocketError(int err) {
 
 #if defined(__linux__)
 
-Status Socket::Init(int flags) {
+Status Socket::Init(int family, int flags) {
   int nonblocking_flag = (flags & FLAG_NONBLOCKING) ? SOCK_NONBLOCK : 0;
-  Reset(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | nonblocking_flag, 0));
+  Reset(::socket(family, SOCK_STREAM | SOCK_CLOEXEC | nonblocking_flag, 0));
   if (fd_ < 0) {
     int err = errno;
     return Status::NetworkError("error opening socket", ErrnoToString(err), err);
@@ -143,8 +147,8 @@ Status Socket::Init(int flags) {
 
 #else
 
-Status Socket::Init(int flags) {
-  Reset(::socket(AF_INET, SOCK_STREAM, 0));
+Status Socket::Init(int family, int flags) {
+  Reset(::socket(family, SOCK_STREAM, 0));
   if (fd_ < 0) {
     int err = errno;
     return Status::NetworkError("error opening socket", ErrnoToString(err), err);
@@ -272,26 +276,26 @@ Status Socket::Listen(int listen_queue_size) {
 }
 
 Status Socket::GetSocketAddress(Sockaddr *cur_addr) const {
-  struct sockaddr_in sin;
-  socklen_t len = sizeof(sin);
+  struct sockaddr_storage ss;
+  socklen_t len = sizeof(ss);
   DCHECK_GE(fd_, 0);
-  if (::getsockname(fd_, reinterpret_cast<struct sockaddr*>(&sin), &len) == -1) {
+  if (::getsockname(fd_, reinterpret_cast<struct sockaddr*>(&ss), &len) == -1) {
     int err = errno;
     return Status::NetworkError("getsockname error", ErrnoToString(err), err);
   }
-  *cur_addr = sin;
+  *cur_addr = Sockaddr(reinterpret_cast<struct sockaddr&>(ss), len);
   return Status::OK();
 }
 
 Status Socket::GetPeerAddress(Sockaddr *cur_addr) const {
-  struct sockaddr_in sin;
-  socklen_t len = sizeof(sin);
+  struct sockaddr_storage addr;
+  socklen_t len = sizeof(addr);
   DCHECK_GE(fd_, 0);
-  if (::getpeername(fd_, reinterpret_cast<struct sockaddr*>(&sin), &len) == -1) {
+  if (::getpeername(fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) == -1) {
     int err = errno;
     return Status::NetworkError("getpeername error", ErrnoToString(err), err);
   }
-  *cur_addr = sin;
+  *cur_addr = Sockaddr(reinterpret_cast<const sockaddr&>(addr), len);
   return Status::OK();
 }
 
@@ -310,17 +314,16 @@ bool Socket::IsLoopbackConnection() const {
 }
 
 Status Socket::Bind(const Sockaddr& bind_addr) {
-  struct sockaddr_in addr = bind_addr.addr();
-
   DCHECK_GE(fd_, 0);
-  if (PREDICT_FALSE(::bind(fd_, (struct sockaddr*) &addr, sizeof(addr)))) {
+  if (PREDICT_FALSE(::bind(fd_, bind_addr.addr(), bind_addr.addrlen()))) {
     int err = errno;
     Status s = Status::NetworkError(
         strings::Substitute("error binding socket to $0: $1",
                             bind_addr.ToString(), ErrnoToString(err)),
         Slice(), err);
 
-    if (s.IsNetworkError() && s.posix_code() == EADDRINUSE && bind_addr.port() != 0) {
+    if (s.IsNetworkError() && bind_addr.is_ip() &&
+        s.posix_code() == EADDRINUSE && bind_addr.port() != 0) {
       TryRunLsof(bind_addr);
     }
     return s;
@@ -331,7 +334,7 @@ Status Socket::Bind(const Sockaddr& bind_addr) {
 
 Status Socket::Accept(Socket *new_conn, Sockaddr *remote, int flags) {
   TRACE_EVENT0("net", "Socket::Accept");
-  struct sockaddr_in addr;
+  struct sockaddr_storage addr;
   socklen_t olen = sizeof(addr);
   DCHECK_GE(fd_, 0);
 #if defined(__linux__)
@@ -360,7 +363,7 @@ Status Socket::Accept(Socket *new_conn, Sockaddr *remote, int flags) {
   RETURN_NOT_OK(new_conn->SetCloseOnExec());
 #endif // defined(__linux__)
 
-  *remote = addr;
+  *remote = Sockaddr(reinterpret_cast<const sockaddr&>(addr), olen);
   TRACE_EVENT_INSTANT1("net", "Accepted", TRACE_EVENT_SCOPE_THREAD,
                        "remote", remote->ToString());
   return Status::OK();
@@ -384,12 +387,9 @@ Status Socket::Connect(const Sockaddr &remote) {
     RETURN_NOT_OK(BindForOutgoingConnection());
   }
 
-  struct sockaddr_in addr;
-  memcpy(&addr, &remote.addr(), sizeof(sockaddr_in));
   DCHECK_GE(fd_, 0);
   int ret;
-  RETRY_ON_EINTR(ret, ::connect(
-      fd_, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr)));
+  RETRY_ON_EINTR(ret, ::connect(fd_, remote.addr(), remote.addrlen()));
   if (ret < 0) {
     int err = errno;
     return Status::NetworkError("connect(2) error", ErrnoToString(err), err);
@@ -517,13 +517,14 @@ Status Socket::Recv(uint8_t *buf, int32_t amt, int32_t *nread) {
   RETRY_ON_EINTR(res, recv(fd_, buf, amt, 0));
   if (res <= 0) {
     Sockaddr remote;
-    GetPeerAddress(&remote);
+    Status get_addr_status = GetPeerAddress(&remote);
+    string remote_str = get_addr_status.ok() ? remote.ToString() : "unknown peer";
     if (res == 0) {
-      string error_message = Substitute("recv got EOF from $0", remote.ToString());
+      string error_message = Substitute("recv got EOF from $0", remote_str);
       return Status::NetworkError(error_message, Slice(), ESHUTDOWN);
     }
     int err = errno;
-    string error_message = Substitute("recv error from $0", remote.ToString());
+    string error_message = Substitute("recv error from $0", remote_str);
     return Status::NetworkError(error_message, ErrnoToString(err), err);
   }
   *nread = res;

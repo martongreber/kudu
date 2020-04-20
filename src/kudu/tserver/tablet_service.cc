@@ -23,9 +23,9 @@
 #include <cstring>
 #include <functional>
 #include <memory>
-#include <numeric>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -148,6 +148,12 @@ DEFINE_bool(scanner_inject_service_unavailable_on_continue_scan, false,
            "If set, the scanner will return a ServiceUnavailable Status on "
            "any Scan continuation RPC call. Used for tests.");
 TAG_FLAG(scanner_inject_service_unavailable_on_continue_scan, unsafe);
+
+DEFINE_bool(scanner_unregister_on_invalid_seq_id, true,
+            "If set, an invalid sequence ID will cause a scanner to get unregistered. "
+            "Used for tests.");
+TAG_FLAG(scanner_unregister_on_invalid_seq_id, unsafe);
+
 
 DEFINE_bool(tserver_enforce_access_control, false,
             "If set, the server will apply fine-grained access control rules "
@@ -691,7 +697,9 @@ class ScanResultCollector {
   // request is decoded and checked for 'row_format_flags'.
   //
   // Does nothing by default.
-  virtual Status InitSerializer(uint64_t /* row_format_flags */) {
+  virtual Status InitSerializer(uint64_t /* row_format_flags */,
+                                const Schema& /* scanner_schema */,
+                                const Schema& /* client_schema */) {
     return Status::OK();
   }
 
@@ -754,6 +762,8 @@ class RowwiseResultSerializer : public ResultSerializer {
 
   int SerializeRowBlock(const RowBlock& row_block,
                         const Schema* client_projection_schema) override {
+    // TODO(todd) create some kind of serializer object that caches the projection
+    // information to avoid recalculating it on every SerializeRowBlock call.
     int num_selected = kudu::SerializeRowBlock(
         row_block, client_projection_schema,
         &rows_data_, &indirect_data_, pad_unixtime_micros_to_16_bytes_);
@@ -795,18 +805,23 @@ class RowwiseResultSerializer : public ResultSerializer {
 
 class ColumnarResultSerializer : public ResultSerializer {
  public:
-  static Status Create(uint64_t flags, unique_ptr<ResultSerializer>* serializer) {
+  static Status Create(uint64_t flags,
+                       int batch_size_bytes,
+                       const Schema& scanner_schema,
+                       const Schema& client_schema,
+                       unique_ptr<ResultSerializer>* serializer) {
     if (flags & ~RowFormatFlags::COLUMNAR_LAYOUT) {
       return Status::InvalidArgument("Row format flags not supported with columnar layout");
     }
-    serializer->reset(new ColumnarResultSerializer());
+    serializer->reset(new ColumnarResultSerializer(
+        scanner_schema, client_schema, batch_size_bytes));
     return Status::OK();
   }
 
   int SerializeRowBlock(const RowBlock& row_block,
-                        const Schema* client_projection_schema) override {
+                        const Schema* /* unused */) override {
     CHECK(!done_);
-    int n_sel = SerializeRowBlockColumnar(row_block, client_projection_schema, &results_);
+    int n_sel = results_.AddRowBlock(row_block);
     num_rows_ += n_sel;
     return n_sel;
   }
@@ -815,7 +830,7 @@ class ColumnarResultSerializer : public ResultSerializer {
     CHECK(!done_);
 
     int total = 0;
-    for (const auto& col : results_.columns) {
+    for (const auto& col : results_.columns()) {
       total += col.data.size();
       if (col.varlen_data) {
         total += col.varlen_data->size();
@@ -831,7 +846,8 @@ class ColumnarResultSerializer : public ResultSerializer {
     CHECK(!done_);
     done_ = true;
     ColumnarRowBlockPB* data = resp->mutable_columnar_data();
-    for (auto& col : results_.columns) {
+    auto cols = std::move(results_).TakeColumns();
+    for (auto& col : cols) {
       auto* col_pb = data->add_columns();
       int sidecar_idx;
       CHECK_OK(context->AddOutboundSidecar(
@@ -854,7 +870,11 @@ class ColumnarResultSerializer : public ResultSerializer {
   }
 
  private:
-  ColumnarResultSerializer() {}
+  ColumnarResultSerializer(const Schema& scanner_schema,
+                           const Schema& client_schema,
+                           int batch_size_bytes)
+      : results_(scanner_schema, client_schema, batch_size_bytes) {
+  }
 
   int64_t num_rows_ = 0;
   ColumnarSerializedBatch results_;
@@ -898,14 +918,17 @@ class ScanResultCopier : public ScanResultCollector {
     return num_rows_returned_;
   }
 
-  Status InitSerializer(uint64_t row_format_flags) override {
+  Status InitSerializer(uint64_t row_format_flags,
+                        const Schema& scanner_schema,
+                        const Schema& client_schema) override {
     if (serializer_) {
       // TODO(todd) for the NewScanner case, this gets called twice
       // which is a bit ugly. Refactor to avoid!
       return Status::OK();
     }
     if (row_format_flags & COLUMNAR_LAYOUT) {
-      return ColumnarResultSerializer::Create(row_format_flags, &serializer_);
+      return ColumnarResultSerializer::Create(
+          row_format_flags, batch_size_bytes_, scanner_schema, client_schema, &serializer_);
     }
     serializer_.reset(new RowwiseResultSerializer(batch_size_bytes_, row_format_flags));
     return Status::OK();
@@ -1796,7 +1819,14 @@ void TabletServiceImpl::ScannerKeepAlive(const ScannerKeepAliveRequestPB *req,
     SetupErrorAndRespond(resp->mutable_error(), s, error_code, context);
     return;
   }
-  scanner->UpdateAccessTime();
+  {
+    // Locking for access has the side effect of updating the access time.
+    // Here we do a trylock -- a failure indicates that there is already another
+    // thread currently accessing the scanner, so that thread will update the
+    // access time upon release of the lock.
+    auto lock = scanner->TryLockForAccess();
+  }
+
   context->RespondSuccess();
 }
 
@@ -2337,18 +2367,14 @@ static Status SetupScanSpec(const NewScanRequestPB& scan_pb,
     const void* lower_bound = nullptr;
     const void* upper_bound = nullptr;
     if (pred_pb.has_lower_bound()) {
-      const void* val;
       RETURN_NOT_OK(ExtractPredicateValue(*col, pred_pb.lower_bound(),
                                           scanner->arena(),
-                                          &val));
-      lower_bound = val;
+                                          &lower_bound));
     }
     if (pred_pb.has_inclusive_upper_bound()) {
-      const void* val;
       RETURN_NOT_OK(ExtractPredicateValue(*col, pred_pb.inclusive_upper_bound(),
                                           scanner->arena(),
-                                          &val));
-      upper_bound = val;
+                                          &upper_bound));
     }
 
     auto pred = ColumnPredicate::InclusiveRange(*col, lower_bound, upper_bound, scanner->arena());
@@ -2432,20 +2458,13 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   TRACE_EVENT1("tserver", "TabletServiceImpl::HandleNewScanRequest",
                "tablet_id", scan_pb.tablet_id());
 
-  Status s = result_collector->InitSerializer(scan_pb.row_format_flags());
-  if (!s.ok()) {
-    *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
-    return s;
-  }
-
-  const Schema& tablet_schema = replica->tablet_metadata()->schema();
-
   SharedScanner scanner;
   server_->scanner_manager()->NewScanner(replica,
                                          rpc_context->remote_user(),
                                          scan_pb.row_format_flags(),
                                          &scanner);
   TRACE("Created scanner $0 for tablet $1", scanner->id(), scanner->tablet_id());
+  auto scanner_lock = scanner->LockForAccess();
 
   // If we early-exit out of this function, automatically unregister
   // the scanner.
@@ -2455,7 +2474,7 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   // Create the user's requested projection.
   // TODO(todd): Add test cases for bad projections including 0 columns.
   Schema projection;
-  s = ColumnPBsToSchema(scan_pb.projected_columns(), &projection);
+  Status s = ColumnPBsToSchema(scan_pb.projected_columns(), &projection);
   if (PREDICT_FALSE(!s.ok())) {
     *error_code = TabletServerErrorPB::INVALID_SCHEMA;
     return s;
@@ -2480,6 +2499,8 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     }
   }
 
+  const Schema& tablet_schema = replica->tablet_metadata()->schema();
+
   ScanSpec spec;
   s = SetupScanSpec(scan_pb, tablet_schema, scanner, &spec);
   if (PREDICT_FALSE(!s.ok())) {
@@ -2498,17 +2519,6 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   // NOTE: We should build the missing column after optimizing scan which will
   // remove unnecessary predicates.
   vector<ColumnSchema> missing_cols = spec.GetMissingColumns(projection);
-  if (spec.CanShortCircuit()) {
-    VLOG(1) << "short-circuiting without creating a server-side scanner.";
-    *has_more_results = false;
-    return Status::OK();
-  }
-
-  // Store the original projection.
-  {
-    unique_ptr<Schema> orig_projection(new Schema(projection));
-    scanner->set_client_projection_schema(std::move(orig_projection));
-  }
 
   // Build a new projection with the projection columns and the missing columns,
   // annotating each column as a key column appropriately.
@@ -2548,8 +2558,26 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
       CHECK_OK(projection_builder.AddColumn(col, /* is_key= */ false));
     }
   }
+
+  // Store the client's specified projection, prior to adding any missing
+  // columns for predicates, etc.
+  unique_ptr<Schema> client_projection(new Schema(std::move(projection)));
   projection = projection_builder.BuildWithoutIds();
   VLOG(3) << "Scan projection: " << projection.ToString(Schema::BASE_INFO);
+
+  s = result_collector->InitSerializer(scan_pb.row_format_flags(),
+                                       projection,
+                                       *client_projection);
+  if (!s.ok()) {
+    *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+    return s;
+  }
+
+  if (spec.CanShortCircuit()) {
+    VLOG(1) << "short-circuiting without creating a server-side scanner.";
+    *has_more_results = false;
+    return Status::OK();
+  }
 
   // It's important to keep the reference to the tablet for the case when the
   // tablet replica's shutdown is run concurrently with the code below.
@@ -2667,7 +2695,7 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     return Status::OK();
   }
 
-  scanner->Init(std::move(iter), std::move(orig_spec));
+  scanner->Init(std::move(iter), std::move(orig_spec), std::move(client_projection));
 
   // Stop the scanner timer because ContinueScanRequest starts its own timer.
   scanner_timer.Stop();
@@ -2686,6 +2714,7 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     // from the first half that is no longer executed in this codepath.
     ScanRequestPB continue_req(*req);
     continue_req.set_scanner_id(scanner->id());
+    scanner_lock.Unlock();
     RETURN_NOT_OK(HandleContinueScanRequest(&continue_req, rpc_context, result_collector,
                                             has_more_results, error_code));
   } else {
@@ -2708,9 +2737,6 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
 
   size_t batch_size_bytes = GetMaxBatchSizeBytesHint(req);
 
-  // TODO(todd): need some kind of concurrency control on these scanner objects
-  // in case multiple RPCs hit the same scanner at the same time. Probably
-  // just a trylock and fail the RPC if it contends.
   SharedScanner scanner;
   TabletServerErrorPB::Code code = TabletServerErrorPB::UNKNOWN_ERROR;
   Status s = server_->scanner_manager()->LookupScanner(req->scanner_id(),
@@ -2727,6 +2753,10 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
     *error_code = code;
     return s;
   }
+  // TODO(todd) consider TryLockForAccess and return ServiceUnavailable in the case that
+  // another thread is already using the scanner? This should be rare in real
+  // circumstances -- only relevant when a client performs some retries on timeout.
+  auto scanner_lock = scanner->LockForAccess();
 
   if (PREDICT_FALSE(FLAGS_scanner_inject_service_unavailable_on_continue_scan)) {
     return Status::ServiceUnavailable("Injecting service unavailable status on Scan due to "
@@ -2741,13 +2771,6 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
           << SecureShortDebugString(*req);
   TRACE("Found scanner $0 for tablet $1", scanner->id(), scanner->tablet_id());
 
-  // Set the row format flags on the ScanResultCollector.
-  s = result_collector->InitSerializer(scanner->row_format_flags());
-  if (!s.ok()) {
-    *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
-    return s;
-  }
-
   if (batch_size_bytes == 0 && req->close_scanner()) {
     *has_more_results = false;
     return Status::OK();
@@ -2755,17 +2778,29 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
 
   if (req->call_seq_id() != scanner->call_seq_id()) {
     *error_code = TabletServerErrorPB::INVALID_SCAN_CALL_SEQ_ID;
+    if (!FLAGS_scanner_unregister_on_invalid_seq_id) {
+      unreg_scanner.Cancel();
+    }
     return Status::InvalidArgument("Invalid call sequence ID in scan request");
   }
   scanner->IncrementCallSeqId();
 
   RowwiseIterator* iter = scanner->iter();
 
+  // Set the row format flags on the ScanResultCollector.
+  s = result_collector->InitSerializer(scanner->row_format_flags(),
+                                       iter->schema(),
+                                       *scanner->client_projection_schema());
+  if (!s.ok()) {
+    *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+    return s;
+  }
+
   // TODO(todd): could size the RowBlock based on the user's requested batch size?
   // If people had really large indirect objects, we would currently overshoot
   // their requested batch size by a lot.
   Arena arena(32 * 1024);
-  RowBlock block(&scanner->iter()->schema(),
+  RowBlock block(&iter->schema(),
                  FLAGS_scanner_batch_size_rows, &arena);
 
   // TODO(todd): in the future, use the client timeout to set a budget. For now,
@@ -2831,17 +2866,8 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
     return s;
   }
 
-  // Calculate the number of rows/cells/bytes actually processed. Here we have to dig
-  // into the per-column iterator stats, sum them up, and then subtract out the
-  // total that we already reported in a previous scan.
-  vector<IteratorStats> stats_by_col;
-  scanner->GetIteratorStats(&stats_by_col);
-  IteratorStats total_stats = std::accumulate(stats_by_col.begin(),
-                                              stats_by_col.end(),
-                                              IteratorStats());
-
-  IteratorStats delta_stats = total_stats - scanner->already_reported_stats();
-  scanner->set_already_reported_stats(total_stats);
+  // Calculate the number of rows/cells/bytes actually processed.
+  IteratorStats delta_stats = scanner->UpdateStatsAndGetDelta();
   TRACE_COUNTER_INCREMENT(SCANNER_BYTES_READ_METRIC_NAME, delta_stats.bytes_read);
 
   // Update metrics based on this scan request.

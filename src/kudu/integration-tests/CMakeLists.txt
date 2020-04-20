@@ -86,6 +86,7 @@ ADD_KUDU_TEST(linked_list-test RUN_SERIAL true)
 ADD_KUDU_TEST(log-rolling-itest)
 ADD_KUDU_TEST(maintenance_mode-itest NUM_SHARDS 8
   DATA_FILES ../scripts/assign-location.py)
+ADD_KUDU_TEST(master_authz-itest RUN_SERIAL true NUM_SHARDS 8 PROCESSORS 4)
 ADD_KUDU_TEST(master_cert_authority-itest PROCESSORS 2)
 ADD_KUDU_TEST(master_failover-itest NUM_SHARDS 4 PROCESSORS 3)
 ADD_KUDU_TEST_DEPENDENCIES(master_failover-itest
@@ -95,8 +96,6 @@ ADD_KUDU_TEST(master_migration-itest)
 ADD_KUDU_TEST_DEPENDENCIES(master_migration-itest
   kudu)
 ADD_KUDU_TEST(master_replication-itest)
-# NOTE: Sentry tests are disabled to allow upgrading to Hive 3.
-#ADD_KUDU_TEST(master_sentry-itest RUN_SERIAL true NUM_SHARDS 8 PROCESSORS 4)
 ADD_KUDU_TEST(master-stress-test RUN_SERIAL true NUM_SHARDS 3)
 if(${KUDU_TCMALLOC_AVAILABLE})
   ADD_KUDU_TEST(memory_gc-itest)
@@ -133,9 +132,8 @@ ADD_KUDU_TEST(tombstoned_voting-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(token_signer-itest)
 ADD_KUDU_TEST(location_assignment-itest
   DATA_FILES ../scripts/assign-location.py)
+ADD_KUDU_TEST(ts_authz-itest NUM_SHARDS 2)
 ADD_KUDU_TEST(ts_recovery-itest PROCESSORS 4)
-# NOTE: Sentry tests are disabled to allow upgrading to Hive 3.
-#ADD_KUDU_TEST(ts_sentry-itest NUM_SHARDS 2)
 ADD_KUDU_TEST(ts_tablet_manager-itest)
 ADD_KUDU_TEST(update_scan_delta_compact-test RUN_SERIAL true)
 ADD_KUDU_TEST(webserver-crawl-itest LABELS no_dist_test)

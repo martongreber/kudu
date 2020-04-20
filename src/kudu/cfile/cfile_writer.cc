@@ -18,6 +18,7 @@
 #include "kudu/cfile/cfile_writer.h"
 
 #include <functional>
+#include <iterator>
 #include <numeric>
 #include <ostream>
 #include <utility>
@@ -178,9 +179,7 @@ Status CFileWriter::Start() {
 
   RETURN_NOT_OK_PREPEND(WriteRawData(header_slices), "Couldn't write header");
 
-  BlockBuilder *bb;
-  RETURN_NOT_OK(type_encoding_info_->CreateBlockBuilder(&bb, &options_));
-  data_block_.reset(bb);
+  RETURN_NOT_OK(type_encoding_info_->CreateBlockBuilder(&data_block_, &options_));
 
   if (is_nullable_) {
     size_t nrows = ((options_.storage_attributes.cfile_block_size + typeinfo_->size() - 1) /
@@ -373,8 +372,8 @@ Status CFileWriter::FinishCurDataBlock() {
 
   // The current data block is full, need to push it
   // into the file, and add to index
-  Slice data = data_block_->Finish(first_elem_ord);
-  VLOG(2) << " actual size=" << data.size();
+  vector<Slice> data_slices;
+  data_block_->Finish(first_elem_ord, &data_slices);
 
   uint8_t key_tmp_space[typeinfo_->size()];
   if (validx_builder_ != nullptr) {
@@ -394,7 +393,7 @@ Status CFileWriter::FinishCurDataBlock() {
     v.emplace_back(null_headers.data(), null_headers.size());
     v.push_back(non_null_bitmap);
   }
-  v.push_back(data);
+  std::move(data_slices.begin(), data_slices.end(), std::back_inserter(v));
   Status s = AppendRawBlock(v, first_elem_ord,
                             reinterpret_cast<const void *>(key_tmp_space),
                             Slice(last_key_),

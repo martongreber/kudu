@@ -404,12 +404,11 @@ fetch_and_patch \
  # autoreconf 2.69-11 (RHEL 7): "autoreconf: 'configure.ac' or 'configure.in' is required".
 
 
-# For upstream Hive and Hadoop, we've stripped extraneous JARs. This isn't the
-# case for downstream components or any Sentry artifacts.
+# For upstream Hive and Hadoop, we've stripped extraneous JARs.
+# This isn't the case for downstream components.
 ECOSYSTEM_URL=${DEPENDENCY_URL}
 HIVE_FILE_NAME="${HIVE_NAME}-stripped.tar.gz"
 HADOOP_FILE_NAME="${HADOOP_NAME}-stripped.tar.gz"
-SENTRY_FILE_NAME="${SENTRY_NAME}.tar.gz"
 if [[ -n "$CDH_TARBALL_URL" ]]; then
   ECOSYSTEM_URL=${CDH_TARBALL_URL}
   HIVE_FILE_NAME="${HIVE_NAME}.tar.gz"
@@ -428,13 +427,6 @@ fetch_with_url_and_patch \
  $HADOOP_FILE_NAME \
  $HADOOP_SOURCE \
  $HADOOP_PATCHLEVEL \
- $ECOSYSTEM_URL
-
-SENTRY_PATCHLEVEL=0
-fetch_with_url_and_patch \
- $SENTRY_FILE_NAME \
- $SENTRY_SOURCE \
- $SENTRY_PATCHLEVEL \
  $ECOSYSTEM_URL
 
 YAML_PATCHLEVEL=0

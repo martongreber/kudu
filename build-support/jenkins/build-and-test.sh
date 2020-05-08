@@ -26,7 +26,7 @@
 #
 #   KUDU_USE_CDH_ECOSYSTEM  Default: 0
 #     If non-zero, use the CDH packages for Hadoop ecosystem components
-#     (e.g. Hadoop, Hive, Sentry).
+#     (e.g. Hadoop, Hive).
 #
 #   KUDU_ALLOW_SLOW_TESTS   Default: 1
 #     Runs the "slow" version of the unit tests. Set to 0 to

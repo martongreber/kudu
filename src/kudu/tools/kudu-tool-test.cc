@@ -1020,7 +1020,7 @@ TEST_F(ToolTest, TestModeHelp) {
         "data_size.*Summarize the data size",
         "dump.*Dump a Kudu filesystem",
         "copy_from_remote.*Copy a tablet replica",
-        "delete.*Delete a tablet replica from the local filesystem",
+        "delete.*Delete tablet replicas from the local filesystem",
         "list.*Show list of tablet replicas"
     };
     NO_FATALS(RunTestHelp("local_replica", kLocalReplicaModeRegexes));
@@ -2748,6 +2748,29 @@ TEST_F(ToolTest, TestLocalReplicaDelete) {
                                             Substitute("tablet-meta/$0", tablet_id));
   ASSERT_FALSE(env_->FileExists(meta_dir));
 
+  // Try to remove the same tablet replica again.
+  s = RunTool(Substitute(
+      "local_replica delete $0 --clean_unsafe --fs_wal_dir=$1 --fs_data_dirs=$1",
+      tablet_id, tserver_dir),
+      nullptr, &stderr, nullptr, nullptr);
+  ASSERT_TRUE(s.IsRuntimeError());
+  ASSERT_STR_CONTAINS(stderr, "Not found: Could not load tablet metadata");
+  ASSERT_STR_CONTAINS(stderr, "No such file or directory");
+
+  // Try to remove the same tablet replica again if --ignore_nonexistent
+  // is specified. The tool should report success and output information on the
+  // error ignored.
+  ASSERT_OK(RunActionStderrString(
+      Substitute("local_replica delete $0 --clean_unsafe --fs_wal_dir=$1 "
+                 "--fs_data_dirs=$1 --ignore_nonexistent",
+                 tablet_id, tserver_dir),
+      &stderr));
+  ASSERT_STR_CONTAINS(stderr, Substitute("ignoring error for tablet replica $0 "
+                                         "because of the --ignore_nonexistent flag",
+                                         tablet_id));
+  ASSERT_STR_CONTAINS(stderr, "Not found: Could not load tablet metadata");
+  ASSERT_STR_CONTAINS(stderr, "No such file or directory");
+
   // Verify that the total size of the data on disk after 'delete' action
   // is less than before. Although this doesn't necessarily check
   // for orphan data blocks left behind for the given tablet, it certainly
@@ -2763,6 +2786,49 @@ TEST_F(ToolTest, TestLocalReplicaDelete) {
   vector<scoped_refptr<TabletReplica>> tablet_replicas;
   ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
   ASSERT_EQ(0, tablet_replicas.size());
+}
+
+// Test 'kudu local_replica delete' tool with multiple tablet replicas to
+// operate at once.
+TEST_F(ToolTest, TestLocalReplicaDeleteMultiple) {
+  static constexpr int kNumTablets = 10;
+  NO_FATALS(StartMiniCluster());
+
+  // TestWorkLoad.Setup() creates a table.
+  TestWorkload workload(mini_cluster_.get());
+  workload.set_num_replicas(1);
+  workload.set_num_tablets(kNumTablets);
+  workload.Setup();
+
+  vector<string> tablet_ids;
+  MiniTabletServer* ts = mini_cluster_->mini_tablet_server(0);
+  {
+    // It's important to clear the 'tablet_replicas' container before shutting
+    // down the minicluster process. Otherwise CHECK() for the ThreadPool's
+    // tokens would trigger.
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(kNumTablets, tablet_replicas.size());
+    for (const auto& replica : tablet_replicas) {
+      tablet_ids.emplace_back(replica->tablet_id());
+    }
+  }
+  // Tablet server should be shutdown to release the lock and allow operating
+  // on its data.
+  ts->Shutdown();
+  const string& tserver_dir = ts->options()->fs_opts.wal_root;
+  const string tablet_ids_csv_str = JoinStrings(tablet_ids, ",");
+  NO_FATALS(RunActionStdoutNone(Substitute(
+      "local_replica delete --fs_wal_dir=$0 --fs_data_dirs=$0 "
+      "--clean_unsafe $1", tserver_dir, tablet_ids_csv_str)));
+
+  ASSERT_OK(ts->Start());
+  ASSERT_OK(ts->WaitStarted());
+  {
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(0, tablet_replicas.size());
+  }
 }
 
 // Test 'kudu local_replica delete' tool for tombstoning the tablet.

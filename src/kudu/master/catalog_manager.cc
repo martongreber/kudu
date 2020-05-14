@@ -120,8 +120,8 @@
 #include "kudu/security/token_verifier.h"
 #include "kudu/server/monitored_task.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/ops/op_tracker.h"
 #include "kudu/tablet/tablet_replica.h"
-#include "kudu/tablet/transactions/transaction_tracker.h"
 #include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/util/condition_variable.h"
@@ -145,6 +145,7 @@
 DEFINE_int32(master_ts_rpc_timeout_ms, 30 * 1000, // 30 sec
              "Timeout used for the master->TS async rpc calls.");
 TAG_FLAG(master_ts_rpc_timeout_ms, advanced);
+TAG_FLAG(master_ts_rpc_timeout_ms, runtime);
 
 DEFINE_int32(tablet_creation_timeout_ms, 30 * 1000, // 30 sec
              "Timeout used by the master when attempting to create tablet "

@@ -57,7 +57,7 @@ versions += [
     schemaValidator: "7.x.0",
     scopt          : "3.7.1",
     slf4j : "1.7.25",
-    spark : "2.4.0.7.2.1.0-SNAPSHOT",
+    spark : "2.4.5.7.2.1.0-SNAPSHOT",
     spotBugs       : "4.0.0-beta1",
     yetus          : "0.12.0"
 ]

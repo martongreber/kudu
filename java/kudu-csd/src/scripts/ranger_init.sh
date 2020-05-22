@@ -94,7 +94,14 @@ function ranger_service_rest() {
   INPUT=${3:+--data @${3}}
 
   connect_ranger
-  read -r http_code < <(curl --output /dev/null -s -k -w "%{http_code}" --negotiate -u :  -X "${HTTP_METHOD}" -H "Content-Type:application/json" ${INPUT} "${RANGER_REST_URL}${API_URL_PATH}")
+  REQUEST_URL=""
+  if [[ "$RANGER_REST_URL" == */ ]]
+  then
+    REQUEST_URL=${RANGER_REST_URL}${API_URL_PATH}
+  else
+    REQUEST_URL=${RANGER_REST_URL}/${API_URL_PATH}
+  fi
+  read -r http_code < <(curl --output /dev/null -s -k -w "%{http_code}" --negotiate -u :  -X "${HTTP_METHOD}" -H "Content-Type:application/json" ${INPUT} "${REQUEST_URL}")
   log "result" "${HTTP_METHOD} ${API_URL_PATH}" "${http_code}"
 }
 

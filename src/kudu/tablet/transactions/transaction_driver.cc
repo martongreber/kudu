@@ -172,8 +172,7 @@ Status TransactionDriver::Init(unique_ptr<Transaction> transaction,
     }
   }
 
-  RETURN_NOT_OK(txn_tracker_->Add(this));
-  return Status::OK();
+  return txn_tracker_->Add(this);
 }
 
 consensus::OpId TransactionDriver::GetOpId() {

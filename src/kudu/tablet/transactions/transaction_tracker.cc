@@ -131,15 +131,17 @@ TransactionTracker::Metrics::Metrics(const scoped_refptr<MetricEntity>& entity)
 #undef MINIT
 
 TransactionTracker::State::State()
-  : memory_footprint(0) {
+    : memory_footprint(0) {
 }
 
 TransactionTracker::TransactionTracker() {
 }
 
 TransactionTracker::~TransactionTracker() {
+#ifndef NDEBUG
   std::lock_guard<simple_spinlock> l(lock_);
-  CHECK_EQ(pending_txns_.size(), 0);
+  DCHECK(pending_txns_.empty());
+#endif
 }
 
 Status TransactionTracker::Add(TransactionDriver* driver) {
@@ -219,8 +221,8 @@ void TransactionTracker::Release(TransactionDriver* driver) {
 
   // Remove the transaction from the map updating memory consumption if needed.
   std::lock_guard<simple_spinlock> l(lock_);
-  State st = FindOrDie(pending_txns_, driver);
   if (mem_tracker_) {
+    const State& st = FindOrDie(pending_txns_, driver);
     mem_tracker_->Release(st.memory_footprint);
   }
   if (PREDICT_FALSE(pending_txns_.erase(driver) != 1)) {

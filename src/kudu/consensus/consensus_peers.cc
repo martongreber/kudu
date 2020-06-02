@@ -138,7 +138,10 @@ Peer::Peer(RaftPeerPB peer_pb,
       queue_(queue),
       failed_attempts_(0),
       messenger_(std::move(messenger)),
-      raft_pool_token_(raft_pool_token) {
+      raft_pool_token_(raft_pool_token),
+      request_pending_(false),
+      closed_(false),
+      has_sent_first_request_(false) {
 }
 
 Status Peer::Init() {
@@ -163,8 +166,11 @@ Status Peer::Init() {
 }
 
 Status Peer::SignalRequest(bool even_if_queue_empty) {
-  std::lock_guard<simple_spinlock> l(peer_lock_);
-
+  // This is a best effort logic in checking for 'closed_' and
+  // 'request_pending_': it's not necessary to block if some other thread has
+  // taken 'peer_lock_' and about to update 'closed_'/'request_pending_' since
+  // the implementation of SendNextRequest() checks for 'closed_' and
+  // 'request_pending_' on its own.
   if (PREDICT_FALSE(closed_)) {
     return Status::IllegalState("Peer was closed.");
   }
@@ -178,12 +184,11 @@ Status Peer::SignalRequest(bool even_if_queue_empty) {
   // Capture a weak_ptr reference into the submitted functor so that we can
   // safely handle the functor outliving its peer.
   weak_ptr<Peer> w_this = shared_from_this();
-  RETURN_NOT_OK(raft_pool_token_->Submit([even_if_queue_empty, w_this]() {
+  return raft_pool_token_->Submit([even_if_queue_empty, w_this]() {
     if (auto p = w_this.lock()) {
       p->SendNextRequest(even_if_queue_empty);
     }
-  }));
-  return Status::OK();
+  });
 }
 
 void Peer::SendNextRequest(bool even_if_queue_empty) {
@@ -271,13 +276,13 @@ void Peer::SendNextRequest(bool even_if_queue_empty) {
 
   MAYBE_FAULT(FLAGS_fault_crash_on_leader_request_fraction);
 
-
   VLOG_WITH_PREFIX_UNLOCKED(2) << "Sending to peer " << peer_pb().permanent_uuid() << ": "
       << SecureShortDebugString(request_);
-  controller_.Reset();
 
+  controller_.Reset();
   request_pending_ = true;
   l.unlock();
+
   // Capture a shared_ptr reference into the RPC callback so that we're guaranteed
   // that this object outlives the RPC.
   shared_ptr<Peer> s_this = shared_from_this();
@@ -318,7 +323,7 @@ void Peer::StartElection() {
 void Peer::ProcessResponse() {
   // Note: This method runs on the reactor thread.
   std::unique_lock<simple_spinlock> lock(peer_lock_);
-  if (closed_) {
+  if (PREDICT_FALSE(closed_)) {
     return;
   }
   CHECK(request_pending_);
@@ -331,7 +336,7 @@ void Peer::ProcessResponse() {
     auto ps = controller_status.IsRemoteError() ?
         PeerStatus::REMOTE_ERROR : PeerStatus::RPC_LAYER_ERROR;
     queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), ps, controller_status);
-    ProcessResponseError(controller_status);
+    ProcessResponseErrorUnlocked(controller_status);
     return;
   }
 
@@ -343,7 +348,7 @@ void Peer::ProcessResponse() {
     Status response_status = StatusFromPB(response_.status().error().status());
     queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), PeerStatus::CANNOT_PREPARE,
                              response_status);
-    ProcessResponseError(response_status);
+    ProcessResponseErrorUnlocked(response_status);
     return;
   }
 
@@ -366,7 +371,7 @@ void Peer::ProcessResponse() {
         ps = PeerStatus::REMOTE_ERROR;
     }
     queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), ps, response_status);
-    ProcessResponseError(response_status);
+    ProcessResponseErrorUnlocked(response_status);
     return;
   }
 
@@ -381,7 +386,6 @@ void Peer::ProcessResponse() {
   Status s = raft_pool_token_->Submit([w_this]() {
     if (auto p = w_this.lock()) {
       p->DoProcessResponse();
-
     }
   });
   if (PREDICT_FALSE(!s.ok())) {
@@ -392,11 +396,11 @@ void Peer::ProcessResponse() {
 }
 
 void Peer::DoProcessResponse() {
-
   VLOG_WITH_PREFIX_UNLOCKED(2) << "Response from peer " << peer_pb().permanent_uuid() << ": "
       << SecureShortDebugString(response_);
 
-  bool send_more_immediately = queue_->ResponseFromPeer(peer_pb_.permanent_uuid(), response_);
+  const auto send_more_immediately =
+      queue_->ResponseFromPeer(peer_pb_.permanent_uuid(), response_);
 
   {
     std::unique_lock<simple_spinlock> lock(peer_lock_);
@@ -404,29 +408,25 @@ void Peer::DoProcessResponse() {
     failed_attempts_ = 0;
     request_pending_ = false;
   }
-  // We're OK to read the state_ without a lock here -- if we get a race,
-  // the worst thing that could happen is that we'll make one more request before
-  // noticing a close.
+
   if (send_more_immediately) {
     SendNextRequest(true);
   }
 }
 
 Status Peer::PrepareTabletCopyRequest() {
-  if (!FLAGS_enable_tablet_copy) {
+  if (PREDICT_FALSE(!FLAGS_enable_tablet_copy)) {
     failed_attempts_++;
     return Status::NotSupported("Tablet Copy is disabled");
   }
 
-  RETURN_NOT_OK(queue_->GetTabletCopyRequestForPeer(peer_pb_.permanent_uuid(), &tc_request_));
-
-  return Status::OK();
+  return queue_->GetTabletCopyRequestForPeer(peer_pb_.permanent_uuid(), &tc_request_);
 }
 
 void Peer::ProcessTabletCopyResponse() {
   // If the peer is already closed return.
   std::unique_lock<simple_spinlock> lock(peer_lock_);
-  if (closed_) {
+  if (PREDICT_FALSE(closed_)) {
     return;
   }
   CHECK(request_pending_);
@@ -453,7 +453,8 @@ void Peer::ProcessTabletCopyResponse() {
   }
 }
 
-void Peer::ProcessResponseError(const Status& status) {
+void Peer::ProcessResponseErrorUnlocked(const Status& status) {
+  DCHECK(peer_lock_.is_locked());
   failed_attempts_++;
   string resp_err_info;
   if (response_.has_error()) {
@@ -487,10 +488,12 @@ string Peer::LogPrefixUnlocked() const {
 }
 
 void Peer::Close() {
-  // If the peer is already closed return.
+  if (closed_) {
+    // Do nothing if the peer is already closed.
+    return;
+  }
   {
     std::lock_guard<simple_spinlock> lock(peer_lock_);
-    if (closed_) return;
     closed_ = true;
   }
   VLOG_WITH_PREFIX_UNLOCKED(1) << "Closing peer: " << peer_pb_.permanent_uuid();

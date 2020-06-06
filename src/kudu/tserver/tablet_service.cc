@@ -649,8 +649,8 @@ class RpcTransactionCompletionCallback : public TransactionCompletionCallback {
  public:
   RpcTransactionCompletionCallback(rpc::RpcContext* context,
                                    Response* response)
- : context_(context),
-   response_(response) {}
+     : context_(context),
+       response_(response) {}
 
   virtual void TransactionCompleted() OVERRIDE {
     if (!status_.ok()) {
@@ -660,10 +660,9 @@ class RpcTransactionCompletionCallback : public TransactionCompletionCallback {
     } else {
       context_->RespondSuccess();
     }
-  };
+  }
 
  private:
-
   TabletServerErrorPB* get_error() {
     return response_->mutable_error();
   }

@@ -303,9 +303,6 @@ class TransactionState {
 
   // The defined consistency mode for this transaction.
   ExternalConsistencyMode external_consistency_mode_;
-
-  // Lock that protects access to transaction state.
-  mutable simple_spinlock txn_state_lock_;
 };
 
 // A parent class for the callback that gets called when transactions

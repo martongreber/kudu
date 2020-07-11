@@ -172,14 +172,16 @@ class RangerClientTest : public KuduTest {
 
 TEST_F(RangerClientTest, TestAuthorizeCreateTableUnauthorized) {
   bool authorized;
-  ASSERT_OK(client_.AuthorizeAction("jdoe", ActionPB::CREATE, "bar", "baz", &authorized));
+  ASSERT_OK(client_.AuthorizeAction("jdoe", ActionPB::CREATE, "bar", "baz",
+                                    /*requires_delegate_admin=*/false, &authorized));
   ASSERT_FALSE(authorized);
 }
 
 TEST_F(RangerClientTest, TestAuthorizeCreateTableAuthorized) {
   Allow("jdoe", ActionPB::CREATE, "foo", "bar");
   bool authorized;
-  ASSERT_OK(client_.AuthorizeAction("jdoe", ActionPB::CREATE, "foo", "bar", &authorized));
+  ASSERT_OK(client_.AuthorizeAction("jdoe", ActionPB::CREATE, "foo", "bar",
+                                    /*requires_delegate_admin=*/false, &authorized));
   ASSERT_TRUE(authorized);
 }
 
@@ -348,6 +350,17 @@ class RangerClientTestBase : public KuduTest {
   Status InitializeRanger() {
     ranger_.reset(new MiniRanger("127.0.0.1"));
     RETURN_NOT_OK(ranger_->Start());
+    // Create a policy so the Ranger client policy refresher can pick something
+    // up. In some environments the absense of policies can cause the plugin to
+    // wait for a policy to appear indefinitely.
+    // See KUDU-3154 and RANGER-2899 for more details.
+    // TODO(awong): remove this when RANGER-2899 is fixed.
+    PolicyItem item({"user"}, {ActionPB::METADATA}, false);
+    AuthorizationPolicy policy;
+    policy.databases.emplace_back("db");
+    policy.tables.emplace_back("table");
+    policy.items.emplace_back(std::move(item));
+    RETURN_NOT_OK(ranger_->AddPolicy(std::move(policy)));
     RETURN_NOT_OK(ranger_->CreateClientConfig(test_dir_));
     client_.reset(new RangerClient(env_, metric_entity_));
     return client_->Start();
@@ -395,7 +408,8 @@ TEST_F(RangerClientTestBase, TestLogging) {
   // Make a request. It doesn't matter whether it succeeds or not -- debug logs
   // should include info about each request.
   bool authorized;
-  ASSERT_OK(client_->AuthorizeAction("user", ActionPB::ALL, "db", "table", &authorized));
+  ASSERT_OK(client_->AuthorizeAction("user", ActionPB::ALL, "db", "table",
+                                     /*requires_delegate_admin=*/false, &authorized));
   ASSERT_FALSE(authorized);
   {
     // Check that the Ranger client logs some DEBUG messages.
@@ -414,7 +428,8 @@ TEST_F(RangerClientTestBase, TestLogging) {
   FLAGS_ranger_overwrite_log_config = false;
   client_.reset(new RangerClient(env_, metric_entity_));
   ASSERT_OK(client_->Start());
-  ASSERT_OK(client_->AuthorizeAction("user", ActionPB::ALL, "db", "table", &authorized));
+  ASSERT_OK(client_->AuthorizeAction("user", ActionPB::ALL, "db", "table",
+                                     /*requires_delegate_admin=*/false, &authorized));
   ASSERT_FALSE(authorized);
   {
     // Our logs should still contain DEBUG messages since we didn't update the
@@ -430,7 +445,8 @@ TEST_F(RangerClientTestBase, TestLogging) {
   FLAGS_ranger_overwrite_log_config = true;
   client_.reset(new RangerClient(env_, metric_entity_));
   ASSERT_OK(client_->Start());
-  ASSERT_OK(client_->AuthorizeAction("user", ActionPB::ALL, "db", "table", &authorized));
+  ASSERT_OK(client_->AuthorizeAction("user", ActionPB::ALL, "db", "table",
+                                     /*requires_delegate_admin=*/false, &authorized));
   ASSERT_FALSE(authorized);
   {
     // We shouldn't see any DEBUG messages since the client is configured to

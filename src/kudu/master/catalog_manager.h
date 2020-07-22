@@ -580,7 +580,6 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   Status Init(bool is_first_run);
 
   void Shutdown();
-  Status CheckOnline() const;
 
   // Create a new Table with the specified attributes.
   //

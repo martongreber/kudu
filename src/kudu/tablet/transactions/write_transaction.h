@@ -246,7 +246,7 @@ class WriteTransactionState : public TransactionState {
   boost::optional<WriteAuthorizationContext> authz_context_;
 
   // The row operations which are decoded from the request during Prepare().
-  // Protected by superclass's txn_state_lock_.
+  // Protected by txn_state_lock_.
   std::vector<RowOp*> row_ops_;
 
   // Array of ProbeStats for each of the operations in 'row_ops_'.
@@ -268,6 +268,9 @@ class WriteTransactionState : public TransactionState {
   // schema change.
   // Protected by superclass's txn_state_lock_.
   const Schema* schema_at_decode_time_;
+
+  // Lock that protects access to various fields of WriteTransactionState.
+  mutable simple_spinlock txn_state_lock_;
 
   DISALLOW_COPY_AND_ASSIGN(WriteTransactionState);
 };

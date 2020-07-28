@@ -62,6 +62,14 @@ DENSE_NODE_ITEST=DenseNodeItest
 BLOCKING_QUEUE_SYMMETRIC_TEST=BlockingQueueSymmetric
 BLOCKING_QUEUE_NON_SYMMETRIC_TEST=BlockingQueueNonSymmetric
 
+GET_TABLE_SCHEMA_RPC=GetTableSchemaTestRpc
+GET_TABLE_SCHEMA_DIRECT_CALL=GetTableSchemaTestDirectCall
+
+GET_TABLE_LOCATIONS_RPC=GetTableLocationsTestRpc
+GET_TABLE_LOCATIONS_DIRECT_CALL=GetTableLocationsTestDirectCall
+
+SAME_TABLET_CONCURRENT_WRITES=SameTabletConcurrentWrites
+
 LOG_DIR_NAME=build/latest/bench-logs
 OUT_DIR_NAME=build/latest/bench-out
 HTML_FILE="benchmarks.html"
@@ -306,6 +314,51 @@ run_benchmarks() {
       --num_non_blocking_writers=1 \
       &> $LOGDIR/${BLOCKING_QUEUE_NON_SYMMETRIC_TEST}$i.log
   done
+
+  # Run ConcurrentGetTableSchemaTest.RPC with and without authz.
+  for i in $(seq 1 $NUM_SAMPLES) ; do
+    KUDU_ALLOW_SLOW_TESTS=true ./build/latest/bin/master-test \
+      --gtest_filter='*/ConcurrentGetTableSchemaTest.Rpc/*' \
+      &> $LOGDIR/${GET_TABLE_SCHEMA_RPC}$i.log
+  done
+
+  # Run ConcurrentGetTableSchemaTest.DirectMethodCall with and without authz.
+  for i in $(seq 1 $NUM_SAMPLES) ; do
+    KUDU_ALLOW_SLOW_TESTS=true ./build/latest/bin/master-test \
+      --gtest_filter='*/ConcurrentGetTableSchemaTest.DirectMethodCall/*' \
+      &> $LOGDIR/${GET_TABLE_SCHEMA_DIRECT_CALL}$i.log
+  done
+
+  # Run GetTableLocationsBenchmark, with and without cache.
+  for capacity_mb in 0 32 do ;
+    for i in $(seq 1 $NUM_SAMPLES) ; do
+      KUDU_ALLOW_SLOW_TESTS=true ./build/latest/bin/table_locations-itest \
+        --gtest_filter=TableLocationsTest.GetTableLocationsBenchmark \
+        --rpc_num_service_threads=8 \
+        --benchmark_num_threads=12 \
+        --table_locations_cache_capacity_mb=$capacity_mb \
+        &> $LOGDIR/${GET_TABLE_LOCATIONS_RPC}_${capacity_mb}_$i.log
+    done
+  done
+
+  # Run GetTableLocationsBenchmarkFunctionCall, with and without cache.
+  for capacity_mb in 0 32 do ;
+    for i in $(seq 1 $NUM_SAMPLES) ; do
+      KUDU_ALLOW_SLOW_TESTS=true ./build/latest/bin/table_locations-itest \
+        --gtest_filter=TableLocationsTest.GetTableLocationsBenchmarkFunctionCall \
+        --benchmark_num_threads=12 \
+        --table_locations_cache_capacity_mb=$capacity_mb \
+        &> $LOGDIR/${GET_TABLE_LOCATIONS_DIRECT_CALL}_${capacity_mb}_$i.log
+    done
+  done
+
+  # Run SameTabletConcurrentWritesTest.InsertsOnly with 16 inserter threads.
+  for i in $(seq 1 $NUM_SAMPLES) ; do
+    KUDU_ALLOW_SLOW_TESTS=true ./build/latest/bin/same_tablet_concurrent_writes-itest \
+      --gtest_filter='SameTabletConcurrentWritesTest.InsertsOnly' \
+      --num_inserter_threads=16 \
+      &> $LOGDIR/${SAME_TABLET_CONCURRENT_WRITES}$i.log
+  done
 }
 
 parse_and_record_all_results() {
@@ -497,6 +550,42 @@ parse_and_record_all_results() {
     record_result $BUILD_IDENTIFIER ${BLOCKING_QUEUE_NON_SYMMETRIC_TEST}_total_call_rate $i $rate
   done
 
+  # Parse out request rate and record the results for ConcurrentGetTableSchemaTest test.
+  for i in $(seq 1 $NUM_SAMPLES); do
+    local log=$LOGDIR/${GET_TABLE_SCHEMA_RPC}$i.log
+    rate=$(grep -o 'GetTableSchema RPC: .* req/sec (authz disabled)' $log | awk '{print $3}')
+    record_result $BUILD_IDENTIFIER ${GET_TABLE_SCHEMA_RPC}_no_authz_req_rate $i $rate
+    rate=$(grep -o 'GetTableSchema RPC: .* req/sec (authz enabled)' $log | awk '{print $3}')
+    record_result $BUILD_IDENTIFIER ${GET_TABLE_SCHEMA_RPC}_authz_req_rate $i $rate
+
+    local log=$LOGDIR/${GET_TABLE_SCHEMA_DIRECT_CALL}$i.log
+    rate=$(grep -o 'GetTableSchema function: .* req/sec (authz disabled)' $log | awk '{print $3}')
+    record_result $BUILD_IDENTIFIER ${GET_TABLE_SCHEMA_DIRECT_CALL}_no_authz_req_rate $i $rate
+    rate=$(grep -o 'GetTableSchema function: .* req/sec (authz enabled)' $log | awk '{print $3}')
+    record_result $BUILD_IDENTIFIER ${GET_TABLE_SCHEMA_DIRECT_CALL}_authz_req_rate $i $rate
+  done
+
+  # Parse out request rate and record the results for GetTableLocationsBenchmark{FunctionCall}.
+  for capacity_mb in 0 32 ; do
+    for i in $(seq 1 $NUM_SAMPLES); do
+      local log=$LOGDIR/${GET_TABLE_LOCATIONS_RPC}_${capacity_mb}_${i}.log
+      rate=$(grep -o 'GetTableLocations RPC: .* req/sec' $log | awk '{print $3}')
+      record_result $BUILD_IDENTIFIER ${GET_TABLE_LOCATIONS_RPC}_${capacity_mb}_req_rate $i $rate
+
+      local log=$LOGDIR/${GET_TABLE_LOCATIONS_DIRECT_CALL}_${capacity_mb}_${i}.log
+      rate=$(grep -o 'GetTableLocations function call: .* req/sec' $log | awk '{print $4}')
+      record_result $BUILD_IDENTIFIER ${GET_TABLE_LOCATIONS_DIRECT_CALL}_${capacity_mb}_req_rate $i $rate
+    done
+  done
+
+  for i in $(seq 1 $NUM_SAMPLES); do
+    local log=$LOGDIR/${SAME_TABLET_CONCURRENT_WRITES}$i.log
+    rate=$(grep -o 'write RPC request rate: .* req/sec' $log | awk '{print $5}')
+    overflows=$(grep -o 'total count of RPC queue overflows: .*' $log | awk '{print $7}')
+    record_result $BUILD_IDENTIFIER ${SAME_TABLET_CONCURRENT_WRITES}_req_rate $i $rate
+    record_result $BUILD_IDENTIFIER ${SAME_TABLET_CONCURRENT_WRITES}_overflows $i $overflows
+  done
+
   popd
   popd
   popd
@@ -576,6 +665,19 @@ load_stats_and_generate_plots() {
   load_and_generate_plot "${DENSE_NODE_ITEST}_num_blocks%" dense-node-bench-blocks
   load_and_generate_plot "${DENSE_NODE_ITEST}_num_threads%" dense-node-bench-threads
   load_and_generate_plot "${DENSE_NODE_ITEST}_num_bytes%" dense-node-bench-bytes
+
+  load_and_generate_plot "${BLOCKING_QUEUE_SYMMETRIC_TEST}%" blocking-queue-symmetric
+  load_and_generate_plot "${BLOCKING_QUEUE_NON_SYMMETRIC_TEST}%" blocking-queue-non-symmetric
+
+  load_and_generate_plot "${GET_TABLE_SCHEMA_RPC}%_req_rate" get-table-schema-rpc
+  load_and_generate_plot "${GET_TABLE_SCHEMA_DIRECT_CALL}_authz_req_rate" get-table-schema-dc-authz
+  load_and_generate_plot "${GET_TABLE_SCHEMA_DIRECT_CALL}_no_authz_req_rate" get-table-schema-dc-no-authz
+
+  load_and_generate_plot "${GET_TABLE_LOCATIONS_RPC}%_req_rate" get-table-locations-rpc
+  load_and_generate_plot "${GET_TABLE_LOCATIONS_DIRECT_CALL}%_req_rate" get-table-locations-dc
+
+  load_and_generate_plot "${SAME_TABLET_CONCURRENT_WRITES}_req_rate" same-tablet-concurrent-writes-rate
+  load_and_generate_plot "${SAME_TABLET_CONCURRENT_WRITES}_overflows" same-tablet-concurrent-writes-overflows
 
   # Generate all the pngs for all the mt-tablet tests
   for i in $(seq 0 $NUM_MT_TABLET_TESTS); do

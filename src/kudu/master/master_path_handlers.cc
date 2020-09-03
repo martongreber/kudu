@@ -590,6 +590,7 @@ void MasterPathHandlers::HandleMasters(const Webserver::WebRequest& /*req*/,
     master_json["start_time"] = StartTimeToString(reg);
     reg.clear_start_time();  // Clear 'start_time' before dumping to string.
     master_json["registration"] = pb_util::SecureShortDebugString(reg);
+    master_json["cluster_id"] =  master.has_cluster_id() ? master.cluster_id() : "";
   }
 }
 
@@ -830,7 +831,7 @@ pair<string, string> MasterPathHandlers::TSDescToLinkPair(const TSDescriptor& de
 }
 
 string MasterPathHandlers::MasterAddrsToCsv() const {
-  if (master_->opts().IsDistributed()) {
+  if (!master_->opts().master_addresses.empty()) {
     vector<string> all_addresses;
     all_addresses.reserve(master_->opts().master_addresses.size());
     for (const HostPort& hp : master_->opts().master_addresses) {

@@ -320,6 +320,9 @@ Status GetMasterEntryForHost(const shared_ptr<rpc::Messenger>& messenger,
   }
   e->mutable_registration()->CopyFrom(resp.registration());
   e->set_role(resp.role());
+  if (resp.has_cluster_id()) {
+    e->set_cluster_id(resp.cluster_id());
+  }
   return Status::OK();
 }
 
@@ -331,6 +334,7 @@ Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
     local_entry.mutable_instance_id()->CopyFrom(catalog_manager_->NodeInstance());
     RETURN_NOT_OK(GetMasterRegistration(local_entry.mutable_registration()));
     local_entry.set_role(RaftPeerPB::LEADER);
+    local_entry.set_cluster_id(cluster_id_);
     masters->emplace_back(std::move(local_entry));
     return Status::OK();
   }
@@ -376,7 +380,7 @@ Status Master::GetMasterHostPorts(vector<HostPort>* hostports) const {
   consensus::RaftConfigPB config = consensus->CommittedConfig();
   for (const auto& peer : *config.mutable_peers()) {
     if (peer.member_type() == consensus::RaftPeerPB::VOTER) {
-      // In non-distributed master configurations, we don't store our own
+      // In non-distributed master configurations, we may not store our own
       // last known address in the Raft config. So, we'll fill it in from
       // the server Registration instead.
       if (!peer.has_last_known_addr()) {

@@ -103,7 +103,6 @@ TAG_FLAG(max_negotiation_threads, advanced);
 DEFINE_int64(rpc_negotiation_timeout_ms, 3000,
              "Timeout for negotiating an RPC connection.");
 TAG_FLAG(rpc_negotiation_timeout_ms, advanced);
-TAG_FLAG(rpc_negotiation_timeout_ms, runtime);
 
 DEFINE_bool(webserver_enabled, true, "Whether to enable the web server on this daemon. "
             "NOTE: disabling the web server is also likely to prevent monitoring systems "
@@ -536,8 +535,13 @@ Status ServerBase::Init() {
   if (FLAGS_rpc_listen_on_unix_domain_socket) {
     VLOG(1) << "Enabling listening on unix domain socket.";
     Sockaddr addr;
+#if !defined(__APPLE__)
     RETURN_NOT_OK_PREPEND(addr.ParseUnixDomainPath(Substitute("@kudu-$0", fs_manager_->uuid())),
                           "unable to parse provided UNIX socket path");
+#else
+    RETURN_NOT_OK_PREPEND(addr.ParseUnixDomainPath(Substitute("/tmp/kudu-$0", fs_manager_->uuid())),
+                          "unable to parse provided UNIX socket path");
+#endif
     RETURN_NOT_OK_PREPEND(rpc_server_->AddBindAddress(addr),
                           "unable to add configured UNIX socket path to list of bind addresses "
                           "for RPC server");

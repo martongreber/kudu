@@ -1071,6 +1071,9 @@ class TxnStatusTabletManagementTest : public TsTabletManagerITest {
     RETURN_NOT_OK(admin_proxy->CreateTablet(req, &resp, &rpc));
     scoped_refptr<TabletReplica> r;
     CHECK(ts->server()->tablet_manager()->LookupTablet(tablet_id, &r));
+
+    // Wait for the tablet to be in RUNNING state and its consensus running too.
+    RETURN_NOT_OK(r->WaitUntilConsensusRunning(kTimeout));
     return r->consensus()->WaitUntilLeaderForTests(kTimeout);
   }
 
@@ -1204,6 +1207,7 @@ TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCalls) {
     CoordinatorOpPB::REGISTER_PARTICIPANT,
     CoordinatorOpPB::BEGIN_COMMIT_TXN,
     CoordinatorOpPB::ABORT_TXN,
+    CoordinatorOpPB::GET_TXN_STATUS,
   };
   // Perform the series of ops for the given transaction ID as the given user,
   // erroring out if an unexpected result is received. If 'user' is empty, use
@@ -1230,7 +1234,8 @@ TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCalls) {
       SCOPED_TRACE(SecureDebugString(resp));
       if (expect_success) {
         ASSERT_FALSE(resp.has_error());
-        ASSERT_FALSE(resp.has_op_result());
+        ASSERT_EQ(op_type == CoordinatorOpPB::GET_TXN_STATUS,
+                  resp.has_op_result());
       } else {
         ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
         ASSERT_STR_CONTAINS(s.ToString(), "Not authorized");

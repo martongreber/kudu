@@ -658,7 +658,7 @@ void MasterServiceImpl::GetMasterRegistration(const GetMasterRegistrationRequest
   const auto& role_and_member = server_->catalog_manager()->GetRoleAndMemberType();
   resp->set_role(role_and_member.first);
   resp->set_member_type(role_and_member.second);
-  resp->set_cluster_id(server_->cluster_id());
+  resp->set_cluster_id(server_->catalog_manager()->GetClusterId());
   rpc->RespondSuccess();
 }
 
@@ -752,6 +752,10 @@ void MasterServiceImpl::ConnectToMaster(const ConnectToMasterRequestPB* /*req*/,
   // until we have taken over all the associated responsibilities.
   resp->set_role(is_leader ? consensus::RaftPeerPB::LEADER
                            : consensus::RaftPeerPB::FOLLOWER);
+
+  // Add the cluster ID.
+  resp->set_cluster_id(server_->catalog_manager()->GetClusterId());
+
   rpc->RespondSuccess();
 }
 

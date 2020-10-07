@@ -25,6 +25,7 @@
 #include <mutex>
 #include <ostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <glog/logging.h>
@@ -54,6 +55,7 @@
 #include "kudu/util/status.h"
 
 namespace kudu {
+
 class AlterTableTest;
 class ConstContiguousRow;
 class EncodedKey;
@@ -65,6 +67,10 @@ class Throttler;
 class Timestamp;
 struct IterWithBounds;
 struct IteratorStats;
+
+namespace consensus {
+class OpId;
+}  // namespace consensus
 
 namespace clock {
 class Clock;
@@ -80,6 +86,7 @@ class AlterSchemaOpState;
 class CompactionPolicy;
 class HistoryGcOpts;
 class MemRowSet;
+class ParticipantOpState;
 class RowSetTree;
 class RowSetsInCompaction;
 class WriteOpState;
@@ -110,9 +117,9 @@ class Tablet {
 
   ~Tablet();
 
-  // Open the tablet.
+  // Open the tablet, initializing transactions for 'in_flight_txn_ids'.
   // Upon completion, the tablet enters the kBootstrapping state.
-  Status Open();
+  Status Open(const std::unordered_set<int64_t>& in_flight_txn_ids = std::unordered_set<int64_t>{});
 
   // Mark that the tablet has finished bootstrapping.
   // This transitions from kBootstrapping to kOpen state.
@@ -151,6 +158,7 @@ class Tablet {
   // TODO(todd): rename this to something like "FinishPrepare" or "StartApply", since
   // it's not the first thing in an op!
   void StartOp(WriteOpState* op_state);
+  void StartOp(ParticipantOpState* op_state);
 
   // Like the above but actually assigns the timestamp. Only used for tests that
   // don't boot a tablet server.
@@ -158,6 +166,7 @@ class Tablet {
 
   // Signal that the given op is about to Apply.
   void StartApplying(WriteOpState* op_state);
+  void StartApplying(ParticipantOpState* op_state);
 
   // Apply all of the row operations associated with this op.
   Status ApplyRowOperations(WriteOpState* op_state) WARN_UNUSED_RESULT;
@@ -168,6 +177,21 @@ class Tablet {
                            WriteOpState* op_state,
                            RowOp* row_op,
                            ProbeStats* stats) WARN_UNUSED_RESULT;
+
+  // Begins the transaction, recording its presence in the tablet metadata.
+  // Upon calling this, 'op_id' will be anchored until the metadata is flushed,
+  // using 'txn' as the anchor owner.
+  void BeginTransaction(Txn* txn, const consensus::OpId& op_id);
+
+  // Commits the transaction, recording its commit timestamp in the tablet metadata.
+  // Upon calling this, 'op_id' will be anchored until the metadata is flushed,
+  // using 'txn' as the anchor owner.
+  void CommitTransaction(Txn* txn, Timestamp commit_ts, const consensus::OpId& op_id);
+
+  // Aborts the transaction, recording the abort in the tablet metadata.
+  // Upon calling this, 'op_id' will be anchored until the metadata is flushed,
+  // using 'txn' as the anchor owner.
+  void AbortTransaction(Txn* txn, const consensus::OpId& op_id);
 
   // Create a new row iterator which yields the rows as of the current MVCC
   // state of this tablet.
@@ -727,10 +751,6 @@ class Tablet {
   scoped_refptr<log::LogAnchorRegistry> log_anchor_registry_;
   TabletMemTrackers mem_trackers_;
 
-  // Maintains the set of in-flight transactions, and any WAL anchors
-  // associated with them.
-  TxnParticipant txn_participant_;
-
   scoped_refptr<MetricEntity> metric_entity_;
   std::unique_ptr<TabletMetrics> metrics_;
 
@@ -742,6 +762,13 @@ class Tablet {
   clock::Clock* clock_;
 
   MvccManager mvcc_;
+
+  // Maintains the set of in-flight transactions, and any WAL anchors
+  // associated with them.
+  // NOTE: the participant may retain MVCC ops, so define it after the
+  // MvccManager, to ensure those ops get destructed before the MvccManager.
+  TxnParticipant txn_participant_;
+
   LockManager lock_manager_;
 
   std::unique_ptr<CompactionPolicy> compaction_policy_;

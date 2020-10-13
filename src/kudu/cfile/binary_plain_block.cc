@@ -19,16 +19,20 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <ostream>
+#include <vector>
 
 #include <glog/logging.h>
 
+#include "kudu/cfile/block_handle.h"
 #include "kudu/cfile/cfile_util.h"
 #include "kudu/common/column_materialization_context.h"
 #include "kudu/common/column_predicate.h"
 #include "kudu/common/columnblock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
 #include "kudu/gutil/stringprintf.h"
@@ -37,7 +41,8 @@
 #include "kudu/util/coding-inl.h"
 #include "kudu/util/group_varint-inl.h"
 #include "kudu/util/hexdump.h"
-#include "kudu/util/memory/arena.h"
+
+using std::vector;
 
 namespace kudu {
 namespace cfile {
@@ -48,15 +53,16 @@ BinaryPlainBlockBuilder::BinaryPlainBlockBuilder(const WriterOptions *options)
     options_(options) {
   Reset();
 }
+BinaryPlainBlockBuilder::~BinaryPlainBlockBuilder() = default;
 
 void BinaryPlainBlockBuilder::Reset() {
   offsets_.clear();
   buffer_.clear();
-  buffer_.resize(kMaxHeaderSize);
   buffer_.reserve(options_->storage_attributes.cfile_block_size);
+  buffer_.resize(kHeaderSize);
 
-  size_estimate_ = kMaxHeaderSize;
-  end_of_data_offset_ = kMaxHeaderSize;
+  size_estimate_ = kHeaderSize;
+  end_of_data_offset_ = kHeaderSize;
   finished_ = false;
 }
 
@@ -64,7 +70,7 @@ bool BinaryPlainBlockBuilder::IsBlockFull() const {
   return size_estimate_ > options_->storage_attributes.cfile_block_size;
 }
 
-Slice BinaryPlainBlockBuilder::Finish(rowid_t ordinal_pos) {
+void BinaryPlainBlockBuilder::Finish(rowid_t ordinal_pos, vector<Slice>* slices) {
   finished_ = true;
 
   size_t offsets_pos = buffer_.size();
@@ -79,7 +85,7 @@ Slice BinaryPlainBlockBuilder::Finish(rowid_t ordinal_pos) {
     coding::AppendGroupVarInt32Sequence(&buffer_, 0, &offsets_[0], offsets_.size());
   }
 
-  return Slice(buffer_);
+  *slices = { Slice(buffer_) };
 }
 
 int BinaryPlainBlockBuilder::Add(const uint8_t *vals, size_t count) {
@@ -131,8 +137,8 @@ Status BinaryPlainBlockBuilder::GetKeyAtIdx(void *key_void, int idx) const {
   }
 
   if (PREDICT_FALSE(offsets_.size() == 1)) {
-    *slice = Slice(&buffer_[kMaxHeaderSize],
-                   end_of_data_offset_ - kMaxHeaderSize);
+    *slice = Slice(&buffer_[kHeaderSize],
+                   end_of_data_offset_ - kHeaderSize);
   } else if (idx + 1 == offsets_.size()) {
     *slice = Slice(&buffer_[offsets_[idx]],
                    end_of_data_offset_ - offsets_[idx]);
@@ -157,13 +163,15 @@ Status BinaryPlainBlockBuilder::GetLastKey(void *key_void) const {
 // Decoding
 ////////////////////////////////////////////////////////////
 
-BinaryPlainBlockDecoder::BinaryPlainBlockDecoder(Slice slice)
-    : data_(slice),
+BinaryPlainBlockDecoder::BinaryPlainBlockDecoder(scoped_refptr<BlockHandle> block)
+    : block_(std::move(block)),
+      data_(block_->data()),
       parsed_(false),
       num_elems_(0),
       ordinal_pos_base_(0),
       cur_idx_(0) {
 }
+BinaryPlainBlockDecoder::~BinaryPlainBlockDecoder() = default;
 
 Status BinaryPlainBlockDecoder::ParseHeader() {
   CHECK(!parsed_);
@@ -198,12 +206,17 @@ Status BinaryPlainBlockDecoder::ParseHeader() {
   size_t rem = num_elems_;
   while (rem >= 4) {
     if (PREDICT_TRUE(p + 16 < limit)) {
+      #ifndef __aarch64__
       p = coding::DecodeGroupVarInt32_SSE(
           p, &dst_ptr[0], &dst_ptr[1], &dst_ptr[2], &dst_ptr[3]);
-
+      #else
+      p = coding::DecodeGroupVarInt32_SlowButSafe(
+          p, &dst_ptr[0], &dst_ptr[1], &dst_ptr[2], &dst_ptr[3]);
+      #endif //__aarch64__
       // The above function should add at most 17 (4 32-bit ints plus a selector byte) to
       // 'p'. Thus, since we checked that (p + 16 < limit) above, we are guaranteed that
       // (p <= limit) now.
+
       DCHECK_LE(p, limit);
     } else {
       p = coding::DecodeGroupVarInt32_SlowButSafe(
@@ -289,7 +302,6 @@ Status BinaryPlainBlockDecoder::HandleBatch(size_t* n, ColumnDataView* dst, Cell
   CHECK_EQ(dst->type_info()->physical_type(), BINARY);
   DCHECK_LE(*n, dst->nrows());
   DCHECK_EQ(dst->stride(), sizeof(Slice));
-  Arena *out_arena = dst->arena();
   if (PREDICT_FALSE(*n == 0 || cur_idx_ >= num_elems_)) {
     *n = 0;
     return Status::OK();
@@ -299,15 +311,16 @@ Status BinaryPlainBlockDecoder::HandleBatch(size_t* n, ColumnDataView* dst, Cell
   Slice *out = reinterpret_cast<Slice*>(dst->data());
   for (size_t i = 0; i < max_fetch; i++, out++, cur_idx_++) {
     Slice elem(string_at_index(cur_idx_));
-    c(i, elem, out, out_arena);
+    c(i, elem, out);
   }
   *n = max_fetch;
   return Status::OK();
 }
 
 Status BinaryPlainBlockDecoder::CopyNextValues(size_t* n, ColumnDataView* dst) {
-  return HandleBatch(n, dst, [&](size_t i, Slice elem, Slice* out, Arena* out_arena) {
-    CHECK(out_arena->RelocateSlice(elem, out));
+  dst->memory()->RetainReference(block_);
+  return HandleBatch(n, dst, [&](size_t /*i*/, Slice elem, Slice* out) {
+                               *out = elem;
   });
 }
 
@@ -315,16 +328,23 @@ Status BinaryPlainBlockDecoder::CopyNextAndEval(size_t* n,
                                                 ColumnMaterializationContext* ctx,
                                                 SelectionVectorView* sel,
                                                 ColumnDataView* dst) {
+  bool retain_block = false;
   ctx->SetDecoderEvalSupported();
-  return HandleBatch(n, dst, [&](size_t i, Slice elem, Slice* out, Arena* out_arena) {
+  Status s = HandleBatch(n, dst, [&](size_t i, Slice elem, Slice* out) {
     if (!sel->TestBit(i)) {
       return;
-    } else if (ctx->pred()->EvaluateCell<BINARY>(static_cast<const void*>(&elem))) {
-      CHECK(out_arena->RelocateSlice(elem, out));
+    }
+    if (ctx->pred()->EvaluateCell<BINARY>(static_cast<const void*>(&elem))) {
+      *out = elem;
+      retain_block = true;
     } else {
       sel->ClearBit(i);
     }
   });
+  if (PREDICT_TRUE(s.ok() && retain_block)) {
+    dst->memory()->RetainReference(block_);
+  }
+  return s;
 }
 
 

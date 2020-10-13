@@ -55,6 +55,7 @@
 #include "kudu/tablet/tablet_bootstrap.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
+#include "kudu/transactions/txn_status_manager.h"
 #include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/util/debug/trace_event.h"
@@ -220,6 +221,7 @@ using kudu::tablet::TABLET_DATA_TOMBSTONED;
 using kudu::tablet::TabletDataState;
 using kudu::tablet::TabletMetadata;
 using kudu::tablet::TabletReplica;
+using kudu::transactions::TxnStatusManagerFactory;
 using kudu::tserver::TabletCopyClient;
 using std::make_shared;
 using std::set;
@@ -451,6 +453,7 @@ Status TSTabletManager::CreateNewTablet(const string& table_id,
                                         RaftConfigPB config,
                                         boost::optional<TableExtraConfigPB> extra_config,
                                         boost::optional<string> dimension_label,
+                                        boost::optional<TableTypePB> table_type,
                                         scoped_refptr<TabletReplica>* replica) {
   CHECK_EQ(state(), MANAGER_RUNNING);
   CHECK(IsRaftConfigMember(server_->instance_pb().permanent_uuid(), config));
@@ -491,6 +494,7 @@ Status TSTabletManager::CreateNewTablet(const string& table_id,
                               /*supports_live_row_count=*/ true,
                               std::move(extra_config),
                               std::move(dimension_label),
+                              std::move(table_type),
                               &meta),
     "Couldn't create tablet metadata");
 
@@ -626,8 +630,7 @@ void TSTabletManager::RunTabletCopy(
   // Copy these strings so they stay valid even after responding to the request.
   string tablet_id = req->tablet_id(); // NOLINT(*)
   string copy_source_uuid = req->copy_peer_uuid(); // NOLINT(*)
-  HostPort copy_source_addr;
-  CALLBACK_RETURN_NOT_OK(HostPortFromPB(req->copy_peer_addr(), &copy_source_addr));
+  HostPort copy_source_addr = HostPortFromPB(req->copy_peer_addr());
   int64_t leader_term = req->caller_term();
 
   scoped_refptr<TabletReplica> old_replica;
@@ -827,12 +830,17 @@ Status TSTabletManager::CreateAndRegisterTabletReplica(
     scoped_refptr<TabletMetadata> meta,
     RegisterTabletReplicaMode mode,
     scoped_refptr<TabletReplica>* replica_out) {
+  // TODO(awong): this factory will at some point contain some tserver-wide
+  // state like a system client that can make calls to leader tablets. For now,
+  // just use a simple local factory.
+  TxnStatusManagerFactory tsm_factory;
   const auto& tablet_id = meta->tablet_id();
   scoped_refptr<TabletReplica> replica(
       new TabletReplica(std::move(meta),
                         cmeta_manager_,
                         local_peer_pb_,
                         server_->tablet_apply_pool(),
+                        &tsm_factory,
                         [this, tablet_id](const string& reason) {
                           this->MarkTabletDirty(tablet_id, reason);
                         }));
@@ -1115,7 +1123,7 @@ void TSTabletManager::OpenTablet(const scoped_refptr<TabletReplica>& replica,
   consensus::ConsensusBootstrapInfo bootstrap_info;
   LOG_TIMING_PREFIX(INFO, LogPrefix(tablet_id), "bootstrapping tablet") {
     // Disable tracing for the bootstrap, since this would result in
-    // potentially millions of transaction traces being attached to the
+    // potentially millions of op traces being attached to the
     // TabletCopy trace.
     ADOPT_TRACE(nullptr);
 
@@ -1336,7 +1344,7 @@ void TSTabletManager::InitLocalRaftPeerPB() {
   Sockaddr addr = server_->first_rpc_address();
   HostPort hp;
   CHECK_OK(HostPortFromSockaddrReplaceWildcard(addr, &hp));
-  CHECK_OK(HostPortToPB(hp, local_peer_pb_.mutable_last_known_addr()));
+  *local_peer_pb_.mutable_last_known_addr() = HostPortToPB(hp);
 }
 
 void TSTabletManager::CreateReportedTabletPB(const scoped_refptr<TabletReplica>& replica,

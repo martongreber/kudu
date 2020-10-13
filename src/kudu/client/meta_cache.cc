@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/repeated_field.h> // IWYU pragma: keep
 
@@ -47,12 +48,15 @@
 #include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/scoped_cleanup.h"
 
 using kudu::consensus::RaftPeerPB;
 using kudu::master::ANY_REPLICA;
@@ -63,6 +67,7 @@ using kudu::master::TabletLocationsPB;
 using kudu::master::TSInfoPB;
 using kudu::rpc::BackoffType;
 using kudu::rpc::CredentialsPolicy;
+using kudu::tserver::TabletServerAdminServiceProxy;
 using kudu::tserver::TabletServerServiceProxy;
 using std::set;
 using std::shared_ptr;
@@ -70,6 +75,16 @@ using std::string;
 using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
+
+// TODO(todd) before enabling by default, need to think about how this works with
+// docker/k8s -- I think the abstract namespace is scoped to a given k8s pod. We
+// probably need to have the client blacklist the socket if it attempts to use it
+// and can't connect.
+DEFINE_bool(client_use_unix_domain_sockets, false,
+            "Whether to try to connect to tablet servers using unix domain sockets. "
+            "This will only be attempted if the server has indicated that it is listening "
+            "on such a socket and the client is running on the same host.");
+TAG_FLAG(client_use_unix_domain_sockets, experimental);
 
 namespace kudu {
 namespace client {
@@ -85,8 +100,7 @@ void RemoteTabletServer::DnsResolutionFinished(const HostPort& hp,
                                                KuduClient* client,
                                                const StatusCallback& user_callback,
                                                const Status &result_status) {
-  unique_ptr<vector<Sockaddr>> scoped_addrs(addrs);
-
+  SCOPED_CLEANUP({ delete addrs; });
   Status s = result_status;
 
   if (s.ok() && addrs->empty()) {
@@ -105,6 +119,8 @@ void RemoteTabletServer::DnsResolutionFinished(const HostPort& hp,
   {
     std::lock_guard<simple_spinlock> l(lock_);
     proxy_.reset(new TabletServerServiceProxy(client->data_->messenger_, (*addrs)[0], hp.host()));
+    admin_proxy_.reset(
+        new TabletServerAdminServiceProxy(client->data_->messenger_, (*addrs)[0], hp.host()));
     proxy_->set_user_credentials(client->data_->user_credentials_);
   }
   user_callback(s);
@@ -129,6 +145,25 @@ void RemoteTabletServer::InitProxy(KuduClient* client, const StatusCallback& cb)
   }
 
   auto addrs = new vector<Sockaddr>();
+
+  if (FLAGS_client_use_unix_domain_sockets && unix_domain_socket_path_ &&
+      client->data_->IsLocalHostPort(hp)) {
+    Sockaddr unix_socket;
+    Status parse_status = unix_socket.ParseUnixDomainPath(*unix_domain_socket_path_);
+    if (!parse_status.ok()) {
+      KLOG_EVERY_N_SECS(WARNING, 60)
+          << Substitute("Tablet server $0 ($1) reported an invalid UNIX domain socket path '$2'",
+                        hp.ToString(), uuid_, *unix_domain_socket_path_);
+      // Fall through to normal TCP path.
+    } else {
+      VLOG(1) << Substitute("Will try to connect to UNIX socket $0 for local tablet server $1 ($2)",
+                            unix_socket.ToString(), hp.ToString(), uuid_);
+      addrs->emplace_back(unix_socket);
+      this->DnsResolutionFinished(hp, addrs, client, cb, Status::OK());
+      return;
+    }
+  }
+
   client->data_->dns_resolver_->ResolveAddressesAsync(
       hp, addrs, [=](const Status& s) {
         this->DnsResolutionFinished(hp, addrs, client, cb, s);
@@ -145,6 +180,11 @@ void RemoteTabletServer::Update(const master::TSInfoPB& pb) {
     rpc_hostports_.emplace_back(hostport_pb.host(), hostport_pb.port());
   }
   location_ = pb.location();
+  if (pb.has_unix_domain_socket_path()) {
+    unix_domain_socket_path_ = pb.unix_domain_socket_path();
+  } else {
+    unix_domain_socket_path_ = boost::none;
+  }
 }
 
 const string& RemoteTabletServer::permanent_uuid() const {
@@ -160,6 +200,12 @@ shared_ptr<TabletServerServiceProxy> RemoteTabletServer::proxy() const {
   std::lock_guard<simple_spinlock> l(lock_);
   CHECK(proxy_);
   return proxy_;
+}
+
+shared_ptr<TabletServerAdminServiceProxy> RemoteTabletServer::admin_proxy() {
+  std::lock_guard<simple_spinlock> l(lock_);
+  DCHECK(admin_proxy_);
+  return admin_proxy_;
 }
 
 string RemoteTabletServer::ToString() const {
@@ -770,26 +816,39 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
   VLOG(2) << "Processing master response for " << rpc.ToString()
           << ". Response: " << pb_util::SecureShortDebugString(rpc.resp());
 
-  MonoTime expiration_time = MonoTime::Now() +
-      MonoDelta::FromMilliseconds(rpc.resp().ttl_millis());
-
-  std::lock_guard<percpu_rwlock> l(lock_);
-  TabletMap& tablets_by_key = LookupOrInsert(&tablets_by_table_and_key_,
-                                             rpc.table_id(), TabletMap());
-
-  const auto& tablet_locations = rpc.resp().tablet_locations();
-
-  if (tablet_locations.empty()) {
+  if (rpc.resp().tablet_locations().empty()) {
     // If there are no tablets in the response, then the table is empty. If
     // there were any tablets in the table they would have been returned, since
     // the master guarantees that if the partition key falls in a non-covered
     // range, the previous tablet will be returned, and we did not set an upper
     // bound partition key on the request.
     DCHECK(!rpc.req().has_partition_key_end());
+  }
 
+  return ProcessGetTableLocationsResponse(rpc.table(), rpc.partition_key(), rpc.is_exact_lookup(),
+      rpc.resp(), cache_entry, max_returned_locations);
+
+}
+
+Status MetaCache::ProcessGetTableLocationsResponse(const KuduTable* table,
+                                                   const string& partition_key,
+                                                   bool is_exact_lookup,
+                                                   const GetTableLocationsResponsePB& resp,
+                                                   MetaCacheEntry* cache_entry,
+                                                   int max_returned_locations) {
+  MonoTime expiration_time = MonoTime::Now() +
+      MonoDelta::FromMilliseconds(resp.ttl_millis());
+
+  std::lock_guard<percpu_rwlock> l(lock_);
+  TabletMap& tablets_by_key = LookupOrInsert(&tablets_by_table_and_key_,
+                                             table->id(), TabletMap());
+
+  const auto& tablet_locations = resp.tablet_locations();
+
+  if (tablet_locations.empty()) {
     tablets_by_key.clear();
     MetaCacheEntry entry(expiration_time, "", "");
-    VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
+    VLOG(3) << "Caching '" << table->name() << "' entry " << entry.DebugString(table);
     InsertOrDie(&tablets_by_key, "", entry);
   } else {
     // First, update the tserver cache, needed for the Refresh calls below.
@@ -801,7 +860,7 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
     }
     // In the case of "interned" replicas, the above 'deprecated_replicas' lists will be empty
     // and instead we'll need to update from the top-level list of tservers.
-    const auto& ts_infos = rpc.resp().ts_infos();
+    const auto& ts_infos = resp.ts_infos();
     for (const TSInfoPB& ts_info : ts_infos) {
       UpdateTabletServer(ts_info);
     }
@@ -822,14 +881,14 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
     // in A.
 
     const auto& first_lower_bound = tablet_locations.Get(0).partition().partition_key_start();
-    if (rpc.partition_key() < first_lower_bound) {
+    if (partition_key < first_lower_bound) {
       // If the first tablet is past the requested partition key, then the
       // partition key falls in an initial non-covered range, such as A.
 
       // Clear any existing entries which overlap with the discovered non-covered range.
       tablets_by_key.erase(tablets_by_key.begin(), tablets_by_key.lower_bound(first_lower_bound));
       MetaCacheEntry entry(expiration_time, "", first_lower_bound);
-      VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
+      VLOG(3) << "Caching '" << table->name() << "' entry " << entry.DebugString(table);
       InsertOrDie(&tablets_by_key, "", entry);
     }
 
@@ -849,7 +908,7 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
                              tablets_by_key.lower_bound(tablet_lower_bound));
 
         MetaCacheEntry entry(expiration_time, last_upper_bound, tablet_lower_bound);
-        VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
+        VLOG(3) << "Caching '" << table->name() << "' entry " << entry.DebugString(table);
         InsertOrDie(&tablets_by_key, last_upper_bound, entry);
       }
       last_upper_bound = tablet_upper_bound;
@@ -892,7 +951,7 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
                                        tablet_id));
 
       MetaCacheEntry entry(expiration_time, remote);
-      VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
+      VLOG(3) << "Caching '" << table->name() << "' entry " << entry.DebugString(table);
 
       InsertOrDie(&tablets_by_id_, tablet_id, remote);
       InsertOrDie(&tablets_by_key, tablet_lower_bound, entry);
@@ -907,14 +966,14 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
                            tablets_by_key.end());
 
       MetaCacheEntry entry(expiration_time, last_upper_bound, "");
-      VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
+      VLOG(3) << "Caching '" << table->name() << "' entry " << entry.DebugString(table);
       InsertOrDie(&tablets_by_key, last_upper_bound, entry);
     }
   }
 
   // Finally, lookup the discovered entry and return it to the requestor.
-  *cache_entry = FindFloorOrDie(tablets_by_key, rpc.partition_key());
-  if (!rpc.is_exact_lookup() && cache_entry->is_non_covered_range() &&
+  *cache_entry = FindFloorOrDie(tablets_by_key, partition_key);
+  if (!is_exact_lookup && cache_entry->is_non_covered_range() &&
       !cache_entry->upper_bound_partition_key().empty()) {
     *cache_entry = FindFloorOrDie(tablets_by_key, cache_entry->upper_bound_partition_key());
     DCHECK(!cache_entry->is_non_covered_range());

@@ -26,8 +26,10 @@
 #include <glog/logging.h>
 
 #include "kudu/cfile/block_encodings.h"
+#include "kudu/cfile/block_handle.h"
 #include "kudu/common/rowid.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
@@ -51,12 +53,7 @@ class BinaryPrefixBlockBuilder final : public BlockBuilder {
 
   int Add(const uint8_t *vals, size_t count) OVERRIDE;
 
-  // Return a Slice which represents the encoded data.
-  //
-  // This Slice points to internal data of this class
-  // and becomes invalid after the builder is destroyed
-  // or after Finish() is called again.
-  Slice Finish(rowid_t ordinal_pos) OVERRIDE;
+  void Finish(rowid_t ordinal_pos, std::vector<Slice>* slices) override;
 
   void Reset() OVERRIDE;
 
@@ -71,6 +68,7 @@ class BinaryPrefixBlockBuilder final : public BlockBuilder {
   Status GetLastKey(void *key) const OVERRIDE;
 
  private:
+  faststring header_buf_;
   faststring buffer_;
   faststring last_val_;
 
@@ -82,19 +80,12 @@ class BinaryPrefixBlockBuilder final : public BlockBuilder {
   bool finished_;
 
   const WriterOptions *options_;
-
-  // Maximum length of a header.
-  // We leave this much space at the start of the buffer before
-  // accumulating any data, so we can later fill in the variable-length
-  // header.
-  // Currently four varints, so maximum is 20 bytes
-  static const size_t kHeaderReservedLength = 20;
 };
 
 // Decoder for BINARY type, PREFIX encoding
 class BinaryPrefixBlockDecoder final : public BlockDecoder {
  public:
-  explicit BinaryPrefixBlockDecoder(Slice slice);
+  explicit BinaryPrefixBlockDecoder(scoped_refptr<BlockHandle> block);
 
   virtual Status ParseHeader() OVERRIDE;
   virtual void SeekToPositionInBlock(uint pos) OVERRIDE;
@@ -141,6 +132,7 @@ class BinaryPrefixBlockDecoder final : public BlockDecoder {
 
   void SeekToStart();
 
+  scoped_refptr<BlockHandle> block_;
   Slice data_;
 
   bool parsed_;

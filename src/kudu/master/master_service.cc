@@ -55,6 +55,7 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/scoped_cleanup.h"
@@ -95,7 +96,12 @@ DEFINE_bool(master_support_authz_tokens, true,
             "testing version compatibility in the client.");
 TAG_FLAG(master_support_authz_tokens, hidden);
 
-using boost::make_optional;
+DEFINE_bool(master_support_change_config, false,
+            "Whether the master supports adding/removing master servers dynamically.");
+TAG_FLAG(master_support_change_config, hidden);
+TAG_FLAG(master_support_change_config, unsafe);
+
+
 using google::protobuf::Message;
 using kudu::consensus::ReplicaManagementInfoPB;
 using kudu::pb_util::SecureDebugString;
@@ -228,6 +234,36 @@ void MasterServiceImpl::ChangeTServerState(const ChangeTServerStateRequestPB* re
     return;
   }
   rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::AddMaster(const AddMasterRequestPB* req,
+                                  AddMasterResponsePB* resp,
+                                  rpc::RpcContext* rpc) {
+  if (!FLAGS_master_support_change_config) {
+    rpc->RespondFailure(Status::NotSupported("Adding master is not supported"));
+    return;
+  }
+
+  if (!req->has_rpc_addr()) {
+    rpc->RespondFailure(Status::InvalidArgument("RPC address of master to be added not supplied"));
+    return;
+  }
+
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+
+  Status s = server_->AddMaster(HostPortFromPB(req->rpc_addr()), rpc);
+  if (!s.ok()) {
+    LOG(ERROR) << Substitute("Failed adding master $0:$1. $2", req->rpc_addr().host(),
+                             req->rpc_addr().port(), s.ToString());
+    rpc->RespondFailure(s);
+    return;
+  }
+  // ChangeConfig request successfully submitted. Once the ChangeConfig request is complete
+  // the completion callback will respond back with the result to the RPC client.
+  // See completion_cb in CatalogManager::InitiateMasterChangeConfig().
 }
 
 void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
@@ -387,7 +423,7 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
   }
 
-  CatalogManager::TSInfosDict infos_dict;
+  CatalogManager::TSInfosDict infos_dict(resp->GetArena());
   for (const string& tablet_id : req->tablet_ids()) {
     // TODO(todd): once we have catalog data. ACL checks would also go here, probably.
     TabletLocationsPB* locs_pb = resp->add_tablet_locations();
@@ -395,7 +431,7 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
         tablet_id, req->replica_type_filter(),
         locs_pb,
         req->intern_ts_infos_in_response() ? &infos_dict : nullptr,
-        make_optional<const string&>(rpc->remote_user().username()));
+        rpc->remote_user().username());
     if (!s.ok()) {
       resp->mutable_tablet_locations()->RemoveLast();
 
@@ -404,8 +440,9 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
       StatusToPB(s, err->mutable_status());
     }
   }
-  for (auto& pb : infos_dict.ts_info_pbs) {
-    resp->mutable_ts_infos()->AddAllocated(pb.release());
+  for (auto* pb : infos_dict.ts_info_pbs()) {
+    DCHECK_EQ(pb->GetArena(), resp->GetArena());
+    resp->mutable_ts_infos()->AddAllocated(pb);
   }
 
   rpc->RespondSuccess();
@@ -432,8 +469,8 @@ void MasterServiceImpl::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->IsCreateTableDone(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+  auto s = server_->catalog_manager()->IsCreateTableDone(
+      req, resp, rpc->remote_user().username());
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -472,8 +509,8 @@ void MasterServiceImpl::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->IsAlterTableDone(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+  auto s = server_->catalog_manager()->IsAlterTableDone(
+      req, resp, rpc->remote_user().username());
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -486,8 +523,8 @@ void MasterServiceImpl::ListTables(const ListTablesRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->ListTables(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+  auto s = server_->catalog_manager()->ListTables(
+      req, resp, rpc->remote_user().username());
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -500,7 +537,7 @@ void MasterServiceImpl::GetTableStatistics(const GetTableStatisticsRequestPB* re
     return;
   }
   Status s = server_->catalog_manager()->GetTableStatistics(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
+      req, resp, rpc->remote_user().username());
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -511,16 +548,20 @@ void MasterServiceImpl::GetTableLocations(const GetTableLocationsRequestPB* req,
   TRACE_EVENT1("master", "GetTableLocations",
                "requestor", rpc->requestor_string());
 
-  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
-  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
-    return;
+  Status s;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+    if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+      return;
+    }
+
+    if (PREDICT_FALSE(FLAGS_master_inject_latency_on_tablet_lookups_ms > 0)) {
+      SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
+    }
+    s = server_->catalog_manager()->GetTableLocations(
+        req, resp, rpc->remote_user().username());
   }
 
-  if (PREDICT_FALSE(FLAGS_master_inject_latency_on_tablet_lookups_ms > 0)) {
-    SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
-  }
-  Status s = server_->catalog_manager()->GetTableLocations(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()));
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -528,20 +569,19 @@ void MasterServiceImpl::GetTableLocations(const GetTableLocationsRequestPB* req,
 void MasterServiceImpl::GetTableSchema(const GetTableSchemaRequestPB* req,
                                        GetTableSchemaResponsePB* resp,
                                        rpc::RpcContext* rpc) {
-  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
-  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
-    return;
+  Status s;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+    if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+      return;
+    }
+
+    s = server_->catalog_manager()->GetTableSchema(
+        req, resp, rpc->remote_user().username(),
+        FLAGS_master_support_authz_tokens ? server_->token_signer() : nullptr);
   }
 
-  Status s = server_->catalog_manager()->GetTableSchema(
-      req, resp, make_optional<const string&>(rpc->remote_user().username()),
-      FLAGS_master_support_authz_tokens ? server_->token_signer() : nullptr);
   CheckRespErrorOrSetUnknown(s, resp);
-  if (resp->has_error()) {
-    // If there was an application error, respond to the RPC.
-    rpc->RespondSuccess();
-    return;
-  }
   rpc->RespondSuccess();
 }
 
@@ -615,7 +655,10 @@ void MasterServiceImpl::GetMasterRegistration(const GetMasterRegistrationRequest
 
   Status s = server_->GetMasterRegistration(resp->mutable_registration());
   CheckRespErrorOrSetUnknown(s, resp);
-  resp->set_role(server_->catalog_manager()->Role());
+  const auto& role_and_member = server_->catalog_manager()->GetRoleAndMemberType();
+  resp->set_role(role_and_member.first);
+  resp->set_member_type(role_and_member.second);
+  resp->set_cluster_id(server_->catalog_manager()->GetClusterId());
   rpc->RespondSuccess();
 }
 
@@ -629,14 +672,17 @@ void MasterServiceImpl::ConnectToMaster(const ConnectToMasterRequestPB* /*req*/,
 
   // Set the info about the other masters, so that the client can verify
   // it has the full set of info.
-  {
-    vector<HostPortPB> hostports;
-    WARN_NOT_OK(server_->GetMasterHostPorts(&hostports),
-                "unable to get HostPorts for masters");
-    resp->mutable_master_addrs()->Reserve(hostports.size());
-    for (auto& hp : hostports) {
-      *resp->add_master_addrs() = std::move(hp);
-    }
+  vector<HostPort> addresses;
+  Status s = server_->GetMasterHostPorts(&addresses);
+  if (!s.ok()) {
+    StatusToPB(s, resp->mutable_error()->mutable_status());
+    resp->mutable_error()->set_code(MasterErrorPB::UNKNOWN_ERROR);
+    rpc->RespondSuccess();
+    return;
+  }
+  resp->mutable_master_addrs()->Reserve(addresses.size());
+  for (const auto& hp : addresses) {
+    *resp->add_master_addrs() = HostPortToPB(hp);
   }
 
   const bool is_leader = l.leader_status().ok();
@@ -706,6 +752,10 @@ void MasterServiceImpl::ConnectToMaster(const ConnectToMasterRequestPB* /*req*/,
   // until we have taken over all the associated responsibilities.
   resp->set_role(is_leader ? consensus::RaftPeerPB::LEADER
                            : consensus::RaftPeerPB::FOLLOWER);
+
+  // Add the cluster ID.
+  resp->set_cluster_id(server_->catalog_manager()->GetClusterId());
+
   rpc->RespondSuccess();
 }
 
@@ -725,14 +775,14 @@ void MasterServiceImpl::ReplaceTablet(const ReplaceTabletRequestPB* req,
   rpc->RespondSuccess();
 }
 
-void MasterServiceImpl::ResetAuthzCache(
-    const ResetAuthzCacheRequestPB* /* req */,
-    ResetAuthzCacheResponsePB* resp,
+void MasterServiceImpl::RefreshAuthzCache(
+    const RefreshAuthzCacheRequestPB* /* req */,
+    RefreshAuthzCacheResponsePB* resp,
     rpc::RpcContext* rpc) {
-  LOG(INFO) << Substitute("request to reset authz privileges cache from $0",
+  LOG(INFO) << Substitute("request to refresh authz privileges cache from $0",
                           rpc->requestor_string());
   CheckRespErrorOrSetUnknown(
-      server_->catalog_manager()->authz_provider()->ResetCache(), resp);
+      server_->catalog_manager()->authz_provider()->RefreshPolicies(), resp);
   rpc->RespondSuccess();
 }
 
@@ -746,6 +796,8 @@ bool MasterServiceImpl::SupportsFeature(uint32_t feature) const {
       return FLAGS_master_support_authz_tokens;
     case MasterFeatures::CONNECT_TO_MASTER:
       return FLAGS_master_support_connect_to_master_rpc;
+    case MasterFeatures::DYNAMIC_MULTI_MASTER:
+      return FLAGS_master_support_change_config;
     default:
       return false;
   }

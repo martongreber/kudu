@@ -176,7 +176,10 @@
     <Match>
         <!-- The return value isn't needed. -->
         <Class name="org.apache.kudu.client.ErrorCollector"/>
-        <Method name="addError" />
+        <Or>
+            <Method name="addError" />
+            <Method name="resize" />
+        </Or>
         <Bug pattern="RV_RETURN_VALUE_IGNORED" />
     </Match>
     <Match>
@@ -252,6 +255,12 @@
             <!-- All cases are handled. -->
             <Bug pattern="SF_SWITCH_NO_DEFAULT" />
         </Or>
+    </Match>
+    <Match>
+        <!-- Null pointer dereference isn't possible given we check for existence. -->
+        <Class name="org.apache.kudu.client.RpcTraceFrame"/>
+        <Method name="getHumanReadableSummaryStringForTraces" />
+        <Bug pattern="NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE" />
     </Match>
 
     <!-- kudu-client-tools exclusions -->

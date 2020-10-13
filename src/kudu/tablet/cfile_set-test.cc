@@ -39,6 +39,7 @@
 #include "kudu/common/iterator_stats.h"
 #include "kudu/common/row.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/rowid.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
@@ -48,7 +49,6 @@
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/tablet-test-util.h"
-#include "kudu/util/auto_release_pool.h"
 #include "kudu/util/block_bloom_filter.h"
 #include "kudu/util/bloom_filter.h"
 #include "kudu/util/hash.pb.h"
@@ -193,9 +193,10 @@ class TestCFileSet : public KuduRowSetTest {
     ASSERT_OK(iter->Init(&spec));
 
     // Check that the range was respected on all the results.
-    Arena arena(1024);
-    RowBlock block(&schema_, 100, &arena);
+    RowBlockMemory mem(1024);
+    RowBlock block(&schema_, 100, &mem);
     while (iter->HasNext()) {
+      mem.Reset();
       ASSERT_OK_FAST(iter->NextBlock(&block));
       for (size_t i = 0; i < block.nrows(); i++) {
         if (block.selection_vector()->IsRowSelected(i)) {
@@ -227,8 +228,8 @@ class TestCFileSet : public KuduRowSetTest {
     }
     ASSERT_OK(iter->Init(&spec));
     // Check that the range was respected on all the results.
-    Arena arena(1024);
-    RowBlock block(&schema_, 100, &arena);
+    RowBlockMemory mem(1024);
+    RowBlock block(&schema_, 100, &mem);
     while (iter->HasNext()) {
       ASSERT_OK_FAST(iter->NextBlock(&block));
       for (size_t i = 0; i < block.nrows(); i++) {
@@ -289,11 +290,11 @@ TEST_F(TestCFileSet, TestPartiallyMaterialize) {
   unique_ptr<CFileSet::Iterator> iter(fileset->NewIterator(&schema_, nullptr));
   ASSERT_OK(iter->Init(nullptr));
 
-  Arena arena(4096);
-  RowBlock block(&schema_, 100, &arena);
+  RowBlockMemory mem(4096);
+  RowBlock block(&schema_, 100, &mem);
   rowid_t row_idx = 0;
   while (iter->HasNext()) {
-    arena.Reset();
+    mem.Reset();
 
     size_t n = block.nrows();
     ASSERT_OK_FAST(iter->PrepareBatch(&n));
@@ -407,7 +408,6 @@ TEST_F(TestCFileSet, TestRangeScan) {
   unique_ptr<RowwiseIterator> iter(NewMaterializingIterator(std::move(cfile_iter)));
   Schema key_schema = schema_.CreateKeyProjection();
   Arena arena(1024);
-  AutoReleasePool pool;
 
   // Create a scan with a range predicate on the key column.
   ScanSpec spec;
@@ -415,7 +415,7 @@ TEST_F(TestCFileSet, TestRangeScan) {
   int32_t upper = 2010;
   auto pred1 = ColumnPredicate::Range(schema_.column(0), &lower, &upper);
   spec.AddPredicate(pred1);
-  spec.OptimizeScan(schema_, &arena, &pool, true);
+  spec.OptimizeScan(schema_, &arena, true);
   ASSERT_OK(iter->Init(&spec));
 
   // Check that the bounds got pushed as index bounds.

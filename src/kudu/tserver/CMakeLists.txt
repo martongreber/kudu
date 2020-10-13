@@ -69,6 +69,7 @@ set(TSERVER_ADMIN_KRPC_LIBS
   krpc
   protobuf
   rpc_header_proto
+  transactions_proto
   tserver_proto
   wire_protocol_proto)
 ADD_EXPORTABLE_LIBRARY(tserver_admin_proto
@@ -133,6 +134,7 @@ target_link_libraries(tserver
   server_process
   tablet
   tablet_copy_proto
+  transactions
   tserver_admin_proto
   tserver_proto
   tserver_service_proto)

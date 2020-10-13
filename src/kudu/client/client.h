@@ -66,6 +66,11 @@ class KuduClient;
 class KuduTable;
 } // namespace client
 
+namespace transactions {
+class CoordinatorRpc;
+class TxnSystemClient;
+} // namespace transactions
+
 namespace tools {
 class LeaderMasterProxy;
 class RemoteKsckCluster;
@@ -589,6 +594,11 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   ///   assigned yet, or if the leader master did not assign a location to
   ///   the client.
   std::string location() const KUDU_NO_EXPORT;
+
+  /// Private API.
+  ///
+  /// @return The ID of the cluster that this client is connected to.
+  std::string cluster_id() const KUDU_NO_EXPORT;
   /// @endcond
 
  private:
@@ -618,6 +628,8 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class internal::WriteRpc;
   friend class kudu::AuthzTokenTest;
   friend class kudu::SecurityUnknownTskTest;
+  friend class transactions::CoordinatorRpc;
+  friend class transactions::TxnSystemClient;
   friend class tools::LeaderMasterProxy;
   friend class tools::RemoteKsckCluster;
 
@@ -874,6 +886,15 @@ class KUDU_EXPORT KuduTableCreator {
   /// @return Reference to the modified table creator.
   KuduTableCreator& add_range_partition_split(KuduPartialRow* split_row);
 
+  /// Set the table owner.
+  ///
+  /// If unspecified, the owner will be the user creating the table.
+  ///
+  /// @param [in] owner
+  ///   The username of the table owner.
+  /// @return Reference to the modified table creator.
+  KuduTableCreator& set_owner(const std::string& owner);
+
   /// @deprecated Use @c add_range_partition_split() instead.
   ///
   /// @param [in] split_rows
@@ -954,6 +975,7 @@ class KUDU_EXPORT KuduTableCreator {
   class KUDU_NO_EXPORT Data;
 
   friend class KuduClient;
+  friend class transactions::TxnSystemClient;
 
   explicit KuduTableCreator(KuduClient* client);
 
@@ -1039,6 +1061,9 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   /// @return Replication factor of the table.
   int num_replicas() const;
 
+  /// @return Owner of the table (empty string if unset).
+  const std::string& owner() const;
+
   /// @return New @c INSERT operation for this table. It is the caller's
   ///   responsibility to free the result, unless it is passed to
   ///   KuduSession::Apply().
@@ -1094,8 +1119,6 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   /// Create a new IN Bloom filter predicate which can be used for scanners on
   /// this table.
   ///
-  /// @note This method is experimental and may change or disappear in future.
-  ///
   /// A Bloom filter is a space-efficient probabilistic data structure used to
   /// test set membership with a possibility of false positive matches.
   /// See @c KuduBloomFilter for creating Bloom filters.
@@ -1103,6 +1126,13 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   /// IN list predicate can be used with small number of values; on the other
   /// hand with IN Bloom filter predicate large number of values can be tested
   /// for membership in a space-efficient manner.
+  ///
+  /// IN Bloom filter predicate may be automatically disabled if determined to
+  /// be ineffective in filtering rows during scan requests.
+  ///
+  /// Users are expected to perform further filtering to guard against false
+  /// positives and automatic disablement of an ineffective Bloom filter
+  /// predicate to get precise set membership information.
   ///
   /// @param [in] col_name
   ///   Name of the column to which the predicate applies.
@@ -1123,8 +1153,8 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   /// @name Advanced/Unstable API
   ///
   /// There are no guarantees on the stability of this client API.
-  ///
   ///@{
+
   /// Create a new IN Bloom filter predicate using direct BlockBloomFilter
   /// pointers which can be used for scanners on this table.
   ///
@@ -1135,11 +1165,17 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   /// hand with IN Bloom filter predicate large number of values can be tested
   /// for membership in a space-efficient manner.
   ///
+  /// IN Bloom filter predicate may be automatically disabled if determined to
+  /// be ineffective in filtering rows during scan requests.
+  ///
+  /// Users are expected to perform further filtering to guard against false
+  /// positives and automatic disablement of an ineffective Bloom filter
+  /// predicate to get precise set membership information.
+  ///
+  /// @warning This method is experimental and may change or disappear in future.
+  ///
   /// @param [in] col_name
   ///   Name of the column to which the predicate applies.
-  /// @param [in] allocator
-  ///   Pointer to the BlockBloomFilterBufferAllocatorIf allocator used with
-  ///   Bloom filters.
   /// @param bloom_filters
   ///   Vector of BlockBloomFilter pointers that contain the values inserted to
   ///   match against the column. The column value must match against all the
@@ -1155,7 +1191,6 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   ///   a non-NULL value is still returned. The error will be returned when
   ///   attempting to add this predicate to a KuduScanner.
   KuduPredicate* NewInBloomFilterPredicate(const Slice& col_name,
-                                           const Slice& allocator,
                                            const std::vector<Slice>& bloom_filters);
   ///@}
 
@@ -1239,11 +1274,13 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
 
   friend class KuduClient;
   friend class KuduPartitioner;
+  friend class KuduScanToken;
 
   KuduTable(const sp::shared_ptr<KuduClient>& client,
             const std::string& name,
             const std::string& id,
             int num_replicas,
+            const std::string& owner,
             const KuduSchema& schema,
             const PartitionSchema& partition_schema,
             const std::map<std::string, std::string>& extra_configs);
@@ -1275,6 +1312,13 @@ class KUDU_EXPORT KuduTableAlterer {
   ///   The new name for the table.
   /// @return Raw pointer to this alterer object.
   KuduTableAlterer* RenameTo(const std::string& new_name);
+
+  /// Set the owner of the table.
+  ///
+  /// @param [in] new_owner
+  ///   The new owner for the table.
+  /// @return Raw pointer to this alterer object.
+  KuduTableAlterer* SetOwner(const std::string& new_owner);
 
   /// Add a new column to the table.
   ///
@@ -2027,7 +2071,7 @@ class KUDU_EXPORT KuduScanner {
     /// the server will take the current time as the snapshot timestamp.
     /// In this mode reads are repeatable, i.e. all future reads at the same
     /// timestamp will yield the same data. This is performed at the expense
-    /// of waiting for in-flight transactions whose timestamp is lower than
+    /// of waiting for in-flight ops whose timestamp is lower than
     /// the snapshot's timestamp to complete, so it might incur
     /// a latency penalty. See KuduScanner::SetSnapshotMicros() and
     /// KuduScanner::SetSnapshotRaw() for details.
@@ -2048,7 +2092,7 @@ class KUDU_EXPORT KuduScanner {
     /// Specifically this mode:
     ///  (1) ensures read-your-writes and read-your-reads session guarantees,
     ///  (2) minimizes latency caused by waiting for outstanding write
-    ///      transactions to complete.
+    ///      ops to complete.
     ///
     /// Reads in this mode are not repeatable: two READ_YOUR_WRITES reads, even if
     /// they provide the same propagated timestamp bound, can execute at different
@@ -2390,15 +2434,19 @@ class KUDU_EXPORT KuduScanner {
   /// @return Schema of the projection being scanned.
   KuduSchema GetProjectionSchema() const;
 
+  /// @return KuduTable being scanned.
+  sp::shared_ptr<KuduTable> GetKuduTable();
+
   /// @name Advanced/Unstable API
-  //
-  ///@{
+  ///
   /// Modifier flags for the row format returned from the server.
   ///
   /// @note Each flag corresponds to a bit that gets set on a bitset that is sent
   ///   to the server. See SetRowFormatFlags() for example usage.
+  ///@{
+
+  /// No flags set.
   static const uint64_t NO_FLAGS = 0;
-  /// Makes the server pad UNIXTIME_MICROS slots to 16 bytes.
   /// @note This flag actually wastes throughput by making messages larger than they need to
   ///   be. It exists merely for compatibility reasons and requires the user to know the row
   ///   format in order to decode the data. That is, if this flag is enabled, the user _must_
@@ -2647,6 +2695,24 @@ class KUDU_EXPORT KuduScanTokenBuilder {
 
   /// @copydoc KuduScanner::SetTimeoutMillis
   Status SetTimeoutMillis(int millis) WARN_UNUSED_RESULT;
+
+  /// If the table metadata is included on the scan token a GetTableSchema
+  /// RPC call to the master can be avoided when deserializing each scan token
+  /// into a scanner.
+  ///
+  /// @param [in] include_metadata
+  ///   true, if table metadata should be included.
+  /// @return Operation result status.
+  Status IncludeTableMetadata(bool include_metadata) WARN_UNUSED_RESULT;
+
+  /// If the tablet metadata is included on the scan token a GetTableLocations
+  /// RPC call to the master can be avoided when scanning with a scanner constructed
+  /// from a scan token.
+  ///
+  /// @param [in] include_metadata
+  ///   true, if table metadata should be included.
+  /// @return Operation result status.
+  Status IncludeTabletMetadata(bool include_metadata) WARN_UNUSED_RESULT;
 
   /// Build the set of scan tokens.
   ///

@@ -18,8 +18,6 @@
 package org.apache.kudu.subprocess.ranger.authorization;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -30,16 +28,17 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.ranger.plugin.audit.RangerDefaultAuditHandler;
-import org.apache.ranger.plugin.model.RangerServiceDef;
 import org.apache.ranger.plugin.policyengine.RangerAccessRequest;
 import org.apache.ranger.plugin.policyengine.RangerAccessRequestImpl;
 import org.apache.ranger.plugin.policyengine.RangerAccessResourceImpl;
 import org.apache.ranger.plugin.policyengine.RangerAccessResult;
+import org.apache.ranger.plugin.policyengine.RangerPolicyEngine;
 import org.apache.ranger.plugin.service.RangerBasePlugin;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.kudu.ranger.Ranger;
 import org.apache.kudu.ranger.Ranger.RangerRequestListPB;
 import org.apache.kudu.ranger.Ranger.RangerRequestPB;
 import org.apache.kudu.subprocess.KuduSubprocessException;
@@ -102,35 +101,33 @@ public class RangerKuduAuthorizer {
    * @return a list of RangerAccessResult
    */
   @VisibleForTesting
-  public Collection<RangerAccessResult> authorize(RangerRequestListPB requests) {
-    Collection<RangerAccessRequest> rangerRequests = createRequests(requests);
-    // Reject requests if user field is empty.
+  public Ranger.RangerResponseListPB.Builder authorize(RangerRequestListPB requests) {
     if (!requests.hasUser() || requests.getUser().isEmpty()) {
-      Collection<RangerAccessResult> results = new ArrayList<>();
-      for (RangerAccessRequest request : rangerRequests) {
-        // Create a 'dummy' RangerAccessResult that denies the request (to have
-        // a short cut), instead of sending the request to Ranger.
-        RangerAccessResult result = new RangerAccessResult(
-            /* policyType= */1, APP_ID,
-            new RangerServiceDef(), request);
-        result.setIsAllowed(false);
-        results.add(result);
+      Ranger.RangerResponseListPB.Builder rangerResponseListPB = Ranger.RangerResponseListPB
+          .newBuilder();
+      List<RangerRequestPB> requestsList = requests.getRequestsList();
+      for (int i = 0, requestsListSize = requestsList.size(); i < requestsListSize; i++) {
+        Ranger.RangerResponsePB response = Ranger.RangerResponsePB.newBuilder()
+            .setAllowed(false)
+            .build();
+        rangerResponseListPB.addResponses(response);
       }
-      return results;
+      return rangerResponseListPB;
     }
-    return plugin.isAccessAllowed(rangerRequests);
+    return authorizeRequests(requests);
   }
 
   /**
-   * Gets a list of authorization decision from Ranger with the specified list
-   * of ranger access request.
+   * Refreshes the policies cached in the authorization provider on a best-effort basis. It
+   * doesn't guarantee invalidating the cache or that the latest policies could be pulled from
+   * the server and doesn't throw exceptions even if the server couldn't be reached.
    *
-   * @param requests a list of RangerAccessRequest
-   * @return a list of RangerAccessResult
+   * TODO(abukor): Revisit if RANGER-2906 is fixed.
    */
-  @VisibleForTesting
-  Collection<RangerAccessResult> authorize(Collection<RangerAccessRequest> requests) {
-    return plugin.isAccessAllowed(requests);
+  public void refreshPolicies() {
+    LOG.debug("Refreshing policies...");
+    plugin.refreshPoliciesAndTags();
+    LOG.debug("Refreshing policies... DONE");
   }
 
   /**
@@ -166,14 +163,15 @@ public class RangerKuduAuthorizer {
   }
 
   /**
-   * Creates a list of <code>RangerAccessRequest</code> for the given
+   * Creates a <code>RangerResponseListPB</code> for the given
    * <code>RangerRequestListPB</code>.
    *
    * @param requests the given RangerRequestListPB
    * @return a list of RangerAccessRequest
    */
-  private static List<RangerAccessRequest> createRequests(RangerRequestListPB requests) {
-    List<RangerAccessRequest> rangerRequests = new ArrayList<>();
+  private Ranger.RangerResponseListPB.Builder authorizeRequests(RangerRequestListPB requests) {
+    Ranger.RangerResponseListPB.Builder rangerResponseList = Ranger.RangerResponseListPB
+        .newBuilder();
     Preconditions.checkArgument(requests.hasUser());
     Preconditions.checkArgument(!requests.getUser().isEmpty());
     final String user = requests.getUser();
@@ -184,10 +182,52 @@ public class RangerKuduAuthorizer {
       String db = request.hasDatabase() ? request.getDatabase() : null;
       String table = request.hasTable() ? request.getTable() : null;
       String column = request.hasColumn() ? request.getColumn() : null;
-      rangerRequests.add(createRequest(action, user, groups,
-                                       db, table, column));
+      boolean requiresAdmin = request.hasRequiresDelegateAdmin() &&
+          request.getRequiresDelegateAdmin();
+      boolean isOwner = request.hasIsOwner() && request.getIsOwner();
+      RangerAccessRequest rangerAccessRequest = createRequest(action, user, groups, db, table,
+                                                              column);
+      RangerAccessResult rangerAccessResult = plugin.isAccessAllowed(rangerAccessRequest);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(String.format("RangerAccessRequest [%s] receives result [%s]",
+            rangerAccessResult.getAccessRequest().toString(), rangerAccessResult.toString()));
+      }
+      if (!rangerAccessResult.getIsAllowed() && isOwner) {
+        rangerAccessRequest = createRequest(action, RangerPolicyEngine.RESOURCE_OWNER, groups,
+                                            db, table, column);
+        rangerAccessResult = plugin.isAccessAllowed(rangerAccessRequest);
+        if (LOG.isDebugEnabled()) {
+          LOG.debug(String.format("RangerAccessRequest [%s] receives result [%s]",
+              rangerAccessResult.getAccessRequest().toString(), rangerAccessResult.toString()));
+        }
+      }
+      if (rangerAccessResult.getIsAllowed() && requiresAdmin) {
+        rangerAccessRequest = createRequest(RangerPolicyEngine.ADMIN_ACCESS, user, groups, db,
+                                            table, column);
+        rangerAccessResult = plugin.isAccessAllowed(rangerAccessRequest);
+        if (LOG.isDebugEnabled()) {
+          LOG.debug(String.format("RangerAccessRequest [%s] receives result [%s]",
+              rangerAccessResult.getAccessRequest().toString(), rangerAccessResult.toString()));
+        }
+        if (!rangerAccessResult.getIsAllowed() && isOwner) {
+          rangerAccessRequest = createRequest(RangerPolicyEngine.ADMIN_ACCESS,
+                                              RangerPolicyEngine.RESOURCE_OWNER,
+                                              groups, db, table, column);
+          rangerAccessResult = plugin.isAccessAllowed(rangerAccessRequest);
+          if (LOG.isDebugEnabled()) {
+            LOG.debug(String.format("RangerAccessRequest [%s] receives result [%s]",
+                rangerAccessResult.getAccessRequest().toString(), rangerAccessResult.toString()));
+          }
+        }
+      }
+
+      Ranger.RangerResponsePB rangerResponsePB = Ranger.RangerResponsePB.newBuilder()
+          .setAllowed(rangerAccessResult.getIsAllowed())
+          .build();
+
+      rangerResponseList.addResponses(rangerResponsePB);
     }
-    return rangerRequests;
+    return rangerResponseList;
   }
 
   /**

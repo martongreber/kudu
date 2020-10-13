@@ -40,6 +40,7 @@
 #include "kudu/common/partition.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
@@ -49,7 +50,6 @@
 #include "kudu/consensus/consensus_peers.h"
 #include "kudu/consensus/log.h"
 #include "kudu/consensus/log_anchor_registry.h"
-#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/quorum_util.h"
 #include "kudu/consensus/raft_consensus.h"
@@ -64,11 +64,11 @@
 #include "kudu/rpc/result_tracker.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/ops/op.h"
+#include "kudu/tablet/ops/write_op.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_bootstrap.h"
 #include "kudu/tablet/tablet_metadata.h"
-#include "kudu/tablet/transactions/transaction.h"
-#include "kudu/tablet/transactions/write_transaction.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/cow_object.h"
@@ -77,7 +77,6 @@
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
-#include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -89,6 +88,12 @@ DEFINE_double(sys_catalog_fail_during_write, 0.0,
               "Fraction of the time when system table writes will fail");
 TAG_FLAG(sys_catalog_fail_during_write, hidden);
 
+DEFINE_string(master_address_add_new_master, "",
+              "Address of master to add as a NON_VOTER on creating a distributed master config.");
+TAG_FLAG(master_address_add_new_master, unsafe);
+TAG_FLAG(master_address_add_new_master, hidden);
+
+DECLARE_bool(master_support_change_config);
 DECLARE_int64(rpc_max_message_size);
 
 METRIC_DEFINE_counter(server, sys_catalog_oversized_write_requests,
@@ -105,7 +110,7 @@ using kudu::consensus::RaftConfigPB;
 using kudu::consensus::RaftPeerPB;
 using kudu::log::Log;
 using kudu::pb_util::SecureShortDebugString;
-using kudu::tablet::LatchTransactionCompletionCallback;
+using kudu::tablet::LatchOpCompletionCallback;
 using kudu::tablet::Tablet;
 using kudu::tablet::TabletReplica;
 using kudu::tserver::WriteRequestPB;
@@ -155,6 +160,8 @@ const char* const SysCatalogTable::kInjectedFailureStatusMsg =
     "INJECTED FAILURE";
 const char* const SysCatalogTable::kLatestNotificationLogEntryIdRowId =
     "latest_notification_log_entry_id";
+const char* const SysCatalogTable::kClusterIdRowId =
+    "cluster_id";
 
 namespace {
 
@@ -194,6 +201,50 @@ void SysCatalogTable::Shutdown() {
   }
 }
 
+Status SysCatalogTable::VerifyAndPopulateSingleMasterConfig(ConsensusMetadata* cmeta) {
+  RaftConfigPB config = cmeta->CommittedConfig();
+  // Manual single to multi-master migration relies on starting up a single master with multiple
+  // masters specified in the on-disk Raft config, so log a warning instead of a strict check.
+  // No further validations or populating 'last_known_addr' in such a case.
+  if (config.peers_size() > 1) {
+    LOG(WARNING) << "For a single master config, multiple peers found in on-disk Raft config! "
+                    "Supply correct list of masters in --master_addresses flag.";
+    return Status::OK();
+  }
+
+  CHECK_EQ(1, config.peers_size()) << "No Raft peer found for single master configuration!";
+  const auto& peer = config.peers(0);
+  HostPort master_addr;
+  bool master_addr_specified = master_->opts().GetTheOnlyMasterAddress(&master_addr).ok();
+  if (master_addr_specified) {
+    if (peer.has_last_known_addr()) {
+      // Verify the supplied master address matches with the on-disk Raft config.
+      auto raft_master_addr = HostPortFromPB(peer.last_known_addr());
+      if (raft_master_addr != master_addr) {
+        return Status::InvalidArgument(
+            Substitute("Single master Raft config error. On-disk master: $0 and "
+                       "supplied master: $1 are different", raft_master_addr.ToString(),
+                       master_addr.ToString()));
+      }
+    } else {
+      // Set the 'last_known_addr' in Raft config for single master configuration.
+      *config.mutable_peers(0)->mutable_last_known_addr() = HostPortToPB(master_addr);
+      cmeta->set_committed_config(config);
+      ConsensusStatePB cstate = cmeta->ToConsensusStatePB();
+      RETURN_NOT_OK(consensus::VerifyRaftConfig(cstate.committed_config()));
+      RETURN_NOT_OK_PREPEND(cmeta->Flush(),
+                            "Failed to flush consensus metadata on populating "
+                            "'last_known_addr' field in consensus metadata");
+    }
+  } else if (peer.has_last_known_addr()) {
+    LOG(WARNING) << Substitute("For a single master config, on-disk Raft master: $0 exists but "
+                               "no master address supplied!",
+                               HostPortFromPB(peer.last_known_addr()).ToString());
+  }
+
+  return Status::OK();
+}
+
 Status SysCatalogTable::Load(FsManager *fs_manager) {
   // Load Metadata Information from disk
   scoped_refptr<tablet::TabletMetadata> metadata;
@@ -205,12 +256,14 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
     return(Status::Corruption("Unexpected schema", metadata->schema().ToString()));
   }
 
-  if (master_->opts().IsDistributed()) {
-    LOG(INFO) << "Verifying existing consensus state";
-    string tablet_id = metadata->tablet_id();
-    scoped_refptr<ConsensusMetadata> cmeta;
-    RETURN_NOT_OK_PREPEND(cmeta_manager_->Load(tablet_id, &cmeta),
-                          "Unable to load consensus metadata for tablet " + tablet_id);
+  LOG(INFO) << "Verifying existing consensus state";
+  const string tablet_id = metadata->tablet_id();
+  scoped_refptr<ConsensusMetadata> cmeta;
+  RETURN_NOT_OK_PREPEND(cmeta_manager_->Load(tablet_id, &cmeta),
+                        "Unable to load consensus metadata for tablet " + tablet_id);
+  if (!master_->opts().IsDistributed()) {
+    RETURN_NOT_OK(VerifyAndPopulateSingleMasterConfig(cmeta.get()));
+  } else {
     ConsensusStatePB cstate = cmeta->ToConsensusStatePB();
     RETURN_NOT_OK(consensus::VerifyRaftConfig(cstate.committed_config()));
     CHECK(!cstate.has_pending_config());
@@ -218,19 +271,18 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
     // Make sure the set of masters passed in at start time matches the set in
     // the on-disk cmeta.
     set<string> peer_addrs_from_opts;
-    for (const auto& hp : master_->opts().master_addresses) {
+    const auto& master_addresses = master_->opts().master_addresses();
+    for (const auto& hp : master_addresses) {
       peer_addrs_from_opts.insert(hp.ToString());
     }
-    if (peer_addrs_from_opts.size() < master_->opts().master_addresses.size()) {
+    if (peer_addrs_from_opts.size() < master_addresses.size()) {
       LOG(WARNING) << Substitute("Found duplicates in --master_addresses: "
                                  "the unique set of addresses is $0",
                                  JoinStrings(peer_addrs_from_opts, ", "));
     }
     set<string> peer_addrs_from_disk;
     for (const auto& p : cstate.committed_config().peers()) {
-      HostPort hp;
-      RETURN_NOT_OK(HostPortFromPB(p.last_known_addr(), &hp));
-      peer_addrs_from_disk.insert(hp.ToString());
+      peer_addrs_from_disk.insert(HostPortFromPB(p.last_known_addr()).ToString());
     }
     vector<string> symm_diff;
     std::set_symmetric_difference(peer_addrs_from_opts.begin(),
@@ -275,6 +327,7 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
                                                   /*supports_live_row_count=*/ true,
                                                   /*extra_config=*/ boost::none,
                                                   /*dimension_label=*/ boost::none,
+                                                  /*table_type=*/ boost::none,
                                                   &metadata));
 
   RaftConfigPB config;
@@ -287,6 +340,12 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
     RaftPeerPB* peer = config.add_peers();
     peer->set_permanent_uuid(fs_manager->uuid());
     peer->set_member_type(RaftPeerPB::VOTER);
+    // Set 'last_known_addr' if master address is specified for a single master configuration.
+    // This helps in migrating to multiple masters.
+    HostPort hp;
+    if (master_->opts().GetTheOnlyMasterAddress(&hp).ok()) {
+      *peer->mutable_last_known_addr() = HostPortToPB(hp);
+    }
   }
 
   string tablet_id = metadata->tablet_id();
@@ -305,12 +364,18 @@ Status SysCatalogTable::CreateDistributedConfig(const MasterOptions& options,
   new_config.set_opid_index(consensus::kInvalidOpIdIndex);
 
   // Build the set of followers from our server options.
-  for (const HostPort& host_port : options.master_addresses) {
+  for (const HostPort& host_port : options.master_addresses()) {
     RaftPeerPB peer;
-    HostPortPB peer_host_port_pb;
-    RETURN_NOT_OK(HostPortToPB(host_port, &peer_host_port_pb));
+    HostPortPB peer_host_port_pb = HostPortToPB(host_port);
     peer.mutable_last_known_addr()->CopyFrom(peer_host_port_pb);
-    peer.set_member_type(RaftPeerPB::VOTER);
+    // Adding new master as a NON_VOTER to ensure it doesn't become a leader on creating
+    // distributed config and also helps with replacing a dead master at the same hostport.
+    if (FLAGS_master_support_change_config &&
+        FLAGS_master_address_add_new_master == host_port.ToString()) {
+      peer.set_member_type(RaftPeerPB::NON_VOTER);
+    } else {
+      peer.set_member_type(RaftPeerPB::VOTER);
+    }
     new_config.add_peers()->CopyFrom(peer);
   }
 
@@ -397,6 +462,7 @@ Status SysCatalogTable::SetupTablet(
       cmeta_manager_,
       local_peer_pb_,
       master_->tablet_apply_pool(),
+      /*txn_coordinator_factory*/ nullptr,
       [this, tablet_id](const string& reason) {
         this->SysCatalogStateChanged(tablet_id, reason);
       }));
@@ -486,16 +552,16 @@ Status SysCatalogTable::SyncWrite(const WriteRequestPB& req) {
   }
   CountDownLatch latch(1);
   WriteResponsePB resp;
-  unique_ptr<tablet::TransactionCompletionCallback> txn_callback(
-      new LatchTransactionCompletionCallback<WriteResponsePB>(&latch, &resp));
-  unique_ptr<tablet::WriteTransactionState> tx_state(
-      new tablet::WriteTransactionState(tablet_replica_.get(),
-                                        &req,
-                                        nullptr, // No RequestIdPB
-                                        &resp));
-  tx_state->set_completion_callback(std::move(txn_callback));
+  unique_ptr<tablet::OpCompletionCallback> op_callback(
+      new LatchOpCompletionCallback<WriteResponsePB>(&latch, &resp));
+  unique_ptr<tablet::WriteOpState> op_state(
+      new tablet::WriteOpState(tablet_replica_.get(),
+                               &req,
+                               nullptr, // No RequestIdPB
+                               &resp));
+  op_state->set_completion_callback(std::move(op_callback));
 
-  RETURN_NOT_OK(tablet_replica_->SubmitWrite(std::move(tx_state)));
+  RETURN_NOT_OK(tablet_replica_->SubmitWrite(std::move(op_state)));
   latch.Wait();
 
   if (resp.has_error()) {
@@ -693,8 +759,8 @@ Status SysCatalogTable::ProcessRows(
   RETURN_NOT_OK(tablet_replica_->tablet()->NewRowIterator(schema_, &iter));
   RETURN_NOT_OK(iter->Init(&spec));
 
-  Arena arena(32 * 1024);
-  RowBlock block(&iter->schema(), 512, &arena);
+  RowBlockMemory mem(32 * 1024);
+  RowBlock block(&iter->schema(), 512, &mem);
   while (iter->HasNext()) {
     RETURN_NOT_OK(iter->NextBlock(&block));
     const size_t nrows = block.nrows();
@@ -739,6 +805,29 @@ Status SysCatalogTable::GetLatestNotificationLogEventId(int64_t* event_id) {
   return ProcessRows<SysNotificationLogEventIdPB, HMS_NOTIFICATION_LOG>(processor);
 }
 
+Status SysCatalogTable::GetClusterIdEntry(SysClusterIdEntryPB* entry) {
+  CHECK(entry);
+  vector<SysClusterIdEntryPB> entries;
+  auto processor = [&](
+      const string& entry_id,
+      const SysClusterIdEntryPB& entry_data) {
+    CHECK_EQ(entry_id, kClusterIdRowId);
+    DCHECK(entry_data.has_cluster_id());
+    DCHECK(!entry_data.cluster_id().empty());
+    entries.push_back(entry_data);
+    return Status::OK();
+  };
+  RETURN_NOT_OK((ProcessRows<SysClusterIdEntryPB, CLUSTER_ID>(processor)));
+  // There should be no more than one cluster ID entry in the system table.
+  CHECK_LE(entries.size(), 1);
+  if (entries.empty()) {
+    return Status::NotFound("cluster ID entry not found");
+  }
+  *entry = std::move(entries.front());
+
+  return Status::OK();
+}
+
 Status SysCatalogTable::GetCertAuthorityEntry(SysCertAuthorityEntryPB* entry) {
   CHECK(entry);
   vector<SysCertAuthorityEntryPB> entries;
@@ -756,9 +845,31 @@ Status SysCatalogTable::GetCertAuthorityEntry(SysCertAuthorityEntryPB* entry) {
   if (entries.empty()) {
     return Status::NotFound("root CA entry not found");
   }
-  entries.front().Swap(entry);
+  *entry = std::move(entries.front());
 
   return Status::OK();
+}
+
+Status SysCatalogTable::AddClusterIdEntry(
+    const SysClusterIdEntryPB& entry) {
+  WriteRequestPB req;
+  req.set_tablet_id(kSysCatalogTabletId);
+  RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
+
+  CHECK(entry.has_cluster_id());
+  CHECK(!entry.cluster_id().empty());
+
+  faststring metadata_buf;
+  pb_util::SerializeToString(entry, &metadata_buf);
+
+  KuduPartialRow row(&schema_);
+  CHECK_OK(row.SetInt8(kSysCatalogTableColType, CLUSTER_ID));
+  CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, kClusterIdRowId));
+  CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
+  RowOperationsPBEncoder enc(req.mutable_row_operations());
+  enc.Add(RowOperationsPB::INSERT, row);
+
+  return SyncWrite(req);
 }
 
 Status SysCatalogTable::AddCertAuthorityEntry(
@@ -1007,7 +1118,7 @@ void SysCatalogTable::InitLocalRaftPeerPB() {
   Sockaddr addr = master_->first_rpc_address();
   HostPort hp;
   CHECK_OK(HostPortFromSockaddrReplaceWildcard(addr, &hp));
-  CHECK_OK(HostPortToPB(hp, local_peer_pb_.mutable_last_known_addr()));
+  *local_peer_pb_.mutable_last_known_addr() = HostPortToPB(hp);
 }
 
 } // namespace master

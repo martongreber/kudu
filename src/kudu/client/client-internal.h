@@ -144,6 +144,7 @@ class KuduClient::Data {
   //   'table_id'         The table unique id.
   //   'table_name'       The table unique name.
   //   'num_replicas'     The table replication factor.
+  //   'owner'            The owner of the table.
   //   'extra_configs'    The table's extra configuration properties.
   Status GetTableSchema(KuduClient* client,
                         const MonoTime& deadline,
@@ -153,6 +154,7 @@ class KuduClient::Data {
                         std::string* table_id,
                         std::string* table_name,
                         int* num_replicas,
+                        std::string* owner,
                         std::map<std::string, std::string>* extra_configs);
 
   Status InitLocalHostNames();
@@ -236,6 +238,8 @@ class KuduClient::Data {
 
   std::string location() const;
 
+  std::string cluster_id() const;
+
   uint64_t GetLatestObservedTimestamp() const;
 
   void UpdateLatestObservedTimestamp(uint64_t timestamp);
@@ -246,6 +250,10 @@ class KuduClient::Data {
   // The location of this client. This is an empty string if a location has not
   // been assigned by the leader master. Protected by 'leader_master_lock_'.
   std::string location_;
+
+  // The ID of the cluster that this client is connected to.
+  // Protected by 'leader_master_lock_'.
+  std::string cluster_id_;
 
   // The user credentials of the client. This field is constant after the client
   // is built.
@@ -300,8 +308,8 @@ class KuduClient::Data {
   std::vector<StatusCallback> leader_master_callbacks_primary_creds_;
 
   // Protects 'leader_master_rpc_{any,primary}_creds_',
-  // 'leader_master_hostport_', 'master_hostports_', 'master_proxy_', and
-  // 'location_'.
+  // 'leader_master_hostport_', 'master_hostports_', 'master_proxy_',
+  // 'location_', and 'cluster_id'.
   //
   // See: KuduClient::Data::ConnectToClusterAsync for a more
   // in-depth explanation of why this is needed and how it works.

@@ -191,8 +191,24 @@ Get familiar with these guidelines so that your contributions can be reviewed an
 integrated quickly and easily.
 
 In general, Kudu follows the
-link:https://google.github.io/styleguide/cppguide.html[Google {cpp} Style Guide],
-with the following exceptions:
+link:https://google.github.io/styleguide/cppguide.html[Google {cpp} Style Guide].
+
+A `clang-format` file is provided in `src/kudu/.clang-format` which allows
+automatic formatting of source code whitespacing, indentation, etc. Not all
+existing code conforms to this automatic formatting, so prefer using
+`clang-format-diff` to format only the lines changed by your patch. For example,
+after making a commit, run the following from the root of your checked out
+source:
++
+[source,bash]
+----
+git show -U0 | build-support/clang_format_diff.sh -i -p1
+git commit -a --amend
+----
+
+=== Exceptions from Google Style Guide
+Kudu's code base makes the following notable exceptions from the Google Style Guide
+referenced above:
 
 ==== Notes on {cpp} 11
 
@@ -246,12 +262,6 @@ as in the following example.
     blah_(blah) {
   }
 ----
-
-NOTE: Older parts of the Kudu code base use `gscoped_ptr` instead of
-`unique_ptr`. These are hold-overs from before Kudu adopted {cpp}11.
-New code should not use `gscoped_ptr` except when necessary to interface
-with existing code. Alternatively, consider updating usages as you come
-across them.
 
 WARNING: Using `std::auto_ptr` is strictly disallowed because of its difficult and
 bug-prone semantics. Besides, `std::auto_ptr` is declared deprecated
@@ -430,6 +440,17 @@ satisfied and the code continues its execution), consider throwing an
 if (!isCriticalConditionSatisfied) {
   throw new AssertionError("cannot continue: data loss is possible otherwise");
 }
+----
+
+===== Checking code style with Gradle checkStyle
+
+Before posting a Java patch to Gerrit for review, make sure to check Java code
+style with Gradle `checkstyle` plugin. See
+link:https://docs.gradle.org/current/userguide/checkstyle_plugin.html[Gradle Checkstyle Plugin documentation]
+for more information.
+[source,bash]
+----
+./gradlew checkstyle
 ----
 
 ===== References

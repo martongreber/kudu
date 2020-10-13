@@ -38,6 +38,7 @@
 #include "kudu/common/row.h"
 #include "kudu/common/row_changelist.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/rowid.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
@@ -135,10 +136,10 @@ class TestCompaction : public KuduRowSetTest {
   // The 'nullable_val' column is set to either NULL (when val is odd)
   // or 'val' (when val is even).
   void InsertRow(MemRowSet *mrs, int row_key, int32_t val) {
-    ScopedTransaction tx(&mvcc_, clock_.Now());
-    tx.StartApplying();
-    InsertRowInTransaction(mrs, tx, row_key, val);
-    tx.Commit();
+    ScopedOp op(&mvcc_, clock_.Now());
+    op.StartApplying();
+    InsertRowInOp(mrs, op, row_key, val);
+    op.FinishApplying();
   }
 
   void BuildRow(int row_key, int32_t val) {
@@ -153,10 +154,10 @@ class TestCompaction : public KuduRowSetTest {
     }
   }
 
-  void InsertRowInTransaction(MemRowSet *mrs,
-                              const ScopedTransaction& txn,
-                              int row_key,
-                              int32_t val) {
+  void InsertRowInOp(MemRowSet *mrs,
+                     const ScopedOp& op,
+                     int row_key,
+                     int32_t val) {
     BuildRow(row_key, val);
     if (!mrs->schema().Equals(*row_builder_.schema())) {
       // The MemRowSet is not projecting the row, so must be done by the caller
@@ -166,9 +167,9 @@ class TestCompaction : public KuduRowSetTest {
       ASSERT_OK_FAST(projector.Init());
       ASSERT_OK_FAST(projector.ProjectRowForWrite(row_builder_.row(),
                                                   &dst_row, static_cast<Arena*>(nullptr)));
-      ASSERT_OK_FAST(mrs->Insert(txn.timestamp(), ConstContiguousRow(dst_row), op_id_));
+      ASSERT_OK_FAST(mrs->Insert(op.timestamp(), ConstContiguousRow(dst_row), op_id_));
     } else {
-      ASSERT_OK_FAST(mrs->Insert(txn.timestamp(), row_builder_.row(), op_id_));
+      ASSERT_OK_FAST(mrs->Insert(op.timestamp(), row_builder_.row(), op_id_));
     }
   }
 
@@ -186,16 +187,16 @@ class TestCompaction : public KuduRowSetTest {
   }
 
   void UpdateRow(RowSet *rowset, int row_key, int32_t new_val) {
-    ScopedTransaction tx(&mvcc_, clock_.Now());
-    tx.StartApplying();
-    UpdateRowInTransaction(rowset, tx, row_key, new_val);
-    tx.Commit();
+    ScopedOp op(&mvcc_, clock_.Now());
+    op.StartApplying();
+    UpdateRowInOp(rowset, op, row_key, new_val);
+    op.FinishApplying();
   }
 
-  void UpdateRowInTransaction(RowSet *rowset,
-                              const ScopedTransaction& txn,
-                              int row_key,
-                              int32_t new_val) {
+  void UpdateRowInOp(RowSet *rowset,
+                     const ScopedOp& op,
+                     int row_key,
+                     int32_t new_val) {
     ColumnId col_id = schema_.column_id(schema_.find_column("val"));
     ColumnId nullable_col_id = schema_.column_id(schema_.find_column("nullable_val"));
 
@@ -217,10 +218,11 @@ class TestCompaction : public KuduRowSetTest {
     Schema proj_key = schema_.CreateKeyProjection();
     RowBuilder rb(&proj_key);
     rb.AddString(Slice(keybuf));
-    RowSetKeyProbe probe(rb.row());
+    Arena arena(64);
+    RowSetKeyProbe probe(rb.row(), &arena);
     ProbeStats stats;
     OperationResultPB result;
-    ASSERT_OK(rowset->MutateRow(txn.timestamp(),
+    ASSERT_OK(rowset->MutateRow(op.timestamp(),
                                 probe,
                                 RowChangeList(update_buf),
                                 op_id_,
@@ -241,13 +243,13 @@ class TestCompaction : public KuduRowSetTest {
   }
 
   void DeleteRow(RowSet* rowset, int row_key) {
-    ScopedTransaction tx(&mvcc_, clock_.Now());
-    tx.StartApplying();
-    DeleteRowInTransaction(rowset, tx, row_key);
-    tx.Commit();
+    ScopedOp op(&mvcc_, clock_.Now());
+    op.StartApplying();
+    DeleteRowInOp(rowset, op, row_key);
+    op.FinishApplying();
   }
 
-  void DeleteRowInTransaction(RowSet *rowset, const ScopedTransaction& txn, int row_key) {
+  void DeleteRowInOp(RowSet *rowset, const ScopedOp& op, int row_key) {
     char keybuf[256];
     faststring update_buf;
     snprintf(keybuf, sizeof(keybuf), kRowKeyFormat, row_key);
@@ -258,10 +260,11 @@ class TestCompaction : public KuduRowSetTest {
     Schema proj_key = schema_.CreateKeyProjection();
     RowBuilder rb(&proj_key);
     rb.AddString(Slice(keybuf));
-    RowSetKeyProbe probe(rb.row());
+    Arena arena(64);
+    RowSetKeyProbe probe(rb.row(), &arena);
     ProbeStats stats;
     OperationResultPB result;
-    ASSERT_OK(rowset->MutateRow(txn.timestamp(),
+    ASSERT_OK(rowset->MutateRow(op.timestamp(),
                                 probe,
                                 RowChangeList(update_buf),
                                 op_id_,
@@ -288,7 +291,9 @@ class TestCompaction : public KuduRowSetTest {
                                 Tablet::DefaultBloomSizing(),
                                 roll_threshold);
     ASSERT_OK(rsw.Open());
-    ASSERT_OK(FlushCompactionInput(input, snap, HistoryGcOpts::Disabled(), &rsw));
+    ASSERT_OK(FlushCompactionInput(tablet()->metadata()->tablet_id(),
+                                   fs_manager()->block_manager()->error_manager(),
+                                   input, snap, HistoryGcOpts::Disabled(), &rsw));
     ASSERT_OK(rsw.Finish());
 
     vector<shared_ptr<RowSetMetadata> > metas;
@@ -464,7 +469,9 @@ class TestCompaction : public KuduRowSetTest {
                                     Tablet::DefaultBloomSizing(),
                                     1024 * 1024); // 1 MB
       ASSERT_OK(rdrsw.Open());
-      ASSERT_OK(FlushCompactionInput(compact_input.get(), merge_snap, HistoryGcOpts::Disabled(),
+      ASSERT_OK(FlushCompactionInput(tablet()->metadata()->tablet_id(),
+                                     fs_manager()->block_manager()->error_manager(),
+                                     compact_input.get(), merge_snap, HistoryGcOpts::Disabled(),
                                      &rdrsw));
       ASSERT_OK(rdrsw.Finish());
     }
@@ -639,7 +646,7 @@ TEST_F(TestCompaction, TestDuplicatedGhostRowsMerging) {
   unique_ptr<CompactionInput> input;
   ASSERT_OK(CompactionInput::Create(*result,
                                     &schema_,
-                                    MvccSnapshot::CreateSnapshotIncludingAllTransactions(),
+                                    MvccSnapshot::CreateSnapshotIncludingAllOps(),
                                     nullptr,
                                     &input));
   vector<string> out;
@@ -726,12 +733,16 @@ void TestCompaction::AddUpdateAndDelete(RowSet* rs, CompactionInputRow* row, int
 // The verification is performed against a vector of expected CompactionInputRow that we build
 // as we insert/update/delete.
 TEST_F(TestCompaction, TestDuplicatedRowsRandomCompaction) {
-  const int kBaseNumRowSets = 10;
+  // NOTE: this test may generate a lot of rowsets; be mindful that some
+  // environments default to a low number of max open files (e.g. 256 on macOS
+  // 10.15.4), and that if we're using the file block manager, each rowset will
+  // use several files.
+  const int kBaseNumRowSets = 5;
   const int kNumRowsPerRowSet = 10;
 
   int total_num_rows = kBaseNumRowSets * kNumRowsPerRowSet;
 
-  MvccSnapshot all_snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
+  MvccSnapshot all_snap = MvccSnapshot::CreateSnapshotIncludingAllOps();
 
   vector<CompactionInputRow> expected_rows(total_num_rows);
   vector<shared_ptr<DiskRowSet>> row_sets;
@@ -779,7 +790,8 @@ TEST_F(TestCompaction, TestDuplicatedRowsRandomCompaction) {
 
   }
 
-  RowBlock block(&schema_, kBaseNumRowSets * kNumRowsPerRowSet, &arena_);
+  RowBlockMemory mem;
+  RowBlock block(&schema_, kBaseNumRowSets * kNumRowsPerRowSet, &mem);
   // Go through the expected compaction input rows, flip the last undo into a redo and
   // build the base. This will give us the final version that we'll expect the result
   // of the real compaction to match.
@@ -789,13 +801,13 @@ TEST_F(TestCompaction, TestDuplicatedRowsRandomCompaction) {
     row->undo_head = reinsert->next();
     row->row = block.row(i);
     BuildRow(i, i);
-    CopyRow(row_builder_.row(), &row->row, &arena_);
+    CopyRow(row_builder_.row(), &row->row, &mem.arena);
     RowChangeListDecoder redo_decoder(reinsert->changelist());
     CHECK_OK(redo_decoder.Init());
     faststring buf;
     RowChangeListEncoder dummy(&buf);
     dummy.SetToUpdate();
-    redo_decoder.MutateRowAndCaptureChanges(&row->row, &arena_, &dummy);
+    redo_decoder.MutateRowAndCaptureChanges(&row->row, &mem.arena, &dummy);
     AddExpectedDelete(&row->redo_head, reinsert->timestamp());
   }
 
@@ -834,7 +846,7 @@ TEST_F(TestCompaction, TestDuplicatedRowsRandomCompaction) {
   }
 }
 
-// Test case that inserts and deletes a row in the same transaction and makes sure
+// Test case that inserts and deletes a row in the same op and makes sure
 // the row isn't on the compaction input.
 TEST_F(TestCompaction, TestMRSCompactionDoesntOutputUnobservableRows) {
   // Insert a row in the mrs and flush it.
@@ -848,7 +860,7 @@ TEST_F(TestCompaction, TestMRSCompactionDoesntOutputUnobservableRows) {
     NO_FATALS();
   }
 
-  // Now make the row a ghost in rs1 in the same transaction as we reinsert it in the mrs then
+  // Now make the row a ghost in rs1 in the same op as we reinsert it in the mrs then
   // flush it. Also insert another row so that the row set isn't completely empty (otherwise
   // it would disappear on flush).
   shared_ptr<DiskRowSet> rs2;
@@ -856,20 +868,20 @@ TEST_F(TestCompaction, TestMRSCompactionDoesntOutputUnobservableRows) {
     shared_ptr<MemRowSet> mrs;
     ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
                                 mem_trackers_.tablet_tracker, &mrs));
-    ScopedTransaction tx(&mvcc_, clock_.Now());
-    tx.StartApplying();
-    DeleteRowInTransaction(rs1.get(), tx, 1);
-    InsertRowInTransaction(mrs.get(), tx, 1, 2);
-    UpdateRowInTransaction(mrs.get(), tx, 1, 3);
-    DeleteRowInTransaction(mrs.get(), tx, 1);
+    ScopedOp op(&mvcc_, clock_.Now());
+    op.StartApplying();
+    DeleteRowInOp(rs1.get(), op, 1);
+    InsertRowInOp(mrs.get(), op, 1, 2);
+    UpdateRowInOp(mrs.get(), op, 1, 3);
+    DeleteRowInOp(mrs.get(), op, 1);
 
-    InsertRowInTransaction(mrs.get(), tx, 2, 0);
-    tx.Commit();
+    InsertRowInOp(mrs.get(), op, 2, 0);
+    op.FinishApplying();
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs2);
     NO_FATALS();
   }
 
-  MvccSnapshot all_snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
+  MvccSnapshot all_snap = MvccSnapshot::CreateSnapshotIncludingAllOps();
 
   unique_ptr<CompactionInput> rs1_input;
   ASSERT_OK(CompactionInput::Create(*rs1, &schema_, all_snap, nullptr, &rs1_input));
@@ -884,7 +896,7 @@ TEST_F(TestCompaction, TestMRSCompactionDoesntOutputUnobservableRows) {
   unique_ptr<CompactionInput> merged(CompactionInput::Merge(to_merge, &schema_));
 
   // Make sure the unobservable version of the row that was inserted and deleted in the MRS
-  // in the same transaction doesn't show up in the compaction input.
+  // in the same op doesn't show up in the compaction input.
   vector<string> out;
   IterateInput(merged.get(), &out);
   EXPECT_EQ(out.size(), 2);

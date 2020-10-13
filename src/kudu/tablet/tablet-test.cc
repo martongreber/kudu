@@ -39,6 +39,7 @@
 #include "kudu/common/key_range.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.pb.h"
@@ -77,6 +78,9 @@ DEFINE_int32(testiterator_num_inserts, 1000,
 DEFINE_int32(testcompaction_num_rows, 1000,
              "Number of rows per rowset in TestCompaction");
 
+using kudu::cfile::ReaderOptions;
+using kudu::fs::ReadableBlock;
+using std::make_shared;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
@@ -84,9 +88,6 @@ using std::vector;
 
 namespace kudu {
 namespace tablet {
-
-using cfile::ReaderOptions;
-using fs::ReadableBlock;
 
 template<class SETUP>
 class TestTablet : public TabletTestBase<SETUP> {
@@ -507,7 +508,8 @@ TYPED_TEST(TestTablet, TestRowIteratorSimple) {
 
   ASSERT_TRUE(iter->HasNext());
 
-  RowBlock block(&this->schema_, 100, &this->arena_);
+  RowBlockMemory mem;
+  RowBlock block(&this->schema_, 100, &mem);
 
   // First call to CopyNextRows should fetch the whole memrowset.
   ASSERT_OK_FAST(iter->NextBlock(&block));
@@ -579,16 +581,18 @@ TYPED_TEST(TestTablet, TestRowIteratorOrdered) {
 
       // Iterate the tablet collecting rows.
       vector<shared_ptr<faststring> > rows;
+      RowBlockMemory mem;
       for (int i = 0; i < numBlocks; i++) {
-        RowBlock block(&this->schema_, rowsPerBlock, &this->arena_);
+        mem.Reset();
+        RowBlock block(&this->schema_, rowsPerBlock, &mem);
         ASSERT_TRUE(iter->HasNext());
         ASSERT_OK(iter->NextBlock(&block));
         ASSERT_EQ(rowsPerBlock, block.nrows()) << "unexpected number of rows returned";
         for (int j = 0; j < rowsPerBlock; j++) {
           RowBlockRow row = block.row(j);
-          shared_ptr<faststring> encoded(new faststring());
+          auto encoded(make_shared<faststring>());
           this->client_schema_.EncodeComparableKey(row, encoded.get());
-          rows.push_back(encoded);
+          rows.push_back(std::move(encoded));
         }
       }
       // Verify the collected rows, checking that they are sorted.
@@ -683,9 +687,10 @@ TYPED_TEST(TestTablet, TestRowIteratorComplex) {
   vector<bool> seen(max_rows, false);
   int seen_count = 0;
 
-  RowBlock block(&schema, 100, &this->arena_);
+  RowBlockMemory mem;
+  RowBlock block(&schema, 100, &mem);
   while (iter->HasNext()) {
-    this->arena_.Reset();
+    mem.Reset();
     ASSERT_OK(iter->NextBlock(&block));
     LOG(INFO) << "Fetched batch of " << block.nrows();
     for (size_t i = 0; i < block.nrows(); i++) {
@@ -755,9 +760,9 @@ TYPED_TEST(TestTablet, TestInsertIgnore) {
 
   // Single batch, insert then insert ingore of same row, operation should succeed
   this->setup_.BuildRow(&row, 0, 1000);
-  vector<LocalTabletWriter::Op> ops;
-  ops.emplace_back(LocalTabletWriter::Op(RowOperationsPB::INSERT, &row));
-  ops.emplace_back(LocalTabletWriter::Op(RowOperationsPB::INSERT_IGNORE, &row));
+  vector<LocalTabletWriter::RowOp> ops;
+  ops.emplace_back(LocalTabletWriter::RowOp(RowOperationsPB::INSERT, &row));
+  ops.emplace_back(LocalTabletWriter::RowOp(RowOperationsPB::INSERT_IGNORE, &row));
   ASSERT_OK(writer.WriteBatch(ops));
   ASSERT_OK(this->IterateToStringList(&rows));
   ASSERT_EQ(1, rows.size());
@@ -767,8 +772,8 @@ TYPED_TEST(TestTablet, TestInsertIgnore) {
 
   ops.clear();
   this->setup_.BuildRow(&row, 0, 1001);
-  ops.emplace_back(LocalTabletWriter::Op(RowOperationsPB::INSERT_IGNORE, &row));
-  ops.emplace_back(LocalTabletWriter::Op(RowOperationsPB::INSERT, &row));
+  ops.emplace_back(LocalTabletWriter::RowOp(RowOperationsPB::INSERT_IGNORE, &row));
+  ops.emplace_back(LocalTabletWriter::RowOp(RowOperationsPB::INSERT, &row));
   Status s = writer.WriteBatch(ops);
   ASSERT_STR_CONTAINS(s.ToString(), "key already present");
   ASSERT_OK(this->IterateToStringList(&rows));
@@ -955,7 +960,7 @@ TYPED_TEST(TestTablet, TestCountLiveRowsAfterShutdown) {
   NO_FATALS(this->CheckLiveRowsCount(max_rows));
 
   // Save the tablet's reference.
-  std::shared_ptr<Tablet> tablet = this->tablet();
+  shared_ptr<Tablet> tablet = this->tablet();
 
   // Shutdown the tablet.
   NO_FATALS(this->tablet()->Shutdown());
@@ -1065,7 +1070,7 @@ TYPED_TEST(TestTablet, TestFlushWithConcurrentMutation) {
 
   // Inject hooks which mutate those rows and add more rows at
   // each key stage of flushing.
-  shared_ptr<MyFlushHooks<TestFixture> > hooks(new MyFlushHooks<TestFixture>(this, false));
+  auto hooks(make_shared<MyFlushHooks<TestFixture>>(this, false));
   this->tablet()->SetFlushHooksForTests(hooks);
   this->tablet()->SetFlushCompactCommonHooksForTests(hooks);
 
@@ -1135,7 +1140,7 @@ TYPED_TEST(TestTablet, TestCompactionWithConcurrentMutation) {
 
   // Rows 20-26 inclusive will be inserted during the flush.
 
-  shared_ptr<MyCompactHooks<TestFixture> > hooks(new MyCompactHooks<TestFixture>(this, true));
+  auto hooks(make_shared<MyCompactHooks<TestFixture>>(this, true));
   this->tablet()->SetCompactionHooksForTests(hooks);
   this->tablet()->SetFlushCompactCommonHooksForTests(hooks);
 
@@ -1262,65 +1267,65 @@ TEST_F(TestTabletStringKey, TestSplitKeyRange) {
 
   RowSetVector old_rowset = comps->rowsets->all_rowsets();
   RowSetVector new_rowset = {
-      std::make_shared<MockDiskRowSet>("0", "9", 9000, 90),
-      std::make_shared<MockDiskRowSet>("2", "5", 3000, 30),
-      std::make_shared<MockDiskRowSet>("5", "6", 1000, 10)
+    make_shared<MockDiskRowSet>("0", "9", 9000, 90),
+    make_shared<MockDiskRowSet>("2", "5", 3000, 30),
+    make_shared<MockDiskRowSet>("5", "6", 1000, 10)
   };
   tablet->AtomicSwapRowSets(old_rowset, new_rowset);
   {
-    std::vector<KeyRange> result = {
-        KeyRange("", "2", 2000),
-        KeyRange("2", "5", 6000),
-        KeyRange("5", "6", 2000),
-        KeyRange("6", "", 3000)
+    vector<KeyRange> result = {
+      KeyRange("", "2", 2000),
+      KeyRange("2", "5", 6000),
+      KeyRange("5", "6", 2000),
+      KeyRange("6", "", 3000)
     };
-    std::vector<ColumnId> col_ids;
-    std::vector<KeyRange> range;
+    vector<ColumnId> col_ids;
+    vector<KeyRange> range;
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 3000, &range);
     AssertChunks(result, range);
   }
   // target chunk size less than the min interval size
   {
-    std::vector<KeyRange> result = {
-        KeyRange("", "2", 2000),
-        KeyRange("2", "5", 6000),
-        KeyRange("5", "6", 2000),
-        KeyRange("6", "", 3000)
+    vector<KeyRange> result = {
+      KeyRange("", "2", 2000),
+      KeyRange("2", "5", 6000),
+      KeyRange("5", "6", 2000),
+      KeyRange("6", "", 3000)
     };
-    std::vector<ColumnId> col_ids;
-    std::vector<KeyRange> range;
+    vector<ColumnId> col_ids;
+    vector<KeyRange> range;
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 900, &range);
     AssertChunks(result, range);
   }
   // target chunk size greater than the max interval size
   {
-    std::vector<KeyRange> result = {
-        KeyRange("", "", 13000)
+    vector<KeyRange> result = {
+      KeyRange("", "", 13000)
     };
-    std::vector<ColumnId> col_ids;
-    std::vector<KeyRange> range;
+    vector<ColumnId> col_ids;
+    vector<KeyRange> range;
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 20000, &range);
     AssertChunks(result, range);
   }
   // test split key range with column
   {
-    std::vector<KeyRange> result = {
-        KeyRange("", "2", 40),
-        KeyRange("2", "5", 120),
-        KeyRange("5", "6", 40),
-        KeyRange("6", "", 60)
+    vector<KeyRange> result = {
+      KeyRange("", "2", 40),
+      KeyRange("2", "5", 120),
+      KeyRange("5", "6", 40),
+      KeyRange("6", "", 60)
     };
-    std::vector<ColumnId> col_ids;
+    vector<ColumnId> col_ids;
     col_ids.emplace_back(0);
     col_ids.emplace_back(1);
-    std::vector<KeyRange> range;
+    vector<KeyRange> range;
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 60, &range);
     AssertChunks(result, range);
   }
   // test split key range with bound
   {
-    unique_ptr<EncodedKey> l_enc_key;
-    unique_ptr<EncodedKey> u_enc_key;
+    EncodedKey* l_enc_key = nullptr;
+    EncodedKey* u_enc_key = nullptr;
     Arena arena(256);
     KuduPartialRow lower_bound(&this->schema_);
     CHECK_OK(lower_bound.SetString("key", "1"));
@@ -1339,36 +1344,36 @@ TEST_F(TestTabletStringKey, TestSplitKeyRange) {
     ASSERT_OK(EncodedKey::DecodeEncodedString(this->schema_, &arena, u_encoded, &u_enc_key));
     // split key range in [1, 4)
     {
-      std::vector<KeyRange> result = {
-          KeyRange("1", "2", 1000),
-          KeyRange("2", "4", 4000)
+      vector<KeyRange> result = {
+        KeyRange("1", "2", 1000),
+        KeyRange("2", "4", 4000)
       };
-      std::vector<ColumnId> col_ids;
-      std::vector<KeyRange> range;
-      tablet->SplitKeyRange(l_enc_key.get(), u_enc_key.get(), col_ids, 2000, &range);
+      vector<ColumnId> col_ids;
+      vector<KeyRange> range;
+      tablet->SplitKeyRange(l_enc_key, u_enc_key, col_ids, 2000, &range);
       AssertChunks(result, range);
     }
     // split key range in [min, 4)
     {
-      std::vector<KeyRange> result = {
-          KeyRange("", "2", 2000),
-          KeyRange("2", "4", 4000)
+      vector<KeyRange> result = {
+        KeyRange("", "2", 2000),
+        KeyRange("2", "4", 4000)
       };
-      std::vector<ColumnId> col_ids;
-      std::vector<KeyRange> range;
-      tablet->SplitKeyRange(nullptr, u_enc_key.get(), col_ids, 2000, &range);
+      vector<ColumnId> col_ids;
+      vector<KeyRange> range;
+      tablet->SplitKeyRange(nullptr, u_enc_key, col_ids, 2000, &range);
       AssertChunks(result, range);
     }
     // split key range in [4, max)
     {
-      std::vector<KeyRange> result = {
-          KeyRange("4", "5", 2000),
-          KeyRange("5", "6", 2000),
-          KeyRange("6", "", 3000)
+      vector<KeyRange> result = {
+        KeyRange("4", "5", 2000),
+        KeyRange("5", "6", 2000),
+        KeyRange("6", "", 3000)
       };
-      std::vector<ColumnId> col_ids;
-      std::vector<KeyRange> range;
-      tablet->SplitKeyRange(u_enc_key.get(), nullptr, col_ids, 2000, &range);
+      vector<ColumnId> col_ids;
+      vector<KeyRange> range;
+      tablet->SplitKeyRange(u_enc_key, nullptr, col_ids, 2000, &range);
       AssertChunks(result, range);
     }
   }
@@ -1385,11 +1390,11 @@ TEST_F(TestTabletStringKey, TestSplitKeyRangeWithZeroRowSets) {
   RowSetVector new_rowset = {};
   tablet->AtomicSwapRowSets(old_rowset, new_rowset);
   {
-    std::vector<KeyRange> result = {
-        KeyRange("", "", 0)
+    vector<KeyRange> result = {
+      KeyRange("", "", 0)
     };
-    std::vector<ColumnId> col_ids;
-    std::vector<KeyRange> range;
+    vector<ColumnId> col_ids;
+    vector<KeyRange> range;
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 3000, &range);
     AssertChunks(result, range);
   }
@@ -1404,15 +1409,15 @@ TEST_F(TestTabletStringKey, TestSplitKeyRangeWithOneRowSet) {
 
   RowSetVector old_rowset = comps->rowsets->all_rowsets();
   RowSetVector new_rowset = {
-      std::make_shared<MockDiskRowSet>("0", "9", 9000, 90)
+    make_shared<MockDiskRowSet>("0", "9", 9000, 90)
   };
   tablet->AtomicSwapRowSets(old_rowset, new_rowset);
   {
-    std::vector<KeyRange> result = {
-        KeyRange("", "", 9000)
+    vector<KeyRange> result = {
+      KeyRange("", "", 9000)
     };
-    std::vector<ColumnId> col_ids;
-    std::vector<KeyRange> range;
+    vector<ColumnId> col_ids;
+    vector<KeyRange> range;
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 3000, &range);
     AssertChunks(result, range);
   }
@@ -1427,20 +1432,20 @@ TEST_F(TestTabletStringKey, TestSplitKeyRangeWithNonOverlappingRowSets) {
   tablet->GetComponents(&comps);
   RowSetVector old_rowset = comps->rowsets->all_rowsets();
   RowSetVector without_gaps_rowset = {
-      std::make_shared<MockDiskRowSet>("0", "2", 2000, 20),
-      std::make_shared<MockDiskRowSet>("2", "5", 3000, 30),
-      std::make_shared<MockDiskRowSet>("5", "6", 1000, 10),
-      std::make_shared<MockDiskRowSet>("6", "9", 3000, 30)
+    make_shared<MockDiskRowSet>("0", "2", 2000, 20),
+    make_shared<MockDiskRowSet>("2", "5", 3000, 30),
+    make_shared<MockDiskRowSet>("5", "6", 1000, 10),
+    make_shared<MockDiskRowSet>("6", "9", 3000, 30)
   };
   tablet->AtomicSwapRowSets(old_rowset, without_gaps_rowset);
   {
-    std::vector<KeyRange> result = {
-        KeyRange("", "2", 2000),
-        KeyRange("2", "5", 3000),
-        KeyRange("5", "", 4000)
+    vector<KeyRange> result = {
+      KeyRange("", "2", 2000),
+      KeyRange("2", "5", 3000),
+      KeyRange("5", "", 4000)
     };
-    std::vector<ColumnId> col_ids;
-    std::vector<KeyRange> range;
+    vector<ColumnId> col_ids;
+    vector<KeyRange> range;
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 3000, &range);
     AssertChunks(result, range);
   }
@@ -1449,18 +1454,18 @@ TEST_F(TestTabletStringKey, TestSplitKeyRangeWithNonOverlappingRowSets) {
   tablet->GetComponents(&comps);
   old_rowset = comps->rowsets->all_rowsets();
   RowSetVector with_gaps_rowset = {
-      std::make_shared<MockDiskRowSet>("0", "2", 2000, 20),
-      std::make_shared<MockDiskRowSet>("5", "6", 1000, 10),
-      std::make_shared<MockDiskRowSet>("6", "9", 3000, 30)
+    make_shared<MockDiskRowSet>("0", "2", 2000, 20),
+    make_shared<MockDiskRowSet>("5", "6", 1000, 10),
+    make_shared<MockDiskRowSet>("6", "9", 3000, 30)
   };
   tablet->AtomicSwapRowSets(old_rowset, with_gaps_rowset);
   {
-    std::vector<KeyRange> result = {
-        KeyRange("", "6", 3000),
-        KeyRange("6", "", 3000)
+    vector<KeyRange> result = {
+      KeyRange("", "6", 3000),
+      KeyRange("6", "", 3000)
     };
-    std::vector<ColumnId> col_ids;
-    std::vector<KeyRange> range;
+    vector<ColumnId> col_ids;
+    vector<KeyRange> range;
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 3000, &range);
     AssertChunks(result, range);
   }
@@ -1475,20 +1480,20 @@ TEST_F(TestTabletStringKey, TestSplitKeyRangeWithMinimumValueRowSet) {
   tablet->GetComponents(&comps);
   RowSetVector old_rowset = comps->rowsets->all_rowsets();
   RowSetVector without_gaps_rowset = {
-      std::make_shared<MockDiskRowSet>("", "2", 2500, 20),
-      std::make_shared<MockDiskRowSet>("2", "5", 3000, 30),
-      std::make_shared<MockDiskRowSet>("5", "6", 1000, 10),
-      std::make_shared<MockDiskRowSet>("6", "9", 3000, 30)
+    make_shared<MockDiskRowSet>("", "2", 2500, 20),
+    make_shared<MockDiskRowSet>("2", "5", 3000, 30),
+    make_shared<MockDiskRowSet>("5", "6", 1000, 10),
+    make_shared<MockDiskRowSet>("6", "9", 3000, 30)
   };
   tablet->AtomicSwapRowSets(old_rowset, without_gaps_rowset);
   {
-    std::vector<KeyRange> result = {
-        KeyRange("", "2", 2500),
-        KeyRange("2", "5", 3000),
-        KeyRange("5", "", 4000)
+    vector<KeyRange> result = {
+      KeyRange("", "2", 2500),
+      KeyRange("2", "5", 3000),
+      KeyRange("5", "", 4000)
     };
-    std::vector<ColumnId> col_ids;
-    std::vector<KeyRange> range;
+    vector<ColumnId> col_ids;
+    vector<KeyRange> range;
     tablet->SplitKeyRange(nullptr, nullptr, col_ids, 3000, &range);
     AssertChunks(result, range);
   }
@@ -1496,7 +1501,7 @@ TEST_F(TestTabletStringKey, TestSplitKeyRangeWithMinimumValueRowSet) {
 
 TYPED_TEST(TestTablet, TestDiffScanUnobservableOperations) {
   LocalTabletWriter writer(this->tablet().get(), &this->client_schema());
-  vector<LocalTabletWriter::Op> ops;
+  vector<LocalTabletWriter::RowOp> ops;
 
   // Row 0: INSERT -> DELETE.
 

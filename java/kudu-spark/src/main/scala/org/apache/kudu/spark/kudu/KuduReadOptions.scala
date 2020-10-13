@@ -38,6 +38,12 @@ import org.apache.kudu.spark.kudu.KuduReadOptions._
  * @param splitSizeBytes Sets the target number of bytes per spark task. If set, tablet's
  *                       primary key range will be split to generate uniform task sizes instead of
  *                       the default of 1 task per tablet.
+ * @param useDriverMetadata If true, sends the table metadata from the driver to the tasks instead
+ *                          of relying on calls to the Kudu master for each task to get the current
+ *                          table metadata.
+ * @param snapshotTimestampMs Sets a timestamp in unixtime milliseconds to use for READ_AT_SNAPSHOT
+ *                            to allow repeatable reads. If not set, the timestamp is generated
+ *                            by the server.
  */
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
@@ -48,11 +54,14 @@ case class KuduReadOptions(
     keepAlivePeriodMs: Long = defaultKeepAlivePeriodMs,
     scanRequestTimeoutMs: Option[Long] = None,
     socketReadTimeoutMs: Option[Long] = None,
-    splitSizeBytes: Option[Long] = None)
+    splitSizeBytes: Option[Long] = None,
+    useDriverMetadata: Boolean = defaultUseDriverMetadata,
+    snapshotTimestampMs: Option[Long] = None)
 
 object KuduReadOptions {
   val defaultBatchSize: Int = 1024 * 1024 * 20 // TODO: Understand/doc this setting?
   val defaultScanLocality: ReplicaSelection = ReplicaSelection.CLOSEST_REPLICA
   val defaultFaultTolerantScanner: Boolean = false
   val defaultKeepAlivePeriodMs: Long = AsyncKuduClient.DEFAULT_KEEP_ALIVE_PERIOD_MS
+  val defaultUseDriverMetadata: Boolean = true
 }

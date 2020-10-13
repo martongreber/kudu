@@ -46,10 +46,10 @@ namespace ranger {
 // List of usernames to be used in PolicyItem;
 typedef std::vector<std::string> UserList;
 
-// Pair of a vector of usernames and a vector of allowed actions to be used in
-// AuthorizationPolicy. Number of users and actions doesn't have to match, their
-// cross-product is taken.
-typedef std::pair<UserList, std::vector<ActionPB>> PolicyItem;
+// Tuple of a vector of usernames,  a vector of allowed actions and a delegate
+// admin flag to be used in AuthorizationPolicy. Number of users and actions
+// doesn't have to match, their cross-product is taken.
+typedef std::tuple<UserList, std::vector<ActionPB>, bool> PolicyItem;
 
 // Policy key used for searching policies_ (values are PolicyItems).
 typedef std::tuple<std::vector<std::string>,
@@ -188,9 +188,8 @@ class MiniRanger {
   uint16_t port_ = 0;
 
   // Determines how frequently clients fetch policies from the server. The
-  // default is 200ms so that tests don't have to wait too long until freshly
-  // created policies can be used.
-  uint32_t policy_poll_interval_ms_ = 200;
+  // default is 30s which aligns with Ranger's default.
+  uint32_t policy_poll_interval_ms_ = 30000;
 
   // Stores existing policies since starting the MiniRanger instance. This is
   // used for adding new policy items (list of users and privileges) to existing

@@ -42,10 +42,12 @@
 #include "kudu/cfile/index_btree.h"
 #include "kudu/cfile/type_encodings.h"
 #include "kudu/common/column_materialization_context.h"
+#include "kudu/common/columnblock-test-util.h"
 #include "kudu/common/columnblock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/encoded_key.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/rowid.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
@@ -67,7 +69,6 @@
 #include "kudu/util/int128.h"
 #include "kudu/util/int128_util.h"
 #include "kudu/util/mem_tracker.h"
-#include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/nvm_cache.h"
 #include "kudu/util/slice.h"
@@ -75,6 +76,10 @@
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+
+namespace kudu {
+class Arena;
+}  // namespace kudu
 
 DECLARE_bool(cfile_write_checksums);
 DECLARE_bool(cfile_verify_checksums);
@@ -163,9 +168,11 @@ class TestCFile : public CFileTestBase {
     ASSERT_OK(iter->SeekToOrdinal(0));
     size_t fetched = 0;
     while (fetched < 10000) {
-      ColumnBlock advancing_block(out.type_info(), nullptr,
+      ColumnBlock advancing_block(out.type_info(),
+                                  nullptr,
                                   out.data() + (fetched * out.stride()),
-                                  out.nrows() - fetched, out.arena());
+                                  out.nrows() - fetched,
+                                  out.memory());
       ColumnMaterializationContext adv_ctx = CreateNonDecoderEvalContext(&advancing_block, &sel);
       ASSERT_TRUE(iter->HasNext());
       size_t batch_size = random() % 5 + 1;
@@ -204,7 +211,7 @@ class TestCFile : public CFileTestBase {
     unique_ptr<CFileIterator> iter;
     ASSERT_OK(reader->NewIterator(&iter, CFileReader::CACHE_BLOCK, nullptr));
 
-    Arena arena(8192);
+    RowBlockMemory mem;
     ScopedColumnBlock<DataGeneratorType::kDataType> cb(10);
 
     SelectionVector sel(10);
@@ -234,7 +241,7 @@ class TestCFile : public CFileTestBase {
             ASSERT_EQ((*generator)[j], cb[j]);
           }
         }
-        cb.arena()->Reset();
+        cb.memory()->Reset();
         read_offset += n;
       }
     }
@@ -247,11 +254,11 @@ class TestCFile : public CFileTestBase {
     WriteTestFile(generator, encoding, compression, 10000, SMALL_BLOCKSIZE, &block_id);
 
     size_t n;
-    TimeReadFile(fs_manager_.get(), block_id, &n);
+    NO_FATALS(TimeReadFile(fs_manager_.get(), block_id, &n));
     ASSERT_EQ(n, 10000);
 
     generator->Reset();
-    TimeSeekAndReadFileWithNulls(generator, block_id, n);
+    NO_FATALS(TimeSeekAndReadFileWithNulls(generator, block_id, n));
   }
 
   void TestReadWriteRawBlocks(CompressionType compression, int num_entries) {
@@ -300,12 +307,12 @@ class TestCFile : public CFileTestBase {
 
     uint32_t count = 0;
     do {
-      BlockHandle dblk_data;
+      scoped_refptr<BlockHandle> dblk_data;
       BlockPointer blk_ptr = iter->GetCurrentBlockPointer();
       ASSERT_OK(reader->ReadBlock(nullptr, blk_ptr, CFileReader::CACHE_BLOCK, &dblk_data));
 
       memcpy(data + 12, &count, 4);
-      ASSERT_EQ(expected_data, dblk_data.data());
+      ASSERT_EQ(expected_data, dblk_data->data());
 
       count++;
     } while (iter->Next().ok());
@@ -383,7 +390,7 @@ class TestCFile : public CFileTestBase {
     RETURN_NOT_OK(iter->SeekToFirst());
 
     do {
-      BlockHandle dblk_data;
+      scoped_refptr<BlockHandle> dblk_data;
       BlockPointer blk_ptr = iter->GetCurrentBlockPointer();
       RETURN_NOT_OK(reader->ReadBlock(&io_context, blk_ptr,
           CFileReader::DONT_CACHE_BLOCK, &dblk_data));
@@ -431,11 +438,9 @@ INSTANTIATE_TEST_CASE_P(CacheMemoryTypes, TestCFileBothCacheMemoryTypes,
                         ::testing::Values(Cache::MemoryType::DRAM,
                                           Cache::MemoryType::NVM));
 
-template<DataType type>
-void CopyOne(CFileIterator *it,
-             typename TypeTraits<type>::cpp_type *ret,
-             Arena *arena) {
-  ColumnBlock cb(GetTypeInfo(type), nullptr, ret, 1, arena);
+template <DataType type>
+void CopyOne(CFileIterator* it, typename TypeTraits<type>::cpp_type* ret, RowBlockMemory* mem) {
+  ColumnBlock cb(GetTypeInfo(type), nullptr, ret, 1, mem);
   SelectionVector sel(1);
   ColumnMaterializationContext ctx(0, nullptr, &cb, &sel);
   ctx.SetDecoderEvalNotSupported();
@@ -601,11 +606,13 @@ TYPED_TEST(BitShuffleTest, TestFixedSizeReadWriteBitShuffle) {
   this->TestBitShuffle();
 }
 
-void EncodeStringKey(const Schema &schema, const Slice& key,
-                     unique_ptr<EncodedKey> *encoded_key) {
-  EncodedKeyBuilder kb(&schema);
+void EncodeStringKey(const Schema& schema,
+                     const Slice& key,
+                     Arena* arena,
+                     EncodedKey** encoded_key) {
+  EncodedKeyBuilder kb(&schema, arena);
   kb.AddColumnKey(&key);
-  encoded_key->reset(kb.BuildEncodedKey());
+  *encoded_key = kb.BuildEncodedKey();
 }
 
 void TestCFile::TestReadWriteStrings(EncodingType encoding,
@@ -632,18 +639,18 @@ void TestCFile::TestReadWriteStrings(EncodingType encoding,
   unique_ptr<CFileIterator> iter;
   ASSERT_OK(reader->NewIterator(&iter, CFileReader::CACHE_BLOCK, nullptr));
 
-  Arena arena(1024);
+  RowBlockMemory mem;
 
   ASSERT_OK(iter->SeekToOrdinal(5000));
-  ASSERT_EQ(5000u, iter->GetCurrentOrdinal());
+  ASSERT_EQ(5000, iter->GetCurrentOrdinal());
   Slice s;
 
-  CopyOne<STRING>(iter.get(), &s, &arena);
+  CopyOne<STRING>(iter.get(), &s, &mem);
   ASSERT_EQ(formatter(5000), s.ToString());
 
   // Seek to last key exactly, should succeed
   ASSERT_OK(iter->SeekToOrdinal(9999));
-  ASSERT_EQ(9999u, iter->GetCurrentOrdinal());
+  ASSERT_EQ(9999, iter->GetCurrentOrdinal());
 
   // Seek to after last key. Should result in not found.
   ASSERT_TRUE(iter->SeekToOrdinal(10000).IsNotFound());
@@ -653,37 +660,37 @@ void TestCFile::TestReadWriteStrings(EncodingType encoding,
   // Now try some seeks by the value instead of position
   /////////
 
-  unique_ptr<EncodedKey> encoded_key;
+  EncodedKey* encoded_key = nullptr;
   bool exact;
 
   // Seek in between each key.
   // (seek to "hello 0000.5" through "hello 9999.5")
   string buf;
   for (int i = 1; i < 10000; i++) {
-    arena.Reset();
+    mem.Reset();
     buf = formatter(i - 1);
     buf.append(".5");
     s = Slice(buf);
-    EncodeStringKey(schema, s, &encoded_key);
+    EncodeStringKey(schema, s, &mem.arena, &encoded_key);
     ASSERT_OK(iter->SeekAtOrAfter(*encoded_key, &exact));
     ASSERT_FALSE(exact);
     ASSERT_EQ(i, iter->GetCurrentOrdinal());
-    CopyOne<STRING>(iter.get(), &s, &arena);
+    CopyOne<STRING>(iter.get(), &s, &mem);
     ASSERT_EQ(formatter(i), s.ToString());
   }
 
   // Seek exactly to each key
   // (seek to "hello 0000" through "hello 9999")
   for (int i = 0; i < 9999; i++) {
-    arena.Reset();
+    mem.Reset();
     buf = formatter(i);
     s = Slice(buf);
-    EncodeStringKey(schema, s, &encoded_key);
+    EncodeStringKey(schema, s, &mem.arena, &encoded_key);
     ASSERT_OK(iter->SeekAtOrAfter(*encoded_key, &exact));
     ASSERT_TRUE(exact);
     ASSERT_EQ(i, iter->GetCurrentOrdinal());
     Slice read_back;
-    CopyOne<STRING>(iter.get(), &read_back, &arena);
+    CopyOne<STRING>(iter.get(), &read_back, &mem);
     ASSERT_EQ(read_back.ToString(), s.ToString());
   }
 
@@ -691,7 +698,7 @@ void TestCFile::TestReadWriteStrings(EncodingType encoding,
   // (seek to "hello 9999.x")
   buf = formatter(9999) + ".x";
   s = Slice(buf);
-  EncodeStringKey(schema, s, &encoded_key);
+  EncodeStringKey(schema, s, &mem.arena, &encoded_key);
   EXPECT_TRUE(iter->SeekAtOrAfter(*encoded_key, &exact).IsNotFound());
 
   // before first entry
@@ -699,17 +706,17 @@ void TestCFile::TestReadWriteStrings(EncodingType encoding,
   buf = formatter(0);
   buf.resize(buf.size() - 1);
   s = Slice(buf);
-  EncodeStringKey(schema, s, &encoded_key);
+  EncodeStringKey(schema, s, &mem.arena, &encoded_key);
   ASSERT_OK(iter->SeekAtOrAfter(*encoded_key, &exact));
   EXPECT_FALSE(exact);
-  EXPECT_EQ(0u, iter->GetCurrentOrdinal());
-  CopyOne<STRING>(iter.get(), &s, &arena);
+  EXPECT_EQ(0, iter->GetCurrentOrdinal());
+  CopyOne<STRING>(iter.get(), &s, &mem);
   EXPECT_EQ(formatter(0), s.ToString());
 
   // Seek to start of file by ordinal
   ASSERT_OK(iter->SeekToFirst());
-  ASSERT_EQ(0u, iter->GetCurrentOrdinal());
-  CopyOne<STRING>(iter.get(), &s, &arena);
+  ASSERT_EQ(0, iter->GetCurrentOrdinal());
+  CopyOne<STRING>(iter.get(), &s, &mem);
   ASSERT_EQ(formatter(0), s.ToString());
 
   // Reseek to start and fetch all data.
@@ -848,9 +855,9 @@ TEST_P(TestCFileBothCacheMemoryTypes, TestDefaultColumnIter) {
   // Test String Default Value
   Slice str_data[kNumItems];
   Slice str_value("Hello");
-  Arena arena(32*1024);
+  RowBlockMemory mem;
   DefaultColumnValueIterator str_iter(GetTypeInfo(STRING), &str_value);
-  ColumnBlock str_col(GetTypeInfo(STRING), nullptr, str_data, kNumItems, &arena);
+  ColumnBlock str_col(GetTypeInfo(STRING), nullptr, str_data, kNumItems, &mem);
   ColumnMaterializationContext str_ctx = CreateNonDecoderEvalContext(&str_col, &sel);
   ASSERT_OK(str_iter.Scan(&str_ctx));
   for (size_t i = 0; i < str_col.nrows(); ++i) {
@@ -1058,7 +1065,7 @@ TEST_P(TestCFileBothCacheMemoryTypes, TestCacheKeysAreStable) {
     iter.reset(IndexTreeIterator::Create(nullptr, reader.get(), reader->posidx_root()));
     ASSERT_OK(iter->SeekToFirst());
 
-    BlockHandle bh;
+    scoped_refptr<BlockHandle> bh;
     ASSERT_OK(reader->ReadBlock(nullptr, iter->GetCurrentBlockPointer(),
                                 CFileReader::CACHE_BLOCK,
                                 &bh));

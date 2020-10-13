@@ -20,10 +20,98 @@ package kudu.tserver;
 option java_package = "org.apache.kudu.tserver";
 
 import "kudu/common/common.proto";
+import "kudu/common/wire_protocol.proto";
 import "kudu/consensus/metadata.proto";
 import "kudu/rpc/rpc_header.proto";
 import "kudu/tablet/metadata.proto";
+import "kudu/transactions/transactions.proto";
 import "kudu/tserver/tserver.proto";
+
+message CoordinatorOpPB {
+  enum CoordinatorOpType {
+    UNKNOWN = 0;
+    BEGIN_TXN = 1;
+    REGISTER_PARTICIPANT = 2;
+    BEGIN_COMMIT_TXN = 3;
+    ABORT_TXN = 4;
+    GET_TXN_STATUS = 5;
+  }
+  optional CoordinatorOpType type = 1;
+  optional int64 txn_id = 2;
+
+  // Only set if 'type' is REGISTER_PARTICIPANT.
+  optional string txn_participant_id = 3;
+
+  // End-user that is associated with this request.
+  optional string user = 4;
+}
+
+message CoordinatorOpResultPB {
+  optional AppStatusPB op_error = 1;
+
+  // The status of the transaction as seen at the moment when the request was
+  // processed. Populated only if responding to a request of the GET_TXN_STATUS
+  // operation type.
+  // TODO(aserbin): does it make sense to populate this with the current status
+  //                of the transaction for other operation types?
+  optional transactions.TxnStatusEntryPB txn_status = 2;
+
+  // The highest transaction identifier (txn_id) seen by the TxnStatusManager
+  // that coordinates the lifecycle of operations for a particular tablet
+  // of the transaction status table. This field is populated when responding
+  // to a request of the BEGIN_TXN type (in success and error cases).
+  optional int64 highest_seen_txn_id = 3;
+
+  // TODO(awong): populate this with some application-level results, like the
+  // actual transaction ID assigned, the next highest transaction ID available,
+  // etc.
+}
+
+message CoordinateTransactionRequestPB {
+  // The tablet ID of the transaction status tablet associated with the given
+  // operation.
+  optional bytes txn_status_tablet_id = 1;
+
+  // TODO(awong): consider batching these ops, though we'll need to give a lot
+  // of thought to locking constraints.
+  optional CoordinatorOpPB op = 2;
+}
+
+message CoordinateTransactionResponsePB {
+  // If there was a service-level error with the request (e.g. the server was
+  // not online, the tablet was not found, etc.), the error status that caused
+  // the failure.
+  optional TabletServerErrorPB error = 1;
+
+  // The application-level result of the operation.
+  optional CoordinatorOpResultPB op_result = 2;
+}
+
+message ParticipantOpPB {
+  enum ParticipantOpType {
+    UNKNOWN = 0;
+    BEGIN_TXN = 1;
+    BEGIN_COMMIT = 2;
+    FINALIZE_COMMIT = 3;
+    ABORT_TXN = 4;
+  }
+  optional ParticipantOpType type = 1;
+  optional int64 txn_id = 2;
+
+  // Only set if 'type' is FINALIZE_COMMIT.
+  optional int64 finalized_commit_timestamp = 3;
+}
+
+message ParticipantRequestPB {
+  optional ParticipantOpPB op = 1;
+}
+
+message ParticipantResponsePB {
+  optional TabletServerErrorPB error = 1;
+
+  // The timestamp chosen by the server for this participant op.
+  optional fixed64 timestamp = 2;
+}
 
 message AlterSchemaRequestPB {
   // UUID of server this request is addressed to.
@@ -52,6 +140,10 @@ message AlterSchemaResponsePB {
 message CreateTabletRequestPB {
   // UUID of server this request is addressed to.
   optional bytes dest_uuid = 8;
+
+  // The type of table this tablet belongs to. If not set, the assumption is
+  // this is a user-defined table as opposed to a Kudu-internal system table.
+  optional TableTypePB table_type = 13;
 
   required bytes table_id = 1;
   required bytes tablet_id = 2;
@@ -147,6 +239,10 @@ service TabletServerAdminService {
 
   // Quiesce the tablet server.
   rpc Quiesce(QuiesceTabletServerRequestPB) returns (QuiesceTabletServerResponsePB);
+
+  // Coordinate the lifecycle of a transaction.
+  rpc CoordinateTransaction(CoordinateTransactionRequestPB)
+      returns (CoordinateTransactionResponsePB);
 }
 
 message QuiesceTabletServerRequestPB {

@@ -36,11 +36,11 @@
 #include "kudu/util/logging.h"
 #include "kudu/util/monotime.h"
 
-DEFINE_int32(inject_latency_ms_before_starting_txn, 0,
+DEFINE_int32(inject_latency_ms_before_starting_op, 0,
              "Amount of latency in ms to inject before registering "
-             "a transaction with MVCC.");
-TAG_FLAG(inject_latency_ms_before_starting_txn, advanced);
-TAG_FLAG(inject_latency_ms_before_starting_txn, hidden);
+             "an op with MVCC.");
+TAG_FLAG(inject_latency_ms_before_starting_op, advanced);
+TAG_FLAG(inject_latency_ms_before_starting_op, hidden);
 
 namespace kudu {
 namespace tablet {
@@ -48,11 +48,11 @@ namespace tablet {
 using strings::Substitute;
 
 MvccManager::MvccManager()
-  : new_txn_timestamp_exc_lower_bound_(Timestamp::kMin),
+  : new_op_timestamp_exc_lower_bound_(Timestamp::kMin),
     earliest_in_flight_(Timestamp::kMax),
     open_(true) {
-  cur_snap_.all_committed_before_ = Timestamp::kInitialTimestamp;
-  cur_snap_.none_committed_at_or_after_ = Timestamp::kInitialTimestamp;
+  cur_snap_.all_applied_before_ = Timestamp::kInitialTimestamp;
+  cur_snap_.none_applied_at_or_after_ = Timestamp::kInitialTimestamp;
 }
 
 Status MvccManager::CheckIsCleanTimeInitialized() const {
@@ -62,23 +62,23 @@ Status MvccManager::CheckIsCleanTimeInitialized() const {
   return Status::OK();
 }
 
-void MvccManager::StartTransaction(Timestamp timestamp) {
-  MAYBE_INJECT_RANDOM_LATENCY(FLAGS_inject_latency_ms_before_starting_txn);
+void MvccManager::StartOp(Timestamp timestamp) {
+  MAYBE_INJECT_RANDOM_LATENCY(FLAGS_inject_latency_ms_before_starting_op);
   std::lock_guard<LockType> l(lock_);
-  CHECK(!cur_snap_.IsCommitted(timestamp)) <<
-      Substitute("Trying to start a new txn at an already committed "
+  CHECK(!cur_snap_.IsApplied(timestamp)) <<
+      Substitute("Trying to start a new op at an already applied "
                  "timestamp: $0, current MVCC snapshot: $1",
                  timestamp.ToString(), cur_snap_.ToString());
-  CHECK(InitTransactionUnlocked(timestamp)) <<
-      Substitute("There is already a txn with timestamp: $0 in flight, or "
+  CHECK(InitOpUnlocked(timestamp)) <<
+      Substitute("There is already a op with timestamp: $0 in flight, or "
                  "this timestamp is below or equal to the exclusive lower "
-                 "bound for new transaction timestamps. Current lower bound: "
+                 "bound for new op timestamps. Current lower bound: "
                  "$1, current MVCC snapshot: $2", timestamp.ToString(),
-                 new_txn_timestamp_exc_lower_bound_.ToString(),
+                 new_op_timestamp_exc_lower_bound_.ToString(),
                  cur_snap_.ToString());
 }
 
-void MvccManager::StartApplyingTransaction(Timestamp timestamp) {
+void MvccManager::StartApplyingOp(Timestamp timestamp) {
   std::lock_guard<LockType> l(lock_);
   auto it = timestamps_in_flight_.find(timestamp.value());
   if (PREDICT_FALSE(it == timestamps_in_flight_.end())) {
@@ -95,10 +95,10 @@ void MvccManager::StartApplyingTransaction(Timestamp timestamp) {
   it->second = APPLYING;
 }
 
-bool MvccManager::InitTransactionUnlocked(const Timestamp& timestamp) {
-  // Ensure we're not trying to start a transaction that falls before our lower
+bool MvccManager::InitOpUnlocked(const Timestamp& timestamp) {
+  // Ensure we're not trying to start an op that falls before our lower
   // bound.
-  if (PREDICT_FALSE(timestamp <= new_txn_timestamp_exc_lower_bound_)) {
+  if (PREDICT_FALSE(timestamp <= new_op_timestamp_exc_lower_bound_)) {
     return false;
   }
 
@@ -109,43 +109,42 @@ bool MvccManager::InitTransactionUnlocked(const Timestamp& timestamp) {
   return InsertIfNotPresent(&timestamps_in_flight_, timestamp.value(), RESERVED);
 }
 
-void MvccManager::AbortTransaction(Timestamp timestamp) {
+void MvccManager::AbortOp(Timestamp timestamp) {
   std::lock_guard<LockType> l(lock_);
 
   // Remove from our in-flight list.
   TxnState old_state = RemoveInFlightAndGetStateUnlocked(timestamp);
 
   // If the tablet is shutting down, we can ignore the state of the
-  // transactions.
+  // ops.
   if (PREDICT_FALSE(!open_.load())) {
-    LOG(WARNING) << "aborting transaction with timestamp " << timestamp.ToString()
+    LOG(WARNING) << "aborting op with timestamp " << timestamp.ToString()
         << " in state " << old_state << "; MVCC is closed";
     return;
   }
 
-  CHECK_EQ(old_state, RESERVED) << "transaction with timestamp " << timestamp.ToString()
+  CHECK_EQ(old_state, RESERVED) << "op with timestamp " << timestamp.ToString()
                                 << " cannot be aborted in state " << old_state;
 
-  // If we're aborting the earliest transaction that was in flight,
+  // If we're aborting the earliest op that was in flight,
   // update our cached value.
   if (earliest_in_flight_ == timestamp) {
     AdvanceEarliestInFlightTimestamp();
   }
 }
 
-void MvccManager::CommitTransaction(Timestamp timestamp) {
+void MvccManager::FinishApplyingOp(Timestamp timestamp) {
   std::lock_guard<LockType> l(lock_);
 
-  // Commit the transaction, but do not adjust 'all_committed_before_', that will
+  // Apply the op, but do not adjust 'all_applied_before_', that will
   // be done with a separate OfflineAdjustCurSnap() call.
   bool was_earliest = false;
-  CommitTransactionUnlocked(timestamp, &was_earliest);
+  ApplyOpUnlocked(timestamp, &was_earliest);
 
-  // NOTE: we should have pushed the lower bound forward before committing, but
+  // NOTE: we should have pushed the lower bound forward before applying, but
   // we may not have in tests.
-  if (was_earliest && new_txn_timestamp_exc_lower_bound_ >= timestamp) {
-
-    // If this transaction was the earliest in-flight, we might have to adjust
+  if (was_earliest && new_op_timestamp_exc_lower_bound_ >= timestamp) {
+    // If this op was the earliest in-flight, we might have to adjust
     // the "clean" timestamp.
     AdjustCleanTimeUnlocked();
   }
@@ -164,21 +163,21 @@ MvccManager::TxnState MvccManager::RemoveInFlightAndGetStateUnlocked(Timestamp t
   return state;
 }
 
-void MvccManager::CommitTransactionUnlocked(Timestamp timestamp,
-                                            bool* was_earliest_in_flight) {
+void MvccManager::ApplyOpUnlocked(Timestamp timestamp,
+                                   bool* was_earliest_in_flight) {
   *was_earliest_in_flight = earliest_in_flight_ == timestamp;
 
   // Remove from our in-flight list.
   TxnState old_state = RemoveInFlightAndGetStateUnlocked(timestamp);
   CHECK_EQ(old_state, APPLYING)
-    << "Trying to commit a transaction which never entered APPLYING state: "
+    << "Trying to apply an op which never entered APPLYING state: "
     << timestamp.ToString() << " state=" << old_state;
 
-  // Add to snapshot's committed list
-  cur_snap_.AddCommittedTimestamp(timestamp);
+  // Add to snapshot's applied list
+  cur_snap_.AddAppliedTimestamp(timestamp);
 
-  // If we're committing the earliest transaction that was in flight,
-  // update our cached value.
+  // If we're applying the earliest op that was in flight, update our cached
+  // value.
   if (*was_earliest_in_flight) {
     AdvanceEarliestInFlightTimestamp();
   }
@@ -193,21 +192,21 @@ void MvccManager::AdvanceEarliestInFlightTimestamp() {
   }
 }
 
-void MvccManager::AdjustNewTransactionLowerBound(Timestamp timestamp) {
+void MvccManager::AdjustNewOpLowerBound(Timestamp timestamp) {
   std::lock_guard<LockType> l(lock_);
-  // No more transactions will start with a timestamp that is lower than or
+  // No more ops will start with a timestamp that is lower than or
   // equal to 'timestamp', so we adjust the snapshot accordingly.
-  if (PREDICT_TRUE(new_txn_timestamp_exc_lower_bound_ <= timestamp)) {
-    DVLOG(4) << "Adjusting new transaction lower bound to: " << timestamp;
-    new_txn_timestamp_exc_lower_bound_ = timestamp;
+  if (PREDICT_TRUE(new_op_timestamp_exc_lower_bound_ <= timestamp)) {
+    DVLOG(4) << "Adjusting new op lower bound to: " << timestamp;
+    new_op_timestamp_exc_lower_bound_ = timestamp;
   } else {
-    // Note: Getting here means that we are about to apply a transaction out of
+    // Note: Getting here means that we are about to apply an op out of
     // order. This out-of-order applying is only safe because concurrrent
-    // transactions are guaranteed to not affect the same state based on locks
-    // taken before starting the transaction (e.g. row locks, schema locks).
+    // ops are guaranteed to not affect the same state based on locks
+    // taken before starting the op (e.g. row locks, schema locks).
     KLOG_EVERY_N(INFO, 10) <<
-        Substitute("Tried to move back new transaction lower bound from $0 to $1. "
-                   "Current Snapshot: $2", new_txn_timestamp_exc_lower_bound_.ToString(),
+        Substitute("Tried to move back new op lower bound from $0 to $1. "
+                   "Current Snapshot: $2", new_op_timestamp_exc_lower_bound_.ToString(),
                    timestamp.ToString(), cur_snap_.ToString());
     return;
   }
@@ -243,40 +242,40 @@ void MvccManager::AdjustCleanTimeUnlocked() {
 
   // There are two possibilities:
   //
-  // 1) We still have an in-flight transaction earlier than
-  //    'new_txn_timestamp_exc_lower_bound_'. In this case, we update the
-  //    watermark to that transaction's timestamp.
+  // 1) We still have an in-flight op earlier than
+  //    'new_op_timestamp_exc_lower_bound_'. In this case, we update the
+  //    watermark to that op's timestamp.
   //
-  // 2) There are no in-flight transactions earlier than
-  //    'new_txn_timestamp_exc_lower_bound_'. In this case, we update the
-  //    watermark to that lower bound, since we know that no new transactions
+  // 2) There are no in-flight ops earlier than
+  //    'new_op_timestamp_exc_lower_bound_'. In this case, we update the
+  //    watermark to that lower bound, since we know that no new ops
   //    can start with an earlier timestamp.
-  //    NOTE: there may still be in-flight transactions with future timestamps
-  //    due to commit-wait transactions which start in the future.
+  //    NOTE: there may still be in-flight ops with future timestamps
+  //    due to commit-wait ops which start in the future.
   //
-  // In either case, we have to add the newly committed ts only if it remains higher
-  // than the new watermark.
+  // In either case, we have to add the newly applied ts only if it remains
+  // higher than the new watermark.
 
-  if (earliest_in_flight_ < new_txn_timestamp_exc_lower_bound_) {
-    cur_snap_.all_committed_before_ = earliest_in_flight_;
+  if (earliest_in_flight_ < new_op_timestamp_exc_lower_bound_) {
+    cur_snap_.all_applied_before_ = earliest_in_flight_;
   } else {
-    cur_snap_.all_committed_before_ = new_txn_timestamp_exc_lower_bound_;
+    cur_snap_.all_applied_before_ = new_op_timestamp_exc_lower_bound_;
   }
 
-  DVLOG(4) << "Adjusted clean time to: " << cur_snap_.all_committed_before_;
+  DVLOG(4) << "Adjusted clean time to: " << cur_snap_.all_applied_before_;
 
-  // Filter out any committed timestamps that now fall below the watermark
-  FilterTimestamps(&cur_snap_.committed_timestamps_, cur_snap_.all_committed_before_.value());
+  // Filter out any applied timestamps that now fall below the watermark
+  FilterTimestamps(&cur_snap_.applied_timestamps_, cur_snap_.all_applied_before_.value());
 
-  // If the current snapshot doesn't have any committed timestamps, then make sure we still
-  // advance the 'none_committed_at_or_after_' watermark so that it never falls below
-  // 'all_committed_before_'.
-  if (cur_snap_.committed_timestamps_.empty()) {
-    cur_snap_.none_committed_at_or_after_ = cur_snap_.all_committed_before_;
+  // If the current snapshot doesn't have any applied timestamps, then make sure we still
+  // advance the 'none_applied_at_or_after_' watermark so that it never falls below
+  // 'all_applied_before_'.
+  if (cur_snap_.applied_timestamps_.empty()) {
+    cur_snap_.none_applied_at_or_after_ = cur_snap_.all_applied_before_;
   }
 
   // it may also have unblocked some waiters.
-  // Check if someone is waiting for transactions to be committed.
+  // Check if someone is waiting for ops to be applied.
   if (PREDICT_FALSE(!waiters_.empty())) {
     auto iter = waiters_.begin();
     while (iter != waiters_.end()) {
@@ -293,7 +292,7 @@ void MvccManager::AdjustCleanTimeUnlocked() {
 
 Status MvccManager::WaitUntil(WaitFor wait_for, Timestamp ts, const MonoTime& deadline) const {
   TRACE_EVENT2("tablet", "MvccManager::WaitUntil",
-               "wait_for", wait_for == ALL_COMMITTED ? "all_committed" : "none_applying",
+               "wait_for", wait_for == ALL_APPLIED ? "all_applied" : "none_applying",
                "ts", ts.ToUint64());
 
   // If MVCC is closed, there's no point in waiting.
@@ -322,16 +321,20 @@ Status MvccManager::WaitUntil(WaitFor wait_for, Timestamp ts, const MonoTime& de
     return CheckOpen();
   }
 
+  // TODO(awong): the distinction here seems nuanced. Do we actually need to
+  // wait for clean-time advancement, or can we wait to finish applying ops?
   waiters_.erase(std::find(waiters_.begin(), waiters_.end(), &waiting_state));
-  return Status::TimedOut(Substitute("Timed out waiting for all transactions with ts < $0 to $1",
+  return Status::TimedOut(Substitute("Timed out waiting for all ops with ts < $0 to $1",
                                      ts.ToString(),
-                                     wait_for == ALL_COMMITTED ? "commit" : "finish applying"));
+                                     wait_for == ALL_APPLIED ?
+                                     "finish applying and guarantee no earlier applying ops" :
+                                     "finish applying"));
 }
 
 bool MvccManager::IsDoneWaitingUnlocked(const WaitingState& waiter) const {
   switch (waiter.wait_for) {
-    case ALL_COMMITTED:
-      return AreAllTransactionsCommittedUnlocked(waiter.timestamp);
+    case ALL_APPLIED:
+      return AreAllOpsAppliedUnlocked(waiter.timestamp);
     case NONE_APPLYING:
       return !AnyApplyingAtOrBeforeUnlocked(waiter.timestamp);
   }
@@ -345,18 +348,18 @@ Status MvccManager::CheckOpen() const {
   return Status::Aborted("MVCC is closed");
 }
 
-bool MvccManager::AreAllTransactionsCommittedUnlocked(Timestamp ts) const {
-  // If ts is before the 'all_committed_before_' watermark on the current snapshot then
-  // all transactions before it are committed.
-  if (ts < cur_snap_.all_committed_before_) return true;
+bool MvccManager::AreAllOpsAppliedUnlocked(Timestamp ts) const {
+  // If ts is before the 'all_applied_before_' watermark on the current snapshot then
+  // all ops before it are applied.
+  if (ts < cur_snap_.all_applied_before_) return true;
 
-  // We might not have moved 'cur_snap_.all_committed_before_' (the clean time) but 'ts'
+  // We might not have moved 'cur_snap_.all_applied_before_' (the clean time) but 'ts'
   // might still come before any possible in-flights.
   return ts < earliest_in_flight_;
 }
 
 bool MvccManager::AnyApplyingAtOrBeforeUnlocked(Timestamp ts) const {
-  // TODO(todd) this is not actually checking on the applying txns, it's checking on
+  // TODO(todd) this is not actually checking on the applying ops, it's checking on
   // _all in-flight_. Is this a bug?
   for (const InFlightMap::value_type entry : timestamps_in_flight_) {
     if (entry.first <= ts.value()) {
@@ -371,21 +374,21 @@ void MvccManager::TakeSnapshot(MvccSnapshot *snap) const {
   *snap = cur_snap_;
 }
 
-Status MvccManager::WaitForSnapshotWithAllCommitted(Timestamp timestamp,
+Status MvccManager::WaitForSnapshotWithAllApplied(Timestamp timestamp,
                                                     MvccSnapshot* snapshot,
                                                     const MonoTime& deadline) const {
-  TRACE_EVENT0("tablet", "MvccManager::WaitForSnapshotWithAllCommitted");
+  TRACE_EVENT0("tablet", "MvccManager::WaitForSnapshotWithAllApplied");
 
-  RETURN_NOT_OK(WaitUntil(ALL_COMMITTED, timestamp, deadline));
+  RETURN_NOT_OK(WaitUntil(ALL_APPLIED, timestamp, deadline));
   *snapshot = MvccSnapshot(timestamp);
   return Status::OK();
 }
 
-Status MvccManager::WaitForApplyingTransactionsToCommit() const {
-  TRACE_EVENT0("tablet", "MvccManager::WaitForApplyingTransactionsToCommit");
+Status MvccManager::WaitForApplyingOpsToApply() const {
+  TRACE_EVENT0("tablet", "MvccManager::WaitForApplyingOpsToApply");
   RETURN_NOT_OK(CheckOpen());
 
-  // Find the highest timestamp of an APPLYING transaction.
+  // Find the highest timestamp of an APPLYING op.
   Timestamp wait_for = Timestamp::kMin;
   {
     std::lock_guard<LockType> l(lock_);
@@ -396,10 +399,9 @@ Status MvccManager::WaitForApplyingTransactionsToCommit() const {
     }
   }
 
-  // Wait until there are no transactions applying with that timestamp
-  // or below. It's possible that we're a bit conservative here - more transactions
-  // may enter the APPLYING set while we're waiting, but we will eventually
-  // succeed.
+  // Wait until there are no ops applying with that timestamp or below. It's
+  // possible that we're a bit conservative here - more ops may enter the
+  // APPLYING set while we're waiting, but we will eventually succeed.
   if (wait_for == Timestamp::kMin) {
     // None were APPLYING: we can just return.
     return Status::OK();
@@ -409,10 +411,10 @@ Status MvccManager::WaitForApplyingTransactionsToCommit() const {
 
 Timestamp MvccManager::GetCleanTimestamp() const {
   std::lock_guard<LockType> l(lock_);
-  return cur_snap_.all_committed_before_;
+  return cur_snap_.all_applied_before_;
 }
 
-void MvccManager::GetApplyingTransactionsTimestamps(std::vector<Timestamp>* timestamps) const {
+void MvccManager::GetApplyingOpsTimestamps(std::vector<Timestamp>* timestamps) const {
   std::lock_guard<LockType> l(lock_);
   timestamps->reserve(timestamps_in_flight_.size());
   for (const InFlightMap::value_type entry : timestamps_in_flight_) {
@@ -431,8 +433,8 @@ MvccManager::~MvccManager() {
 ////////////////////////////////////////////////////////////
 
 MvccSnapshot::MvccSnapshot()
-  : all_committed_before_(Timestamp::kInitialTimestamp),
-    none_committed_at_or_after_(Timestamp::kInitialTimestamp) {
+  : all_applied_before_(Timestamp::kInitialTimestamp),
+    none_applied_at_or_after_(Timestamp::kInitialTimestamp) {
 }
 
 MvccSnapshot::MvccSnapshot(const MvccManager &manager) {
@@ -440,51 +442,51 @@ MvccSnapshot::MvccSnapshot(const MvccManager &manager) {
 }
 
 MvccSnapshot::MvccSnapshot(const Timestamp& timestamp)
-  : all_committed_before_(timestamp),
-    none_committed_at_or_after_(timestamp) {
+  : all_applied_before_(timestamp),
+    none_applied_at_or_after_(timestamp) {
  }
 
-MvccSnapshot MvccSnapshot::CreateSnapshotIncludingAllTransactions() {
+MvccSnapshot MvccSnapshot::CreateSnapshotIncludingAllOps() {
   return MvccSnapshot(Timestamp::kMax);
 }
 
-MvccSnapshot MvccSnapshot::CreateSnapshotIncludingNoTransactions() {
+MvccSnapshot MvccSnapshot::CreateSnapshotIncludingNoOps() {
   return MvccSnapshot(Timestamp::kMin);
 }
 
-bool MvccSnapshot::IsCommittedFallback(const Timestamp& timestamp) const {
-  for (const Timestamp::val_type& v : committed_timestamps_) {
+bool MvccSnapshot::IsAppliedFallback(const Timestamp& timestamp) const {
+  for (const Timestamp::val_type& v : applied_timestamps_) {
     if (v == timestamp.value()) return true;
   }
 
   return false;
 }
 
-bool MvccSnapshot::MayHaveCommittedTransactionsAtOrAfter(const Timestamp& timestamp) const {
-  return timestamp < none_committed_at_or_after_;
+bool MvccSnapshot::MayHaveAppliedOpsAtOrAfter(const Timestamp& timestamp) const {
+  return timestamp < none_applied_at_or_after_;
 }
 
-bool MvccSnapshot::MayHaveUncommittedTransactionsAtOrBefore(const Timestamp& timestamp) const {
-  // The snapshot may have uncommitted transactions before 'timestamp' if:
-  // - 'all_committed_before_' comes before 'timestamp'
-  // - 'all_committed_before_' is precisely 'timestamp' but 'timestamp' isn't in the
-  //   committed set.
-  return timestamp > all_committed_before_ ||
-      (timestamp == all_committed_before_ && !IsCommittedFallback(timestamp));
+bool MvccSnapshot::MayHaveNonAppliedOpsAtOrBefore(const Timestamp& timestamp) const {
+  // The snapshot may have nonapplied ops before 'timestamp' if:
+  // - 'all_applied_before_' comes before 'timestamp'
+  // - 'all_applied_before_' is precisely 'timestamp' but 'timestamp' isn't in the
+  //   applied set.
+  return timestamp > all_applied_before_ ||
+      (timestamp == all_applied_before_ && !IsAppliedFallback(timestamp));
 }
 
 std::string MvccSnapshot::ToString() const {
-  std::string ret("MvccSnapshot[committed={T|");
+  std::string ret("MvccSnapshot[applied={T|");
 
-  if (committed_timestamps_.size() == 0) {
-    StrAppend(&ret, "T < ", all_committed_before_.ToString(),"}]");
+  if (applied_timestamps_.size() == 0) {
+    StrAppend(&ret, "T < ", all_applied_before_.ToString(),"}]");
     return ret;
   }
-  StrAppend(&ret, "T < ", all_committed_before_.ToString(),
+  StrAppend(&ret, "T < ", all_applied_before_.ToString(),
             " or (T in {");
 
   bool first = true;
-  for (Timestamp::val_type t : committed_timestamps_) {
+  for (Timestamp::val_type t : applied_timestamps_) {
     if (!first) {
       ret.push_back(',');
     }
@@ -495,60 +497,60 @@ std::string MvccSnapshot::ToString() const {
   return ret;
 }
 
-void MvccSnapshot::AddCommittedTimestamps(const std::vector<Timestamp>& timestamps) {
+void MvccSnapshot::AddAppliedTimestamps(const std::vector<Timestamp>& timestamps) {
   for (const Timestamp& ts : timestamps) {
-    AddCommittedTimestamp(ts);
+    AddAppliedTimestamp(ts);
   }
 }
 
-void MvccSnapshot::AddCommittedTimestamp(Timestamp timestamp) {
-  if (IsCommitted(timestamp)) return;
+void MvccSnapshot::AddAppliedTimestamp(Timestamp timestamp) {
+  if (IsApplied(timestamp)) return;
 
-  committed_timestamps_.push_back(timestamp.value());
+  applied_timestamps_.push_back(timestamp.value());
 
-  // If this is a new upper bound commit mark, update it.
-  if (none_committed_at_or_after_ <= timestamp) {
-    none_committed_at_or_after_ = Timestamp(timestamp.value() + 1);
+  // If this is a new upper bound apply mark, update it.
+  if (none_applied_at_or_after_ <= timestamp) {
+    none_applied_at_or_after_ = Timestamp(timestamp.value() + 1);
   }
 }
 
 bool MvccSnapshot::Equals(const MvccSnapshot& other) const {
-  if (all_committed_before_ != other.all_committed_before_) {
+  if (all_applied_before_ != other.all_applied_before_) {
     return false;
   }
-  if (none_committed_at_or_after_ != other.none_committed_at_or_after_) {
+  if (none_applied_at_or_after_ != other.none_applied_at_or_after_) {
     return false;
   }
-  return committed_timestamps_ == other.committed_timestamps_;
+  return applied_timestamps_ == other.applied_timestamps_;
 }
 
 ////////////////////////////////////////////////////////////
-// ScopedTransaction
+// ScopedOp
 ////////////////////////////////////////////////////////////
-ScopedTransaction::ScopedTransaction(MvccManager* manager, Timestamp timestamp)
+ScopedOp::ScopedOp(MvccManager* manager, Timestamp timestamp)
   : done_(false),
     manager_(DCHECK_NOTNULL(manager)),
     timestamp_(timestamp) {
-  manager_->StartTransaction(timestamp);
+  manager_->StartOp(timestamp);
 }
 
-ScopedTransaction::~ScopedTransaction() {
+ScopedOp::~ScopedOp() {
   if (!done_) {
     Abort();
   }
 }
 
-void ScopedTransaction::StartApplying() {
-  manager_->StartApplyingTransaction(timestamp_);
+void ScopedOp::StartApplying() {
+  manager_->StartApplyingOp(timestamp_);
 }
 
-void ScopedTransaction::Commit() {
-  manager_->CommitTransaction(timestamp_);
+void ScopedOp::FinishApplying() {
+  manager_->FinishApplyingOp(timestamp_);
   done_ = true;
 }
 
-void ScopedTransaction::Abort() {
-  manager_->AbortTransaction(timestamp_);
+void ScopedOp::Abort() {
+  manager_->AbortOp(timestamp_);
   done_ = true;
 }
 

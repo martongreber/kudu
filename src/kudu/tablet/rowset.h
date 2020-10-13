@@ -74,12 +74,12 @@ struct RowIteratorOptions {
   // Defaults to nullptr.
   const Schema* projection;
 
-  // Transactions not committed in this snapshot will be ignored in the iteration.
+  // Ops not committed in this snapshot will be ignored in the iteration.
   //
-  // Defaults to a snapshot that includes all transactions.
+  // Defaults to a snapshot that includes all op.
   MvccSnapshot snap_to_include;
 
-  // Transactions committed in this snapshot will be ignored in the iteration.
+  // Ops committed in this snapshot will be ignored in the iteration.
   // This is stored in a boost::optional so that iterators can ignore it
   // entirely if it is unset (the common case).
   //
@@ -315,23 +315,12 @@ class RowSetKeyProbe {
   // to probe for.
   //
   // NOTE: row_key is not copied and must be valid for the lifetime
+  // of this object. Similarly, the Arena must not be reset for the lifetime
   // of this object.
-  explicit RowSetKeyProbe(ConstContiguousRow row_key)
+  RowSetKeyProbe(ConstContiguousRow row_key, Arena* arena)
       : row_key_(row_key),
-        encoded_key_(EncodedKey::FromContiguousRow(row_key_)),
-        bloom_probe_(BloomKeyProbe(encoded_key_slice())) {
-  }
-
-  // RowSetKeyProbes are usually allocated on the stack, which means that we
-  // must copy it if we require it later (e.g. Table::Mutate()).
-  //
-  // Still, the ConstContiguousRow row_key_ remains a reference to the data
-  // underlying the original RowsetKeyProbe and is not copied.
-  explicit RowSetKeyProbe(const RowSetKeyProbe& probe)
-  : row_key_(probe.row_key_) {
-    encoded_key_ = EncodedKey::FromContiguousRow(row_key_);
-    bloom_probe_ = BloomKeyProbe(encoded_key_slice());
-  }
+        encoded_key_(EncodedKey::FromContiguousRow(row_key_, arena)),
+        bloom_probe_(BloomKeyProbe(encoded_key_slice())) {}
 
   const ConstContiguousRow& row_key() const { return row_key_; }
 
@@ -351,7 +340,8 @@ class RowSetKeyProbe {
 
  private:
   const ConstContiguousRow row_key_;
-  std::unique_ptr<EncodedKey> encoded_key_;
+  // Allocated from the Arena.
+  EncodedKey* encoded_key_;
   BloomKeyProbe bloom_probe_;
 };
 

@@ -41,6 +41,13 @@ function do_make_build() {
   ccache -s || true
 }
 
+# Create a tarball of the patched source for use by Impala. Impala builds Kudu with
+# its own toolchain, and it needs to build the patched source.
+mkdir -p ../kudu-${VERSION}-patched-source
+cp -R * ../kudu-${VERSION}-patched-source
+tar --exclude-vcs -czf kudu-${VERSION}-patched-source.tar.gz ../kudu-${VERSION}-patched-source
+rm -rf ../kudu-${VERSION}-patched-source
+
 # This script is typically invoked from one of several different Jenkins jobs.
 # The jobs share a common ccache but each operates in its own workspace:
 #

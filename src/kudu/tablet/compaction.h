@@ -36,6 +36,7 @@ class Arena;
 class Schema;
 
 namespace fs {
+class FsErrorManager;
 struct IOContext;
 }  // namespace fs
 
@@ -100,7 +101,7 @@ class CompactionInput {
   // NOTE: For efficiency, this doesn't currently filter the mutations to only
   // include those committed in the given snapshot. It does, however, filter out
   // rows that weren't inserted prior to this snapshot. Users of this input still
-  // need to call snap.IsCommitted() on each mutation.
+  // need to call snap.IsApplied() on each mutation.
   //
   // TODO: can we make the above less messy?
   static Status Create(const DiskRowSet &rowset,
@@ -226,15 +227,17 @@ Status ApplyMutationsAndGenerateUndos(const MvccSnapshot& snap,
 //
 // After return of this function, this CompactionInput object is "used up" and will
 // no longer be useful.
-Status FlushCompactionInput(CompactionInput *input,
+Status FlushCompactionInput(const std::string& tablet_id,
+                            const fs::FsErrorManager* error_manager,
+                            CompactionInput* input,
                             const MvccSnapshot &snap,
                             const HistoryGcOpts& history_gc_opts,
                             RollingDiskRowSetWriter *out);
 
-// Iterate through this compaction input, finding any mutations which came between
-// snap_to_exclude and snap_to_include (ie those transactions that were not yet
-// committed in 'snap_to_exclude' but _are_ committed in 'snap_to_include'). For
-// each such mutation, propagate it into the compaction's output rowsets.
+// Iterate through this compaction input, finding any mutations which came
+// between snap_to_exclude and snap_to_include (ie those ops that were not yet
+// committed in 'snap_to_exclude' but _are_ committed in 'snap_to_include').
+// For each such mutation, propagate it into the compaction's output rowsets.
 //
 // The output rowsets passed in must be non-overlapping and in ascending key order:
 // typically they are the resulting rowsets from a RollingDiskRowSetWriter.

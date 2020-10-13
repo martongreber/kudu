@@ -17,6 +17,7 @@
 
 #include "kudu/tserver/tablet_copy_source_session.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -50,12 +51,12 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/result_tracker.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/ops/op.h"
+#include "kudu/tablet/ops/write_op.h"
 #include "kudu/tablet/tablet-test-util.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
-#include "kudu/tablet/transactions/transaction.h"
-#include "kudu/tablet/transactions/write_transaction.h"
 #include "kudu/tserver/tablet_copy.pb.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/countdown_latch.h"
@@ -103,7 +104,7 @@ using tablet::KuduTabletTest;
 using tablet::RowSetDataPB;
 using tablet::TabletReplica;
 using tablet::TabletSuperBlockPB;
-using tablet::WriteTransactionState;
+using tablet::WriteOpState;
 
 class TabletCopyTest : public KuduTabletTest {
  public:
@@ -163,6 +164,7 @@ class TabletCopyTest : public KuduTabletTest {
                           cmeta_manager,
                           *config_peer,
                           apply_pool_.get(),
+                          nullptr,
                           [this, tablet_id](const string& reason) {
                             this->TabletReplicaStateChangedCallback(tablet_id, reason);
                           }));
@@ -210,13 +212,13 @@ class TabletCopyTest : public KuduTabletTest {
       WriteResponsePB resp;
       CountDownLatch latch(1);
 
-      unique_ptr<tablet::WriteTransactionState> state(
-          new tablet::WriteTransactionState(tablet_replica_.get(),
-                                            &req,
-                                            nullptr, // No RequestIdPB
-                                            &resp));
-      state->set_completion_callback(unique_ptr<tablet::TransactionCompletionCallback>(
-          new tablet::LatchTransactionCompletionCallback<WriteResponsePB>(&latch, &resp)));
+      unique_ptr<tablet::WriteOpState> state(
+          new tablet::WriteOpState(tablet_replica_.get(),
+                                   &req,
+                                   nullptr, // No RequestIdPB
+                                   &resp));
+      state->set_completion_callback(unique_ptr<tablet::OpCompletionCallback>(
+          new tablet::LatchOpCompletionCallback<WriteResponsePB>(&latch, &resp)));
       ASSERT_OK(tablet_replica_->SubmitWrite(std::move(state)));
       latch.Wait();
       ASSERT_FALSE(resp.has_error())
@@ -279,7 +281,7 @@ TEST_F(TabletCopyTest, TestSuperBlocksEqual) {
 
   {
     const TabletSuperBlockPB& session_superblock = session_->tablet_superblock();
-    int size = session_superblock.ByteSize();
+    size_t size = session_superblock.ByteSizeLong();
     session_buf.resize(size);
     uint8_t* session_dst = session_buf.data();
     session_superblock.SerializeWithCachedSizesToArray(session_dst);
@@ -288,7 +290,7 @@ TEST_F(TabletCopyTest, TestSuperBlocksEqual) {
   {
     TabletSuperBlockPB tablet_superblock;
     ASSERT_OK(tablet()->metadata()->ToSuperBlock(&tablet_superblock));
-    int size = tablet_superblock.ByteSize();
+    size_t size = tablet_superblock.ByteSizeLong();
     tablet_buf.resize(size);
     uint8_t* tablet_dst = tablet_buf.data();
     tablet_superblock.SerializeWithCachedSizesToArray(tablet_dst);

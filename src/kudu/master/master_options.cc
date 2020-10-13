@@ -32,7 +32,8 @@
 DEFINE_string(master_addresses, "",
               "Comma-separated list of the RPC addresses belonging to all "
               "Masters in this cluster. "
-              "NOTE: if not specified, configures a non-replicated Master.");
+              "NOTE: if not specified or a single address is specified, "
+              "configures a non-replicated Master.");
 TAG_FLAG(master_addresses, stable);
 
 namespace kudu {
@@ -43,18 +44,13 @@ MasterOptions::MasterOptions() {
 
   if (!FLAGS_master_addresses.empty()) {
     Status s = HostPort::ParseStrings(FLAGS_master_addresses, Master::kDefaultPort,
-                                      &master_addresses);
+                                      &master_addresses_);
     if (!s.ok()) {
       LOG(FATAL) << "Couldn't parse the master_addresses flag('" << FLAGS_master_addresses << "'): "
                  << s.ToString();
     }
-    if (master_addresses.size() < 2) {
-      LOG(FATAL) << "At least 2 masters are required for a distributed config, but "
-          "master_addresses flag ('" << FLAGS_master_addresses << "') only specifies "
-                 << master_addresses.size() << " masters.";
-    }
     // TODO(wdberkeley): Un-actionable warning. Link to docs, once they exist.
-    if (master_addresses.size() == 2) {
+    if (master_addresses_.size() == 2) {
       LOG(WARNING) << "Only 2 masters are specified by master_addresses_flag ('" <<
           FLAGS_master_addresses << "'), but minimum of 3 are required to tolerate failures"
           " of any one master. It is recommended to use at least 3 masters.";
@@ -62,8 +58,15 @@ MasterOptions::MasterOptions() {
   }
 }
 
-bool MasterOptions::IsDistributed() const {
-  return !master_addresses.empty();
+Status MasterOptions::GetTheOnlyMasterAddress(HostPort* hp) const {
+  if (IsDistributed()) {
+    return Status::IllegalState("Not a single master configuration");
+  }
+  if (master_addresses_.empty()) {
+    return Status::NotFound("Master address not specified");
+  }
+  *hp = master_addresses_.front();
+  return Status::OK();
 }
 
 } // namespace master

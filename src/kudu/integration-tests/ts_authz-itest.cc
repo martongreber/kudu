@@ -34,25 +34,22 @@
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
-#include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/data_gen_util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
-#include "kudu/integration-tests/hms_itest-base.h"
-#include "kudu/master/sentry_authz_provider-test-base.h"
+#include "kudu/master/master.pb.h"
+#include "kudu/master/master.proxy.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/ranger/mini_ranger.h"
 #include "kudu/ranger/ranger.pb.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/test/mini_kdc.h"
-#include "kudu/sentry/mini_sentry.h"
-#include "kudu/sentry/sentry_client.h"
-#include "kudu/sentry/sentry_policy_service_types.h"
-#include "kudu/tablet/transactions/write_transaction.h"
-#include "kudu/thrift/client.h"
+#include "kudu/tablet/ops/write_op.h"
 #include "kudu/util/barrier.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
@@ -80,19 +77,15 @@ using kudu::client::KuduTableAlterer;
 using kudu::client::KuduTableCreator;
 using kudu::cluster::ExternalMiniCluster;
 using kudu::cluster::ExternalMiniClusterOptions;
-using kudu::master::AlterRoleGrantPrivilege;
-using kudu::master::CreateRoleAndAddToGroups;
-using kudu::master::GetColumnPrivilege;
-using kudu::master::GetDatabasePrivilege;
-using kudu::master::GetTablePrivilege;
+using kudu::master::RefreshAuthzCacheRequestPB;
+using kudu::master::RefreshAuthzCacheResponsePB;
 using kudu::ranger::ActionPB;
 using kudu::ranger::AuthorizationPolicy;
 using kudu::ranger::PolicyItem;
 using kudu::ranger::MiniRanger;
-using kudu::sentry::SentryClient;
+using kudu::rpc::RpcController;
 using kudu::tablet::WritePrivileges;
 using kudu::tablet::WritePrivilegeType;
-using sentry::TSentryGrantOption;
 using std::pair;
 using std::string;
 using std::thread;
@@ -249,17 +242,13 @@ Status PerformAction(const RWPrivileges& privileges,
   return Status::OK();
 }
 
-// Note: groups and users therein are statically provided to MiniSentry (see
-// mini_sentry.cc). We expect Sentry to be aware of users "user[0-2]".
 constexpr int kNumUsers = 3;
-constexpr const char* kAdminGroup = "admin";
 constexpr const char* kAdminUser = "test-admin";
 
 constexpr int kNumTables = 3;
 constexpr int kNumColsPerTable = 3;
 constexpr const char* kDb = "db";
 constexpr const char* kTablePrefix = "table";
-constexpr const char* kAdminRole = "kudu-admin";
 
 constexpr int kAuthzTokenTTLSecs = 1;
 constexpr int kAuthzCacheTTLMultiplier = 3;
@@ -267,7 +256,7 @@ constexpr int kAuthzCacheTTLMultiplier = 3;
 } // anonymous namespace
 
 // Test harness used to set up a cluster and grant privileges, that is agnostic
-// the underlying authorization service (e.g. Sentry, Ranger).
+// the underlying authorization service (e.g. Ranger).
 class TSAuthzITestHarness {
  public:
   virtual ~TSAuthzITestHarness() {}
@@ -289,7 +278,7 @@ class TSAuthzITestHarness {
     return opts;
   }
 
-  // Sets up the external services (e.g. Sentry, Ranger).
+  // Sets up the external services (e.g. Ranger).
   virtual void SetUpExternalMiniServiceOpts(ExternalMiniClusterOptions* opts) = 0;
   virtual Status SetUpExternalServiceClients(const unique_ptr<ExternalMiniCluster>& cluster) = 0;
 
@@ -300,16 +289,21 @@ class TSAuthzITestHarness {
   // Sets up table-related metadata (e.g. HMS database, columns).
   virtual Status SetUpTables() = 0;
 
-  // Grants privileges on the given table/column. These abide by Sentry's
-  // hierarchical definition of privileges, so if granting privileges on a
+  // Grants privileges on the given table/column.
+  // These abide the hierarchical definition of privileges, so if granting privileges on a
   // table, these grant privileges on the table and all columns in that table.
   virtual Status GrantTablePrivilege(const string& db, const string& tbl, const string& user,
-                                     const string& action) = 0;
+                                     const string& action, bool admin,
+                                     const unique_ptr<ExternalMiniCluster>& cluster) = 0;
   virtual Status GrantColumnPrivilege(const string& db, const string& tbl, const string& col,
-                                      const string& user, const string& action) = 0;
+                                      const string& user, const string& action, bool admin,
+                                      const unique_ptr<ExternalMiniCluster>& cluster) = 0;
+  virtual Status RefreshAuthzPolicies(const unique_ptr<ExternalMiniCluster>& cluster) = 0;
 
   // Creates a table named 'table_ident' with 'kNumColsPerTable' columns.
-  Status CreateTable(const string& table_ident, const shared_ptr<KuduClient>& client) {
+  Status CreateTable(const string& table_ident,
+                     const shared_ptr<KuduClient>& client,
+                     const string& owner) {
     KuduSchema schema;
     KuduSchemaBuilder b;
     auto iter = cols_.begin();
@@ -321,8 +315,9 @@ class TSAuthzITestHarness {
     unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
     return table_creator->table_name(table_ident)
         .schema(&schema)
-        .set_range_partition_columns({ "col0" })
+        .set_range_partition_columns({"col0"})
         .num_replicas(1)
+        .set_owner(owner)
         .Create();
   }
 
@@ -337,76 +332,6 @@ class TSAuthzITestHarness {
 
   // A list of columns that each table should have.
   vector<string> cols_;
-};
-
-class SentryITestHarness : public TSAuthzITestHarness,
-                           public HmsITestHarness {
- public:
-  void SetUpExternalMiniServiceOpts(ExternalMiniClusterOptions* opts) override {
-    opts->hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
-    opts->enable_sentry = true;
-    opts->extra_master_flags.emplace_back(Substitute("--sentry_privileges_cache_ttl_factor=$0",
-                                                    kAuthzCacheTTLMultiplier));
-  }
-
-  Status SetUpExternalServiceClients(const unique_ptr<ExternalMiniCluster>& cluster) override {
-    // Set up the HMS client so we can set up a database.
-    thrift::ClientOptions hms_opts;
-    hms_opts.enable_kerberos = true;
-    hms_opts.service_principal = "hive";
-    RETURN_NOT_OK(RestartHmsClient(cluster, hms_opts));
-
-    // Set up the Sentry client so we can set up privileges.
-    thrift::ClientOptions sentry_opts;
-    sentry_opts.enable_kerberos = true;
-    sentry_opts.service_principal = "sentry";
-    sentry_client_.reset(new SentryClient(cluster->sentry()->address(), sentry_opts));
-    return sentry_client_->Start();
-  }
-
-  Status SetUpCredentials() override {
-    RETURN_NOT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kAdminRole, kAdminGroup));
-    RETURN_NOT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kAdminRole,
-        GetDatabasePrivilege(kDb, "ALL", TSentryGrantOption::DISABLED)));
-
-    // Set up our users such that userN --> groupN --> roleN.
-    // NOTE: The user-group mappings are specified in mini_sentry.cc.
-    for (int i = 0; i < kNumUsers; i++) {
-      const string user = Substitute("user$0", i);
-      const string role = Substitute("role$0", i);
-      const string group = Substitute("group$0", i);
-      RETURN_NOT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), role, group));
-      EmplaceOrDie(&role_by_user_, user, role);
-    }
-    return Status::OK();
-  }
-  Status SetUpTables() override {
-    // Create the database in the HMS.
-    RETURN_NOT_OK(CreateDatabase(kDb));
-    // Finally populate a set of column names to use for our tables.
-    for (int i = 0; i < kNumColsPerTable; i++) {
-      cols_.emplace_back(Substitute("col$0", i));
-    }
-    return Status::OK();
-  }
-  Status GrantTablePrivilege(const string& db, const string& tbl, const string& user,
-                             const string& action) override {
-    const auto& role = FindOrDie(role_by_user_, user);
-    return AlterRoleGrantPrivilege(sentry_client_.get(), role,
-                                   GetTablePrivilege(db, tbl, action));
-  }
-  Status GrantColumnPrivilege(const string& db, const string& tbl, const string& col,
-                              const string& user, const string& action) override {
-    const auto& role = FindOrDie(role_by_user_, user);
-    return AlterRoleGrantPrivilege(sentry_client_.get(), role,
-                                   GetColumnPrivilege(db, tbl, col, action));
-  }
- private:
-  // A Sentry client with which to grant privileges.
-  unique_ptr<SentryClient> sentry_client_;
-
-  // Maintain a mapping between users and roles.
-  unordered_map<string, string> role_by_user_;
 };
 
 namespace {
@@ -440,10 +365,8 @@ class RangerITestHarness : public TSAuthzITestHarness {
     policy.databases = { kDb };
     policy.tables = { "*" };
     policy.columns = { "*" };
-    policy.items.emplace_back(PolicyItem({ kAdminUser }, { ActionPB::ALL }));
-    RETURN_NOT_OK(ranger_->AddPolicy(std::move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-    return Status::OK();
+    policy.items.emplace_back(PolicyItem({ kAdminUser }, { ActionPB::ALL }, true));
+    return ranger_->AddPolicy(std::move(policy));
   }
   Status SetUpTables() override {
     // Finally populate a set of column names to use for our tables.
@@ -452,27 +375,40 @@ class RangerITestHarness : public TSAuthzITestHarness {
     }
     return Status::OK();
   }
+
+  Status RefreshAuthzPolicies(const unique_ptr<ExternalMiniCluster>& cluster) override {
+    RefreshAuthzCacheRequestPB req;
+    RefreshAuthzCacheResponsePB resp;
+    RpcController rpc;
+    rpc.set_timeout(MonoDelta::FromSeconds(10));
+    RETURN_NOT_OK(cluster->master_proxy()->RefreshAuthzCache(req, &resp, &rpc));
+    if (resp.has_error()) {
+      return StatusFromPB(resp.error().status());
+    }
+    return Status::OK();
+  }
+
   Status GrantTablePrivilege(const string& db, const string& tbl, const string& user,
-                             const string& action) override {
+                             const string& action, bool admin,
+                             const unique_ptr<ExternalMiniCluster>& cluster) override {
     AuthorizationPolicy policy;
     policy.databases = { db };
     policy.tables = { tbl };
     policy.columns = { "*" };
-    policy.items.emplace_back(PolicyItem({ user }, { StringToActionPB(action) }));
+    policy.items.emplace_back(PolicyItem({ user }, { StringToActionPB(action) }, admin));
     RETURN_NOT_OK(ranger_->AddPolicy(std::move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-    return Status::OK();
+    return RefreshAuthzPolicies(cluster);
   }
   Status GrantColumnPrivilege(const string& db, const string& tbl, const string& col,
-                              const string& user, const string& action) override {
+                              const string& user, const string& action, bool admin,
+                              const unique_ptr<ExternalMiniCluster>& cluster) override {
     AuthorizationPolicy policy;
     policy.databases = { db };
     policy.tables = { tbl };
     policy.columns = { col };
-    policy.items.emplace_back(PolicyItem({ user }, { StringToActionPB(action) }));
+    policy.items.emplace_back(PolicyItem({ user }, { StringToActionPB(action) }, admin));
     RETURN_NOT_OK(ranger_->AddPolicy(std::move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-    return Status::OK();
+    return RefreshAuthzPolicies(cluster);
   }
  private:
   MiniRanger* ranger_;
@@ -480,20 +416,17 @@ class RangerITestHarness : public TSAuthzITestHarness {
 
 // TODO(awong): refactor so we can share code between master_authz-itest.
 enum HarnessEnum {
-  kSentry,
   kRanger,
 };
 string HarnessEnumToString(HarnessEnum h) {
   switch (h) {
-    case kSentry:
-      return "Sentry";
     case kRanger:
       return "Ranger";
   }
   return "";
 }
 
-// These tests will use the HMS and Sentry, and thus, are very slow.
+// These tests will use the HMS and an Authz provider, and thus, are very slow.
 // SKIP_IF_SLOW_NOT_ALLOWED() should be the very first thing called in the body
 // of every test based on this test class.
 class TSAuthzITest : public ExternalMiniClusterITestBase,
@@ -502,9 +435,6 @@ class TSAuthzITest : public ExternalMiniClusterITestBase,
   void SetUp() override {
     SKIP_IF_SLOW_NOT_ALLOWED();
     switch (GetParam()) {
-      case kSentry:
-        harness_.reset(new SentryITestHarness());
-        break;
       case kRanger:
         harness_.reset(new RangerITestHarness());
         break;
@@ -522,6 +452,7 @@ class TSAuthzITest : public ExternalMiniClusterITestBase,
 
     ASSERT_OK(harness_->SetUpExternalServiceClients(cluster_));
     ASSERT_OK(harness_->SetUpCredentials());
+    ASSERT_OK(harness_->RefreshAuthzPolicies(cluster_));
     ASSERT_OK(harness_->SetUpTables());
 
     // Create a client as the admin user, who now has admin privileges on the
@@ -531,8 +462,8 @@ class TSAuthzITest : public ExternalMiniClusterITestBase,
     ASSERT_OK(cluster_->CreateClient(/*builder*/nullptr, &client_));
   }
 
-  Status CreateTable(const string& table_ident) {
-    return harness_->CreateTable(table_ident, client_);
+  Status CreateTable(const string& table_ident, const string& owner) {
+    return harness_->CreateTable(table_ident, client_, owner);
   }
 
   void TearDown() override {
@@ -553,7 +484,7 @@ TEST_P(TSAuthzITest, TestReadsAndWrites) {
   vector<string> tables;
   for (int i = 0; i < kNumTables; i++) {
     string table_name = Substitute("$0$1", kTablePrefix, i);
-    ASSERT_OK(CreateTable(Substitute("$0.$1", kDb, table_name)));
+    ASSERT_OK(CreateTable(Substitute("$0.$1", kDb, table_name), harness_->users_[0]));
     tables.emplace_back(std::move(table_name));
   }
 
@@ -582,17 +513,22 @@ TEST_P(TSAuthzITest, TestReadsAndWrites) {
       clients.emplace_back(std::move(client));
     }
     EmplaceOrDie(&user_to_clients, user, std::move(clients));
+    const string& user_to_grant = i ? user : "{OWNER}";
 
-    // Generate privileges for each user for every table, and grant the
-    // appropriate privileges.
+    // Generate privileges for each user for every table, and grant
+    // the appropriate privileges.
     TableNameToPrivileges table_to_privileges;
     for (const string& table_name : tables) {
       RWPrivileges granted_privileges = GeneratePrivileges(cols, &prng);
       for (const auto& wp : granted_privileges.table_write_privileges) {
-        ASSERT_OK(harness_->GrantTablePrivilege(kDb, table_name, user, WritePrivilegeToString(wp)));
+        ASSERT_OK(harness_->GrantTablePrivilege(kDb, table_name, user_to_grant,
+                                                WritePrivilegeToString(wp),
+                                                /*admin=*/false, cluster_));
       }
       for (const auto& col : granted_privileges.column_scan_privileges) {
-        ASSERT_OK(harness_->GrantColumnPrivilege(kDb, table_name, col, user, "SELECT"));
+        ASSERT_OK(harness_->GrantColumnPrivilege(kDb, table_name, col,
+                                                 user_to_grant, "SELECT",
+                                                 /*admin=*/false, cluster_));
       }
       RWPrivileges not_granted_privileges = ComplementaryPrivileges(cols, granted_privileges);
       InsertOrDie(&table_to_privileges, table_name,
@@ -657,24 +593,26 @@ TEST_P(TSAuthzITest, TestAlters) {
 
   static const string kTableName = "table";
   const string table_ident = Substitute("$0.$1", kDb, kTableName);
-  ASSERT_OK(CreateTable(table_ident));
-
   const string user = "user0";
   ASSERT_OK(cluster_->kdc()->CreateUserPrincipal(user));
   ASSERT_OK(cluster_->kdc()->Kinit(user));
+
+  ASSERT_OK(CreateTable(table_ident, user));
 
   shared_ptr<KuduClient> user_client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &user_client));
 
   // Note: we only need privileges on the metadata for OpenTable() calls.
-  // METADATA isn't a first-class Sentry privilege and won't get carried over
+  // METADATA isn't a first-class privilege and won't get carried over
   // on table rename, so we just grant INSERT privileges.
-  ASSERT_OK(harness_->GrantTablePrivilege(kDb, kTableName, user, "INSERT"));
+  ASSERT_OK(harness_->GrantTablePrivilege(kDb, kTableName, user, "INSERT", /*admin=*/false,
+                                          cluster_));
 
   // First, grant privileges on a new column that doesn't yet exist. Once that
   // column is created, we should be able to scan it immediately.
   const string new_column = Substitute("col$0", kNumColsPerTable);
-  ASSERT_OK(harness_->GrantColumnPrivilege(kDb, kTableName, new_column, user, "SELECT"));
+  ASSERT_OK(harness_->GrantColumnPrivilege(kDb, kTableName, new_column, user, "SELECT",
+                                           /*admin=*/false, cluster_));
   {
     unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(table_ident));
     table_alterer->AddColumn(new_column)->Type(KuduColumnSchema::INT32);
@@ -686,22 +624,15 @@ TEST_P(TSAuthzITest, TestAlters) {
 
   // Now create another column and grant the user privileges for that column.
   const string another_column = Substitute("col$0", kNumColsPerTable + 1);
-  ASSERT_OK(harness_->GrantColumnPrivilege(kDb, kTableName, another_column, user, "SELECT"));
+  ASSERT_OK(harness_->GrantColumnPrivilege(kDb, kTableName, another_column, user, "SELECT",
+                                           /*admin=*/false, cluster_));
   {
     unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(table_ident));
     table_alterer->AddColumn(another_column)->Type(KuduColumnSchema::INT32);
     ASSERT_OK(table_alterer->Alter());
   }
-  // Since privileges are cached in Sentry, even though we've granted
-  // privileges, clients will use the cached privilege and not be authorized
-  // for a bit. Provided we waited a bit after granting each privilege, no such
-  // behavior exists in Ranger.
+
   ASSERT_OK(user_client->OpenTable(table_ident, &table));
-  if (GetParam() == kSentry) {
-    Status s = PerformScan({ another_column }, /*prng=*/nullptr, table.get());
-    ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
-    ASSERT_STR_CONTAINS(s.ToString(), "not authorized");
-  }
 
   // Wait the full duration of the cache TTL, and an additional full token TTL.
   // This ensures that the client's token will expire we will get a new one
@@ -709,15 +640,12 @@ TEST_P(TSAuthzITest, TestAlters) {
   SleepFor(MonoDelta::FromSeconds(kAuthzTokenTTLSecs * (1 + kAuthzCacheTTLMultiplier)));
   ASSERT_OK(PerformScan({ another_column }, /*prng=*/nullptr, table.get()));
 
-  // Now rename the table to something else. There shouldn't be any privileges
-  // cached for the newly-renamed table, so we should immediately be able to
-  // scan it. Sentry automatically renames privileges -- Ranger doesn't, so we
-  // need to explicitly grant privileges on the new table name.
+  // Now rename the table to something else.
+  // We need to explicitly grant privileges on the new table name.
   const string kNewTableName = "newtable";
   const string new_table_ident = Substitute("$0.$1", kDb, kNewTableName);
-  if (GetParam() != kSentry) {
-    ASSERT_OK(harness_->GrantTablePrivilege(kDb, kNewTableName, user, "SELECT"));
-  }
+  ASSERT_OK(harness_->GrantTablePrivilege(kDb, kNewTableName, user, "SELECT", /*admin=*/false,
+                                          cluster_));
   {
     unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(table_ident));
     table_alterer->RenameTo(new_table_ident);
@@ -728,7 +656,7 @@ TEST_P(TSAuthzITest, TestAlters) {
 }
 
 INSTANTIATE_TEST_CASE_P(AuthzProviders, TSAuthzITest,
-    ::testing::Values(/*kSentry, */kRanger),
+    ::testing::Values(kRanger),
     [] (const testing::TestParamInfo<TSAuthzITest::ParamType>& info) {
       return HarnessEnumToString(info.param);
     });

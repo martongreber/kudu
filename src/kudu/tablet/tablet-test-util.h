@@ -38,6 +38,7 @@
 
 #include "kudu/cfile/cfile_util.h"
 #include "kudu/common/columnblock.h"
+#include "kudu/common/columnblock-test-util.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/row.h"
@@ -64,11 +65,11 @@
 #include "kudu/tablet/deltamemstore.h"
 #include "kudu/tablet/mutation.h"
 #include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/ops/alter_schema_op.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet-harness.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
-#include "kudu/tablet/transactions/alter_schema_transaction.h"
 #include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/mem_tracker.h"
@@ -149,10 +150,10 @@ class KuduTabletTest : public KuduTest {
       *(req.mutable_new_extra_config()) = *extra_config;
     }
 
-    AlterSchemaTransactionState tx_state(nullptr, &req, nullptr);
-    ASSERT_OK(tablet()->CreatePreparedAlterSchema(&tx_state, &schema));
-    ASSERT_OK(tablet()->AlterSchema(&tx_state));
-    tx_state.Finish();
+    AlterSchemaOpState op_state(nullptr, &req, nullptr);
+    ASSERT_OK(tablet()->CreatePreparedAlterSchema(&op_state, &schema));
+    ASSERT_OK(tablet()->AlterSchema(&op_state));
+    op_state.Finish();
   }
 
   const std::shared_ptr<Tablet>& tablet() const {
@@ -199,8 +200,8 @@ class KuduRowSetTest : public KuduTabletTest {
 static inline Status SilentIterateToStringList(RowwiseIterator* iter,
                                                int* fetched) {
   const Schema& schema = iter->schema();
-  Arena arena(1024);
-  RowBlock block(&schema, 100, &arena);
+  RowBlockMemory memory(1024);
+  RowBlock block(&schema, 100, &memory);
   *fetched = 0;
   while (iter->HasNext()) {
     RETURN_NOT_OK(iter->NextBlock(&block));
@@ -218,8 +219,8 @@ static inline Status IterateToStringList(RowwiseIterator* iter,
                                          int limit = INT_MAX) {
   out->clear();
   Schema schema = iter->schema();
-  Arena arena(1024);
-  RowBlock block(&schema, 100, &arena);
+  RowBlockMemory memory(1024);
+  RowBlock block(&schema, 100, &memory);
   int fetched = 0;
   while (iter->HasNext() && fetched < limit) {
     RETURN_NOT_OK(iter->NextBlock(&block));

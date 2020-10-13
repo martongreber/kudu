@@ -53,7 +53,6 @@
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
-#include "kudu/master/master_options.h"
 #include "kudu/master/sys_catalog.h"
 #include "kudu/master/table_metrics.h"
 #include "kudu/master/ts_descriptor.h"
@@ -261,6 +260,7 @@ void MasterPathHandlers::HandleCatalogManager(const Webserver::WebRequest& req,
     EasyJson table_json = tables_json.PushBack(EasyJson::kObject);
     table_json["name"] = EscapeForHtmlToString(l.data().name());
     table_json["id"] = EscapeForHtmlToString(table->id());
+    table_json["owner"] = EscapeForHtmlToString(l.data().owner());
     table_json["state"] = state;
     table_json["message"] = EscapeForHtmlToString(l.data().pb.state_msg());
     table_json["tablet_count"] = HumanReadableInt::ToString(table->num_tablets());
@@ -356,6 +356,7 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
   {
     TableMetadataLock l(table.get(), LockMode::READ);
     (*output)["name"] = l.data().name();
+    (*output)["owner"] = l.data().owner();
 
     // Not all Kudu tablenames are also valid Impala identifiers. We need to
     // replace such names with a placeholder when they are used as Impala
@@ -588,6 +589,7 @@ void MasterPathHandlers::HandleMasters(const Webserver::WebRequest& /*req*/,
     master_json["start_time"] = StartTimeToString(reg);
     reg.clear_start_time();  // Clear 'start_time' before dumping to string.
     master_json["registration"] = pb_util::SecureShortDebugString(reg);
+    master_json["cluster_id"] =  master.has_cluster_id() ? master.cluster_id() : "";
   }
 }
 
@@ -828,17 +830,23 @@ pair<string, string> MasterPathHandlers::TSDescToLinkPair(const TSDescriptor& de
 }
 
 string MasterPathHandlers::MasterAddrsToCsv() const {
-  if (master_->opts().IsDistributed()) {
+  vector<HostPort> master_addresses;
+  Status s = master_->GetMasterHostPorts(&master_addresses);
+  LOG(WARNING) << "Unable to fetch master addresses: " << s.ToString();
+  if (!s.ok()) {
+    return string();
+  }
+  if (!master_addresses.empty()) {
     vector<string> all_addresses;
-    all_addresses.reserve(master_->opts().master_addresses.size());
-    for (const HostPort& hp : master_->opts().master_addresses) {
+    all_addresses.reserve(master_addresses.size());
+    for (const HostPort& hp : master_addresses) {
       all_addresses.push_back(hp.ToString());
     }
     return JoinElements(all_addresses, ",");
   }
   Sockaddr addr = master_->first_rpc_address();
   HostPort hp;
-  Status s = HostPortFromSockaddrReplaceWildcard(addr, &hp);
+  s = HostPortFromSockaddrReplaceWildcard(addr, &hp);
   if (s.ok()) {
     return hp.ToString();
   }

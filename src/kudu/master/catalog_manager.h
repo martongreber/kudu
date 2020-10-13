@@ -37,6 +37,7 @@
 #include <sparsehash/dense_hash_map>
 
 #include "kudu/consensus/metadata.pb.h"
+#include "kudu/consensus/raft_consensus.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
@@ -53,12 +54,18 @@
 #include "kudu/util/rw_mutex.h"
 #include "kudu/util/status.h"
 
+namespace google {
+namespace protobuf {
+class Arena;
+}  // namespace protobuf
+}  // namespace google
 template <class X> struct GoodFastHash;
 
 namespace kudu {
 
 class AuthzTokenTest_TestSingleMasterUnavailable_Test;
 class CreateTableStressTest_TestConcurrentCreateTableAndReloadMetadata_Test;
+class HostPort;
 class MetricEntity;
 class MetricRegistry;
 class MonitoredTask;
@@ -76,7 +83,6 @@ class ServiceUnavailableRetryClientTest_CreateTable_Test;
 } // namespace client
 
 namespace consensus {
-class RaftConsensus;
 class StartTabletCopyRequestPB;
 } // namespace consensus
 
@@ -114,6 +120,7 @@ class PlacementPolicy;
 class SysCatalogTable;
 class TSDescriptor;
 class TableInfo;
+class TableLocationsCache;
 struct DeferredAssignmentActions;
 struct TableMetrics;
 
@@ -241,6 +248,11 @@ struct PersistentTableInfo {
   // Return the table's name.
   const std::string& name() const {
     return pb.name();
+  }
+
+  // Return the table's owner.
+  const std::string& owner() const {
+    return pb.owner();
   }
 
   // Helper to set the state of the tablet with a custom message.
@@ -390,22 +402,6 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   std::unique_ptr<TableMetrics> metrics_;
 
   DISALLOW_COPY_AND_ASSIGN(TableInfo);
-};
-
-// Helper to manage locking on the persistent metadata of TabletInfo or TableInfo.
-template<class MetadataClass>
-class MetadataLock : public CowLock<typename MetadataClass::cow_state> {
- public:
-  typedef CowLock<typename MetadataClass::cow_state> super;
-  MetadataLock()
-      : super() {
-  }
-  MetadataLock(MetadataClass* info, LockMode mode)
-      : super(DCHECK_NOTNULL(info)->mutable_metadata(), mode) {
-  }
-  MetadataLock(const MetadataClass* info, LockMode mode)
-      : super(&(DCHECK_NOTNULL(info))->metadata(), mode) {
-  }
 };
 
 // Helper to manage locking on the persistent metadata of multiple TabletInfo
@@ -583,7 +579,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
 
   // Create a new Table with the specified attributes.
   //
-  // The RPC context is provided for logging/tracing purposes,
+  // The RPC context is provded for logging/tracing purposes,
   // but this function does not itself respond to the RPC.
   Status CreateTable(const CreateTableRequestPB* req,
                      CreateTableResponsePB* resp,
@@ -617,11 +613,12 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                        AlterTableResponsePB* resp,
                        rpc::RpcContext* rpc);
 
-  // Rename the specified table in response to an 'ALTER TABLE RENAME' HMS
+  // Alter the specified table in response to an 'ALTER TABLE' HMS
   // notification log listener event.
-  Status RenameTableHms(const std::string& table_id,
+  Status AlterTableHms(const std::string& table_id,
                         const std::string& table_name,
-                        const std::string& new_table_name,
+                        const boost::optional<std::string>& new_table_name,
+                        const boost::optional<std::string>& new_table_owner,
                         int64_t notification_log_event_id) WARN_UNUSED_RESULT;
 
   // Get the information about an in-progress alter operation. If 'user' is
@@ -659,12 +656,32 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                            GetTableLocationsResponsePB* resp,
                            boost::optional<const std::string&> user);
 
-  struct TSInfosDict {
-    std::vector<std::unique_ptr<TSInfoPB>> ts_info_pbs;
-    google::dense_hash_map<StringPiece, int, GoodFastHash<StringPiece>> uuid_to_idx;
-    TSInfosDict() {
-      uuid_to_idx.set_empty_key(StringPiece());
+  // Dictionary mapping tablet servers to indexes, so that when a GetTableLocations
+  // response returns many replicas mapping to the same UUID, they can be sent
+  // only once in the returned protobuf and referred to by an index.
+  class TSInfosDict {
+   public:
+    // If 'arena' is non-NULL, the TSInfoPBs allocated by 'LookupOrAdd' will be
+    // allocated from the arena. Otherwise, they will be heap-allocated and freed
+    // when the TSInfosDict is destructed.
+    explicit TSInfosDict(google::protobuf::Arena* arena = nullptr) : arena_(arena) {
+      uuid_to_idx_.set_empty_key(StringPiece());
     }
+    ~TSInfosDict();
+
+    // Lookup the index for the given tablet server UUID. If that UUID has not been
+    // added yet, allocates a new TSInfoPB and calls 'creator(pb)' to fill it in,
+    // returning the index of the newly-added TS.
+    int LookupOrAdd(const std::string& uuid, const std::function<void(TSInfoPB*)>& creator);
+
+    const std::vector<TSInfoPB*>& ts_info_pbs() const { return ts_info_pbs_; }
+
+   private:
+    std::vector<TSInfoPB*> ts_info_pbs_;
+    google::dense_hash_map<StringPiece, int, GoodFastHash<StringPiece>> uuid_to_idx_;
+
+    // If non-null, the TSInfoPBs are allocated from this Arena.
+    google::protobuf::Arena* const arena_;
   };
 
   // Look up the locations of the given tablet. If 'user' is provided, checks
@@ -697,6 +714,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                              const TabletReportPB& full_report,
                              TabletReportUpdatesPB* full_report_update,
                              rpc::RpcContext* rpc);
+
+  std::string GetClusterId() const;
 
   // Returns the latest handled Hive Metastore notification log event ID.
   int64_t GetLatestNotificationLogEventId();
@@ -756,9 +775,15 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
       const consensus::StartTabletCopyRequestPB* req,
       std::function<void(const Status&, tserver::TabletServerErrorPB::Code)> cb) override;
 
-  // Returns this CatalogManager's role in a consensus configuration. CatalogManager
-  // must be initialized before calling this method.
+  // Returns this CatalogManager's role in a consensus configuration.
+  // CatalogManager is expected to be initialized before calling this method otherwise
+  // UNKNOWN_ROLE is returned.
   consensus::RaftPeerPB::Role Role() const;
+
+  // Returns this CatalogManager's role and member type in a consensus configuration.
+  // CatalogManager is expected to be initialized before calling this method otherwise
+  // <UNKNOWN_ROLE, UNKNOWN_MEMBER_TYPE> is returned.
+  consensus::RaftConsensus::RoleAndMemberType GetRoleAndMemberType() const;
 
   hms::HmsCatalog* hms_catalog() const {
     return hms_catalog_.get();
@@ -781,6 +806,16 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // If the HMS integration is not configured then a copy of the original table
   // name is returned.
   static std::string NormalizeTableName(const std::string& table_name);
+
+  enum ChangeConfigOp {
+    kAddMaster
+  };
+
+  // Add/remove a master specified by 'hp' and 'uuid' by initiating change config request.
+  // RpContext 'rpc' will be used to respond back to the client asynchronously.
+  // Returns the status of submission of the request.
+  Status InitiateMasterChangeConfig(ChangeConfigOp op, const HostPort& hp,
+                                    const std::string& uuid, rpc::RpcContext* rpc);
 
  private:
   // These tests call ElectedAsLeaderCb() directly.
@@ -851,6 +886,9 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Currently, it's about having a means to authenticate clients by authn tokens.
   Status PrepareFollower(MonoTime* last_tspk_run);
 
+  // Load the cluster ID for the follower catalog manager.
+  Status PrepareFollowerClusterId();
+
   // Prepare CA-related information for the follower catalog manager. Currently,
   // this includes reading the CA information from the system table, creating
   // TLS server certificate request, signing it with the CA key, and installing
@@ -876,6 +914,11 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // This method is thread-safe.
   Status InitSysCatalogAsync(bool is_first_run);
 
+  // Initialize the cluster ID: load the cluster ID record
+  // from the system table. If a cluster ID record is not present in the
+  // table, generate and store a new one.
+  Status InitClusterId();
+
   // Initialize the IPKI certificate authority: load the CA information record
   // from the system table. If the CA information record is not present in the
   // table, generate and store a new one.
@@ -886,11 +929,18 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   Status InitCertAuthorityWith(std::unique_ptr<security::PrivateKey> key,
                                std::unique_ptr<security::Cert> cert);
 
+  // Load the cluster ID from the system table.
+  // If the cluster ID is not found in the table, return Status::NotFound.
+  Status LoadClusterId(std::string* cluster_id);
+
   // Load the IPKI certficate authority information from the system
   // table: the private key and the certificate. If the CA info entry is not
   // found in the table, return Status::NotFound.
   Status LoadCertAuthorityInfo(std::unique_ptr<security::PrivateKey>* key,
                                std::unique_ptr<security::Cert>* cert);
+
+  // Store cluster ID into the system table.
+  Status StoreClusterId(const std::string& cluster_id);
 
   // Store the IPKI certificate authority information into the system table.
   Status StoreCertAuthorityInfo(const security::PrivateKey& key,
@@ -1052,6 +1102,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                                const TabletMetadataLock& tablet_lock,
                                const std::string& deletion_msg);
 
+  void ResetTableLocationsCache();
+
   std::string GenerateId() { return oid_generator_.Next(); }
 
   // Conventional "T xxx P yyy: " prefix for logging.
@@ -1128,6 +1180,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   mutable simple_spinlock state_lock_;
   State state_;
 
+  static const char* ChangeConfigOpToString(ChangeConfigOp type);
+
   // Singleton pool that serializes invocations of ElectedAsLeaderCb().
   std::unique_ptr<ThreadPool> leader_election_pool_;
 
@@ -1160,6 +1214,13 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Async operations are accessing some private methods
   // (TODO: this stuff should be deferred and done in the background thread)
   friend class AsyncAlterTable;
+
+  // LRU cache to store responses generated by GetTableLocations().
+  std::unique_ptr<TableLocationsCache> table_locations_cache_;
+
+  // Lock protecting cluster_id_.
+  mutable simple_spinlock cluster_id_lock_;
+  std::string cluster_id_;
 
   DISALLOW_COPY_AND_ASSIGN(CatalogManager);
 };

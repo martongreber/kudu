@@ -17,19 +17,24 @@
 
 #include "kudu/util/block_bloom_filter.h"
 
+#ifdef __aarch64__
+#include "kudu/util/sse2neon.h"
+#else //__aarch64__
 #include <emmintrin.h>
 #include <mm_malloc.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <string>
 
 #include <gflags/gflags.h>
 
 #include "kudu/gutil/cpu.h"
+#include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/block_bloom_filter.pb.h"
 #include "kudu/util/flag_tags.h"
@@ -45,9 +50,6 @@ DEFINE_bool(disable_blockbloomfilter_avx2, false,
             "that doesn't support AVX2.");
 TAG_FLAG(disable_blockbloomfilter_avx2, hidden);
 
-// Flag used to initialize the static function pointers for the BlockBloomFilter class.
-static std::once_flag g_init_func_ptrs_flag;
-
 namespace kudu {
 
 // Initialize the static member variables from BlockBloomFilter class.
@@ -57,29 +59,6 @@ const base::CPU BlockBloomFilter::kCpu = base::CPU();
 // Hence no duplicate initialization in the definition here.
 constexpr BlockBloomFilter* const BlockBloomFilter::kAlwaysTrueFilter;
 
-decltype(&BlockBloomFilter::BucketInsert) BlockBloomFilter::bucket_insert_func_ptr_ = nullptr;
-decltype(&BlockBloomFilter::BucketFind) BlockBloomFilter::bucket_find_func_ptr_ = nullptr;
-decltype(&BlockBloomFilter::OrEqualArrayNoAVX2) BlockBloomFilter::or_equal_array_func_ptr_ =
-    nullptr;
-
-void BlockBloomFilter::InitializeFunctionPtrs() {
-#ifdef USE_AVX2
-  if (has_avx2()) {
-    bucket_insert_func_ptr_ = &BlockBloomFilter::BucketInsertAVX2;
-    bucket_find_func_ptr_ = &BlockBloomFilter::BucketFindAVX2;
-    or_equal_array_func_ptr_ = &BlockBloomFilter::OrEqualArrayAVX2;
-  } else {
-    bucket_insert_func_ptr_ = &BlockBloomFilter::BucketInsert;
-    bucket_find_func_ptr_ = &BlockBloomFilter::BucketFind;
-    or_equal_array_func_ptr_ = &BlockBloomFilter::OrEqualArrayNoAVX2;
-  }
-#else
-  bucket_insert_func_ptr_ = &BlockBloomFilter::BucketInsert;
-  bucket_find_func_ptr_ = &BlockBloomFilter::BucketFind;
-  or_equal_array_func_ptr_ = &BlockBloomFilter::OrEqualArrayNoAVX2;
-#endif
-}
-
 BlockBloomFilter::BlockBloomFilter(BlockBloomFilterBufferAllocatorIf* buffer_allocator) :
   always_false_(true),
   buffer_allocator_(buffer_allocator),
@@ -88,11 +67,22 @@ BlockBloomFilter::BlockBloomFilter(BlockBloomFilterBufferAllocatorIf* buffer_all
   directory_(nullptr),
   hash_algorithm_(UNKNOWN_HASH),
   hash_seed_(0) {
-  std::call_once(g_init_func_ptrs_flag, InitializeFunctionPtrs);
+
+#ifdef USE_AVX2
+  if (has_avx2()) {
+    bucket_insert_func_ptr_ = &BlockBloomFilter::BucketInsertAVX2;
+    bucket_find_func_ptr_ = &BlockBloomFilter::BucketFindAVX2;
+  } else {
+    bucket_insert_func_ptr_ = &BlockBloomFilter::BucketInsert;
+    bucket_find_func_ptr_ = &BlockBloomFilter::BucketFind;
+  }
+#else
+  bucket_insert_func_ptr_ = &BlockBloomFilter::BucketInsert;
+  bucket_find_func_ptr_ = &BlockBloomFilter::BucketFind;
+#endif
 
   DCHECK(bucket_insert_func_ptr_);
   DCHECK(bucket_find_func_ptr_);
-  DCHECK(or_equal_array_func_ptr_);
 }
 
 BlockBloomFilter::~BlockBloomFilter() {
@@ -198,10 +188,17 @@ void BlockBloomFilter::BucketInsert(const uint32_t bucket_idx, const uint32_t ha
     new_bucket[i] = 1U << new_bucket[i];
   }
   for (int i = 0; i < 2; ++i) {
+#ifdef __aarch64__
+    // IWYU pragma: no_include <arm_neon.h>
+    uint8x16_t new_bucket_neon = vreinterpretq_u8_u32(vld1q_u32(new_bucket + 4 * i));
+    uint8x16_t* existing_bucket = reinterpret_cast<uint8x16_t*>(&directory_[bucket_idx][4 * i]);
+    *existing_bucket = vorrq_u8(*existing_bucket, new_bucket_neon);
+#else
     __m128i new_bucket_sse = _mm_load_si128(reinterpret_cast<__m128i*>(new_bucket + 4 * i));
     __m128i* existing_bucket = reinterpret_cast<__m128i*>(
         &DCHECK_NOTNULL(directory_)[bucket_idx][4 * i]);
     *existing_bucket = _mm_or_si128(*existing_bucket, new_bucket_sse);
+#endif
   }
 }
 
@@ -218,32 +215,91 @@ bool BlockBloomFilter::BucketFind(
   return true;
 }
 
-// The following three methods are derived from
-//
-// fpp = (1 - exp(-kBucketWords * ndv/space))^kBucketWords
-//
-// where space is in bits.
+// This implements the false positive probability in Putze et al.'s "Cache-, hash-and
+// space-efficient bloom filters", equation 3.
+double BlockBloomFilter::FalsePositiveProb(const size_t ndv, const int log_space_bytes) {
+  static constexpr double kWordBits = 1 << kLogBucketWordBits;
+  const double bytes = static_cast<double>(1L << log_space_bytes);
+  if (ndv == 0) return 0.0;
+  if (bytes <= 0) return 1.0;
+  // This short-cuts a slowly-converging sum for very dense filters
+  if (ndv / (bytes * CHAR_BIT) > 2) return 1.0;
+
+  double result = 0;
+  // lam is the usual parameter to the Poisson's PMF. Following the notation in the paper,
+  // lam is B/c, where B is the number of bits in a bucket and c is the number of bits per
+  // distinct value
+  const double lam = kBucketWords * kWordBits / ((bytes * CHAR_BIT) / ndv);
+  // Some of the calculations are done in log-space to increase numerical stability
+  const double loglam = log(lam);
+
+  // 750 iterations are sufficient to cause the sum to converge in all of the tests. In
+  // other words, setting the iterations higher than 750 will give the same result as
+  // leaving it at 750.
+  static constexpr uint64_t kBloomFppIters = 750;
+  for (uint64_t j = 0; j < kBloomFppIters; ++j) {
+    // We start with the highest value of i, since the values we're adding to result are
+    // mostly smaller at high i, and this increases accuracy to sum from the smallest
+    // values up.
+    const double i = static_cast<double>(kBloomFppIters - 1 - j);
+    // The PMF of the Poisson distribution is lam^i * exp(-lam) / i!. In logspace, using
+    // lgamma for the log of the factorial function:
+    double logp = i * loglam - lam - lgamma(i + 1);
+    // The f_inner part of the equation in the paper is the probability of a single
+    // collision in the bucket. Since there are kBucketWords non-overlapping lanes in each
+    // bucket, the log of this probability is:
+    const double logfinner = kBucketWords * log(1.0 - pow(1.0 - 1.0 / kWordBits, i));
+    // Here we are forced out of log-space calculations
+    result += exp(logp + logfinner);
+  }
+  return (result > 1.0) ? 1.0 : result;
+}
+
 size_t BlockBloomFilter::MaxNdv(const int log_space_bytes, const double fpp) {
   DCHECK(log_space_bytes > 0 && log_space_bytes < 61);
   DCHECK(0 < fpp && fpp < 1);
-  static const double ik = 1.0 / kBucketWords;
-  return -1 * ik * static_cast<double>(1ULL << (log_space_bytes + 3)) * log(1 - pow(fpp, ik));
+  // Starting with an exponential search, we find bounds for how many distinct values a
+  // filter of size (1 << log_space_bytes) can hold before it exceeds a false positive
+  // probability of fpp.
+  size_t too_many = 1;
+  while (FalsePositiveProb(too_many, log_space_bytes) <= fpp) {
+    too_many *= 2;
+  }
+  // From here forward, we have the invariant that FalsePositiveProb(too_many,
+  // log_space_bytes) > fpp
+  size_t too_few = too_many / 2;
+  // Invariant for too_few: FalsePositiveProb(too_few, log_space_bytes) <= fpp
+
+  constexpr size_t kProximity = 1;
+  // Simple binary search. If this is too slow, the required proximity of too_few and
+  // too_many can be raised from 1 to something higher.
+  while (too_many - too_few > kProximity) {
+    const size_t mid = (too_many + too_few) / 2;
+    const double mid_fpp = FalsePositiveProb(mid, log_space_bytes);
+    if (mid_fpp <= fpp) {
+      too_few = mid;
+    } else {
+      too_many = mid;
+    }
+  }
+  DCHECK_LE(FalsePositiveProb(too_few, log_space_bytes), fpp);
+  DCHECK_GT(FalsePositiveProb(too_few + kProximity, log_space_bytes), fpp);
+  return too_few;
 }
 
 int BlockBloomFilter::MinLogSpace(const size_t ndv, const double fpp) {
-  static const double k = kBucketWords;
-  if (0 == ndv) return 0;
-  // m is the number of bits we would need to get the fpp specified
-  const double m = -k * ndv / log(1 - pow(fpp, 1.0 / k));
-
-  // Handle case where ndv == 1 => ceil(log2(m/8)) < 0.
-  return std::max(0, static_cast<int>(ceil(log2(m / 8))));
-}
-
-double BlockBloomFilter::FalsePositiveProb(const size_t ndv, const int log_space_bytes) {
-  return pow(1 - exp((-1.0 * static_cast<double>(kBucketWords) * static_cast<double>(ndv))
-                     / static_cast<double>(1ULL << (log_space_bytes + 3))),
-             kBucketWords);
+  int low = 0;
+  int high = 64;
+  while (high > low + 1) {
+    int mid = (high + low) / 2;
+    const double candidate = FalsePositiveProb(ndv, mid);
+    if (candidate <= fpp) {
+      high = mid;
+    } else {
+      low = mid;
+    }
+  }
+  return high;
 }
 
 void BlockBloomFilter::InsertNoAvx2(const uint32_t hash) noexcept {
@@ -260,6 +316,7 @@ void BlockBloomFilter::InsertNoAvx2(const uint32_t hash) noexcept {
 void BlockBloomFilter::Insert(const uint32_t hash) noexcept {
   always_false_ = false;
   const uint32_t bucket_idx = Rehash32to32(hash) & directory_mask_;
+  DCHECK(bucket_insert_func_ptr_);
   (this->*bucket_insert_func_ptr_)(bucket_idx, hash);
 }
 
@@ -268,6 +325,7 @@ bool BlockBloomFilter::Find(const uint32_t hash) const noexcept {
     return false;
   }
   const uint32_t bucket_idx = Rehash32to32(hash) & directory_mask_;
+  DCHECK(bucket_find_func_ptr_);
   return (this->*bucket_find_func_ptr_)(bucket_idx, hash);
 }
 
@@ -292,15 +350,27 @@ bool BlockBloomFilter::operator!=(const BlockBloomFilter& rhs) const {
   return !(rhs == *this);
 }
 
+void BlockBloomFilter::OrEqualArrayInternal(size_t n, const uint8_t* __restrict__ in,
+                                            uint8_t* __restrict__ out) {
+#ifdef USE_AVX2
+  if (has_avx2()) {
+    BlockBloomFilter::OrEqualArrayAVX2(n, in, out);
+  } else {
+    BlockBloomFilter::OrEqualArrayNoAVX2(n, in, out);
+  }
+#else
+  BlockBloomFilter::OrEqualArrayNoAVX2(n, in, out);
+#endif
+}
+
 Status BlockBloomFilter::OrEqualArray(size_t n, const uint8_t* __restrict__ in,
                                       uint8_t* __restrict__ out) {
   if ((n % kBucketByteSize) != 0) {
     return Status::InvalidArgument(Substitute("Input size $0 not a multiple of 32-bytes", n));
   }
 
-  std::call_once(g_init_func_ptrs_flag, InitializeFunctionPtrs);
-  DCHECK(or_equal_array_func_ptr_);
-  (*or_equal_array_func_ptr_)(n, in, out);
+  OrEqualArrayInternal(n, in, out);
+
   return Status::OK();
 }
 
@@ -347,9 +417,9 @@ Status BlockBloomFilter::Or(const BlockBloomFilter& other) {
     return Status::OK();
   }
 
-  (*or_equal_array_func_ptr_)(directory_size(),
-                              reinterpret_cast<uint8_t*>(other.directory_),
-                              reinterpret_cast<uint8_t*>(directory_));
+  OrEqualArrayInternal(directory_size(), reinterpret_cast<const uint8*>(other.directory_),
+                       reinterpret_cast<uint8*>(directory_));
+
   always_false_ = false;
   return Status::OK();
 }

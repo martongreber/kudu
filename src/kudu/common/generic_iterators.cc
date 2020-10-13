@@ -29,6 +29,7 @@
 #include <numeric>
 #include <ostream>
 #include <string>
+#include <typeinfo>
 #include <unordered_map>
 #include <utility>
 
@@ -45,8 +46,10 @@
 #include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/iterator_stats.h"
+#include "kudu/common/predicate_effectiveness.h"
 #include "kudu/common/row.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/gutil/casts.h"
@@ -68,7 +71,6 @@ template <class T> struct compare;
 
 using std::deque;
 using std::get;
-using std::pair;
 using std::sort;
 using std::string;
 using std::unique_ptr;
@@ -96,6 +98,9 @@ void AddIterStats(const RowwiseIterator& iter,
 }
 } // anonymous namespace
 
+
+typedef std::pair<int32_t, ColumnPredicate> ColumnIdxAndPredicate;
+
 ////////////////////////////////////////////////////////////
 // MergeIterator
 ////////////////////////////////////////////////////////////
@@ -111,7 +116,7 @@ class MergeIterState : public boost::intrusive::list_base_hook<> {
  public:
   explicit MergeIterState(IterWithBounds iwb)
       : iwb_(std::move(iwb)),
-        arena_(1024),
+        memory_(1024),
         next_row_idx_(0)
   {}
 
@@ -144,18 +149,18 @@ class MergeIterState : public boost::intrusive::list_base_hook<> {
   // exist. If not, we have to pull a block immediately: after Init() is
   // finished it must be safe to call next_row() and last_row().
   //
-  // Decoded bound allocations are done against 'decoded_bounds_arena'.
-  Status Init(Arena* decoded_bounds_arena) {
+  // Decoded bound allocations are done against the arena in 'decoded_bounds_memory'.
+  Status Init(RowBlockMemory* decoded_bounds_memory) {
     DCHECK(!read_block_);
 
     if (iwb_.encoded_bounds) {
-      decoded_bounds_.emplace(&schema(), decoded_bounds_arena);
+      decoded_bounds_.emplace(&schema(), decoded_bounds_memory);
       decoded_bounds_->lower = decoded_bounds_->block.row(0);
       decoded_bounds_->upper = decoded_bounds_->block.row(1);
       RETURN_NOT_OK(schema().DecodeRowKey(
-          iwb_.encoded_bounds->first, &decoded_bounds_->lower, decoded_bounds_arena));
+          iwb_.encoded_bounds->first, &decoded_bounds_->lower, &decoded_bounds_memory->arena));
       RETURN_NOT_OK(schema().DecodeRowKey(
-          iwb_.encoded_bounds->second, &decoded_bounds_->upper, decoded_bounds_arena));
+          iwb_.encoded_bounds->second, &decoded_bounds_->upper, &decoded_bounds_memory->arena));
     } else {
       RETURN_NOT_OK(PullNextBlock());
     }
@@ -219,14 +224,14 @@ class MergeIterState : public boost::intrusive::list_base_hook<> {
   IterWithBounds iwb_;
 
   // Allocates memory for read_block_.
-  Arena arena_;
+  RowBlockMemory memory_;
 
   // Optional rowset bounds, decoded during Init().
   struct DecodedBounds {
     // 'block' must be constructed immediately; the bounds themselves can be
     // initialized later.
-    DecodedBounds(const Schema* schema, Arena* arena)
-        : block(schema, /*nrows=*/2, arena) {}
+    DecodedBounds(const Schema* schema, RowBlockMemory* mem)
+        : block(schema, /*nrows=*/2, mem) {}
 
     RowBlock block;
     RowBlockRow lower;
@@ -270,7 +275,7 @@ Status MergeIterState::Advance(size_t num_rows, bool* pulled_new_block) {
   // We either exhausted the block outright, or all subsequent rows were
   // deselected. Either way, we need to pull the next block.
   next_row_idx_ = read_block_->nrows();
-  arena_.Reset();
+  memory_.Reset();
   RETURN_NOT_OK(PullNextBlock());
   *pulled_new_block = true;
   return Status::OK();
@@ -281,7 +286,7 @@ Status MergeIterState::PullNextBlock() {
       << "should not pull next block until current block is exhausted";
 
   if (!read_block_) {
-    read_block_.reset(new RowBlock(&schema(), kMergeRowBuffer, &arena_));
+    read_block_.reset(new RowBlock(&schema(), kMergeRowBuffer, &memory_));
   }
   while (iwb_.iter->HasNext()) {
     RETURN_NOT_OK(iwb_.iter->NextBlock(read_block_.get()));
@@ -536,7 +541,7 @@ class MergeIterator : public RowwiseIterator {
   // Each MergeIterState has an arena for buffered row data, but it is reset
   // every time a new block is pulled. This single arena ensures that a
   // MergeIterState's decoded bounds remain allocated for its lifetime.
-  Arena decoded_bounds_arena_;
+  RowBlockMemory decoded_bounds_memory_;
 
   // Min-heap that orders rows by their keys. A call to top() will yield the row
   // with the smallest key.
@@ -591,7 +596,7 @@ MergeIterator::MergeIterator(MergeIteratorOptions opts,
       initted_(false),
       orig_iters_(std::move(iters)),
       num_orig_iters_(orig_iters_.size()),
-      decoded_bounds_arena_(1024) {
+      decoded_bounds_memory_(1024) {
   CHECK_GT(orig_iters_.size(), 0);
 }
 
@@ -660,7 +665,7 @@ Status MergeIterator::InitSubIterators(ScanSpec *spec) {
     ScanSpec *spec_copy = spec != nullptr ? scan_spec_copies_.Construct(*spec) : nullptr;
     RETURN_NOT_OK(InitAndMaybeWrap(&i.iter, spec_copy));
     unique_ptr<MergeIterState> state(new MergeIterState(std::move(i)));
-    RETURN_NOT_OK(state->Init(&decoded_bounds_arena_));
+    RETURN_NOT_OK(state->Init(&decoded_bounds_memory_));
     states_.push_back(*state.release());
   }
   orig_iters_.clear();
@@ -1138,9 +1143,15 @@ class MaterializingIterator : public RowwiseIterator {
 
   virtual void GetIteratorStats(std::vector<IteratorStats>* stats) const OVERRIDE {
     iter_->GetIteratorStats(stats);
+    predicates_effectiveness_ctx_.PopulateIteratorStatsWithDisabledPredicates(
+        col_idx_predicates_, stats);
   }
 
   virtual Status NextBlock(RowBlock* dst) OVERRIDE;
+
+  const IteratorPredicateEffectivenessContext& effectiveness_context() const {
+    return predicates_effectiveness_ctx_;
+  }
 
  private:
   Status MaterializeBlock(RowBlock *dst);
@@ -1149,10 +1160,13 @@ class MaterializingIterator : public RowwiseIterator {
 
   // List of (column index, predicate) in order of most to least selective, with
   // ties broken by the index.
-  vector<std::pair<int32_t, ColumnPredicate>> col_idx_predicates_;
+  vector<ColumnIdxAndPredicate> col_idx_predicates_;
 
   // List of column indexes without predicates to materialize.
   vector<int32_t> non_predicate_column_indexes_;
+
+  // Predicate effective contexts help disable ineffective column predicates.
+  IteratorPredicateEffectivenessContext predicates_effectiveness_ctx_;
 
   // Set only by test code to disallow pushdown.
   bool disallow_pushdown_for_tests_;
@@ -1171,7 +1185,6 @@ Status MaterializingIterator::Init(ScanSpec *spec) {
   const int32_t num_columns = schema().num_columns();
   col_idx_predicates_.clear();
   non_predicate_column_indexes_.clear();
-
   if (PREDICT_FALSE(!disallow_pushdown_for_tests_) && spec != nullptr) {
     col_idx_predicates_.reserve(spec->predicates().size());
     DCHECK_GE(num_columns, spec->predicates().size());
@@ -1205,12 +1218,20 @@ Status MaterializingIterator::Init(ScanSpec *spec) {
   // Sort the predicates by selectivity so that the most selective are evaluated
   // earlier, with ties broken by the column index.
   sort(col_idx_predicates_.begin(), col_idx_predicates_.end(),
-       [] (const pair<int32_t, ColumnPredicate>& left,
-           const pair<int32_t, ColumnPredicate>& right) {
+       [] (const ColumnIdxAndPredicate& left,
+           const ColumnIdxAndPredicate& right) {
           int comp = SelectivityComparator(left.second, right.second);
           return comp ? comp < 0 : left.first < right.first;
        });
 
+  // Important to initialize the effectiveness contexts after sorting the predicates
+  // to get right order of predicate indices.
+  for (int pred_idx = 0; pred_idx < col_idx_predicates_.size(); pred_idx++) {
+    const auto* predicate = &col_idx_predicates_[pred_idx].second;
+    if (IsColumnPredicateDisableable(predicate->predicate_type())) {
+      predicates_effectiveness_ctx_.AddDisableablePredicate(pred_idx, predicate);
+    }
+  }
   return Status::OK();
 }
 
@@ -1244,21 +1265,58 @@ Status MaterializingIterator::MaterializeBlock(RowBlock *dst) {
     return Status::OK();
   }
 
-  for (const auto& col_pred : col_idx_predicates_) {
+  predicates_effectiveness_ctx_.IncrementNextBlockCount();
+  for (int i = 0; i < col_idx_predicates_.size(); i++) {
+    const auto& col_pred = col_idx_predicates_[i];
+    const auto& col_idx = get<0>(col_pred);
+    const auto& predicate = get<1>(col_pred);
+
     // Materialize the column itself into the row block.
-    ColumnBlock dst_col(dst->column_block(get<0>(col_pred)));
-    ColumnMaterializationContext ctx(get<0>(col_pred),
-                                     &get<1>(col_pred),
+    ColumnBlock dst_col(dst->column_block(col_idx));
+    ColumnMaterializationContext ctx(col_idx,
+                                     &predicate,
                                      &dst_col,
                                      dst->selection_vector());
     // None predicates should be short-circuited in scan spec.
     DCHECK(ctx.pred()->predicate_type() != PredicateType::None);
-    if (disallow_decoder_eval_) {
+    auto* effectiveness_ctx = IsColumnPredicateDisableable(predicate.predicate_type()) ?
+                              &predicates_effectiveness_ctx_[i] : nullptr;
+    // Predicate evaluation will be disabled for a predicate already determined to be ineffective
+    // both at decoder level and outside.
+    //
+    // Indicate whether the predicate has been disabled or not. If the predicate is not disableable
+    // (currently only Bloom filter predicates are disableable), both of these are false.
+    bool disableable_predicate_disabled =
+        effectiveness_ctx && !effectiveness_ctx->IsPredicateEnabled();
+    bool disableable_predicate_enabled =
+        effectiveness_ctx && effectiveness_ctx->IsPredicateEnabled();
+
+    if (disallow_decoder_eval_ || disableable_predicate_disabled) {
+      // This column predicate is determined to be ineffective, hence disable the decoder level
+      // evaluation.
       ctx.SetDecoderEvalNotSupported();
     }
+
+    // Determine the number of rows filtered out by this predicate, if disableable.
+    //
+    // Currently we don't have a mechanism to get precise number of rows filtered out by a
+    // particular predicate and adding such a stat could in fact slow down the filtering.
+    // This count of rows filtered out is not precise as the rows filtered out by predicates
+    // earlier in the sort order get more credit than the ones later in the order. Nevertheless it
+    // still helps measure whether the predicate is effective in filtering out rows.
+    auto num_rows_before = disableable_predicate_enabled ?
+                           dst->selection_vector()->CountSelected() : 0;
+
     RETURN_NOT_OK(iter_->MaterializeColumn(&ctx));
-    if (ctx.DecoderEvalNotSupported()) {
-      get<1>(col_pred).Evaluate(dst_col, dst->selection_vector());
+    if (ctx.DecoderEvalNotSupported() && !disableable_predicate_disabled) {
+      predicate.Evaluate(dst_col, dst->selection_vector());
+    }
+    if (disableable_predicate_enabled) {
+      auto num_rows_rejected = num_rows_before - dst->selection_vector()->CountSelected();
+      DCHECK_GE(num_rows_rejected, 0);
+      DCHECK_LE(num_rows_rejected, num_rows_before);
+      effectiveness_ctx->rows_rejected += num_rows_rejected;
+      effectiveness_ctx->rows_read += dst->nrows();
     }
 
     // If after evaluating this predicate the entire row block has been filtered
@@ -1268,6 +1326,7 @@ Status MaterializingIterator::MaterializeBlock(RowBlock *dst) {
       return Status::OK();
     }
   }
+  predicates_effectiveness_ctx_.DisableIneffectivePredicates();
 
   for (size_t col_idx : non_predicate_column_indexes_) {
     // Materialize the column itself into the row block.
@@ -1325,16 +1384,36 @@ class PredicateEvaluatingIterator : public RowwiseIterator {
 
   virtual void GetIteratorStats(std::vector<IteratorStats>* stats) const OVERRIDE {
     base_iter_->GetIteratorStats(stats);
+    predicates_effectiveness_ctx_.PopulateIteratorStatsWithDisabledPredicates(
+        col_idx_predicates_, stats);
   }
 
-  const vector<ColumnPredicate>& col_predicates() const { return col_predicates_; }
+  // Return the column predicates tracked by this iterator. Only valid for the lifetime of
+  // the iterator.
+  vector<const ColumnPredicate*> col_predicates() const {
+    vector<const ColumnPredicate*> result;
+    result.reserve(col_idx_predicates_.size());
+    std::transform(col_idx_predicates_.begin(),
+                   col_idx_predicates_.end(),
+                   std::back_inserter(result),
+                   [](const ColumnIdxAndPredicate& idx_and_pred) { return &idx_and_pred.second; });
+    return result;
+  }
+
+  const IteratorPredicateEffectivenessContext& effectiveness_context() const {
+    return predicates_effectiveness_ctx_;
+  }
 
  private:
+
   unique_ptr<RowwiseIterator> base_iter_;
 
-  // List of predicates in order of most to least selective, with
+  // List of (column index, predicate) in order of most to least selective, with
   // ties broken by the column index.
-  vector<ColumnPredicate> col_predicates_;
+  vector<ColumnIdxAndPredicate> col_idx_predicates_;
+
+  // Predicate effective contexts help disable ineffective column predicates.
+  IteratorPredicateEffectivenessContext predicates_effectiveness_ctx_;
 };
 
 PredicateEvaluatingIterator::PredicateEvaluatingIterator(unique_ptr<RowwiseIterator> base_iter)
@@ -1347,22 +1426,38 @@ Status PredicateEvaluatingIterator::Init(ScanSpec *spec) {
 
   // Gather any predicates that the base iterator did not pushdown, and remove
   // the predicates from the spec.
-  col_predicates_.clear();
-  col_predicates_.reserve(spec->predicates().size());
-  for (auto& predicate : spec->predicates()) {
-    col_predicates_.emplace_back(predicate.second);
+  col_idx_predicates_.clear();
+  col_idx_predicates_.reserve(spec->predicates().size());
+  for (const auto& col_pred : spec->predicates()) {
+    const auto& col_name = col_pred.first;
+    const ColumnPredicate& pred = col_pred.second;
+    DCHECK_EQ(col_name, pred.column().name());
+    int col_idx = schema().find_column(col_name);
+    if (col_idx == Schema::kColumnNotFound) {
+      return Status::InvalidArgument("No such column", col_name);
+    }
+    VLOG(1) << "Pushing down predicate " << pred.ToString();
+    col_idx_predicates_.emplace_back(col_idx, pred);
   }
   spec->RemovePredicates();
 
   // Sort the predicates by selectivity so that the most selective are evaluated
   // earlier, with ties broken by the column index.
-  sort(col_predicates_.begin(), col_predicates_.end(),
-       [&] (const ColumnPredicate& left, const ColumnPredicate& right) {
-          int comp = SelectivityComparator(left, right);
-          if (comp != 0) return comp < 0;
-          return schema().find_column(left.column().name())
-               < schema().find_column(right.column().name());
+  sort(col_idx_predicates_.begin(), col_idx_predicates_.end(),
+       [] (const ColumnIdxAndPredicate& left,
+           const ColumnIdxAndPredicate& right) {
+         int comp = SelectivityComparator(left.second, right.second);
+         return comp ? comp < 0 : left.first < right.first;
        });
+
+  // Important to initialize the effectiveness contexts after sorting the predicates
+  // to get right order of predicate indices.
+  for (int pred_idx = 0; pred_idx < col_idx_predicates_.size(); pred_idx++) {
+    const auto* predicate = &col_idx_predicates_[pred_idx].second;
+    if (IsColumnPredicateDisableable(predicate->predicate_type())) {
+      predicates_effectiveness_ctx_.AddDisableablePredicate(pred_idx, predicate);
+    }
+  }
 
   return Status::OK();
 }
@@ -1374,12 +1469,38 @@ bool PredicateEvaluatingIterator::HasNext() const {
 Status PredicateEvaluatingIterator::NextBlock(RowBlock *dst) {
   RETURN_NOT_OK(base_iter_->NextBlock(dst));
 
-  for (const auto& predicate : col_predicates_) {
-    int32_t col_idx = dst->schema()->find_column(predicate.column().name());
-    if (col_idx == Schema::kColumnNotFound) {
-      return Status::InvalidArgument("Unknown column in predicate", predicate.ToString());
+  predicates_effectiveness_ctx_.IncrementNextBlockCount();
+  for (int i = 0; i < col_idx_predicates_.size(); i++) {
+    const auto& col_idx = col_idx_predicates_[i].first;
+    const auto& predicate = col_idx_predicates_[i].second;
+    DCHECK_NE(col_idx, Schema::kColumnNotFound);
+
+    auto* effectiveness_ctx = IsColumnPredicateDisableable(predicate.predicate_type()) ?
+                              &predicates_effectiveness_ctx_[i] : nullptr;
+    if (effectiveness_ctx && !effectiveness_ctx->IsPredicateEnabled()) {
+      // Column predicate determined to be disabled.
+      continue;
     }
+
+    // Determine the number of rows filtered out by this predicate.
+    //
+    // Currently we don't have a mechanism to get precise number of rows filtered out by a
+    // particular predicate and adding such stat could in fact slow down the filtering.
+    // This count of rows filtered out is not precise as the rows filtered out by predicates
+    // earlier in the sort order get more credit than the ones later in the order. Nevertheless it
+    // still helps measure whether the predicate is effective in filtering out rows.
+    auto num_rows_before = effectiveness_ctx ?
+                           dst->selection_vector()->CountSelected() : 0;
+
     predicate.Evaluate(dst->column_block(col_idx), dst->selection_vector());
+
+    if (effectiveness_ctx) {
+      auto num_rows_rejected = num_rows_before - dst->selection_vector()->CountSelected();
+      DCHECK_GE(num_rows_rejected, 0);
+      DCHECK_LE(num_rows_rejected, num_rows_before);
+      effectiveness_ctx->rows_rejected += num_rows_rejected;
+      effectiveness_ctx->rows_read += dst->nrows();
+    }
 
     // If after evaluating this predicate, the entire row block has now been
     // filtered out, we don't need to evaluate any further predicates.
@@ -1387,6 +1508,7 @@ Status PredicateEvaluatingIterator::NextBlock(RowBlock *dst) {
       break;
     }
   }
+  predicates_effectiveness_ctx_.DisableIneffectivePredicates();
 
   return Status::OK();
 }
@@ -1408,11 +1530,29 @@ Status InitAndMaybeWrap(unique_ptr<RowwiseIterator>* base_iter,
   return Status::OK();
 }
 
-const vector<ColumnPredicate>& GetIteratorPredicatesForTests(
+vector<const ColumnPredicate*> GetIteratorPredicatesForTests(
     const unique_ptr<RowwiseIterator>& iter) {
   PredicateEvaluatingIterator* pred_eval =
       down_cast<PredicateEvaluatingIterator*>(iter.get());
   return pred_eval->col_predicates();
+}
+
+const IteratorPredicateEffectivenessContext& GetIteratorPredicateEffectivenessCtxForTests(
+    const std::unique_ptr<RowwiseIterator>& iter) {
+  auto* iter_ptr = iter.get();
+  // Using dynamic_cast like below is not recommended but okay considering following reasons:
+  // - This function is only used for tests
+  // - PredicateEvaluatingIterator and MaterializingIterator are hidden from public access.
+  // - Introducing effectiveness context for base RowwiseIterator would be unnecessary
+  //   for other derived classes of RowwiseIterator.
+  if (auto* pred_iter = dynamic_cast<PredicateEvaluatingIterator*>(iter_ptr)) {
+    return pred_iter->effectiveness_context();
+  }
+  if (auto* pred_iter = dynamic_cast<MaterializingIterator*>(iter_ptr)) {
+    return pred_iter->effectiveness_context();
+  }
+  LOG(FATAL) << "Effectiveness context not available for iterator type: "
+             << typeid(iter_ptr).name();
 }
 
 } // namespace kudu

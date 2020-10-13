@@ -151,9 +151,15 @@ include(CompilerInfo)
 
 
 # compiler flags that are common across debug/release builds
-#  -msse4.2: Enable sse4.2 compiler intrinsics.
-execute_process(COMMAND uname -p OUTPUT_VARIABLE ARCH_NAME)
-if (NOT "${ARCH_NAME}" MATCHES "aarch64")
+execute_process(COMMAND uname -m OUTPUT_VARIABLE ARCH_NAME)
+if("${ARCH_NAME}" MATCHES "aarch64")
+  # Certain platforms such as ARM do not use signed chars by default
+  # which causes issues with certain bounds checks.
+  set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fsigned-char")
+  # Turn off fp-contract on aarch64 to avoid multiply-add operation result difference.
+  set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -ffp-contract=off")
+else()
+  # -msse4.2: Enable sse4.2 compiler intrinsics.
   set(CXX_COMMON_FLAGS "-msse4.2")
 endif()
 #  -Wall: Enable all warnings.
@@ -409,11 +415,32 @@ if (${KUDU_USE_TSAN})
   # require all code to be position independent, and the easiest way to
   # guarantee that is via dynamic linking (not all 3rd party archives are
   # compiled with -fPIC e.g. boost).
-  if("${KUDU_LINK}" STREQUAL "a")
-    message("Using dynamic linking for TSAN")
+  if(NOT "${ARCH_NAME}" MATCHES "aarch64")
+    if("${KUDU_LINK}" STREQUAL "a")
+      message("Using dynamic linking for TSAN")
+      set(KUDU_LINK "d")
+    elseif("${KUDU_LINK}" STREQUAL "s")
+      message(SEND_ERROR "Cannot use TSAN with static linking")
+    endif()
+  else()
+    # workaround for github.com/google/sanitizers/issues/1208
+    # TSAN with dynamic linking cause all of test cases failed on aarch64,
+    # we don't apply ENABLE_DIST_TEST on aarch64, so apply static linking direcly
+    message("Using static linking for TSAN on aarch64")
+    set(KUDU_LINK "s")
+  endif()
+endif()
+
+# If we still don't know what kind of linking to perform, choose based on
+# build type (developers like fast builds).
+if ("${KUDU_LINK}" STREQUAL "a")
+  if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG" OR
+      "${CMAKE_BUILD_TYPE}" STREQUAL "FASTDEBUG")
+    message("Using dynamic linking for ${CMAKE_BUILD_TYPE} builds")
     set(KUDU_LINK "d")
-  elseif("${KUDU_LINK}" STREQUAL "s")
-    message(SEND_ERROR "Cannot use TSAN with static linking")
+  else()
+    message("Using static linking for ${CMAKE_BUILD_TYPE} builds")
+    set(KUDU_LINK "s")
   endif()
 endif()
 
@@ -456,19 +483,6 @@ if ("${KUDU_GENERATE_COVERAGE}")
     # compiler. clang also handles flushing coverage from shared libraries
     # better than gcc.
     message(SEND_ERROR "Must use clang for coverage build")
-  endif()
-endif()
-
-# If we still don't know what kind of linking to perform, choose based on
-# build type (developers like fast builds).
-if ("${KUDU_LINK}" STREQUAL "a")
-  if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG" OR
-      "${CMAKE_BUILD_TYPE}" STREQUAL "FASTDEBUG")
-    message("Using dynamic linking for ${CMAKE_BUILD_TYPE} builds")
-    set(KUDU_LINK "d")
-  else()
-    message("Using static linking for ${CMAKE_BUILD_TYPE} builds")
-    set(KUDU_LINK "s")
   endif()
 endif()
 
@@ -1322,7 +1336,7 @@ endif (UNIX)
 ############################################################
 if (UNIX)
   add_custom_target(generated-headers
-    DEPENDS pb-gen krpc-gen hms_thrift sentry_thrift gen_version_info)
+    DEPENDS pb-gen krpc-gen hms_thrift gen_version_info)
 endif (UNIX)
 
 ############################################################
@@ -1355,13 +1369,13 @@ endif (UNIX)
 
 ############################################################
 # "make doxygen" target
-# Requires doxygen of version >= 1.8.11 to leverage the
-# WARN_AS_ERROR configuration parameter (introduced in
-# version 1.8.11) for spotting various issues in the Kudu
+# Requires doxygen of version >= 1.8.19 that includes the
+# fix of a bug that would otherwise fail the build as we
+# treat warnings as errors to spot various issues in the
 # C++ client API documentation.
 ############################################################
 if (UNIX)
-  find_package(Doxygen 1.8.11)
+  find_package(Doxygen 1.8.19)
   if (NOT (DOXYGEN_FOUND AND DOXYGEN_DOT_FOUND))
     message(WARNING "Doxygen with Dot support (graphviz) not found: 'doxygen' target is not available")
   else ()
@@ -1439,11 +1453,11 @@ add_subdirectory(src/kudu/ranger)
 add_subdirectory(src/kudu/rebalance)
 add_subdirectory(src/kudu/rpc)
 add_subdirectory(src/kudu/security)
-add_subdirectory(src/kudu/sentry)
 add_subdirectory(src/kudu/server)
 add_subdirectory(src/kudu/subprocess)
 add_subdirectory(src/kudu/tablet)
 add_subdirectory(src/kudu/thrift)
 add_subdirectory(src/kudu/tools)
+add_subdirectory(src/kudu/transactions)
 add_subdirectory(src/kudu/tserver)
 add_subdirectory(src/kudu/util)

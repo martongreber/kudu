@@ -20,8 +20,10 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 #include "kudu/cfile/block_encodings.h"
+#include "kudu/cfile/block_handle.h"
 #include "kudu/cfile/cfile_util.h"
 #include "kudu/common/columnblock.h"
 #include "kudu/gutil/port.h"
@@ -65,11 +67,11 @@ class PlainBitMapBlockBuilder final : public BlockBuilder {
     return count;
   }
 
-  virtual Slice Finish(rowid_t ordinal_pos) OVERRIDE {
+  virtual void Finish(rowid_t ordinal_pos, std::vector<Slice>* slices) OVERRIDE {
     InlineEncodeFixed32(&buf_[0], count_);
     InlineEncodeFixed32(&buf_[4], ordinal_pos);
     writer_.Flush(false);
-    return Slice(buf_);
+    *slices = { Slice(buf_) };
   }
 
   virtual void Reset() OVERRIDE {
@@ -108,8 +110,9 @@ class PlainBitMapBlockBuilder final : public BlockBuilder {
 //
 class PlainBitMapBlockDecoder final : public BlockDecoder {
  public:
-  explicit PlainBitMapBlockDecoder(Slice slice)
-      : data_(slice),
+  explicit PlainBitMapBlockDecoder(scoped_refptr<BlockHandle> block)
+      : block_(std::move(block)),
+        data_(block_->data()),
         parsed_(false),
         num_elems_(0),
         ordinal_pos_base_(0),
@@ -206,6 +209,7 @@ class PlainBitMapBlockDecoder final : public BlockDecoder {
     kHeaderSize = 8
   };
 
+  scoped_refptr<BlockHandle> block_;
   Slice data_;
   bool parsed_;
   uint32_t num_elems_;

@@ -46,15 +46,10 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
-#include "kudu/master/sentry_authz_provider-test-base.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/security/test/mini_kdc.h"
-#include "kudu/sentry/sentry_client.h"
-#include "kudu/sentry/sentry_policy_service_types.h"
 #include "kudu/tablet/tablet.pb.h"
-#include "kudu/thrift/client.h"
 #include "kudu/tserver/tablet_copy.proxy.h"
 #include "kudu/tserver/tablet_server_test_util.h"
 #include "kudu/tserver/tserver_admin.pb.h"
@@ -72,8 +67,6 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
-using ::sentry::TSentryGrantOption;
-using ::sentry::TSentryPrivilege;
 using boost::optional;
 using kudu::client::KuduSchema;
 using kudu::client::KuduSchemaBuilder;
@@ -105,7 +98,6 @@ using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::Messenger;
 using kudu::rpc::RpcController;
-using kudu::sentry::SentryClient;
 using kudu::tablet::TabletDataState;
 using kudu::tserver::CreateTsClientProxies;
 using kudu::tserver::ListTabletsResponsePB;
@@ -310,14 +302,13 @@ Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
 Status CreateTabletServerMap(const shared_ptr<MasterServiceProxy>& master_proxy,
                              const shared_ptr<Messenger>& messenger,
                              unordered_map<string, TServerDetails*>* ts_map) {
+  CHECK(ts_map->empty());
   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
   vector<ListTabletServersResponsePB_Entry> tservers;
   RETURN_NOT_OK(ListTabletServers(master_proxy, kTimeout, &tservers));
 
-  ts_map->clear();
   for (const auto& entry : tservers) {
-    HostPort host_port;
-    RETURN_NOT_OK(HostPortFromPB(entry.registration().rpc_addresses(0), &host_port));
+    HostPort host_port = HostPortFromPB(entry.registration().rpc_addresses(0));
     vector<Sockaddr> addresses;
     host_port.ResolveAddresses(&addresses);
 
@@ -1227,7 +1218,7 @@ Status StartTabletCopy(const TServerDetails* ts,
   req.set_dest_uuid(ts->uuid());
   req.set_tablet_id(tablet_id);
   req.set_copy_peer_uuid(copy_source_uuid);
-  RETURN_NOT_OK(HostPortToPB(copy_source_addr, req.mutable_copy_peer_addr()));
+  *req.mutable_copy_peer_addr() = HostPortToPB(copy_source_addr);
   req.set_caller_term(caller_term);
 
   RETURN_NOT_OK(ts->consensus_proxy->StartTabletCopy(req, &resp, &rpc));
@@ -1325,6 +1316,29 @@ Status GetInt64Metric(const HostPort& http_hp,
   return Status::NotFound(msg);
 }
 
+Status GetMasterRegistration(const shared_ptr<MasterServiceProxy>& master_proxy,
+                             const MonoDelta& timeout,
+                             master::GetMasterRegistrationResponsePB* registration) {
+  master::GetMasterRegistrationRequestPB req;
+  RpcController rpc;
+  rpc.set_timeout(timeout);
+  RETURN_NOT_OK(master_proxy->GetMasterRegistration(req, registration, &rpc));
+  if (registration->has_error()) {
+    return StatusFromPB(registration->error().status());
+  }
+  return Status::OK();
+}
+
+Status GetClusterId(const shared_ptr<MasterServiceProxy>& master_proxy,
+                    const MonoDelta& timeout,
+                    string* cluster_id) {
+  master::GetMasterRegistrationResponsePB registration;
+  RETURN_NOT_OK(GetMasterRegistration(master_proxy, timeout, &registration));
+  CHECK(registration.has_cluster_id());
+  *cluster_id = registration.cluster_id();
+  return Status::OK();
+}
+
 Status GetTsCounterValue(ExternalTabletServer* ets,
                          MetricPrototype* metric,
                          int64_t* value) {
@@ -1334,28 +1348,6 @@ Status GetTsCounterValue(ExternalTabletServer* ets,
                         metric,
                         "value",
                         value);
-}
-
-Status SetupAdministratorPrivileges(MiniKdc* kdc,
-                                    const HostPort& address) {
-  DCHECK(kdc);
-  RETURN_NOT_OK(kdc->CreateUserPrincipal("kudu"));
-  RETURN_NOT_OK(kdc->Kinit("kudu"));
-
-  thrift::ClientOptions sentry_opts;
-  sentry_opts.service_principal = "sentry";
-  sentry_opts.enable_kerberos = true;
-  unique_ptr<SentryClient> sentry_client(
-      new SentryClient(address, sentry_opts));
-  RETURN_NOT_OK(sentry_client->Start());
-
-  // Create an admin role for the "admin" group specified in mini_sentry.cc.
-  // Grant this role all privileges for the server so the admin user can
-  // perform any operations required in tests.
-  RETURN_NOT_OK(master::CreateRoleAndAddToGroups(sentry_client.get(), "admin-role", "admin"));
-  TSentryPrivilege privilege = master::GetServerPrivilege("ALL", TSentryGrantOption::DISABLED);
-  RETURN_NOT_OK(master::AlterRoleGrantPrivilege(sentry_client.get(), "admin-role", privilege));
-  return kdc->Kinit("test-admin");
 }
 
 Status AlterTableName(const shared_ptr<MasterServiceProxy>& master_proxy,

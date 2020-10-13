@@ -77,6 +77,13 @@
         "url" : "http://${host}:${webserver_port}"
       },
       "topology" : { "minInstances" : 1 },
+      // With 3 masters, this means 1 down (66% green) would be yellow and 2 down (33%) would be red.
+      // With 5 masters, this means 1 down (80% green) would be yellow and 2 down (60%) would be red.
+      "healthAggregation" : {
+        "type" : "nonSingleton",
+        "percentGreenForGreen" : 80.1,
+        "percentYellowGreenForYellow" : 60.0
+      },
       "parameters" : [
         {
           "name" : "webserver_port",
@@ -202,6 +209,13 @@
         "url" : "http://${host}:${webserver_port}"
       },
       "topology" : { "minInstances" : 1 },
+      // With 4 tservers, this means 1 down (75% green) would be yellow and 2 down (50% green) would be red.
+      // With 10 tservers, this means 3 down (70% green) would be yellow and 5 down (50% green) would be red.
+      "healthAggregation" : {
+        "type" : "nonSingleton",
+        "percentGreenForGreen" : 75.0,
+        "percentYellowGreenForYellow" : 50.0
+      },
       "parameters" : [
         {
           "name" : "webserver_interface",

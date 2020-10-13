@@ -33,6 +33,7 @@
 #include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/inbound_call.h"
@@ -206,7 +207,7 @@ Connection::Connection(ReactorThread *reactor_thread,
       direction_(direction),
       last_activity_time_(MonoTime::Now()),
       is_epoll_registered_(false),
-      next_call_id_(1),
+      call_id_(std::numeric_limits<int32_t>::max()),
       credentials_policy_(policy),
       negotiation_complete_(false),
       is_confidential_(false),
@@ -907,7 +908,7 @@ Status Connection::DumpPB(const DumpConnectionsRequestPB& req,
     LOG(FATAL);
   }
 #ifdef __linux__
-  if (negotiation_complete_) {
+  if (negotiation_complete_ && remote_.is_ip()) {
     // TODO(todd): it's a little strange to not set socket level stats during
     // negotiation, but we don't have access to the socket here until negotiation
     // is complete.

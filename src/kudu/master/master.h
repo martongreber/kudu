@@ -19,7 +19,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <vector>
 
 #include "kudu/common/wire_protocol.pb.h"
@@ -32,10 +31,14 @@
 
 namespace kudu {
 
-class HostPortPB;
+class HostPort;
 class MaintenanceManager;
 class MonoDelta;
 class ThreadPool;
+
+namespace rpc {
+class RpcContext;
+}  // namespace rpc
 
 namespace master {
 class LocationCache;
@@ -102,20 +105,19 @@ class Master : public kserver::KuduServer {
   // request.
   Status ListMasters(std::vector<ServerEntryPB>* masters) const;
 
-  // Gets the HostPorts for all of the masters in the cluster.
+  // Gets the HostPorts for all of the VOTER masters in the cluster.
   // This is not as complete as ListMasters() above, but operates just
   // based on local state.
-  Status GetMasterHostPorts(std::vector<HostPortPB>* hostports) const;
-
-  // Crash the master on disk error.
-  static void CrashMasterOnDiskError(const std::string& uuid);
-
-  // Crash the master on CFile corruption.
-  static void CrashMasterOnCFileCorruption(const std::string& tablet_id);
+  Status GetMasterHostPorts(std::vector<HostPort>* hostports) const;
 
   bool IsShutdown() const {
     return state_ == kStopped;
   }
+
+  // Adds the master specified by 'hp' by initiating change config request.
+  // RpContext 'rpc' will be used to respond back to the client asynchronously.
+  // Returns the status of the master addition request.
+  Status AddMaster(const HostPort& hp, rpc::RpcContext* rpc);
 
   MaintenanceManager* maintenance_manager() {
     return maintenance_manager_.get();
@@ -123,6 +125,7 @@ class Master : public kserver::KuduServer {
 
  private:
   friend class MasterTest;
+  friend class CatalogManager;
 
   void InitCatalogManagerTask();
   Status InitCatalogManager();

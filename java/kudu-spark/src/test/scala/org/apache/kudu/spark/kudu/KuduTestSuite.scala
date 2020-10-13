@@ -35,23 +35,24 @@ import org.apache.kudu.test.KuduTestHarness
 import org.apache.kudu.util.CharUtil
 import org.apache.kudu.util.DateUtil
 import org.apache.kudu.util.DecimalUtil
+import org.apache.kudu.util.HybridTimeUtil
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.SparkSession
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
-import org.scalatestplus.junit.JUnitSuite
 
 import scala.annotation.meta.getter
 
-trait KuduTestSuite extends JUnitSuite {
+trait KuduTestSuite {
   var ss: SparkSession = _
   var kuduClient: KuduClient = _
   var table: KuduTable = _
   var kuduContext: KuduContext = _
 
   val tableName: String = "test"
+  val owner: String = "testuser"
   val simpleTableName: String = "simple-test"
 
   lazy val schema: Schema = {
@@ -115,6 +116,7 @@ trait KuduTestSuite extends JUnitSuite {
       .setRangePartitionColumns(List("key").asJava)
       .addRangePartition(bottom, middle)
       .addRangePartition(middle, top)
+      .setOwner(owner)
       .setNumReplicas(1)
   }
 
@@ -203,6 +205,12 @@ trait KuduTestSuite extends JUnitSuite {
       (i, i, s, ts)
     }
     rows
+  }
+
+  def getLastPropagatedTimestampMs(): Long = {
+    HybridTimeUtil
+      .HTTimestampToPhysicalAndLogical(kuduClient.getLastPropagatedTimestamp)
+      .head / 1000
   }
 
   def upsertRowsWithRowDataSize(

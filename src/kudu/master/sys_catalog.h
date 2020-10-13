@@ -43,6 +43,7 @@ class MetricRegistry;
 class RowBlockRow;
 
 namespace consensus {
+class ConsensusMetadata;
 class ConsensusMetadataManager;
 }
 
@@ -58,6 +59,7 @@ namespace master {
 
 class Master;
 class SysCertAuthorityEntryPB;
+class SysClusterIdEntryPB;
 class SysTServerStateEntryPB;
 class SysTablesEntryPB;
 class SysTabletsEntryPB;
@@ -101,6 +103,7 @@ class TServerStateVisitor {
 
 // SysCatalogTable is a Kudu table that keeps track of the following
 // system information:
+//   * cluster id
 //   * table metadata
 //   * tablet metadata
 //   * root CA (certificate authority) certificate of the Kudu IPKI
@@ -139,6 +142,9 @@ class SysCatalogTable {
   // The row ID of the latest notification log entry in the sys catalog table.
   static const char* const kLatestNotificationLogEntryIdRowId;
 
+  // The row ID of the cluster ID entry in the sys catalog table.
+  static const char* const kClusterIdRowId;
+
   typedef std::function<Status()> ElectedLeaderCallback;
 
   enum CatalogEntryType {
@@ -148,6 +154,7 @@ class SysCatalogTable {
     TSK_ENTRY = 4,            // Token Signing Key entry.
     HMS_NOTIFICATION_LOG = 5, // HMS notification log latest event ID.
     TSERVER_STATE = 6,        // TServer state.
+    CLUSTER_ID = 7            // Unique Cluster ID.
   };
 
   // 'leader_cb_' is invoked whenever this node is elected as a leader
@@ -172,7 +179,7 @@ class SysCatalogTable {
   // Create the new Metadata and initialize the TabletReplica for the sys-table.
   Status CreateNew(FsManager *fs_manager);
 
-  // Perform a series of table/tablet actions in one WriteTransaction.
+  // Perform a series of table/tablet actions in one WriteOp.
   struct Actions {
     Actions() = default;
 
@@ -219,8 +226,15 @@ class SysCatalogTable {
   // Get the latest processed HMS notification log event ID.
   Status GetLatestNotificationLogEventId(int64_t* event_id) WARN_UNUSED_RESULT;
 
+  // Get the cluster ID from the system table.
+  Status GetClusterIdEntry(SysClusterIdEntryPB* entry) WARN_UNUSED_RESULT;
+
   // Retrive the CA entry (private key and certificate) from the system table.
   Status GetCertAuthorityEntry(SysCertAuthorityEntryPB* entry);
+
+  // Add cluster ID entry into the system table.
+  // There should be no more than one cluster ID in the system table.
+  Status AddClusterIdEntry(const SysClusterIdEntryPB& entry);
 
   // Add root CA entry (private key and certificate) into the system table.
   // There should be no more than one CA entry in the system table.
@@ -261,7 +275,7 @@ class SysCatalogTable {
   // NOTE: This is the "server-side" schema, so it must have the column IDs.
   Schema BuildTableSchema();
 
-  // Returns 'Status::OK()' if the WriteTransaction completed
+  // Returns 'Status::OK()' if the WriteOp completed
   Status SyncWrite(const tserver::WriteRequestPB& req);
 
   void SysCatalogStateChanged(const std::string& tablet_id, const std::string& reason);
@@ -355,6 +369,11 @@ class SysCatalogTable {
   static std::string TskSeqNumberToEntryId(int64_t seq_number);
 
   static int64_t TskEntryIdToSeqNumber(const std::string& entry_id);
+
+  // For a single master config, verifies the on-disk Raft config and populates the
+  // 'last_known_addr' in the on-disk Raft config, if master address is specified.
+  // Pointer 'cmeta' must outlive the call to this function.
+  Status VerifyAndPopulateSingleMasterConfig(consensus::ConsensusMetadata* cmeta);
 
   // Special string injected into SyncWrite() random failures (if enabled).
   //

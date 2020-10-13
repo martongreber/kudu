@@ -247,8 +247,7 @@ SNAPPY_PATCHLEVEL=0
 fetch_and_patch \
  snappy-${SNAPPY_VERSION}.tar.gz \
  $SNAPPY_SOURCE \
- $SNAPPY_PATCHLEVEL \
- "autoreconf -fvi"
+ $SNAPPY_PATCHLEVEL
 
 ZLIB_PATCHLEVEL=0
 fetch_and_patch \
@@ -346,13 +345,11 @@ fetch_and_patch \
  $TRACE_VIEWER_SOURCE \
  $TRACE_VIEWER_PATCHLEVEL
 
-BOOST_PATCHLEVEL=2
+BOOST_PATCHLEVEL=0
 fetch_and_patch \
  boost_${BOOST_VERSION}.tar.gz \
  $BOOST_SOURCE \
- $BOOST_PATCHLEVEL \
- "patch -p0 < $TP_DIR/patches/boost-issue-12179-fix-compilation-errors.patch" \
- "patch -p0 < $TP_DIR/patches/boost-issue-440-darwin-version.patch"
+ $BOOST_PATCHLEVEL
 
 # Return 0 if the current system appears to be el6 (either CentOS or proper RHEL)
 needs_openssl_workaround() {
@@ -367,12 +364,13 @@ if needs_openssl_workaround && [ ! -d "$OPENSSL_WORKAROUND_DIR" ] ; then
   $TP_DIR/install-openssl-el6-workaround.sh
 fi
 
-BREAKPAD_PATCHLEVEL=1
+BREAKPAD_PATCHLEVEL=2
 fetch_and_patch \
  breakpad-${BREAKPAD_VERSION}.tar.gz \
  $BREAKPAD_SOURCE \
  $BREAKPAD_PATCHLEVEL \
- "patch -p1 < $TP_DIR/patches/breakpad-add-basic-support-for-dwz-dwarf-extension.patch"
+ "patch -p1 < $TP_DIR/patches/breakpad-add-basic-support-for-dwz-dwarf-extension.patch" \
+ "patch -p1 < $TP_DIR/patches/breakpad-syscall-rsp-clobber-fix.patch"
 
 SPARSEHASH_PATCHLEVEL=3
 fetch_and_patch \
@@ -403,12 +401,11 @@ fetch_and_patch \
  # autoreconf 2.69-11 (RHEL 7): "autoreconf: 'configure.ac' or 'configure.in' is required".
 
 
-# For upstream Hive and Hadoop, we've stripped extraneous JARs. This isn't the
-# case for downstream components or any Sentry artifacts.
+# For upstream Hive and Hadoop, we've stripped extraneous JARs.
+# This isn't the case for downstream components.
 ECOSYSTEM_URL=${DEPENDENCY_URL}
 HIVE_FILE_NAME="${HIVE_NAME}-stripped.tar.gz"
 HADOOP_FILE_NAME="${HADOOP_NAME}-stripped.tar.gz"
-SENTRY_FILE_NAME="${SENTRY_NAME}.tar.gz"
 if [[ -n "$CDH_TARBALL_URL" ]]; then
   ECOSYSTEM_URL=${CDH_TARBALL_URL}
   HIVE_FILE_NAME="${HIVE_NAME}.tar.gz"
@@ -427,13 +424,6 @@ fetch_with_url_and_patch \
  $HADOOP_FILE_NAME \
  $HADOOP_SOURCE \
  $HADOOP_PATCHLEVEL \
- $ECOSYSTEM_URL
-
-SENTRY_PATCHLEVEL=0
-fetch_with_url_and_patch \
- $SENTRY_FILE_NAME \
- $SENTRY_SOURCE \
- $SENTRY_PATCHLEVEL \
  $ECOSYSTEM_URL
 
 YAML_PATCHLEVEL=0

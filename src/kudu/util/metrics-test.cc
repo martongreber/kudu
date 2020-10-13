@@ -116,6 +116,21 @@ TEST_F(MetricsTest, SimpleCounterMergeTest) {
   ASSERT_EQ(14, requests_for_merge->value());
 }
 
+TEST_F(MetricsTest, ResetCounter) {
+  scoped_refptr<Counter> c(new Counter(&METRIC_test_counter));
+  ASSERT_EQ(0, c->value());
+  c->Increment();
+  ASSERT_EQ(1, c->value());
+  c->Reset();
+  ASSERT_EQ(0, c->value());
+  c->IncrementBy(2);
+  ASSERT_EQ(2, c->value());
+  c->IncrementBy(-1);
+  ASSERT_EQ(1, c->value());
+  c->Reset();
+  ASSERT_EQ(0, c->value());
+}
+
 METRIC_DEFINE_gauge_string(test_entity, test_string_gauge, "Test string Gauge",
                            MetricUnit::kState, "Description of string Gauge",
                            kudu::MetricLevel::kInfo);
@@ -184,6 +199,18 @@ TEST_F(MetricsTest, SimpleMeanGaugeTest) {
   ASSERT_EQ(5, average_usage->value());
   average_usage->set_value(5.0, 2.0);
   ASSERT_EQ(2.5, average_usage->value());
+}
+
+TEST_F(MetricsTest, SimpleMeanGaugeSnapshotTest) {
+  scoped_refptr<MeanGauge> average_usage =
+    METRIC_test_mean_gauge.InstantiateMeanGauge(entity_);
+  scoped_refptr<MeanGauge> old_metric =
+    down_cast<MeanGauge*>(average_usage->snapshot().get());
+  ASSERT_EQ(0, old_metric->value());
+  average_usage->set_value(10.0, 2.0);
+  scoped_refptr<MeanGauge> new_metric =
+    down_cast<MeanGauge*>(average_usage->snapshot().get());
+  ASSERT_EQ(5, new_metric->value());
 }
 
 TEST_F(MetricsTest, SimpleMeanGaugeMergeTest) {

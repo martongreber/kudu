@@ -20,9 +20,11 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 #include "kudu/gutil/port.h"
 #include "kudu/cfile/block_encodings.h"
+#include "kudu/cfile/block_handle.h"
 #include "kudu/cfile/cfile_util.h"
 #include "kudu/common/columnblock.h"
 #include "kudu/util/coding.h"
@@ -70,11 +72,11 @@ class RleBitMapBlockBuilder final : public BlockBuilder {
     return encoder_.len() > options_->storage_attributes.cfile_block_size;
   }
 
-  virtual Slice Finish(rowid_t ordinal_pos) OVERRIDE {
+  virtual void Finish(rowid_t ordinal_pos, std::vector<Slice>* slices) OVERRIDE {
     InlineEncodeFixed32(&buf_[0], count_);
     InlineEncodeFixed32(&buf_[4], ordinal_pos);
     encoder_.Flush();
-    return Slice(buf_);
+    *slices = { buf_ };
   }
 
   virtual void Reset() OVERRIDE {
@@ -109,8 +111,9 @@ class RleBitMapBlockBuilder final : public BlockBuilder {
 //
 class RleBitMapBlockDecoder final : public BlockDecoder {
  public:
-  explicit RleBitMapBlockDecoder(Slice slice)
-      : data_(slice),
+  explicit RleBitMapBlockDecoder(scoped_refptr<BlockHandle> block)
+      : block_(std::move(block)),
+        data_(block_->data()),
         parsed_(false),
         num_elems_(0),
         ordinal_pos_base_(0),
@@ -206,6 +209,7 @@ class RleBitMapBlockDecoder final : public BlockDecoder {
   virtual rowid_t GetFirstRowId() const OVERRIDE { return ordinal_pos_base_; }
 
  private:
+  scoped_refptr<BlockHandle> block_;
   Slice data_;
   bool parsed_;
   uint32_t num_elems_;
@@ -250,11 +254,11 @@ class RleIntBlockBuilder final : public BlockBuilder {
     return count;
   }
 
-  virtual Slice Finish(rowid_t ordinal_pos) OVERRIDE {
+  virtual void Finish(rowid_t ordinal_pos, std::vector<Slice>* slices) OVERRIDE {
     InlineEncodeFixed32(&buf_[0], count_);
     InlineEncodeFixed32(&buf_[4], ordinal_pos);
     rle_encoder_.Flush();
-    return Slice(buf_);
+    *slices = { Slice(buf_) };
   }
 
   virtual void Reset() OVERRIDE {
@@ -308,8 +312,9 @@ class RleIntBlockBuilder final : public BlockBuilder {
 template <DataType IntType>
 class RleIntBlockDecoder final : public BlockDecoder {
  public:
-  explicit RleIntBlockDecoder(Slice slice)
-      : data_(slice),
+  explicit RleIntBlockDecoder(scoped_refptr<BlockHandle> block)
+      : block_(std::move(block)),
+        data_(block_->data()),
         parsed_(false),
         num_elems_(0),
         ordinal_pos_base_(0),
@@ -494,6 +499,7 @@ class RleIntBlockDecoder final : public BlockDecoder {
     kCppTypeSize = TypeTraits<IntType>::size
   };
 
+  scoped_refptr<BlockHandle> block_;
   Slice data_;
   bool parsed_;
   uint32_t num_elems_;

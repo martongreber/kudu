@@ -104,6 +104,9 @@ class HostPort {
 };
 
 bool operator==(const HostPort& hp1, const HostPort& hp2);
+inline bool operator!=(const HostPort& hp1, const HostPort& hp2) {
+  return !(hp1 == hp2);
+}
 
 // Hasher of HostPort objects for UnorderedAssociativeContainers.
 struct HostPortHasher {
@@ -175,6 +178,7 @@ Status GetHostname(std::string* hostname);
 Status GetLocalNetworks(std::vector<Network>* net);
 
 // Return the local machine's FQDN.
+// If domain name is not available, FQDN returns hostname.
 Status GetFQDN(std::string* hostname);
 
 // Returns a single socket address from a HostPort.

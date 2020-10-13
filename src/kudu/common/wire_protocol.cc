@@ -185,21 +185,22 @@ Status StatusFromPB(const AppStatusPB& pb) {
   }
 }
 
-Status HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb) {
-  host_port_pb->set_host(host_port.host());
-  host_port_pb->set_port(host_port.port());
-  return Status::OK();
+HostPortPB HostPortToPB(const HostPort& host_port) {
+  HostPortPB ret;
+  ret.set_host(host_port.host());
+  ret.set_port(host_port.port());
+  return ret;
 }
 
-Status HostPortFromPB(const HostPortPB& host_port_pb, HostPort* host_port) {
-  host_port->set_host(host_port_pb.host());
-  host_port->set_port(host_port_pb.port());
-  return Status::OK();
+HostPort HostPortFromPB(const HostPortPB& host_port_pb) {
+  return HostPort(host_port_pb.host(), host_port_pb.port());
 }
 
 Status AddHostPortPBs(const vector<Sockaddr>& addrs,
                       RepeatedPtrField<HostPortPB>* pbs) {
   for (const Sockaddr& addr : addrs) {
+    // Don't add unix domain sockets to the list of HostPorts.
+    if (!addr.is_ip()) continue;
     HostPortPB* pb = pbs->Add();
     if (addr.IsWildcard()) {
       RETURN_NOT_OK(GetFQDN(pb->mutable_host()));
@@ -849,7 +850,8 @@ Status FindLeaderHostPort(const RepeatedPtrField<ServerEntryPB>& entries,
                               SecureShortDebugString(entry)));
     }
     if (entry.role() == consensus::RaftPeerPB::LEADER) {
-      return HostPortFromPB(entry.registration().rpc_addresses(0), leader_hostport);
+      *leader_hostport = HostPortFromPB(entry.registration().rpc_addresses(0));
+      return Status::OK();
     }
   }
   return Status::NotFound("No leader found.");

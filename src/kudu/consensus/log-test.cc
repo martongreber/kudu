@@ -18,6 +18,7 @@
 #include "kudu/consensus/log.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cerrno>
 #include <cstdint>
 #include <functional>
@@ -467,9 +468,9 @@ TEST_F(LogTest, TestWriteAndReadToAndFromInProgressSegment) {
   repl->set_timestamp(0L);
 
   // Entries are prefixed with a header.
-  int64_t single_entry_size = batch.ByteSize() + kEntryHeaderSizeV2;
+  int64_t single_entry_size = batch.ByteSizeLong() + kEntryHeaderSizeV2;
 
-  int written_entries_size = header_size;
+  size_t written_entries_size = header_size;
   ASSERT_OK(AppendNoOps(&op_id, kNumEntries, &written_entries_size));
   ASSERT_EQ(single_entry_size * kNumEntries + header_size, written_entries_size);
   ASSERT_EQ(written_entries_size, log_->segment_allocator_.active_segment_->written_offset());
@@ -927,11 +928,11 @@ void LogTest::AppendTestSequence(const vector<TestLogSequenceElem>& seq) {
       }
       case TestLogSequenceElem::COMMIT:
       {
-        unique_ptr<CommitMsg> commit(new CommitMsg);
-        commit->set_op_type(NO_OP);
-        commit->mutable_commited_op_id()->CopyFrom(e.id);
+        CommitMsg commit;
+        commit.set_op_type(NO_OP);
+        commit.mutable_commited_op_id()->CopyFrom(e.id);
         Synchronizer s;
-        ASSERT_OK(log_->AsyncAppendCommit(std::move(commit), s.AsStatusCallback()));
+        ASSERT_OK(log_->AsyncAppendCommit(commit, s.AsStatusCallback()));
         ASSERT_OK(s.Wait());
       }
       case TestLogSequenceElem::ROLL:
@@ -1015,13 +1016,13 @@ TEST_P(LogTestOptionalCompression, TestReadLogWithReplacedReplicates) {
         ElementDeleter d(&repls);
         ASSERT_OK(reader->ReadReplicatesInRange(start_index, end_index, size_limit, &repls));
         ASSERT_LE(repls.size(), end_index - start_index + 1);
-        int total_size = 0;
+        size_t total_size = 0;
         int expected_index = start_index;
         for (const ReplicateMsg* repl : repls) {
           ASSERT_EQ(expected_index, repl->id().index());
           ASSERT_EQ(terms_by_index[expected_index], repl->id().term());
           expected_index++;
-          total_size += repl->SpaceUsed();
+          total_size += repl->SpaceUsedLong();
         }
         if (total_size > size_limit) {
           ASSERT_EQ(1, repls.size());

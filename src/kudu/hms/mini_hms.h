@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -46,21 +47,11 @@ class MiniHms {
                       std::string keytab_file,
                       rpc::SaslProtection::Type protection);
 
-  // Configures the mini HMS to enable the Sentry plugin, passing the
-  // Sentry service's principal to be used in Kerberos environment.
-  //
-  // Parameters 'sentry_client_rpc_retry_num' and
-  // 'sentry_client_rpc_retry_interval_ms' are used to override default settings
-  // of the Sentry client used by HMS plugins. The default values for these two
-  // parameters are set to allow for shorter HMS --> Sentry RPC timeout
-  // (i.e. shorter than with the default Sentry v2.{0,1} client's settings).
-  void EnableSentry(const HostPort& sentry_address,
-                    std::string sentry_service_principal,
-                    int sentry_client_rpc_retry_num = 3,
-                    int sentry_client_rpc_retry_interval_ms = 500);
-
   // Configures the mini HMS to enable or disable the Kudu plugin.
   void EnableKuduPlugin(bool enable);
+
+  // Add extra environment variables to the HMS environment.
+  void AddEnvVar(const std::string& key, const std::string& value);
 
   // Configures the mini HMS to store its data in the provided path. If not set,
   // it uses a test-only temporary directory.
@@ -91,15 +82,15 @@ class MiniHms {
   // hive.metastore.uris configuration expects.
   std::string uris() const;
 
-  // Returns true when Sentry as well as Kerberos is enabled.
-  bool IsAuthorizationEnabled() const;
-
   // Returns true when Kerberos is enabled.
   bool IsKerberosEnabled() const {
     return !keytab_file_.empty();
   }
 
  private:
+
+  // Creates a security.properties file for use via `-Djava.security.properties` in the mini HMS.
+  Status CreateSecurityProperties() const WARN_UNUSED_RESULT;
 
   // Creates a hive-site.xml for the mini HMS.
   Status CreateHiveSite() const WARN_UNUSED_RESULT;
@@ -124,14 +115,10 @@ class MiniHms {
   std::string keytab_file_;
   rpc::SaslProtection::Type protection_ = rpc::SaslProtection::kAuthentication;
 
-  // Sentry configuration
-  std::string sentry_address_;
-  std::string sentry_service_principal_;
-  int sentry_client_rpc_retry_num_;
-  int sentry_client_rpc_retry_interval_ms_;
-
   // Whether to enable the Kudu listener plugin.
   bool enable_kudu_plugin_ = true;
+
+  std::map<std::string, std::string> extra_env_vars_ = {};
 };
 
 } // namespace hms

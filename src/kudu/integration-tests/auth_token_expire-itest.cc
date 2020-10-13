@@ -41,6 +41,7 @@
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/tablet/key_value_test_schema.h"
+#include "kudu/transactions/txn_system_client.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
@@ -53,8 +54,10 @@ DECLARE_bool(rpc_reopen_outbound_connections);
 using kudu::client::sp::shared_ptr;
 using kudu::cluster::ExternalMiniCluster;
 using kudu::cluster::ExternalMiniClusterOptions;
+using kudu::transactions::TxnSystemClient;
 using std::string;
 using std::unique_ptr;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
@@ -449,6 +452,32 @@ TEST_F(TokenBasedConnectionITest, ReacquireAuthnToken) {
   NO_FATALS(cluster_->AssertNoCrashes());
 }
 
+// Like the above test but testing the transaction system client and its access
+// of the transaction status table.
+TEST_F(TokenBasedConnectionITest, TxnSystemClientReacquireAuthnToken) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  vector<string> master_addrs;
+  for (const auto& hp : cluster_->master_rpc_addrs()) {
+    master_addrs.emplace_back(hp.ToString());
+  }
+  unique_ptr<TxnSystemClient> txn_client;
+  ASSERT_OK(TxnSystemClient::Create(master_addrs, &txn_client));
+  ASSERT_OK(txn_client->CreateTxnStatusTable(10));
+  ASSERT_OK(txn_client->OpenTxnStatusTable());
+
+  // Reset all connections with the cluster. Since authn token validty is
+  // checked for new connections (but not for existing non-idle connections),
+  // this will ensure our token expiration is checked below.
+  cluster_->Shutdown();
+  ASSERT_OK(cluster_->Restart());
+
+  // Wait for the initial authn token to expire and try to access the cluster.
+  // Try making a connection to the tablet server for the first time. It should
+  // automatically fetch a new token and succeed.
+  SleepFor(MonoDelta::FromSeconds(authn_token_validity_seconds_ + 1));
+  ASSERT_OK(txn_client->BeginTransaction(1, "user"));
+}
+
 // Test for scenarios involving multiple masters where
 // client-to-non-leader-master connections are closed due to inactivity,
 // but the connection to the former leader master is kept open.
@@ -522,13 +551,12 @@ class MultiMasterIdleConnectionsITest : public AuthTokenExpireITestBase {
 // when the client tried to open the test table after master leader re-election:
 //   Timed out: GetTableSchema timed out after deadline expired
 TEST_F(MultiMasterIdleConnectionsITest, ClientReacquiresAuthnToken) {
-  const string kTableName = "keep-connection-to-former-master-leader";
-
   if (!AllowSlowTests()) {
     LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
     return;
   }
 
+  const string kTableName = "keep-connection-to-former-master-leader";
   const auto time_start = MonoTime::Now();
 
   shared_ptr<KuduClient> client;
@@ -560,6 +588,9 @@ TEST_F(MultiMasterIdleConnectionsITest, ClientReacquiresAuthnToken) {
     SleepFor(MonoDelta::FromMilliseconds(250));
   }
 
+  int former_leader_master_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&former_leader_master_idx));
+
   // Given the relation between the master_rpc_keepalive_time_ms_ and
   // authn_token_validity_seconds_ parameters, the original authn token should
   // expire and connections to follower masters should be torn down due to
@@ -567,26 +598,33 @@ TEST_F(MultiMasterIdleConnectionsITest, ClientReacquiresAuthnToken) {
   // after waiting for additional token expiration interval.
   SleepFor(MonoDelta::FromSeconds(authn_token_validity_seconds_));
 
-  {
-    int former_leader_master_idx;
-    ASSERT_OK(cluster_->GetLeaderMasterIndex(&former_leader_master_idx));
-    const int leader_idx = (former_leader_master_idx + 1) % num_masters_;
-    ASSERT_EVENTUALLY([&] {
+  ASSERT_EVENTUALLY([&] {
+    // The leadership could change behind the scenes, so if a new leader master
+    // is already around, another leadership change isn't needed.
+    int leader_idx;
+    ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+    if (former_leader_master_idx == leader_idx) {
+      // Make a request to the current leader master to step down, transferring
+      // the leadership role to other master.
       consensus::ConsensusServiceProxy proxy(
           cluster_->messenger(), cluster_->master(leader_idx)->bound_rpc_addr(),
           cluster_->master(leader_idx)->bound_rpc_hostport().host());
-      consensus::RunLeaderElectionRequestPB req;
-      req.set_tablet_id(master::SysCatalogTable::kSysCatalogTabletId);
+      consensus::LeaderStepDownRequestPB req;
       req.set_dest_uuid(cluster_->master(leader_idx)->uuid());
+      req.set_tablet_id(master::SysCatalogTable::kSysCatalogTabletId);
+      req.set_mode(consensus::LeaderStepDownMode::GRACEFUL);
+      consensus::LeaderStepDownResponsePB resp;
       rpc::RpcController rpc;
-      rpc.set_timeout(MonoDelta::FromSeconds(1));
-      consensus::RunLeaderElectionResponsePB resp;
-      ASSERT_OK(proxy.RunLeaderElection(req, &resp, &rpc));
+      rpc.set_timeout(MonoDelta::FromSeconds(3));
+      ASSERT_OK(proxy.LeaderStepDown(req, &resp, &rpc));
+
+      // Make sure the leader has actually changed. If not, the step-down
+      // request is retried until ASSERT_EVENTUALLY() times out.
       int idx;
       ASSERT_OK(cluster_->GetLeaderMasterIndex(&idx));
       ASSERT_NE(former_leader_master_idx, idx);
-    });
-  }
+    }
+  });
 
   // Try to open the table after leader master re-election. The former leader
   // responds with NOT_THE_LEADER error even if the authn token has expired

@@ -121,7 +121,7 @@ LogEntryReader::LogEntryReader(const ReadableLogSegment* seg)
   // If we have a footer we only read up to it. If we don't we likely crashed
   // and always read to the end.
   read_up_to_ = (seg_->footer_.IsInitialized() && !seg_->footer_was_rebuilt_) ?
-      seg_->file_size() - seg_->footer_.ByteSize() - kLogSegmentFooterMagicAndFooterLength :
+      seg_->file_size() - seg_->footer_.ByteSizeLong() - kLogSegmentFooterMagicAndFooterLength :
       readable_to_offset;
   VLOG(1) << "Reading segment entries from "
           << seg_->path_ << ": offset=" << offset_ << " file_size="
@@ -392,7 +392,7 @@ Status ReadableLogSegment::RebuildFooterByScanning() {
 
     DCHECK(entry);
     if (entry->has_replicate()) {
-      UpdateFooterForReplicateEntry(*entry, &new_footer);
+      UpdateFooterForReplicateEntry(entry->replicate().id(), &new_footer);
     }
     num_entries++;
   }
@@ -782,7 +782,7 @@ Status WritableLogSegment::WriteHeader(const LogSegmentHeaderPB& new_header) {
   // First the magic.
   buf.append(kLogSegmentHeaderMagicString);
   // Then Length-prefixed header.
-  PutFixed32(&buf, new_header.ByteSize());
+  PutFixed32(&buf, static_cast<uint32_t>(new_header.ByteSizeLong()));
   // Then Serialize the PB.
   pb_util::AppendToString(new_header, &buf);
   RETURN_NOT_OK(file_->Write(0, Slice(buf)));
@@ -804,7 +804,7 @@ Status WritableLogSegment::WriteFooter(const LogSegmentFooterPB& footer) {
   faststring buf;
   pb_util::AppendToString(footer, &buf);
   buf.append(kLogSegmentFooterMagicString);
-  PutFixed32(&buf, footer.ByteSize());
+  PutFixed32(&buf, static_cast<uint32_t>(footer.ByteSizeLong()));
 
   RETURN_NOT_OK_PREPEND(file_->Write(written_offset_, Slice(buf)),
                         "Could not write the footer");
@@ -873,10 +873,9 @@ bool IsLogFileName(const string& fname) {
   return true;
 }
 
-void UpdateFooterForReplicateEntry(const LogEntryPB& entry_pb,
+void UpdateFooterForReplicateEntry(const OpId& op_id,
                                    LogSegmentFooterPB* footer) {
-  DCHECK(entry_pb.has_replicate());
-  int64_t index = entry_pb.replicate().id().index();
+  int64_t index = op_id.index();
   if (!footer->has_min_replicate_index() ||
       index < footer->min_replicate_index()) {
     footer->set_min_replicate_index(index);

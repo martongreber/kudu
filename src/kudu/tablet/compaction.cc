@@ -26,6 +26,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/clock/hybrid_clock.h"
@@ -33,11 +34,13 @@
 #include "kudu/common/iterator.h"
 #include "kudu/common/row.h"
 #include "kudu/common/row_changelist.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/rowid.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
+#include "kudu/fs/error_manager.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
@@ -54,10 +57,15 @@
 #include "kudu/tablet/tablet.pb.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/fault_injection.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/memory/arena.h"
 
 using kudu::clock::HybridClock;
+using kudu::fault_injection::MaybeTrue;
 using kudu::fs::IOContext;
+using kudu::fs::FsErrorManager;
+using kudu::fs::KUDU_2233_CORRUPTION;
 using std::deque;
 using std::shared_ptr;
 using std::string;
@@ -65,6 +73,12 @@ using std::unique_ptr;
 using std::unordered_set;
 using std::vector;
 using strings::Substitute;
+
+DEFINE_double(tablet_inject_kudu_2233, 0,
+              "Fraction of the time that compactions that merge the history "
+              "of a single row spread across multiple rowsets will return "
+              "with a corruption status");
+TAG_FLAG(tablet_inject_kudu_2233, hidden);
 
 namespace kudu {
 namespace tablet {
@@ -202,8 +216,8 @@ class DiskRowSetCompactionInput : public CompactionInput {
       : base_iter_(std::move(base_iter)),
         redo_delta_iter_(std::move(redo_delta_iter)),
         undo_delta_iter_(std::move(undo_delta_iter)),
-        arena_(32 * 1024),
-        block_(&base_iter_->schema(), kRowsPerBlock, &arena_),
+        mem_(32 * 1024),
+        block_(&base_iter_->schema(), kRowsPerBlock, &mem_),
         redo_mutation_block_(kRowsPerBlock, static_cast<Mutation *>(nullptr)),
         undo_mutation_block_(kRowsPerBlock, static_cast<Mutation *>(nullptr)) {}
 
@@ -248,7 +262,7 @@ class DiskRowSetCompactionInput : public CompactionInput {
     return Status::OK();
   }
 
-  Arena* PreparedBlockArena() override { return &arena_; }
+  Arena* PreparedBlockArena() override { return &mem_.arena; }
 
   Status FinishBlock() override {
     return Status::OK();
@@ -264,7 +278,7 @@ class DiskRowSetCompactionInput : public CompactionInput {
   unique_ptr<DeltaIterator> redo_delta_iter_;
   unique_ptr<DeltaIterator> undo_delta_iter_;
 
-  Arena arena_;
+  RowBlockMemory mem_;
 
   // The current block of data which has come from the input iterator
   RowBlock block_;
@@ -690,7 +704,7 @@ class MergeCompactionInput : public CompactionInput {
     num_dup_rows_++;
     if (row_idx == 0) {
       duplicated_rows_.push_back(std::unique_ptr<RowBlock>(
-          new RowBlock(schema_, kDuplicatedRowsPerBlock, static_cast<Arena*>(nullptr))));
+          new RowBlock(schema_, kDuplicatedRowsPerBlock, static_cast<RowBlockMemory*>(nullptr))));
     }
     return duplicated_rows_.back()->row(row_idx);
   }
@@ -754,7 +768,9 @@ Mutation* MergeUndoHistories(Mutation* left, Mutation* right) {
 
 // If 'old_row' has previous versions, this transforms prior version in undos and adds them
 // to 'new_undo_head'.
-Status MergeDuplicatedRowHistory(CompactionInputRow* old_row,
+Status MergeDuplicatedRowHistory(const string& tablet_id,
+                                 const FsErrorManager* error_manager,
+                                 CompactionInputRow* old_row,
                                  Mutation** new_undo_head,
                                  Arena* arena) {
   if (PREDICT_TRUE(old_row->previous_ghost == nullptr)) return Status::OK();
@@ -762,7 +778,7 @@ Status MergeDuplicatedRowHistory(CompactionInputRow* old_row,
   // Use an all inclusive snapshot as all of the previous version's undos and redos
   // are guaranteed to be committed, otherwise the compaction wouldn't be able to
   // see the new row.
-  MvccSnapshot all_snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
+  MvccSnapshot all_snap = MvccSnapshot::CreateSnapshotIncludingAllOps();
 
   faststring dst;
 
@@ -785,9 +801,17 @@ Status MergeDuplicatedRowHistory(CompactionInputRow* old_row,
                                                  &previous_ghost->row));
 
     // We should be left with only one redo, the delete.
-    CHECK(pv_delete_redo != nullptr);
-    CHECK(pv_delete_redo->changelist().is_delete());
-    CHECK(pv_delete_redo->next() == nullptr);
+    DCHECK(pv_delete_redo != nullptr);
+    DCHECK(pv_delete_redo->changelist().is_delete());
+    DCHECK(pv_delete_redo->next() == nullptr);
+    if (PREDICT_FALSE(
+        pv_delete_redo == nullptr ||
+        !pv_delete_redo->changelist().is_delete() ||
+        pv_delete_redo->next() ||
+        MaybeTrue(FLAGS_tablet_inject_kudu_2233))) {
+      error_manager->RunErrorNotificationCb(KUDU_2233_CORRUPTION, tablet_id);
+      return Status::Corruption("data was corrupted in a version prior to Kudu 1.7.0");
+    }
 
     // Now transform the redo delete into an undo (reinsert), which will contain the previous
     // ghost. The reinsert will have the timestamp of the delete.
@@ -868,7 +892,7 @@ Status CompactionInput::Create(const DiskRowSet &rowset,
   // "empty" snapshot ensures that all deltas are included.
   RowIteratorOptions undo_opts;
   undo_opts.projection = projection;
-  undo_opts.snap_to_include = MvccSnapshot::CreateSnapshotIncludingNoTransactions();
+  undo_opts.snap_to_include = MvccSnapshot::CreateSnapshotIncludingNoOps();
   undo_opts.io_context = io_context;
   unique_ptr<DeltaIterator> undo_deltas;
   RETURN_NOT_OK_PREPEND(rowset.delta_tracker_->NewDeltaIterator(
@@ -996,7 +1020,7 @@ Status ApplyMutationsAndGenerateUndos(const MvccSnapshot& snap,
        redo_mut = redo_mut->acquire_next()) {
 
     // Skip anything not committed.
-    if (!snap.IsCommitted(redo_mut->timestamp())) {
+    if (!snap.IsApplied(redo_mut->timestamp())) {
       break;
     }
 
@@ -1093,7 +1117,9 @@ Status ApplyMutationsAndGenerateUndos(const MvccSnapshot& snap,
   #undef ERROR_LOG_CONTEXT
 }
 
-Status FlushCompactionInput(CompactionInput* input,
+Status FlushCompactionInput(const string& tablet_id,
+                            const FsErrorManager* error_manager,
+                            CompactionInput* input,
                             const MvccSnapshot& snap,
                             const HistoryGcOpts& history_gc_opts,
                             RollingDiskRowSetWriter* out) {
@@ -1134,7 +1160,9 @@ Status FlushCompactionInput(CompactionInput* input,
                                                    &dst_row));
 
       // Merge the histories of 'input_row' with previous ghosts, if there are any.
-      RETURN_NOT_OK(MergeDuplicatedRowHistory(input_row,
+      RETURN_NOT_OK(MergeDuplicatedRowHistory(tablet_id,
+                                              error_manager,
+                                              input_row,
                                               &new_undos_head,
                                               input->PreparedBlockArena()));
 
@@ -1239,7 +1267,7 @@ Status ReupdateMissedDeltas(const IOContext* io_context,
         RowChangeListDecoder decoder(mut->changelist());
         RETURN_NOT_OK(decoder.Init());
 
-        if (snap_to_exclude.IsCommitted(mut->timestamp())) {
+        if (snap_to_exclude.IsApplied(mut->timestamp())) {
           // This update was already taken into account in the first phase of the
           // compaction. We don't need to reapply it.
 
@@ -1277,7 +1305,7 @@ Status ReupdateMissedDeltas(const IOContext* io_context,
           << " row=" << schema->DebugRow(row.row)
           << " mutations=" << Mutation::StringifyMutationList(*schema, row.redo_head);
 
-        if (!snap_to_include.IsCommitted(mut->timestamp())) {
+        if (!snap_to_include.IsApplied(mut->timestamp())) {
           // The mutation was inserted after the DuplicatingRowSet was swapped in.
           // Therefore, it's already present in the output rowset, and we don't need
           // to copy it in.

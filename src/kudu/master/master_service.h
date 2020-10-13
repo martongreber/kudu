@@ -36,6 +36,8 @@ class RpcContext;
 
 namespace master {
 
+class AddMasterRequestPB;
+class AddMasterResponsePB;
 class AlterTableRequestPB;
 class AlterTableResponsePB;
 class ChangeTServerStateRequestPB;
@@ -69,10 +71,10 @@ class ListTabletServersResponsePB;
 class Master;
 class PingRequestPB;
 class PingResponsePB;
+class RefreshAuthzCacheRequestPB;
+class RefreshAuthzCacheResponsePB;
 class ReplaceTabletRequestPB;
 class ReplaceTabletResponsePB;
-class ResetAuthzCacheRequestPB;
-class ResetAuthzCacheResponsePB;
 class TSHeartbeatRequestPB;
 class TSHeartbeatResponsePB;
 
@@ -103,6 +105,9 @@ class MasterServiceImpl : public MasterServiceIf {
   void ChangeTServerState(const ChangeTServerStateRequestPB* req,
                           ChangeTServerStateResponsePB* resp,
                           rpc::RpcContext* rpc) override;
+
+  void AddMaster(const AddMasterRequestPB* req,
+                 AddMasterResponsePB* resp, rpc::RpcContext* rpc) override;
 
   void Ping(const PingRequestPB* req,
             PingResponsePB* resp,
@@ -172,9 +177,9 @@ class MasterServiceImpl : public MasterServiceIf {
                      ReplaceTabletResponsePB* resp,
                      rpc::RpcContext* rpc) override;
 
-  void ResetAuthzCache(const ResetAuthzCacheRequestPB* req,
-                       ResetAuthzCacheResponsePB* resp,
-                       rpc::RpcContext* rpc) override;
+  void RefreshAuthzCache(const RefreshAuthzCacheRequestPB* req,
+                         RefreshAuthzCacheResponsePB* resp,
+                         rpc::RpcContext* rpc) override;
 
   bool SupportsFeature(uint32_t feature) const override;
 

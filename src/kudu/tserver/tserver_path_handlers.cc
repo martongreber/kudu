@@ -51,11 +51,11 @@
 #include "kudu/rpc/remote_user.h"
 #include "kudu/server/webui_util.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/ops/op.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet.pb.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
-#include "kudu/tablet/transactions/transaction.h"
 #include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
@@ -72,14 +72,14 @@ using kudu::MaintenanceManagerStatusPB;
 using kudu::consensus::ConsensusStatePB;
 using kudu::consensus::GetConsensusRole;
 using kudu::consensus::RaftPeerPB;
-using kudu::consensus::TransactionStatusPB;
+using kudu::consensus::OpStatusPB;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using kudu::tablet::Tablet;
 using kudu::tablet::TabletReplica;
 using kudu::tablet::TabletStatePB;
 using kudu::tablet::TabletStatusPB;
-using kudu::tablet::Transaction;
+using kudu::tablet::Op;
 using std::endl;
 using std::map;
 using std::ostringstream;
@@ -256,8 +256,8 @@ void TabletServerPathHandlers::HandleTransactionsPage(const Webserver::WebReques
   tserver_->tablet_manager()->GetTabletReplicas(&replicas);
 
   string arg = FindWithDefault(req.parsed_args, "include_traces", "false");
-  Transaction::TraceType trace_type = ParseLeadingBoolValue(
-      arg.c_str(), false) ? Transaction::TRACE_TXNS : Transaction::NO_TRACE_TXNS;
+  Op::TraceType trace_type = ParseLeadingBoolValue(
+      arg.c_str(), false) ? Op::TRACE_OPS : Op::NO_TRACE_OPS;
 
   if (!as_text) {
     *output << "<h1>Transactions</h1>\n";
@@ -269,35 +269,35 @@ void TabletServerPathHandlers::HandleTransactionsPage(const Webserver::WebReques
   }
 
   for (const scoped_refptr<TabletReplica>& replica : replicas) {
-    vector<TransactionStatusPB> inflight;
+    vector<OpStatusPB> inflight;
 
     if (replica->tablet() == nullptr) {
       continue;
     }
 
-    replica->GetInFlightTransactions(trace_type, &inflight);
-    for (const TransactionStatusPB& inflight_tx : inflight) {
-      string total_time_str = Substitute("$0 us.", inflight_tx.running_for_micros());
+    replica->GetInFlightOps(trace_type, &inflight);
+    for (const OpStatusPB& inflight_op : inflight) {
+      string total_time_str = Substitute("$0 us.", inflight_op.running_for_micros());
       string description;
-      if (trace_type == Transaction::TRACE_TXNS) {
+      if (trace_type == Op::TRACE_OPS) {
         description = Substitute("$0, Trace: $1",
-                                  inflight_tx.description(), inflight_tx.trace_buffer());
+                                 inflight_op.description(), inflight_op.trace_buffer());
       } else {
-        description = inflight_tx.description();
+        description = inflight_op.description();
       }
 
       if (!as_text) {
         *output << Substitute(
           "<tr><th>$0</th><th>$1</th><th>$2</th><th>$3</th><th>$4</th></tr>\n",
           EscapeForHtmlToString(replica->tablet_id()),
-          EscapeForHtmlToString(SecureShortDebugString(inflight_tx.op_id())),
-          OperationType_Name(inflight_tx.tx_type()),
+          EscapeForHtmlToString(SecureShortDebugString(inflight_op.op_id())),
+          OperationType_Name(inflight_op.op_type()),
           total_time_str,
           EscapeForHtmlToString(description));
       } else {
         *output << "Tablet: " << replica->tablet_id() << endl;
-        *output << "Op ID: " << SecureShortDebugString(inflight_tx.op_id()) << endl;
-        *output << "Type: " << OperationType_Name(inflight_tx.tx_type()) << endl;
+        *output << "Op ID: " << SecureShortDebugString(inflight_op.op_id()) << endl;
+        *output << "Type: " << OperationType_Name(inflight_op.op_type()) << endl;
         *output << "Running: " << total_time_str;
         *output << description << endl;
         *output << endl;
@@ -640,6 +640,7 @@ void TabletServerPathHandlers::HandleMaintenanceManagerPage(const Webserver::Web
     registered_op["ram_anchored"] = HumanReadableNumBytes::ToString(op_pb.ram_anchored_bytes());
     registered_op["logs_retained"] = HumanReadableNumBytes::ToString(op_pb.logs_retained_bytes());
     registered_op["perf"] = op_pb.perf_improvement();
+    registered_op["workload_score"] = op_pb.workload_score();
   }
 }
 

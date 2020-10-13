@@ -50,7 +50,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <numeric>
 #include <ostream>
 #include <set>
 #include <string>
@@ -60,8 +59,11 @@
 #include <vector>
 
 #include <boost/optional/optional.hpp>
+#include <boost/optional/optional_io.hpp> // IWYU pragma: keep
+#include <boost/type_traits/decay.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <google/protobuf/arena.h>
 #include <google/protobuf/stubs/common.h>
 
 #include "kudu/cfile/type_encodings.h"
@@ -78,7 +80,6 @@
 #include "kudu/consensus/consensus.proxy.h"
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/quorum_util.h"
-#include "kudu/consensus/raft_consensus.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/basictypes.h"
@@ -86,6 +87,7 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -102,8 +104,9 @@
 #include "kudu/master/master_cert_authority.h"
 #include "kudu/master/placement_policy.h"
 #include "kudu/master/ranger_authz_provider.h"
-#include "kudu/master/sentry_authz_provider.h"
 #include "kudu/master/sys_catalog.h"
+#include "kudu/master/table_locations_cache.h"
+#include "kudu/master/table_locations_cache_metrics.h"
 #include "kudu/master/table_metrics.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
@@ -121,10 +124,11 @@
 #include "kudu/security/token_verifier.h"
 #include "kudu/server/monitored_task.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/ops/op_tracker.h"
 #include "kudu/tablet/tablet_replica.h"
-#include "kudu/tablet/transactions/transaction_tracker.h"
 #include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/tserver/tserver_admin.proxy.h"
+#include "kudu/util/cache_metrics.h"
 #include "kudu/util/condition_variable.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/fault_injection.h"
@@ -134,6 +138,7 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/random_util.h"
 #include "kudu/util/scoped_cleanup.h"
@@ -184,7 +189,14 @@ DEFINE_int32(max_identifier_length, 256,
              "Maximum length of the name of a column or table.");
 
 DEFINE_int32(max_column_comment_length, 256,
-             "Maximum length of the comment of a column");
+             "Maximum length of the comment of a column.");
+
+DEFINE_int32(max_owner_length, 128,
+             "Maximum length of the name of a table owner.");
+
+DEFINE_bool(allow_empty_owner, false,
+            "Allow empty owner. Only for testing.");
+TAG_FLAG(allow_empty_owner, hidden);
 
 // Tag as unsafe because we end up writing schemas in every WAL entry, etc,
 // and having very long column names would enter untested territory and affect
@@ -311,24 +323,17 @@ DEFINE_bool(auto_rebalancing_enabled, false,
 TAG_FLAG(auto_rebalancing_enabled, advanced);
 TAG_FLAG(auto_rebalancing_enabled, experimental);
 
+DEFINE_uint32(table_locations_cache_capacity_mb, 0,
+              "Capacity for the table locations cache (in MiB); a value "
+              "of 0 means table locations are not be cached");
+TAG_FLAG(table_locations_cache_capacity_mb, advanced);
+
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_int64(tsk_rotation_seconds);
 
 METRIC_DEFINE_entity(table);
 
-DECLARE_string(sentry_service_rpc_addresses);
 DECLARE_string(ranger_config_path);
-
-static bool ValidateRangerSentryFlags() {
-  if (!FLAGS_sentry_service_rpc_addresses.empty() &&
-      !FLAGS_ranger_config_path.empty()) {
-    LOG(ERROR) << "--sentry_service_rpc_addresses and --ranger_config_path "
-                  "cannot be set at the same time.";
-    return false;
-  }
-  return true;
-}
-GROUP_FLAG_VALIDATOR(ranger_sentry_flags, ValidateRangerSentryFlags);
 
 // Validates that if auto-rebalancing is enabled, the cluster uses 3-4-3 replication
 // (the --raft_prepare_replacement_before_eviction flag must be set to true).
@@ -378,9 +383,6 @@ using kudu::tablet::TabletDataState;
 using kudu::tablet::TabletReplica;
 using kudu::tablet::TabletStatePB;
 using kudu::tserver::TabletServerErrorPB;
-using std::accumulate;
-using std::inserter;
-using std::map;
 using std::pair;
 using std::set;
 using std::shared_ptr;
@@ -782,9 +784,7 @@ CatalogManager::CatalogManager(Master* master)
       leader_ready_term_(-1),
       hms_notification_log_event_id_(-1),
       leader_lock_(RWMutex::Priority::PREFER_WRITING) {
-  if (SentryAuthzProvider::IsEnabled()) {
-    authz_provider_.reset(new SentryAuthzProvider(master_->metric_entity()));
-  } else if (RangerAuthzProvider::IsEnabled()) {
+  if (RangerAuthzProvider::IsEnabled()) {
     authz_provider_.reset(new RangerAuthzProvider(master_->fs_manager()->env(),
                                                   master_->metric_entity()));
   } else {
@@ -796,6 +796,7 @@ CatalogManager::CatalogManager(Master* master)
            // closely timed consecutive elections).
            .set_max_threads(1)
            .Build(&leader_election_pool_));
+  ResetTableLocationsCache();
 }
 
 CatalogManager::~CatalogManager() {
@@ -827,13 +828,12 @@ Status CatalogManager::Init(bool is_first_run) {
     auto_rebalancer_ = std::move(task);
   }
 
+  vector<HostPort> master_addresses;
+  RETURN_NOT_OK(master_->GetMasterHostPorts(&master_addresses));
   if (hms::HmsCatalog::IsEnabled()) {
-    vector<HostPortPB> master_addrs_pb;
-    RETURN_NOT_OK(master_->GetMasterHostPorts(&master_addrs_pb));
-
-    string master_addresses = JoinMapped(
-      master_addrs_pb,
-      [] (const HostPortPB& hostport) {
+    string master_addresses_str = JoinMapped(
+      master_addresses,
+      [] (const HostPort& hostport) {
         return Substitute("$0:$1", hostport.host(), hostport.port());
       },
       ",");
@@ -845,7 +845,7 @@ Status CatalogManager::Init(bool is_first_run) {
     // holding leader_lock_, so this is the path of least resistance.
     std::lock_guard<RWMutex> leader_lock_guard(leader_lock_);
 
-    hms_catalog_.reset(new hms::HmsCatalog(std::move(master_addresses)));
+    hms_catalog_.reset(new hms::HmsCatalog(std::move(master_addresses_str)));
     RETURN_NOT_OK_PREPEND(hms_catalog_->Start(HmsClientVerifyKuduSyncConfig::VERIFY),
                           "failed to start Hive Metastore catalog");
 
@@ -883,9 +883,38 @@ Status CatalogManager::WaitUntilCaughtUpAsLeader(const MonoDelta& timeout) {
                     uuid, SecureShortDebugString(cstate)));
   }
 
-  // Wait for all transactions to be committed.
-  RETURN_NOT_OK(sys_catalog_->tablet_replica()->transaction_tracker()->WaitForAllToFinish(timeout));
+  // Wait for all ops to be committed.
+  RETURN_NOT_OK(sys_catalog_->tablet_replica()->op_tracker()->WaitForAllToFinish(timeout));
   return Status::OK();
+}
+
+Status CatalogManager::InitClusterId() {
+  leader_lock_.AssertAcquiredForWriting();
+
+  string cluster_id;
+  Status s = LoadClusterId(&cluster_id);
+  if (s.IsNotFound()) {
+    // Status::NotFound is returned if no cluster ID record is
+    // found in the system catalog table. It can happen on the very first run
+    // of a Kudu cluster or on upgrade from an older version that did not have
+    // cluster IDs. If so, it's necessary to create and persist
+    // a new cluster ID record which, if persisted, will be used for this and next runs.
+
+    // Generate new cluster ID.
+    cluster_id = GenerateId();
+
+    // If the leadership was lost, writing into the system table fails.
+    s = StoreClusterId(cluster_id);
+  }
+
+  // Once the cluster ID is loaded or stored, store it in a variable for
+  // fast lookup.
+  if (s.ok()) {
+    std::lock_guard<simple_spinlock> l(cluster_id_lock_);
+    cluster_id_ = cluster_id;
+  }
+
+  return s;
 }
 
 Status CatalogManager::InitCertAuthority() {
@@ -1007,6 +1036,17 @@ Status CatalogManager::InitCertAuthorityWith(
   return Status::OK();
 }
 
+Status CatalogManager::LoadClusterId(string* cluster_id) {
+  leader_lock_.AssertAcquired();
+
+  SysClusterIdEntryPB entry;
+  RETURN_NOT_OK(sys_catalog_->GetClusterIdEntry(&entry));
+  *cluster_id = entry.cluster_id();
+  LOG(INFO) << "Loaded cluster ID: " << *cluster_id;
+
+  return Status::OK();
+}
+
 Status CatalogManager::LoadCertAuthorityInfo(unique_ptr<PrivateKey>* key,
                                              unique_ptr<Cert>* cert) {
   leader_lock_.AssertAcquired();
@@ -1027,6 +1067,18 @@ Status CatalogManager::LoadCertAuthorityInfo(unique_ptr<PrivateKey>* key,
 
   key->swap(ca_private_key);
   cert->swap(ca_cert);
+
+  return Status::OK();
+}
+
+// Store cluster ID into the system table.
+Status CatalogManager::StoreClusterId(const string& cluster_id) {
+  leader_lock_.AssertAcquiredForWriting();
+
+  SysClusterIdEntryPB entry;
+  entry.set_cluster_id(cluster_id);
+  RETURN_NOT_OK(sys_catalog_->AddClusterIdEntry(entry));
+  LOG(INFO) << "Generated new cluster ID: " << cluster_id;
 
   return Status::OK();
 }
@@ -1153,6 +1205,15 @@ void CatalogManager::PrepareForLeadershipTask() {
       }
     }
 
+    static const char* const kClustIdInitOpDescription = "Initializing Kudu cluster ID";
+    LOG(INFO) << kClustIdInitOpDescription << "...";
+    LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kClustIdInitOpDescription) {
+      if (!check([this]() { return this->InitClusterId(); },
+                 *consensus, term, kClustIdInitOpDescription).ok()) {
+        return;
+      }
+    }
+
     // TODO(KUDU-1920): update this once "BYO PKI" feature is supported.
     static const char* const kCaInitOpDescription =
         "Initializing Kudu internal certificate authority";
@@ -1196,10 +1257,32 @@ void CatalogManager::PrepareForLeadershipTask() {
         }
       }
     }
+
+    // Reset the cache storing information on table locations.
+    ResetTableLocationsCache();
   }
 
   std::lock_guard<simple_spinlock> l(state_lock_);
   leader_ready_term_ = term;
+}
+
+Status CatalogManager::PrepareFollowerClusterId() {
+  static const char* const kDescription =
+      "loading cluster ID for follower catalog manager";
+
+  // Load the cluster ID.
+  string cluster_id;
+  Status s = LoadClusterId(&cluster_id);
+  if (s.ok()) {
+    LOG_WITH_PREFIX(INFO) << kDescription << ": success";
+    // Once the cluster ID is loaded or stored, store it in a variable for
+    // fast lookup.
+    std::lock_guard<simple_spinlock> l(cluster_id_lock_);
+    cluster_id_ = cluster_id;
+  } else {
+    LOG_WITH_PREFIX(WARNING) << kDescription << ": " << s.ToString();
+  }
+  return s;
 }
 
 Status CatalogManager::PrepareFollowerCaInfo() {
@@ -1249,6 +1332,10 @@ Status CatalogManager::PrepareFollowerTokenVerifier() {
 
 Status CatalogManager::PrepareFollower(MonoTime* last_tspk_run) {
   leader_lock_.AssertAcquiredForReading();
+  // Load the cluster ID.
+  if (GetClusterId().empty()) {
+    RETURN_NOT_OK(PrepareFollowerClusterId());
+  }
   // Load the CA certificate and CA private key.
   if (!master_->tls_context().has_signed_cert()) {
     RETURN_NOT_OK(PrepareFollowerCaInfo());
@@ -1328,6 +1415,12 @@ RaftPeerPB::Role CatalogManager::Role() const {
     }
   }
   return consensus ? consensus->role() : RaftPeerPB::UNKNOWN_ROLE;
+}
+
+RaftConsensus::RoleAndMemberType CatalogManager::GetRoleAndMemberType() const {
+  return IsInitialized() ?
+      sys_catalog_->tablet_replica()->shared_consensus()->GetRoleAndMemberType() :
+      std::make_pair(RaftPeerPB::UNKNOWN_ROLE, RaftPeerPB::UNKNOWN_MEMBER_TYPE);
 }
 
 void CatalogManager::Shutdown() {
@@ -1448,11 +1541,23 @@ Status ValidateCommentIdentifier(const string& id) {
   return ValidateLengthAndUTF8(id, FLAGS_max_column_comment_length);
 }
 
+Status ValidateOwner(const string& name) {
+  if (name.empty() && !FLAGS_allow_empty_owner) {
+    return Status::InvalidArgument("empty string is not a valid owner");
+  }
+
+  return ValidateLengthAndUTF8(name, FLAGS_max_owner_length);
+}
+
 // Validate the client-provided schema and name.
 Status ValidateClientSchema(const optional<string>& name,
+                            const optional<string>& owner,
                             const Schema& schema) {
   if (name) {
     RETURN_NOT_OK_PREPEND(ValidateIdentifier(name.get()), "invalid table name");
+  }
+  if (owner) {
+    RETURN_NOT_OK_PREPEND(ValidateOwner(*owner), "invalid owner name");
   }
   for (int i = 0; i < schema.num_columns(); i++) {
     RETURN_NOT_OK_PREPEND(ValidateIdentifier(schema.column(i).name()),
@@ -1510,6 +1615,15 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   LOG(INFO) << Substitute("Servicing CreateTable request from $0:\n$1",
                           RequestorString(rpc), SecureDebugString(req));
 
+  optional<const string&> user;
+  if (rpc) {
+    user = rpc->remote_user().username();
+  }
+  // Default the owner if it isn't set.
+  if (user && !req.has_owner()) {
+    req.set_owner(*user);
+  }
+
   // Do some fix-up of any defaults specified on columns.
   // Clients are only expected to pass the default value in the 'read_default'
   // field, but we need to write the schema to disk including the default
@@ -1520,26 +1634,34 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     RETURN_NOT_OK(SetupError(ProcessColumnPBDefaults(col), resp, MasterErrorPB::INVALID_SCHEMA));
   }
 
-  // a. Validate the user request.
+  bool is_user_table = req.table_type() == TableTypePB::DEFAULT_TABLE;
   const string& normalized_table_name = NormalizeTableName(req.name());
-  if (rpc) {
-    const string& user = rpc->remote_user().username();
-    const string& owner = req.has_owner() ? req.owner() : user;
-    RETURN_NOT_OK(SetupError(
-        authz_provider_->AuthorizeCreateTable(normalized_table_name, user, owner),
-        resp, MasterErrorPB::NOT_AUTHORIZED));
-  }
+  if (is_user_table) {
+    // a. Validate the user request.
+    if (rpc) {
+      DCHECK_NE(boost::none, user);
+      RETURN_NOT_OK(SetupError(
+          authz_provider_->AuthorizeCreateTable(normalized_table_name, user.get(), req.owner()),
+          resp, MasterErrorPB::NOT_AUTHORIZED));
+    }
 
-  // If the HMS integration is enabled, wait for the notification log listener
-  // to catch up. This reduces the likelihood of attempting to create a table
-  // with a name that conflicts with a table that has just been deleted or
-  // renamed in the HMS.
-  RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
+    // If the HMS integration is enabled, wait for the notification log listener
+    // to catch up. This reduces the likelihood of attempting to create a table
+    // with a name that conflicts with a table that has just been deleted or
+    // renamed in the HMS.
+    RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
+  } else {
+    if (user && !master_->IsServiceUserOrSuperUser(*user)) {
+      return SetupError(
+          Status::NotAuthorized("must be a service user or super user to create system tables"),
+          resp, MasterErrorPB::NOT_AUTHORIZED);
+    }
+  }
 
   Schema client_schema;
   RETURN_NOT_OK(SchemaFromPB(req.schema(), &client_schema));
 
-  RETURN_NOT_OK(SetupError(ValidateClientSchema(normalized_table_name, client_schema),
+  RETURN_NOT_OK(SetupError(ValidateClientSchema(normalized_table_name, req.owner(), client_schema),
                            resp, MasterErrorPB::INVALID_SCHEMA));
   if (client_schema.has_column_ids()) {
     return SetupError(Status::InvalidArgument("user requests should not have Column IDs"),
@@ -1727,8 +1849,8 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
       e->mutable_metadata()->AbortMutation();
     }
   });
-  optional<string> dimension_label =
-      req.has_dimension_label() ? make_optional<string>(req.dimension_label()) : none;
+  const optional<string> dimension_label =
+      req.has_dimension_label() ? make_optional(req.dimension_label()) : none;
   for (const Partition& partition : partitions) {
     PartitionPB partition_pb;
     partition.ToPB(&partition_pb);
@@ -1750,10 +1872,10 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   //
   // It is critical that this step happen before writing the table to the sys catalog,
   // since this step validates that the table name is available in the HMS catalog.
-  if (hms_catalog_) {
+  if (hms_catalog_ && is_user_table) {
     CHECK(rpc);
-    const string& owner = req.has_owner() ? req.owner() : rpc->remote_user().username();
-    Status s = hms_catalog_->CreateTable(table->id(), normalized_table_name, owner, schema);
+    Status s = hms_catalog_->CreateTable(table->id(), normalized_table_name, GetClusterId(),
+        req.owner(), schema);
     if (!s.ok()) {
       s = s.CloneAndPrepend(Substitute("an error occurred while creating table $0 in the HMS",
                                        normalized_table_name));
@@ -1765,7 +1887,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // Delete the new HMS entry if we exit early.
   auto abort_hms = MakeScopedCleanup([&] {
       // TODO(dan): figure out how to test this.
-      if (hms_catalog_) {
+      if (hms_catalog_ && is_user_table) {
         TRACE("Rolling back HMS table creation");
         WARN_NOT_OK(hms_catalog_->DropTable(table->id(), normalized_table_name),
                     "an error occurred while attempting to delete orphaned HMS table entry");
@@ -1836,8 +1958,9 @@ Status CatalogManager::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
   //    the user is authorized to operate on the table.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  auto authz_func = [&] (const string& username, const string& table_name) {
-    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username),
+  auto authz_func = [&] (const string& username, const string& table_name, const string& owner) {
+    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username,
+                                                                 username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
@@ -1865,6 +1988,9 @@ scoped_refptr<TableInfo> CatalogManager::CreateTableInfo(
   metadata->set_version(0);
   metadata->set_next_column_id(ColumnId(schema.max_col_id() + 1));
   metadata->set_num_replicas(req.num_replicas());
+  if (req.has_table_type()) {
+    metadata->set_table_type(req.table_type());
+  }
   // Use the Schema object passed in, since it has the column IDs already assigned,
   // whereas the user request PB does not.
   CHECK_OK(SchemaToPB(schema, metadata->mutable_schema()));
@@ -1872,6 +1998,9 @@ scoped_refptr<TableInfo> CatalogManager::CreateTableInfo(
   metadata->set_create_timestamp(time(nullptr));
   (*metadata->mutable_extra_config()) = std::move(extra_config_pb);
   table->RegisterMetrics(master_->metric_registry(), metadata->name());
+  if (req.has_owner()) {
+    metadata->set_owner(req.owner());
+  }
   return table;
 }
 
@@ -1918,9 +2047,9 @@ Status CatalogManager::FindLockAndAuthorizeTable(
   // *----------------*--------------*---------------------*-----------------*
   // | NO             | NO           | N/A                 | InvalidArgument |
   // *----------------*--------------*---------------------*-----------------*
-  auto authorize = [&] (const string& name) {
+  auto authorize = [&] (const string& name, const string& owner) {
     if (user) {
-      return authz_func(*user, name);
+      return authz_func(*user, name, owner);
     }
     return Status::OK();
   };
@@ -1933,7 +2062,7 @@ Status CatalogManager::FindLockAndAuthorizeTable(
 
   scoped_refptr<TableInfo> table;
   // Set to true if the client-provided table name and ID refer to different tables.
-  bool mismatched_table = false;
+  scoped_refptr<TableInfo> table_with_mismatched_name;
   {
     shared_lock<LockType> l(lock_);
     if (table_identifier.has_table_id()) {
@@ -1941,10 +2070,11 @@ Status CatalogManager::FindLockAndAuthorizeTable(
 
       // If the request contains both a table ID and table name, ensure that
       // both match the same table.
+      auto table_by_name = FindPtrOrNull(normalized_table_names_map_,
+                                         NormalizeTableName(table_identifier.table_name()));
       if (table_identifier.has_table_name() &&
-          table.get() != FindPtrOrNull(normalized_table_names_map_,
-                                       NormalizeTableName(table_identifier.table_name())).get()) {
-        mismatched_table = true;
+          table.get() != table_by_name.get()) {
+        table_with_mismatched_name.swap(table_by_name);
       }
     } else if (table_identifier.has_table_name()) {
       table = FindPtrOrNull(normalized_table_names_map_,
@@ -1962,7 +2092,9 @@ Status CatalogManager::FindLockAndAuthorizeTable(
   // NOT_AUTHORIZED error, to avoid leaking table existence.
   if (!table) {
     if (table_identifier.has_table_name()) {
-      RETURN_NOT_OK(authorize(NormalizeTableName(table_identifier.table_name())));
+      // if the table doesn't exist, we don't have ownership information to pass
+      // to authorize().
+      RETURN_NOT_OK(authorize(NormalizeTableName(table_identifier.table_name()), ""));
     }
     return tnf_error();
   }
@@ -1971,7 +2103,13 @@ Status CatalogManager::FindLockAndAuthorizeTable(
   // found is authorized.
   TableMetadataLock lock(table.get(), lock_mode);
   string table_name = NormalizeTableName(lock.data().name());
-  RETURN_NOT_OK(authorize(table_name));
+  if (lock.data().pb.table_type() == TableTypePB::DEFAULT_TABLE) {
+    RETURN_NOT_OK(authorize(table_name, lock.data().owner()));
+  } else {
+    if (user && !master_->IsServiceUserOrSuperUser(*user)) {
+      return Status::NotAuthorized("must be a service user or super user to access system tables");
+    }
+  }
 
   // If the table name and table ID refer to different tables, for example,
   //   1. the ID maps to table A.
@@ -1979,8 +2117,10 @@ Status CatalogManager::FindLockAndAuthorizeTable(
   //
   // Authorize user against both tables, then return TABLE_NOT_FOUND error to
   // avoid leaking table existence.
-  if (mismatched_table) {
-    RETURN_NOT_OK(authorize(NormalizeTableName(table_identifier.table_name())));
+  if (table_with_mismatched_name) {
+    TableMetadataLock lock_table_by_name(table_with_mismatched_name.get(), lock_mode);
+    RETURN_NOT_OK(authorize(NormalizeTableName(lock_table_by_name.data().name()),
+                            lock_table_by_name.data().owner()));
     return SetupError(
         Status::NotFound(
             Substitute("the table ID refers to a different table '$0' than '$1'",
@@ -2009,8 +2149,10 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
 
   leader_lock_.AssertAcquiredForReading();
 
-  optional<const string&> user = rpc ?
-      make_optional<const string&>(rpc->remote_user().username()) : none;
+  optional<const string&> user;
+  if (rpc) {
+    user = rpc->remote_user().username();
+  }
 
   // If the HMS integration is enabled and the table should be deleted in the HMS,
   // then don't directly remove the table from the Kudu catalog. Instead, delete
@@ -2027,8 +2169,9 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
     // to operate on the table.
     scoped_refptr<TableInfo> table;
     TableMetadataLock l;
-    auto authz_func = [&](const string& username, const string& table_name) {
-      return SetupError(authz_provider_->AuthorizeDropTable(table_name, username),
+    auto authz_func = [&](const string& username, const string& table_name, const string& owner) {
+      return SetupError(authz_provider_->AuthorizeDropTable(table_name, username,
+                                                            username == owner),
                         resp, MasterErrorPB::NOT_AUTHORIZED);
     };
     RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::READ, authz_func, user,
@@ -2089,8 +2232,8 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
   //    to operate on the table. Last, mark it as removed.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  auto authz_func = [&] (const string& username, const string& table_name) {
-    return SetupError(authz_provider_->AuthorizeDropTable(table_name, username),
+  auto authz_func = [&] (const string& username, const string& table_name, const string& owner) {
+    return SetupError(authz_provider_->AuthorizeDropTable(table_name, username, username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::WRITE, authz_func, user,
@@ -2161,6 +2304,11 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
 
   // 8. Send a DeleteTablet() request to each tablet replica in the table.
   SendDeleteTableRequest(table, deletion_msg);
+
+  // 9. Invalidate/purge corresponding entries in the table locations cache.
+  if (table_locations_cache_) {
+    table_locations_cache_->Remove(table->id());
+  }
 
   VLOG(1) << "Deleted table " << table->ToString();
   return Status::OK();
@@ -2283,8 +2431,9 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     }
 
     if (ops.size() != 2) {
-      return Status::InvalidArgument("expected two row operations for alter range partition step",
-                                     SecureShortDebugString(step));
+      return Status::InvalidArgument(
+          "expected two row operations for alter range partition step",
+          SecureShortDebugString(step));
     }
 
     if ((ops[0].type != RowOperationsPB::RANGE_LOWER_BOUND &&
@@ -2293,7 +2442,7 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
          ops[1].type != RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND)) {
       return Status::InvalidArgument(
           "expected a lower bound and upper bound row op for alter range partition step",
-          strings::Substitute("$0, $1", ops[0].ToString(schema), ops[1].ToString(schema)));
+          Substitute("$0, $1", ops[0].ToString(schema), ops[1].ToString(schema)));
     }
 
     if (ops[0].type == RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND) {
@@ -2306,64 +2455,97 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     }
 
     vector<Partition> partitions;
-    RETURN_NOT_OK(partition_schema.CreatePartitions({}, {{ *ops[0].split_row, *ops[1].split_row }},
-                                                    schema, &partitions));
-
+    RETURN_NOT_OK(partition_schema.CreatePartitions(
+        {}, {{ *ops[0].split_row, *ops[1].split_row }}, schema, &partitions));
     switch (step.type()) {
       case AlterTableRequestPB::ADD_RANGE_PARTITION: {
         for (const Partition& partition : partitions) {
           const string& lower_bound = partition.partition_key_start();
           const string& upper_bound = partition.partition_key_end();
 
-          // Check that the new tablet doesn't overlap with the existing tablets.
-          // Iter points at the tablet directly *after* the lower bound (or to
-          // existing_tablets.end(), if such a tablet does not exist).
-          auto existing_iter = existing_tablets.upper_bound(lower_bound);
+          // Check that the new tablet does not overlap with any of the existing
+          // tablets. Since the elements of 'existing_tablets' are ordered by
+          // the tablets' lower bounds, the iterator points at the tablet
+          // directly *after* the lower bound or to existing_tablets.end()
+          // if such a tablet does not exist.
+          const auto existing_iter = existing_tablets.upper_bound(lower_bound);
           if (existing_iter != existing_tablets.end()) {
-            TabletMetadataLock metadata(existing_iter->second.get(), LockMode::READ);
-            if (upper_bound.empty() ||
-                metadata.data().pb.partition().partition_key_start() < upper_bound) {
+            TabletMetadataLock metadata(existing_iter->second.get(),
+                                        LockMode::READ);
+            const auto& p = metadata.data().pb.partition();
+            // Check for the overlapping ranges.
+            if (upper_bound.empty() || p.partition_key_start() < upper_bound) {
               return Status::InvalidArgument(
-                  "New range partition conflicts with existing range partition",
-                  partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+                  "new range partition conflicts with existing one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
             }
           }
+          // This is the case when there is an existing tablet with the lower
+          // bound being less or equal to the lower bound of the new tablet to
+          // create. This cannot be the case of an empty 'existing_tablets'
+          // container (otherwise, existing_tablets.end() would be equal to
+          // existing_tablets.begin()), so it's safe to decrement the iterator
+          // (i.e. call std::prev() on it) and de-reference it.
           if (existing_iter != existing_tablets.begin()) {
             TabletMetadataLock metadata(std::prev(existing_iter)->second.get(),
                                         LockMode::READ);
-            if (metadata.data().pb.partition().partition_key_end().empty() ||
-                metadata.data().pb.partition().partition_key_end() > lower_bound) {
+            const auto& p = metadata.data().pb.partition();
+            // Check for the exact match of ranges.
+            if (lower_bound == p.partition_key_start() &&
+                upper_bound == p.partition_key_end()) {
+              return Status::AlreadyPresent(
+                  "range partition already exists",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
+            }
+            // Check for the overlapping ranges.
+            if (p.partition_key_end().empty() ||
+                p.partition_key_end() > lower_bound) {
               return Status::InvalidArgument(
-                  "New range partition conflicts with existing range partition",
-                  partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+                  "new range partition conflicts with existing one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
             }
           }
 
           // Check that the new tablet doesn't overlap with any other new tablets.
           auto new_iter = new_tablets.upper_bound(lower_bound);
           if (new_iter != new_tablets.end()) {
-            const auto& metadata = new_iter->second->mutable_metadata()->dirty();
-            if (upper_bound.empty() ||
-                metadata.pb.partition().partition_key_start() < upper_bound) {
+            // Check for the overlapping ranges.
+            const auto& p = new_iter->second->mutable_metadata()->dirty().pb.partition();
+            if (upper_bound.empty() || p.partition_key_start() < upper_bound) {
               return Status::InvalidArgument(
-                  "New range partition conflicts with another new range partition",
-                  partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+                  "new range partition conflicts with another newly added one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
             }
           }
           if (new_iter != new_tablets.begin()) {
-            const auto& metadata = std::prev(new_iter)->second->mutable_metadata()->dirty();
-            if (metadata.pb.partition().partition_key_end().empty() ||
-                metadata.pb.partition().partition_key_end() > lower_bound) {
+            const auto& p = std::prev(new_iter)->second->mutable_metadata()->dirty().pb.partition();
+            // Check for the exact match of ranges.
+            if (lower_bound == p.partition_key_start() &&
+                upper_bound == p.partition_key_end()) {
+              return Status::AlreadyPresent(
+                  "new range partiton duplicates another newly added one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
+            }
+            // Check for the overlapping ranges.
+            if (p.partition_key_end().empty() || p.partition_key_end() > lower_bound) {
               return Status::InvalidArgument(
-                  "New range partition conflicts with another new range partition",
-                  partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+                  "new range partition conflicts with another newly added one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
             }
           }
 
+          const optional<string> dimension_label =
+              step.add_range_partition().has_dimension_label()
+              ? make_optional(step.add_range_partition().dimension_label())
+              : none;
           PartitionPB partition_pb;
           partition.ToPB(&partition_pb);
-          optional<string> dimension_label = step.add_range_partition().has_dimension_label() ?
-              make_optional<string>(step.add_range_partition().dimension_label()) : none;
           new_tablets.emplace(lower_bound,
                               CreateTabletInfo(table, partition_pb, dimension_label));
         }
@@ -2402,15 +2584,15 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
             new_iter->second->mutable_metadata()->AbortMutation();
             new_tablets.erase(new_iter);
           } else {
-            return Status::InvalidArgument(
-                "No range partition found for drop range partition step",
-                partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+            return Status::InvalidArgument("no range partition to drop",
+                partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                           *ops[1].split_row));
           }
         }
         break;
       }
       default: {
-        return Status::InvalidArgument("Unknown alter table range partitioning step",
+        return Status::InvalidArgument("unknown alter table range partitioning step",
                                        SecureShortDebugString(step));
       }
     }
@@ -2428,16 +2610,20 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
                                      rpc::RpcContext* rpc) {
   leader_lock_.AssertAcquiredForReading();
 
-  // If the HMS integration is enabled, wait for the notification log listener
-  // to catch up. This reduces the likelihood of attempting to apply an
-  // alteration to a table which has just been renamed or deleted through the HMS.
-  RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
+  if (req.modify_external_catalogs()) {
+    // If the HMS integration is enabled, wait for the notification log listener
+    // to catch up. This reduces the likelihood of attempting to apply an
+    // alteration to a table which has just been renamed or deleted through the HMS.
+    RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
+  }
 
   LOG(INFO) << Substitute("Servicing AlterTable request from $0:\n$1",
                           RequestorString(rpc), SecureShortDebugString(req));
 
-  optional<const string&> user = rpc ?
-      make_optional<const string&>(rpc->remote_user().username()) : none;
+  optional<const string&> user;
+  if (rpc) {
+    user = rpc->remote_user().username();
+  }
 
   // If the HMS integration is enabled, the alteration includes a table
   // rename and the table should be altered in the HMS, then don't directly
@@ -2452,10 +2638,11 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
     TableMetadataLock l;
     string normalized_new_table_name = NormalizeTableName(req.new_table_name());
     auto authz_func = [&](const string& username,
-                          const string& table_name) {
+                          const string& table_name,
+                          const string& owner) {
       return SetupError(authz_provider_->AuthorizeAlterTable(table_name,
                                                              normalized_new_table_name,
-                                                             username),
+                                                             username, username == owner),
                         resp, MasterErrorPB::NOT_AUTHORIZED);
     };
     RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::READ, authz_func, user,
@@ -2479,7 +2666,7 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
     // Rename the table in the HMS.
     RETURN_NOT_OK(SetupError(hms_catalog_->AlterTable(
             table->id(), l.data().name(), normalized_new_table_name,
-            schema),
+            GetClusterId(), l.data().owner(), schema),
         resp, MasterErrorPB::HIVE_METASTORE_ERROR));
 
     // Unlock the table, and wait for the notification log listener to handle
@@ -2510,15 +2697,21 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
   return AlterTable(req, resp, /*hms_notification_log_event_id=*/ none, user);
 }
 
-Status CatalogManager::RenameTableHms(const string& table_id,
-                                      const string& table_name,
-                                      const string& new_table_name,
-                                      int64_t notification_log_event_id) {
+Status CatalogManager::AlterTableHms(const string& table_id,
+                                     const string& table_name,
+                                     const optional<string>& new_table_name,
+                                     const optional<string>& new_table_owner,
+                                     int64_t notification_log_event_id) {
   AlterTableRequestPB req;
   AlterTableResponsePB resp;
   req.mutable_table()->set_table_id(table_id);
   req.mutable_table()->set_table_name(table_name);
-  req.set_new_table_name(new_table_name);
+  if (new_table_name) {
+    req.set_new_table_name(new_table_name.get());
+  }
+  if (new_table_owner) {
+    req.set_new_table_owner(new_table_owner.get());
+  }
 
   // Use empty user to skip the authorization validation since the operation
   // originates from catalog manager. Moreover, this avoids duplicate effort,
@@ -2566,10 +2759,22 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
   auto authz_func = [&] (const string& username,
-                         const string& table_name) {
+                         const string& table_name,
+                         const string& owner) {
     const string new_table = req.has_new_table_name() ?
         NormalizeTableName(req.new_table_name()) : table_name;
-    return SetupError(authz_provider_->AuthorizeAlterTable(table_name, new_table, username),
+    // Change owner requires higher level of privilege (ALL WITH GRANT OPTION,
+    // or ALL + delegate admin) than other types of alter operations, so if a
+    // single alter contains an owner change as well as other changes, it's
+    // sufficient to authorize only the owner change.
+    if (req.has_new_table_owner()) {
+      return SetupError(authz_provider_->AuthorizeChangeOwner(table_name, username,
+                                                              username == owner),
+                        resp, MasterErrorPB::NOT_AUTHORIZED);
+    }
+
+    return SetupError(authz_provider_->AuthorizeAlterTable(table_name, new_table, username,
+                                                           username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::WRITE, authz_func, user,
@@ -2600,9 +2805,9 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   DCHECK_EQ(new_schema.find_column_by_id(next_col_id),
             static_cast<int>(Schema::kColumnNotFound));
 
-  // Just validate the schema, not the name (validated below).
+  // Just validate the schema, not the name and owner (validated below).
   RETURN_NOT_OK(SetupError(
-        ValidateClientSchema(none, new_schema),
+        ValidateClientSchema(none, none, new_schema),
         resp, MasterErrorPB::INVALID_SCHEMA));
 
   // 4. Validate and try to acquire the new table name.
@@ -2655,7 +2860,16 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     }
   });
 
-  // 5. Alter table partitioning.
+  // 5. Alter the table owner.
+  if (req.has_new_table_owner()) {
+    RETURN_NOT_OK(SetupError(
+          ValidateOwner(req.new_table_owner()).CloneAndAppend("invalid owner name"),
+          resp, MasterErrorPB::INVALID_SCHEMA));
+
+    l.mutable_data()->pb.set_owner(req.new_table_owner());
+  }
+
+  // 6. Alter table partitioning.
   vector<scoped_refptr<TabletInfo>> tablets_to_add;
   vector<scoped_refptr<TabletInfo>> tablets_to_drop;
   if (!alter_partitioning_steps.empty()) {
@@ -2669,7 +2883,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
           resp, MasterErrorPB::UNKNOWN_ERROR));
   }
 
-  // 6. Alter table's extra configuration properties.
+  // 7. Alter table's extra configuration properties.
   if (!req.new_extra_configs().empty()) {
     TRACE("Apply alter extra-config");
     Map<string, string> new_extra_configs;
@@ -2685,9 +2899,11 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
 
   // Set to true if columns are altered, added or dropped.
   bool has_schema_changes = !alter_schema_steps.empty();
-  // Set to true if there are schema changes, or the table is renamed.
-  bool has_metadata_changes =
-      has_schema_changes || req.has_new_table_name() || !req.new_extra_configs().empty();
+  // Set to true if there are schema changes, the table is renamed, the owner changed,
+  // or extra configuration has changed.
+  bool has_metadata_changes = has_schema_changes ||
+      req.has_new_table_name() || req.has_new_table_owner() ||
+      !req.new_extra_configs().empty();
   // Set to true if there are partitioning changes.
   bool has_partitioning_changes = !alter_partitioning_steps.empty();
   // Set to true if metadata changes need to be applied to existing tablets.
@@ -2699,7 +2915,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     return Status::OK();
   }
 
-  // 7. Serialize the schema and increment the version number.
+  // 8. Serialize the schema and increment the version number.
   if (has_metadata_changes_for_existing_tablets && !l.data().pb.has_fully_applied_schema()) {
     l.mutable_data()->pb.mutable_fully_applied_schema()->CopyFrom(l.data().pb.schema());
   }
@@ -2724,7 +2940,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   TabletMetadataGroupLock tablets_to_add_lock(LockMode::WRITE);
   TabletMetadataGroupLock tablets_to_drop_lock(LockMode::RELEASED);
 
-  // 8. Update sys-catalog with the new table schema and tablets to add/drop.
+  // 9. Update sys-catalog with the new table schema and tablets to add/drop.
   TRACE("Updating metadata on disk");
   {
     SysCatalogTable::Actions actions;
@@ -2754,7 +2970,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     }
   }
 
-  // 9. Commit the in-memory state.
+  // 10. Commit the in-memory state.
   TRACE("Committing alterations to in-memory state");
   {
     // Commit new tablet in-memory state. This doesn't require taking the global
@@ -2810,17 +3026,18 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   // the tablet again.
   tablets_to_drop_lock.Commit();
 
-  // If there are schema changes, then update the entry in the Hive Metastore.
+  // If there are schema changes or the owner changed, then update the entry in the Hive Metastore.
   // This is done on a best-effort basis, since Kudu is the source of truth for
   // table schema information, and the table has already been altered in the
   // Kudu catalog via the successful sys-table write above.
-  if (hms_catalog_ && has_schema_changes) {
+  if (hms_catalog_ && (has_schema_changes || req.has_new_table_owner())) {
     // Sanity check: if there are schema changes then this is necessarily not a
     // table rename, since we split out the rename portion into its own
     // 'transaction' which is serialized through the HMS.
     DCHECK(!req.has_new_table_name());
     WARN_NOT_OK(hms_catalog_->AlterTable(
-          table->id(), normalized_table_name, normalized_table_name, new_schema),
+          table->id(), normalized_table_name, normalized_table_name,
+          GetClusterId(), l.mutable_data()->owner(), new_schema),
         Substitute("failed to alter HiveMetastore schema for table $0, "
                    "HMS schema information will be stale", table->ToString()));
   }
@@ -2837,6 +3054,12 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     SendDeleteTabletRequest(tablet, l, deletion_msg);
   }
 
+  // 10. Invalidate/purge corresponding entries in the table locations cache.
+  if (table_locations_cache_ &&
+      (!tablets_to_add.empty() || !tablets_to_drop.empty())) {
+    table_locations_cache_->Remove(table->id());
+  }
+
   background_tasks_->Wake();
   return Status::OK();
 }
@@ -2850,8 +3073,9 @@ Status CatalogManager::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
   //    the user is authorized to operate on the table.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  auto authz_func = [&] (const string& username, const string& table_name) {
-    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username),
+  auto authz_func = [&] (const string& username, const string& table_name, const string& owner) {
+    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username,
+                                                                 username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
@@ -2877,8 +3101,9 @@ Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
 
-  auto authz_func = [&] (const string& username, const string& table_name) {
-    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username),
+  auto authz_func = [&] (const string& username, const string& table_name, const string& owner) {
+    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username,
+                                                                 username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
@@ -2895,8 +3120,9 @@ Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
     TablePrivilegePB table_privilege;
     table_privilege.set_table_id(table->id());
     RETURN_NOT_OK(
-        SetupError(authz_provider_->FillTablePrivilegePB(l.data().name(), *user, schema_pb,
-                                                         &table_privilege),
+        SetupError(authz_provider_->FillTablePrivilegePB(l.data().name(), *user,
+                                                         *user == l.data().owner(),
+                                                         schema_pb, &table_privilege),
                    resp, MasterErrorPB::UNKNOWN_ERROR));
     security::SignedTokenPB authz_token;
     RETURN_NOT_OK(token_signer->GenerateAuthzToken(
@@ -2908,6 +3134,8 @@ Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
   resp->set_table_id(table->id());
   resp->mutable_partition_schema()->CopyFrom(l.data().pb.partition_schema());
   resp->set_table_name(l.data().pb.name());
+  resp->set_owner(l.data().pb.owner());
+
   RETURN_NOT_OK(ExtraConfigPBToPBMap(l.data().pb.extra_config(), resp->mutable_extra_configs()));
 
   return Status::OK();
@@ -2925,13 +3153,33 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
       tables_info.emplace_back(entry.second);
     }
   }
+  unordered_set<int> table_types;
+  for (auto idx = 0; idx < req->type_filter_size(); ++idx) {
+    table_types.emplace(req->type_filter(idx));
+  }
+  if (table_types.empty()) {
+    // The default behavior is to list only user tables (that's backwards
+    // compatible).
+    table_types.emplace(TableTypePB::DEFAULT_TABLE);
+  }
   unordered_map<string, scoped_refptr<TableInfo>> table_info_by_name;
-  unordered_set<string> table_names;
+  unordered_map<string, bool> table_owner_map;
   for (const auto& table_info : tables_info) {
     TableMetadataLock ltm(table_info.get(), LockMode::READ);
-    if (!ltm.data().is_running()) continue; // implies !is_deleted() too
+    const auto& table_data = ltm.data();
+    // Don't list tables that aren't running
+    if (!table_data.is_running()) {
+      continue;
+    }
+    // The table type might be unset in the data stored in the system catalog.
+    const auto table_type = table_data.pb.has_table_type()
+        ? table_data.pb.table_type() : TableTypePB::DEFAULT_TABLE;
+    if (!ContainsKey(table_types, table_type)) {
+      continue;
+    }
 
-    const string& table_name = ltm.data().name();
+    const string& table_name = table_data.name();
+    const string& owner = table_data.owner();
     if (req->has_name_filter()) {
       size_t found = table_name.find(req->name_filter());
       if (found == string::npos) {
@@ -2939,20 +3187,21 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
       }
     }
     InsertOrUpdate(&table_info_by_name, table_name, table_info);
-    EmplaceIfNotPresent(&table_names, table_name);
+    EmplaceIfNotPresent(&table_owner_map, table_name, owner == *user);
   }
 
   MAYBE_INJECT_FIXED_LATENCY(FLAGS_catalog_manager_inject_latency_list_authz_ms);
   bool checked_table_names = false;
   if (user) {
     RETURN_NOT_OK(authz_provider_->AuthorizeListTables(
-        *user, &table_names, &checked_table_names));
+        *user, &table_owner_map, &checked_table_names));
   }
 
   // If we checked privileges, do another pass over the tables to filter out
   // any that may have been altered while authorizing.
   if (checked_table_names) {
-    for (const auto& table_name : table_names) {
+    for (const auto& table_owner_pair : table_owner_map) {
+      const auto& table_name = table_owner_pair.first;
       const auto& table_info = FindOrDie(table_info_by_name, table_name);
       TableMetadataLock ltm(table_info.get(), LockMode::READ);
       if (!ltm.data().is_running()) continue;
@@ -2986,8 +3235,9 @@ Status CatalogManager::GetTableStatistics(const GetTableStatisticsRequestPB* req
 
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  auto authz_func = [&] (const string& username, const string& table_name) {
-      return SetupError(authz_provider_->AuthorizeGetTableStatistics(table_name, username),
+  auto authz_func = [&] (const string& username, const string& table_name, const string& owner) {
+      return SetupError(authz_provider_->AuthorizeGetTableStatistics(table_name, username,
+                                                                     username == owner),
                         resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
@@ -3459,6 +3709,7 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
     req_.mutable_extra_config()->CopyFrom(
         table_lock.data().pb.extra_config());
     req_.set_dimension_label(tablet_lock.data().pb.dimension_label());
+    req_.set_table_type(table_lock.data().pb.table_type());
   }
 
   string type_name() const override { return "CreateTablet"; }
@@ -4059,6 +4310,7 @@ Status CatalogManager::ProcessTabletReport(
   // 3. Process each tablet. This may not be in the order that the tablets
   // appear in 'full_report', but that has no bearing on correctness.
   vector<scoped_refptr<TabletInfo>> mutated_tablets;
+  unordered_set<string> mutated_table_ids;
   unordered_set<string> uuids_ignored_for_underreplication =
       master_->ts_manager()->GetUuidsToIgnoreForUnderreplication();
   for (const auto& e : tablet_infos) {
@@ -4304,6 +4556,7 @@ Status CatalogManager::ProcessTabletReport(
     // Done here and not on a per-mutation basis to avoid duplicate entries.
     if (tablet_was_mutated) {
       mutated_tablets.push_back(tablet);
+      mutated_table_ids.emplace(table->id());
     }
 
     // 10. Process the report's tablet statistics.
@@ -4389,7 +4642,19 @@ Status CatalogManager::ProcessTabletReport(
     WARN_NOT_OK(rpc->Run(), Substitute("Failed to send $0", rpc->description()));
   }
 
+  // 16. Invalidate corresponding entries in the table locations cache.
+  if (table_locations_cache_) {
+    for (const auto& table_id : mutated_table_ids) {
+      table_locations_cache_->Remove(table_id);
+    }
+  }
+
   return Status::OK();
+}
+
+string CatalogManager::GetClusterId() const {
+  std::lock_guard<simple_spinlock> l(cluster_id_lock_);
+  return cluster_id_;
 }
 
 int64_t CatalogManager::GetLatestNotificationLogEventId() {
@@ -4615,8 +4880,9 @@ void CatalogManager::HandleAssignCreatingTablet(const scoped_refptr<TabletInfo>&
 
   const PersistentTabletInfo& old_info = tablet->metadata().state();
 
-  optional<string> dimension_label = old_info.pb.has_dimension_label() ?
-      make_optional<string>(old_info.pb.dimension_label()) : none;
+  const optional<string> dimension_label = old_info.pb.has_dimension_label()
+      ? make_optional(old_info.pb.dimension_label())
+      : none;
   // The "tablet creation" was already sent, but we didn't receive an answer
   // within the timeout. So the tablet will be replaced by a new one.
   scoped_refptr<TabletInfo> replacement = CreateTabletInfo(tablet->table(),
@@ -4892,6 +5158,11 @@ Status CatalogManager::BuildLocationsForTablet(
   DCHECK(l_tablet.data().pb.has_consensus_state());
 
   const ConsensusStatePB& cstate = l_tablet.data().pb.consensus_state();
+
+  if (ts_infos_dict) {
+    locs_pb->mutable_interned_replicas()->Reserve(cstate.committed_config().peers().size());
+  }
+
   for (const consensus::RaftPeerPB& peer : cstate.committed_config().peers()) {
     DCHECK(!peer.has_health_report()); // Health report shouldn't be persisted.
     switch (filter) {
@@ -4916,15 +5187,11 @@ Status CatalogManager::BuildLocationsForTablet(
     }
 
     // Helper function to create a TSInfoPB.
-    auto make_tsinfo_pb = [this, &peer]() {
-      unique_ptr<TSInfoPB> tsinfo_pb(new TSInfoPB);
+    auto fill_tsinfo_pb = [this, &peer](TSInfoPB* tsinfo_pb) {
       tsinfo_pb->set_permanent_uuid(peer.permanent_uuid());
       shared_ptr<TSDescriptor> ts_desc;
       if (master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid(), &ts_desc)) {
-        ServerRegistrationPB reg;
-        ts_desc->GetRegistration(&reg);
-        tsinfo_pb->mutable_rpc_addresses()->Swap(reg.mutable_rpc_addresses());
-        if (ts_desc->location()) tsinfo_pb->set_location(*(ts_desc->location()));
+        ts_desc->GetTSInfoPB(tsinfo_pb);
       } else {
         // If we've never received a heartbeat from the tserver, we'll fall back
         // to the last known RPC address in the RaftPeerPB.
@@ -4932,24 +5199,14 @@ Status CatalogManager::BuildLocationsForTablet(
         // TODO(wdberkeley): We should track these RPC addresses in the master table itself.
         tsinfo_pb->add_rpc_addresses()->CopyFrom(peer.last_known_addr());
       }
-      return tsinfo_pb;
     };
 
     const auto role = GetParticipantRole(peer, cstate);
-    optional<string> dimension = none;
-    if (l_tablet.data().pb.has_dimension_label()) {
-      dimension = l_tablet.data().pb.dimension_label();
-    }
+    const optional<string> dimension = l_tablet.data().pb.has_dimension_label()
+        ? make_optional(l_tablet.data().pb.dimension_label())
+        : none;
     if (ts_infos_dict) {
-      const auto idx = *ComputePairIfAbsent(
-          &ts_infos_dict->uuid_to_idx, peer.permanent_uuid(),
-          [&]() -> pair<StringPiece, int> {
-            auto& ts_info_pbs = ts_infos_dict->ts_info_pbs;
-            auto ts_info_idx = ts_info_pbs.size();
-            ts_info_pbs.emplace_back(make_tsinfo_pb().release());
-            return { ts_info_pbs.back()->permanent_uuid(), ts_info_idx };
-          });
-
+      const auto idx = ts_infos_dict->LookupOrAdd(peer.permanent_uuid(), fill_tsinfo_pb);
       auto* interned_replica_pb = locs_pb->add_interned_replicas();
       interned_replica_pb->set_ts_info_idx(idx);
       interned_replica_pb->set_role(role);
@@ -4958,7 +5215,9 @@ Status CatalogManager::BuildLocationsForTablet(
       }
     } else {
       TabletLocationsPB_DEPRECATED_ReplicaPB* replica_pb = locs_pb->add_deprecated_replicas();
-      replica_pb->set_allocated_ts_info(make_tsinfo_pb().release());
+      TSInfoPB* tsi = google::protobuf::Arena::CreateMessage<TSInfoPB>(locs_pb->GetArena());
+      fill_tsinfo_pb(tsi);
+      replica_pb->set_allocated_ts_info(tsi);
       replica_pb->set_role(role);
     }
   }
@@ -4995,7 +5254,7 @@ Status CatalogManager::GetTabletLocations(const string& tablet_id,
     // the table that the tablet belongs to.
     TableMetadataLock table_lock(tablet_info->table().get(), LockMode::READ);
     RETURN_NOT_OK(authz_provider_->AuthorizeGetTableMetadata(
-        NormalizeTableName(table_lock.data().name()), *user));
+        NormalizeTableName(table_lock.data().name()), *user, *user == table_lock.data().owner()));
   }
 
   return BuildLocationsForTablet(tablet_info, filter, locs_pb, ts_infos_dict);
@@ -5094,11 +5353,11 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
                                          optional<const string&> user) {
   // If start-key is > end-key report an error instead of swapping the two
   // since probably there is something wrong app-side.
-  if (req->has_partition_key_start() && req->has_partition_key_end()
-      && req->partition_key_start() > req->partition_key_end()) {
+  if (PREDICT_FALSE(req->has_partition_key_start() && req->has_partition_key_end()
+      && req->partition_key_start() > req->partition_key_end())) {
     return Status::InvalidArgument("start partition key is greater than the end partition key");
   }
-  if (req->max_returned_locations() <= 0) {
+  if (PREDICT_FALSE(req->max_returned_locations() <= 0)) {
     return Status::InvalidArgument("max_returned_locations must be greater than 0");
   }
 
@@ -5108,8 +5367,9 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
   // the user is authorized to operate on the table.
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  auto authz_func = [&] (const string& username, const string& table_name) {
-    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username),
+  auto authz_func = [&] (const string& username, const string& table_name, const string& owner) {
+    return SetupError(authz_provider_->AuthorizeGetTableMetadata(table_name, username,
+                                                                 username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
@@ -5119,27 +5379,42 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
   vector<scoped_refptr<TabletInfo>> tablets_in_range;
   table->GetTabletsInRange(req, &tablets_in_range);
 
-  TSInfosDict infos_dict;
+  // Check for items in the cache.
+  if (table_locations_cache_) {
+    auto handle = table_locations_cache_->Get(
+        table->id(),
+        tablets_in_range.size(),
+        tablets_in_range.empty() ? "" : tablets_in_range.front()->id(),
+        *req);
+    if (handle) {
+      *resp = handle.value();
+      return Status::OK();
+    }
+  }
 
+  TSInfosDict infos_dict(resp->GetArena());
+  bool consistent_locations = true;
   for (const auto& tablet : tablets_in_range) {
-    Status s = BuildLocationsForTablet(
+    const auto s = BuildLocationsForTablet(
         tablet, req->replica_type_filter(), resp->add_tablet_locations(),
         req->intern_ts_infos_in_response() ? &infos_dict : nullptr);
-    if (s.ok()) {
+    if (PREDICT_TRUE(s.ok())) {
       continue;
     }
+
+    // All the rest are various error cases.
+    consistent_locations = false;
+    resp->Clear();
+    resp->mutable_error()->set_code(
+        MasterErrorPB_Code::MasterErrorPB_Code_TABLET_NOT_RUNNING);
     if (s.IsNotFound()) {
       // The tablet has been deleted; force the client to retry. This is a
       // transient state that only happens with a concurrent drop range
       // partition alter table operation.
-      resp->Clear();
-      resp->mutable_error()->set_code(MasterErrorPB_Code::MasterErrorPB_Code_TABLET_NOT_RUNNING);
       StatusToPB(Status::ServiceUnavailable("Tablet not running"),
                  resp->mutable_error()->mutable_status());
     } else if (s.IsServiceUnavailable()) {
       // The tablet is not yet running; fail the request.
-      resp->Clear();
-      resp->mutable_error()->set_code(MasterErrorPB_Code::MasterErrorPB_Code_TABLET_NOT_RUNNING);
       StatusToPB(s, resp->mutable_error()->mutable_status());
       break;
     } else {
@@ -5148,10 +5423,25 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
           << s.ToString();
     }
   }
-  for (auto& pb : infos_dict.ts_info_pbs) {
-    resp->mutable_ts_infos()->AddAllocated(pb.release());
+  resp->mutable_ts_infos()->Reserve(infos_dict.ts_info_pbs().size());
+  for (auto* pb : infos_dict.ts_info_pbs()) {
+    DCHECK_EQ(pb->GetArena(), resp->GetArena());
+    resp->mutable_ts_infos()->AddAllocated(pb);
   }
   resp->set_ttl_millis(FLAGS_table_locations_ttl_ms);
+
+  // Items with consistent tablet location information are added into the cache.
+  if (table_locations_cache_ && consistent_locations) {
+    unique_ptr<GetTableLocationsResponsePB> entry_ptr(
+        new GetTableLocationsResponsePB(*resp));
+    table_locations_cache_->Put(
+        table->id(),
+        tablets_in_range.size(),
+        tablets_in_range.empty() ? "" : tablets_in_range.front()->id(),
+        *req,
+        std::move(entry_ptr));
+  }
+
   return Status::OK();
 }
 
@@ -5282,6 +5572,100 @@ const char* CatalogManager::StateToString(State state) {
   __builtin_unreachable();
 }
 
+const char* CatalogManager::ChangeConfigOpToString(ChangeConfigOp type) {
+  switch (type) {
+    case CatalogManager::kAddMaster: return "add";
+  }
+  __builtin_unreachable();
+}
+
+void CatalogManager::ResetTableLocationsCache() {
+  const auto cache_capacity_bytes =
+      FLAGS_table_locations_cache_capacity_mb * 1024 * 1024;
+  if (cache_capacity_bytes == 0) {
+    table_locations_cache_.reset();
+  } else {
+    unique_ptr<TableLocationsCache> new_cache(
+        new TableLocationsCache(cache_capacity_bytes));
+    unique_ptr<TableLocationsCacheMetrics> metrics(
+        new TableLocationsCacheMetrics(master_->metric_entity()));
+    new_cache->SetMetrics(std::move(metrics));
+    table_locations_cache_ = std::move(new_cache);
+  }
+  VLOG(1) << "table locations cache has been reset";
+}
+
+Status CatalogManager::InitiateMasterChangeConfig(ChangeConfigOp op, const HostPort& hp,
+                                                  const std::string& uuid, rpc::RpcContext* rpc) {
+  auto consensus = master_consensus();
+  if (!consensus) {
+    return Status::IllegalState("Consensus not running");
+  }
+
+  consensus::ChangeConfigRequestPB req;
+  // Request is targeted to itself, the leader master.
+  req.set_dest_uuid(master_->fs_manager()->uuid());
+  req.set_tablet_id(sys_catalog()->tablet_id());
+  req.set_cas_config_opid_index(consensus->CommittedConfig().opid_index());
+  RaftPeerPB* peer = req.mutable_server();
+  peer->set_permanent_uuid(uuid);
+
+  switch (op) {
+    case CatalogManager::kAddMaster:
+      req.set_type(consensus::ADD_PEER);
+      *peer->mutable_last_known_addr() = HostPortToPB(hp);
+      // Adding the new master as a NON_VOTER that'll be promoted to VOTER once the tablet
+      // copy is complete and is sufficiently caught up.
+      peer->set_member_type(RaftPeerPB::NON_VOTER);
+      peer->mutable_attrs()->set_promote(true);
+      break;
+    default:
+      LOG(FATAL) << "Unsupported ChangeConfig operation: " << op;
+  }
+
+  const string op_str = ChangeConfigOpToString(op);
+  LOG(INFO) << Substitute("Initiating ChangeConfig request to $0 master $1: $2",
+                          op_str, hp.ToString(), SecureDebugString(req));
+  auto completion_cb = [op_str, hp, rpc] (const Status& completion_status) {
+    if (completion_status.ok()) {
+      LOG(INFO) << Substitute("Successfully completed master ChangeConfig request to $0 master $1",
+                              op_str, hp.ToString());
+      rpc->RespondSuccess();
+    } else {
+      LOG(WARNING) << Substitute("ChangeConfig request failed to $0 master $1: $2 ",
+                                 op_str, hp.ToString(), completion_status.ToString());
+      rpc->RespondFailure(completion_status);
+    }
+  };
+  boost::optional<TabletServerErrorPB::Code> err_code;
+  RETURN_NOT_OK_PREPEND(
+      consensus->ChangeConfig(req, completion_cb, &err_code),
+      Substitute("Failed initiating master Raft ChangeConfig request, error: $0",
+                 err_code ? TabletServerErrorPB::Code_Name(*err_code) : "unknown"));
+  return Status::OK();
+}
+
+////////////////////////////////////////////////////////////
+// CatalogManager::TSInfosDict
+////////////////////////////////////////////////////////////
+CatalogManager::TSInfosDict::~TSInfosDict() {
+  if (!arena_) {
+    STLDeleteElements(&ts_info_pbs_);
+  }
+}
+
+int CatalogManager::TSInfosDict::LookupOrAdd(const string& uuid,
+                                             const std::function<void(TSInfoPB*)>& creator) {
+  return *ComputePairIfAbsent(&uuid_to_idx_, uuid, [&]() -> pair<StringPiece, int> {
+    auto idx = ts_info_pbs_.size();
+    auto* pb = google::protobuf::Arena::CreateMessage<TSInfoPB>(arena_);
+    ts_info_pbs_.push_back(pb);
+    creator(pb);
+    DCHECK_EQ(pb->permanent_uuid(), uuid);
+    return {pb->permanent_uuid(), idx};
+  });
+}
+
 ////////////////////////////////////////////////////////////
 // CatalogManager::ScopedLeaderSharedLock
 ////////////////////////////////////////////////////////////
@@ -5295,12 +5679,16 @@ CatalogManager::ScopedLeaderSharedLock::ScopedLeaderSharedLock(
       initial_term_(-1) {
 
   // Check if the catalog manager is running.
-  std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
-  if (PREDICT_FALSE(catalog_->state_ != kRunning)) {
-    catalog_status_ = Status::ServiceUnavailable(
-        Substitute("Catalog manager is not initialized. State: $0",
-                   StateToString(catalog_->state_)));
-    return;
+  int64_t leader_ready_term;
+  {
+    std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
+    if (PREDICT_FALSE(catalog_->state_ != kRunning)) {
+      catalog_status_ = Status::ServiceUnavailable(
+          Substitute("Catalog manager is not initialized. State: $0",
+                     StateToString(catalog_->state_)));
+      return;
+    }
+    leader_ready_term = catalog_->leader_ready_term_;
   }
 
   ConsensusStatePB cstate;
@@ -5322,7 +5710,7 @@ CatalogManager::ScopedLeaderSharedLock::ScopedLeaderSharedLock(
                    uuid, SecureShortDebugString(cstate)));
     return;
   }
-  if (PREDICT_FALSE(catalog_->leader_ready_term_ != cstate.current_term() ||
+  if (PREDICT_FALSE(leader_ready_term != initial_term_ ||
                     !leader_shared_lock_.owns_lock())) {
     leader_status_ = Status::ServiceUnavailable(
         "Leader not yet ready to serve requests");
@@ -5377,6 +5765,7 @@ bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrResp
 INITTED_OR_RESPOND(ConnectToMasterResponsePB);
 INITTED_OR_RESPOND(GetMasterRegistrationResponsePB);
 INITTED_OR_RESPOND(TSHeartbeatResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(AddMasterResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(AlterTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(ChangeTServerStateResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(CreateTableResponsePB);

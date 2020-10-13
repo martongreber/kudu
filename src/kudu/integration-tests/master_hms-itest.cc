@@ -33,6 +33,7 @@
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/common/common.pb.h"
 #include "kudu/common/table_util.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/hms/hive_metastore_types.h"
 #include "kudu/hms/hms_client.h"
@@ -42,17 +43,22 @@
 #include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/security/test/mini_kdc.h"
 #include "kudu/thrift/client.h"
+#include "kudu/transactions/txn_system_client.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+using boost::make_optional;
 using boost::none;
+using boost::optional;
 using kudu::client::KuduTable;
 using kudu::client::KuduTableAlterer;
 using kudu::client::sp::shared_ptr;
 using kudu::cluster::ExternalMiniClusterOptions;
 using kudu::hms::HmsClient;
+using kudu::transactions::TxnSystemClient;
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -117,6 +123,12 @@ class MasterHmsTest : public ExternalMiniClusterITestBase {
                         const std::string& old_table_name,
                         const std::string& new_table_name) {
     return harness_.RenameHmsTable(database_name, old_table_name, new_table_name);
+  }
+
+  Status ChangeHmsOwner(const std::string& database_name,
+                        const std::string& table_name,
+                        const std::string& new_table_owner) {
+    return harness_.ChangeHmsOwner(database_name, table_name, new_table_owner);
   }
 
   Status AlterHmsTableDropColumns(const std::string& database_name,
@@ -290,6 +302,27 @@ TEST_F(MasterHmsTest, TestRenameTable) {
   NO_FATALS(CheckTable("db2", "t2", /*user=*/ none));
   NO_FATALS(CheckTableDoesNotExist("db1", "t1"));
   NO_FATALS(CheckTableDoesNotExist("db1", "t2"));
+}
+
+TEST_F(MasterHmsTest, TestAlterTableOwner) {
+  // Create the Kudu table.
+  ASSERT_OK(CreateKuduTable("default", "userTable"));
+  NO_FATALS(CheckTable("default", "userTable", /*user=*/ none));
+
+  // Change the owner through the HMS, and ensure the owner is handled in Kudu.
+  const string user_a = "user_a";
+  ASSERT_OK(ChangeHmsOwner("default", "userTable", user_a));
+  ASSERT_EVENTUALLY([&] {
+    NO_FATALS(CheckTable("default", "userTable", user_a));
+  });
+
+  // Change the owner through Kudu, and ensure the owner is reflected in HMS.
+  const string user_b = "user_b";
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer("default.userTable"));
+  ASSERT_OK(table_alterer->SetOwner(user_b)->Alter());
+  ASSERT_EVENTUALLY([&] {
+    NO_FATALS(CheckTable("default", "userTable", user_b));
+  });
 }
 
 TEST_F(MasterHmsTest, TestAlterTable) {
@@ -527,6 +560,68 @@ TEST_F(MasterHmsTest, TestIgnoreExternalTables) {
   ASSERT_EQ(kManagedTableName, ext.parameters[HmsClient::kKuduTableNameKey]);
 }
 
+TEST_F(MasterHmsTest, TestIgnoreOtherClusterIds) {
+  // Set up a few tables.
+  ASSERT_OK(CreateKuduTable("default", "same"));
+  ASSERT_OK(CreateKuduTable("default", "other"));
+  ASSERT_OK(CreateKuduTable("default", "noid"));
+  shared_ptr<KuduTable> kudu_table;
+  hive::Table hive_table;
+
+  // Alter the cluster id for the `other` table so that it no longer matches the cluster.
+  // This event and any future events should be ignored.
+  ASSERT_OK(harness_.hms_client()->GetTable("default", "other", &hive_table));
+  hive_table.parameters[HmsClient::kKuduClusterIdKey] = "other_cluster_id";
+  ASSERT_OK(harness_.hms_client()->AlterTable("default", "other", hive_table));
+
+  // Remove the cluster id for the `noid` table to represent a table created before
+  // cluster id support was added.
+  ASSERT_OK(harness_.hms_client()->GetTable("default", "noid", &hive_table));
+  EraseKeyReturnValuePtr(&hive_table.parameters, HmsClient::kKuduClusterIdKey);
+  ASSERT_OK(harness_.hms_client()->AlterTable("default", "noid", hive_table));
+
+  // Alter the tables in the HMS, the `same` and `noid` tables should be updated in Kudu.
+  ASSERT_OK(harness_.hms_client()->GetTable("default", "same", &hive_table));
+  hive_table.tableName = "same1";
+  ASSERT_OK(harness_.hms_client()->AlterTable("default", "same", hive_table));
+  ASSERT_OK(harness_.hms_client()->GetTable("default", "other", &hive_table));
+  hive_table.tableName = "other1";
+  ASSERT_OK(harness_.hms_client()->AlterTable("default", "other", hive_table));
+  ASSERT_OK(harness_.hms_client()->GetTable("default", "noid", &hive_table));
+  hive_table.tableName = "noid1";
+  ASSERT_OK(harness_.hms_client()->AlterTable("default", "noid", hive_table));
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(client_->OpenTable("default.same1", &kudu_table));
+    ASSERT_OK(client_->OpenTable("default.other", &kudu_table));
+    ASSERT_OK(client_->OpenTable("default.noid1", &kudu_table));
+    Status s = client_->OpenTable("default.other1", &kudu_table);
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+  });
+
+  // Alter the tables back.
+  ASSERT_OK(harness_.hms_client()->GetTable("default", "same1", &hive_table));
+  hive_table.tableName = "same";
+  ASSERT_OK(harness_.hms_client()->AlterTable("default", "same1", hive_table));
+  ASSERT_OK(harness_.hms_client()->GetTable("default", "other1", &hive_table));
+  hive_table.tableName = "other";
+  ASSERT_OK(harness_.hms_client()->AlterTable("default", "other1", hive_table));
+  ASSERT_OK(harness_.hms_client()->GetTable("default", "noid1", &hive_table));
+  hive_table.tableName = "noid";
+  ASSERT_OK(harness_.hms_client()->AlterTable("default", "noid1", hive_table));
+
+  // Drop the tables in the HMS, the `same` and `noid` tables should be dropped in Kudu.
+  ASSERT_OK(harness_.hms_client()->DropTable("default", "same"));
+  ASSERT_OK(harness_.hms_client()->DropTable("default", "other"));
+  ASSERT_OK(harness_.hms_client()->DropTable("default", "noid"));
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(client_->OpenTable("default.other", &kudu_table));
+    Status s = client_->OpenTable("default.same", &kudu_table);
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+    s = client_->OpenTable("default.noid", &kudu_table);
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+  });
+}
+
 TEST_F(MasterHmsTest, TestUppercaseIdentifiers) {
   ASSERT_OK(CreateKuduTable("default", "MyTable"));
   NO_FATALS(CheckTable("default", "MyTable", /*user=*/none));
@@ -577,6 +672,27 @@ TEST_F(MasterHmsTest, TestUppercaseIdentifiers) {
   ASSERT_OK(client_->DeleteTable("DEFAULT.abc"));
   NO_FATALS(CheckTableDoesNotExist("default", "AbC"));
   NO_FATALS(CheckTableDoesNotExist("default", "abc"));
+}
+
+// Test that we can create a transaction status table that doesn't get
+// synchronized to the HMS.
+TEST_F(MasterHmsTest, TestTransactionStatusTableDoesntSync) {
+  // Create a transaction status table.
+  vector<string> master_addrs;
+  for (const auto& hp : cluster_->master_rpc_addrs()) {
+    master_addrs.emplace_back(hp.ToString());
+  }
+  unique_ptr<TxnSystemClient> txn_sys_client;
+  ASSERT_OK(TxnSystemClient::Create(master_addrs, &txn_sys_client));
+  ASSERT_OK(txn_sys_client->CreateTxnStatusTable(100));
+
+  // We shouldn't see the table in the HMS catalog.
+  vector<string> tables;
+  ASSERT_OK(harness_.hms_client()->GetTableNames("kudu_system", &tables));
+  ASSERT_TRUE(tables.empty());
+
+  // We should still be able to add partitions.
+  ASSERT_OK(txn_sys_client->AddTxnStatusTableRange(100, 200));
 }
 
 class MasterHmsUpgradeTest : public MasterHmsTest {

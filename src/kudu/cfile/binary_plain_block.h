@@ -41,6 +41,7 @@
 #include "kudu/cfile/block_encodings.h"
 #include "kudu/common/rowid.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
@@ -53,22 +54,19 @@ class SelectionVectorView;
 
 namespace cfile {
 
+class BlockHandle;
 struct WriterOptions;
 
 class BinaryPlainBlockBuilder final : public BlockBuilder {
  public:
   explicit BinaryPlainBlockBuilder(const WriterOptions *options);
+  virtual ~BinaryPlainBlockBuilder();
 
   bool IsBlockFull() const override;
 
   int Add(const uint8_t *vals, size_t count) OVERRIDE;
 
-  // Return a Slice which represents the encoded data.
-  //
-  // This Slice points to internal data of this class
-  // and becomes invalid after the builder is destroyed
-  // or after Finish() is called again.
-  Slice Finish(rowid_t ordinal_pos) OVERRIDE;
+  void Finish(rowid_t ordinal_pos, std::vector<Slice>* slices) override;
 
   void Reset() OVERRIDE;
 
@@ -87,7 +85,7 @@ class BinaryPlainBlockBuilder final : public BlockBuilder {
   Status GetLastKey(void* key) const OVERRIDE;
 
   // Length of a header.
-  static const size_t kMaxHeaderSize = sizeof(uint32_t) * 3;
+  static constexpr size_t kHeaderSize = sizeof(uint32_t) * 3;
 
  private:
   faststring buffer_;
@@ -106,7 +104,8 @@ class BinaryPlainBlockBuilder final : public BlockBuilder {
 
 class BinaryPlainBlockDecoder final : public BlockDecoder {
  public:
-  explicit BinaryPlainBlockDecoder(Slice slice);
+  explicit BinaryPlainBlockDecoder(scoped_refptr<BlockHandle> block);
+  virtual ~BinaryPlainBlockDecoder();
 
   virtual Status ParseHeader() OVERRIDE;
   virtual void SeekToPositionInBlock(uint pos) OVERRIDE;
@@ -143,6 +142,10 @@ class BinaryPlainBlockDecoder final : public BlockDecoder {
     return Slice(&data_[str_offset], len);
   }
 
+  const scoped_refptr<BlockHandle>& block_handle() {
+    return block_;
+  }
+
   // Minimum length of a header.
   static const size_t kMinHeaderSize = sizeof(uint32_t) * 3;
 
@@ -164,6 +167,7 @@ class BinaryPlainBlockDecoder final : public BlockDecoder {
     return ret;
   }
 
+  scoped_refptr<BlockHandle> block_;
   Slice data_;
   bool parsed_;
 

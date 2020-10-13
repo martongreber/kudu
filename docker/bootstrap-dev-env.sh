@@ -63,12 +63,22 @@ if [[ -f "/usr/bin/yum" ]]; then
     which \
     wget
 
+  # Get the major version for version specific package logic below.
+  OS_MAJOR_VERSION=$(lsb_release -rs | cut -f1 -d.)
+
   # Install exta impala packages for the impala images. They are nominal in size.
   # --no-install-recommends keeps the install smaller
   yum install -y \
     libffi-devel \
     lzo-devel \
     tzdata
+
+  # We need to enable the PowerTools repository on versions 8.0 and newer
+  # to install the ninja-build package.
+  if [[ "$OS_MAJOR_VERSION" -gt "7" ]]; then
+    yum install -y 'dnf-command(config-manager)'
+    yum config-manager --set-enabled PowerTools
+  fi
 
   # Install libraries often used for Kudu development and build performance.
   yum install -y epel-release
@@ -89,14 +99,11 @@ if [[ -f "/usr/bin/yum" ]]; then
 
   # To build on a version older than 7.0, the Red Hat Developer Toolset
   # must be installed (in order to have access to a C++11 capable compiler).
-  OS_MAJOR_VERSION=$(lsb_release -rs | cut -f1 -d.)
   if [[ "$OS_MAJOR_VERSION" -lt "7" ]]; then
-    DTLS_RPM=rhscl-devtoolset-3-epel-6-x86_64-1-2.noarch.rpm
-    DTLS_RPM_URL=https://www.softwarecollections.org/repos/rhscl/devtoolset-3/epel-6-x86_64/noarch/${DTLS_RPM}
-    wget ${DTLS_RPM_URL} -O ${DTLS_RPM}
-    yum install -y scl-utils ${DTLS_RPM}
+    DTLS_REPO_URL=https://copr.fedorainfracloud.org/coprs/rhscl/devtoolset-3/repo/epel-6/rhscl-devtoolset-3-epel-6.repo
+    yum install -y scl-utils yum-utils
+    yum-config-manager --add-repo=${DTLS_REPO_URL}
     yum install -y devtoolset-3-toolchain
-    rm -f $DTLS_RPM
   fi
 
   # Reduce the image size by cleaning up after the install.

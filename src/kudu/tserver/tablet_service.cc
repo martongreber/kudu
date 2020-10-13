@@ -23,7 +23,6 @@
 #include <cstring>
 #include <functional>
 #include <memory>
-#include <numeric>
 #include <ostream>
 #include <string>
 #include <type_traits>
@@ -31,6 +30,7 @@
 #include <vector>
 
 #include <boost/optional/optional.hpp>
+#include <boost/type_traits/decay.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -45,6 +45,7 @@
 #include "kudu/common/key_range.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
@@ -76,14 +77,16 @@
 #include "kudu/tablet/compaction.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/ops/alter_schema_op.h"
+#include "kudu/tablet/ops/op.h"
+#include "kudu/tablet/ops/write_op.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_replica.h"
-#include "kudu/tablet/transactions/alter_schema_transaction.h"
-#include "kudu/tablet/transactions/transaction.h"
-#include "kudu/tablet/transactions/write_transaction.h"
+#include "kudu/tablet/txn_coordinator.h"
+#include "kudu/transactions/transactions.pb.h"
 #include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_replica_lookup.h"
 #include "kudu/tserver/tablet_server.h"
@@ -91,8 +94,6 @@
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/tserver/tserver_service.pb.h"
-#include "kudu/util/auto_release_pool.h"
-#include "kudu/util/bitset.h"
 #include "kudu/util/crc.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/faststring.h"
@@ -104,9 +105,11 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/process_memory.h"
+#include "kudu/util/random_util.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/threadpool.h"
 #include "kudu/util/trace.h"
 #include "kudu/util/trace_metrics.h"
 
@@ -134,7 +137,7 @@ TAG_FLAG(scanner_allow_snapshot_scans_with_logical_timestamps, unsafe);
 
 DEFINE_int32(scanner_max_wait_ms, 1000,
              "The maximum amount of time (in milliseconds) we'll hang a scanner thread waiting for "
-             "safe time to advance or transactions to commit, even if its deadline allows waiting "
+             "safe time to advance or ops to commit, even if its deadline allows waiting "
              "longer.");
 TAG_FLAG(scanner_max_wait_ms, advanced);
 
@@ -150,6 +153,12 @@ DEFINE_bool(scanner_inject_service_unavailable_on_continue_scan, false,
            "any Scan continuation RPC call. Used for tests.");
 TAG_FLAG(scanner_inject_service_unavailable_on_continue_scan, unsafe);
 
+DEFINE_bool(scanner_unregister_on_invalid_seq_id, true,
+            "If set, an invalid sequence ID will cause a scanner to get unregistered. "
+            "Used for tests.");
+TAG_FLAG(scanner_unregister_on_invalid_seq_id, unsafe);
+
+
 DEFINE_bool(tserver_enforce_access_control, false,
             "If set, the server will apply fine-grained access control rules "
             "to client RPCs.");
@@ -162,6 +171,14 @@ TAG_FLAG(tserver_inject_invalid_authz_token_ratio, hidden);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_int32(memory_limit_warn_threshold_percentage);
 DECLARE_int32(tablet_history_max_age_sec);
+
+METRIC_DEFINE_counter(
+    server,
+    op_apply_queue_overload_rejections,
+    "Number of Rejected Write Requests Due to Queue Overloaded Error",
+    kudu::MetricUnit::kRequests,
+    "Number of rejected write requests due to overloaded op apply queue",
+    kudu::MetricLevel::kWarn);
 
 using google::protobuf::RepeatedPtrField;
 using kudu::consensus::BulkChangeConfigRequestPB;
@@ -196,18 +213,18 @@ using kudu::rpc::RpcSidecar;
 using kudu::security::TokenVerifier;
 using kudu::security::TokenPB;
 using kudu::server::ServerBase;
-using kudu::tablet::AlterSchemaTransactionState;
+using kudu::tablet::AlterSchemaOpState;
 using kudu::tablet::MvccSnapshot;
 using kudu::tablet::TABLET_DATA_COPYING;
 using kudu::tablet::TABLET_DATA_DELETED;
 using kudu::tablet::TABLET_DATA_TOMBSTONED;
 using kudu::tablet::Tablet;
 using kudu::tablet::TabletReplica;
-using kudu::tablet::TransactionCompletionCallback;
+using kudu::tablet::OpCompletionCallback;
 using kudu::tablet::WriteAuthorizationContext;
 using kudu::tablet::WritePrivileges;
 using kudu::tablet::WritePrivilegeType;
-using kudu::tablet::WriteTransactionState;
+using kudu::tablet::WriteOpState;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
@@ -642,19 +659,19 @@ void HandleErrorResponse(const ReqType* req, RespType* resp, RpcContext* context
   }
 }
 
-// A transaction completion callback that responds to the client when transactions
-// complete and sets the client error if there is one to set.
+// A op completion callback that responds to the client when ops complete and
+// sets the client error if there is one to set.
 template<class Response>
-class RpcTransactionCompletionCallback : public TransactionCompletionCallback {
+class RpcOpCompletionCallback : public OpCompletionCallback {
  public:
-  RpcTransactionCompletionCallback(rpc::RpcContext* context,
-                                   Response* response)
-     : context_(context),
-       response_(response) {}
+  RpcOpCompletionCallback(rpc::RpcContext* context,
+                          Response* response)
+      : context_(context),
+        response_(response) {}
 
-  virtual void TransactionCompleted() OVERRIDE {
+  virtual void OpCompleted() OVERRIDE {
     if (!status_.ok()) {
-      LOG(WARNING) << Substitute("failed transaction from $0: $1",
+      LOG(WARNING) << Substitute("failed op from $0: $1",
                                  context_->requestor_string(), status_.ToString());
       SetupErrorAndRespond(get_error(), status_, code_, context_);
     } else {
@@ -669,7 +686,6 @@ class RpcTransactionCompletionCallback : public TransactionCompletionCallback {
 
   rpc::RpcContext* context_;
   Response* response_;
-  tablet::TransactionState* state_;
 };
 
 // Generic interface to handle scan results.
@@ -800,13 +816,15 @@ class RowwiseResultSerializer : public ResultSerializer {
 class ColumnarResultSerializer : public ResultSerializer {
  public:
   static Status Create(uint64_t flags,
+                       int batch_size_bytes,
                        const Schema& scanner_schema,
                        const Schema& client_schema,
                        unique_ptr<ResultSerializer>* serializer) {
     if (flags & ~RowFormatFlags::COLUMNAR_LAYOUT) {
       return Status::InvalidArgument("Row format flags not supported with columnar layout");
     }
-    serializer->reset(new ColumnarResultSerializer(scanner_schema, client_schema));
+    serializer->reset(new ColumnarResultSerializer(
+        scanner_schema, client_schema, batch_size_bytes));
     return Status::OK();
   }
 
@@ -863,8 +881,9 @@ class ColumnarResultSerializer : public ResultSerializer {
 
  private:
   ColumnarResultSerializer(const Schema& scanner_schema,
-                           const Schema& client_schema)
-      : results_(scanner_schema, client_schema) {
+                           const Schema& client_schema,
+                           int batch_size_bytes)
+      : results_(scanner_schema, client_schema, batch_size_bytes) {
   }
 
   int64_t num_rows_ = 0;
@@ -919,7 +938,7 @@ class ScanResultCopier : public ScanResultCollector {
     }
     if (row_format_flags & COLUMNAR_LAYOUT) {
       return ColumnarResultSerializer::Create(
-          row_format_flags, scanner_schema, client_schema, &serializer_);
+          row_format_flags, batch_size_bytes_, scanner_schema, client_schema, &serializer_);
     }
     serializer_.reset(new RowwiseResultSerializer(batch_size_bytes_, row_format_flags));
     return Status::OK();
@@ -1042,8 +1061,11 @@ static size_t GetMaxBatchSizeBytesHint(const ScanRequestPB* req) {
 }
 
 TabletServiceImpl::TabletServiceImpl(TabletServer* server)
-  : TabletServerServiceIf(server->metric_entity(), server->result_tracker()),
-    server_(server) {
+    : TabletServerServiceIf(server->metric_entity(), server->result_tracker()),
+      server_(server),
+      rng_(GetRandomSeed32()) {
+  num_op_apply_queue_rejections_ = server_->metric_entity()->FindOrCreateCounter(
+      &METRIC_op_apply_queue_overload_rejections);
 }
 
 bool TabletServiceImpl::AuthorizeClientOrServiceUser(const google::protobuf::Message* /*req*/,
@@ -1141,15 +1163,14 @@ void TabletServiceAdminImpl::AlterSchema(const AlterSchemaRequestPB* req,
     return;
   }
 
-  unique_ptr<AlterSchemaTransactionState> tx_state(
-    new AlterSchemaTransactionState(replica.get(), req, resp));
+  unique_ptr<AlterSchemaOpState> op_state(
+    new AlterSchemaOpState(replica.get(), req, resp));
 
-  tx_state->set_completion_callback(unique_ptr<TransactionCompletionCallback>(
-      new RpcTransactionCompletionCallback<AlterSchemaResponsePB>(context,
-                                                                  resp)));
+  op_state->set_completion_callback(unique_ptr<OpCompletionCallback>(
+      new RpcOpCompletionCallback<AlterSchemaResponsePB>(context, resp)));
 
   // Submit the alter schema op. The RPC will be responded to asynchronously.
-  Status s = replica->SubmitAlterSchema(std::move(tx_state));
+  Status s = replica->SubmitAlterSchema(std::move(op_state));
   if (PREDICT_FALSE(!s.ok())) {
     SetupErrorAndRespond(resp->mutable_error(), s,
                          TabletServerErrorPB::UNKNOWN_ERROR,
@@ -1158,12 +1179,122 @@ void TabletServiceAdminImpl::AlterSchema(const AlterSchemaRequestPB* req,
   }
 }
 
+namespace {
+// Returns an error if 'op' is missing any required fields, or if it's of an
+// unknown type.
+Status ValidateCoordinatorOpFields(const CoordinatorOpPB& op) {
+  const auto& type = op.type();
+  Status s;
+  switch (type) {
+    case CoordinatorOpPB::REGISTER_PARTICIPANT:
+      if (!op.has_txn_participant_id()) {
+        return Status::InvalidArgument(Substitute("Missing participant id: $0",
+                                                  SecureShortDebugString(op)));
+      }
+      FALLTHROUGH_INTENDED;
+    case CoordinatorOpPB::BEGIN_TXN:
+    case CoordinatorOpPB::BEGIN_COMMIT_TXN:
+    case CoordinatorOpPB::ABORT_TXN:
+    case CoordinatorOpPB::GET_TXN_STATUS:
+      if (!op.has_txn_id()) {
+        return Status::InvalidArgument(Substitute("Missing txn id: $0",
+                                                  SecureShortDebugString(op)));
+      }
+      return Status::OK();
+    default:
+      return Status::InvalidArgument(Substitute("Unknown op type: $0", type));
+  }
+  __builtin_unreachable();
+}
+} // anonymous namespace
+
+void TabletServiceAdminImpl::CoordinateTransaction(const CoordinateTransactionRequestPB* req,
+                                                   CoordinateTransactionResponsePB* resp,
+                                                   rpc::RpcContext* context) {
+  if (PREDICT_FALSE(!req->has_txn_status_tablet_id() ||
+                    !req->has_op())) {
+    Status s = Status::InvalidArgument(
+        Substitute("Missing fields in request: $0", SecureShortDebugString(*req)));
+    SetupErrorAndRespond(resp->mutable_error(), s,
+                         TabletServerErrorPB::UNKNOWN_ERROR,
+                         context);
+    return;
+  }
+  const auto& op = req->op();
+  Status s = ValidateCoordinatorOpFields(op);
+  if (PREDICT_FALSE(!s.ok())) {
+    SetupErrorAndRespond(resp->mutable_error(), s,
+                         TabletServerErrorPB::UNKNOWN_ERROR,
+                         context);
+    return;
+  }
+  scoped_refptr<TabletReplica> replica;
+  if (PREDICT_FALSE(!LookupRunningTabletReplicaOrRespond(server_->tablet_manager(),
+                                                         req->txn_status_tablet_id(),
+                                                         resp, context, &replica))) {
+    return;
+  }
+  tablet::TxnCoordinator* txn_coordinator = replica->txn_coordinator();
+  if (PREDICT_FALSE(!txn_coordinator)) {
+    Status s = Status::InvalidArgument(
+        Substitute("Requested tablet is not a txn coordinator: $0", replica->tablet_id()));
+    SetupErrorAndRespond(resp->mutable_error(), s,
+                         TabletServerErrorPB::UNKNOWN_ERROR,
+                         context);
+    return;
+  }
+  // Catch any replication errors in this 'ts_error' so we can return an
+  // appropriate error to the caller if need be.
+  TabletServerErrorPB ts_error;
+  transactions::TxnStatusEntryPB txn_status;
+  const auto& user = op.user();
+  const auto& txn_id = op.txn_id();
+  int64_t highest_seen_txn_id = -1;
+  switch (op.type()) {
+    case CoordinatorOpPB::BEGIN_TXN:
+      s = txn_coordinator->BeginTransaction(txn_id, user, &highest_seen_txn_id, &ts_error);
+      break;
+    case CoordinatorOpPB::REGISTER_PARTICIPANT:
+      s = txn_coordinator->RegisterParticipant(txn_id, op.txn_participant_id(), user, &ts_error);
+      break;
+    case CoordinatorOpPB::BEGIN_COMMIT_TXN:
+      s = txn_coordinator->BeginCommitTransaction(txn_id, user, &ts_error);
+      break;
+    case CoordinatorOpPB::ABORT_TXN:
+      s = txn_coordinator->AbortTransaction(txn_id, user, &ts_error);
+      break;
+    case CoordinatorOpPB::GET_TXN_STATUS:
+      s = txn_coordinator->GetTransactionStatus(txn_id, user, &txn_status);
+      break;
+    default:
+      s = Status::InvalidArgument(Substitute("Unknown op type: $0", op.type()));
+  }
+  if (ts_error.has_status() && ts_error.status().code() != AppStatusPB::OK) {
+    *resp->mutable_error() = std::move(ts_error);
+    context->RespondNoCache();
+    return;
+  }
+  // From here on out, errors are considered application errors.
+  if (PREDICT_FALSE(!s.ok())) {
+    StatusToPB(s, resp->mutable_op_result()->mutable_op_error());
+  } else if (op.type() == CoordinatorOpPB::GET_TXN_STATUS) {
+    // Populate corresponding field in the response.
+    *(resp->mutable_op_result()->mutable_txn_status()) = std::move(txn_status);
+  }
+  if (op.type() == CoordinatorOpPB::BEGIN_TXN) {
+    DCHECK_GE(highest_seen_txn_id, 0);
+    resp->mutable_op_result()->set_highest_seen_txn_id(highest_seen_txn_id);
+  }
+  context->RespondSuccess();
+}
+
 bool TabletServiceAdminImpl::SupportsFeature(uint32_t feature) const {
   switch (feature) {
     case TabletServerFeatures::COLUMN_PREDICATES:
     case TabletServerFeatures::PAD_UNIXTIME_MICROS_TO_16_BYTES:
     case TabletServerFeatures::QUIESCING:
     case TabletServerFeatures::BLOOM_FILTER_PREDICATE:
+    // TODO(awong): once transactions are useable, add a feature flag.
       return true;
     default:
       return false;
@@ -1221,10 +1352,11 @@ void TabletServiceAdminImpl::CreateTablet(const CreateTabletRequestPB* req,
   Partition partition;
   Partition::FromPB(req->partition(), &partition);
 
-  LOG(INFO) << "Processing CreateTablet for tablet " << req->tablet_id()
-            << " (table=" << req->table_name()
-            << " [id=" << req->table_id() << "]), partition="
-            << partition_schema.PartitionDebugString(partition, schema);
+  LOG(INFO) << Substitute("Processing CreateTablet for tablet $0 ($1table=$2 [id=$3]), "
+                          "partition=$4", req->tablet_id(),
+                          req->has_table_type() ? TableTypePB_Name(req->table_type()) + " ": "",
+                          req->table_name(), req->table_id(),
+                          partition_schema.PartitionDebugString(partition, schema));
   VLOG(1) << "Full request: " << SecureDebugString(*req);
 
   s = server_->tablet_manager()->CreateNewTablet(
@@ -1237,6 +1369,8 @@ void TabletServiceAdminImpl::CreateTablet(const CreateTabletRequestPB* req,
       req->config(),
       req->has_extra_config() ? boost::make_optional(req->extra_config()) : boost::none,
       req->has_dimension_label() ? boost::make_optional(req->dimension_label()) : boost::none,
+      req->has_table_type() && req->table_type() != TableTypePB::DEFAULT_TABLE ?
+          boost::make_optional(req->table_type()) : boost::none,
       nullptr);
   if (PREDICT_FALSE(!s.ok())) {
     TabletServerErrorPB::Code code;
@@ -1325,14 +1459,14 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
       // If we know there are no write-related privileges outright, we can
       // short-circuit further checking and reject the request immediately.
       // Otherwise, we'll defer the checking to the prepare phase of the
-      // transaction after decoding the operations.
+      // op after decoding the operations.
       LOG(WARNING) << Substitute("rejecting Write request from $0: no write privileges",
                                  context->requestor_string());
       context->RespondRpcFailure(rpc::ErrorStatusPB::FATAL_UNAUTHORIZED,
           Status::NotAuthorized("not authorized to write"));
       return;
     }
-    authz_context = { privileges, /*requested_op_types=*/{} };
+    authz_context = WriteAuthorizationContext{ privileges, /*requested_op_types=*/{} };
   }
 
   shared_ptr<Tablet> tablet;
@@ -1379,7 +1513,31 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
     return;
   }
 
-  unique_ptr<WriteTransactionState> tx_state(new WriteTransactionState(
+  // If the apply queue is overloaded, the write request might be rejected.
+  // The longer the queue was in overloaded state, the higher the probability
+  // of rejecting the request.
+  MonoDelta queue_otime;
+  MonoDelta threshold;
+  if (server_->tablet_apply_pool()->QueueOverloaded(&queue_otime, &threshold)) {
+    DCHECK(threshold.Initialized());
+    DCHECK_GT(threshold.ToMilliseconds(), 0);
+    auto overload_threshold_ms = threshold.ToMilliseconds();
+    // The longer the queue has been in the overloaded state, the higher the
+    // probability of an op to be rejected.
+    auto time_factor = queue_otime.ToMilliseconds() / overload_threshold_ms + 1;
+    if (!rng_.OneIn(time_factor * time_factor + 1)) {
+      static const Status kStatus = Status::ServiceUnavailable(
+          "op apply queue is overloaded");
+      num_op_apply_queue_rejections_->Increment();
+      SetupErrorAndRespond(resp->mutable_error(),
+                           kStatus,
+                           TabletServerErrorPB::THROTTLED,
+                           context);
+      return;
+    }
+  }
+
+  unique_ptr<WriteOpState> op_state(new WriteOpState(
       replica.get(),
       req,
       context->AreResultsTracked() ? context->request_id() : nullptr,
@@ -1399,12 +1557,11 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
     return;
   }
 
-  tx_state->set_completion_callback(unique_ptr<TransactionCompletionCallback>(
-      new RpcTransactionCompletionCallback<WriteResponsePB>(context,
-                                                            resp)));
+  op_state->set_completion_callback(unique_ptr<OpCompletionCallback>(
+      new RpcOpCompletionCallback<WriteResponsePB>(context, resp)));
 
   // Submit the write. The RPC will be responded to asynchronously.
-  s = replica->SubmitWrite(std::move(tx_state));
+  s = replica->SubmitWrite(std::move(op_state));
 
   // Check that we could submit the write
   if (PREDICT_FALSE(!s.ok())) {
@@ -1810,7 +1967,14 @@ void TabletServiceImpl::ScannerKeepAlive(const ScannerKeepAliveRequestPB *req,
     SetupErrorAndRespond(resp->mutable_error(), s, error_code, context);
     return;
   }
-  scanner->UpdateAccessTime();
+  {
+    // Locking for access has the side effect of updating the access time.
+    // Here we do a trylock -- a failure indicates that there is already another
+    // thread currently accessing the scanner, so that thread will update the
+    // access time upon release of the lock.
+    auto lock = scanner->TryLockForAccess();
+  }
+
   context->RespondSuccess();
 }
 
@@ -2038,8 +2202,8 @@ void TabletServiceImpl::SplitKeyRange(const SplitKeyRangeRequestPB* req,
   // Decode encoded key
   Arena arena(256);
   Schema tablet_schema = replica->tablet_metadata()->schema();
-  unique_ptr<EncodedKey> start;
-  unique_ptr<EncodedKey> stop;
+  EncodedKey* start = nullptr;
+  EncodedKey* stop = nullptr;
   if (req->has_start_primary_key()) {
     s = EncodedKey::DecodeEncodedString(tablet_schema, &arena, req->start_primary_key(), &start);
     if (PREDICT_FALSE(!s.ok())) {
@@ -2113,9 +2277,8 @@ void TabletServiceImpl::SplitKeyRange(const SplitKeyRangeRequestPB* req,
   }
 
   vector<KeyRange> ranges;
-  tablet->SplitKeyRange(start.get(), stop.get(), column_ids,
-                        req->target_chunk_size_bytes(), &ranges);
-  for (auto range : ranges) {
+  tablet->SplitKeyRange(start, stop, column_ids, req->target_chunk_size_bytes(), &ranges);
+  for (const auto& range : ranges) {
     range.ToPB(resp->add_ranges());
   }
 
@@ -2282,8 +2445,8 @@ static Status DecodeEncodedKeyRange(const NewScanRequestPB& scan_pb,
                                     const Schema& tablet_schema,
                                     const SharedScanner& scanner,
                                     ScanSpec* spec) {
-  unique_ptr<EncodedKey> start;
-  unique_ptr<EncodedKey> stop;
+  EncodedKey* start = nullptr;  // Arena allocated.
+  EncodedKey* stop = nullptr;   // Arena allocated.
   if (scan_pb.has_start_primary_key()) {
     RETURN_NOT_OK_PREPEND(EncodedKey::DecodeEncodedString(
                             tablet_schema, scanner->arena(),
@@ -2312,12 +2475,10 @@ static Status DecodeEncodedKeyRange(const NewScanRequestPB& scan_pb,
   }
 
   if (start) {
-    spec->SetLowerBoundKey(start.get());
-    scanner->autorelease_pool()->Add(start.release());
+    spec->SetLowerBoundKey(start);
   }
   if (stop) {
-    spec->SetExclusiveUpperBoundKey(stop.get());
-    scanner->autorelease_pool()->Add(stop.release());
+    spec->SetExclusiveUpperBoundKey(stop);
   }
 
   return Status::OK();
@@ -2351,18 +2512,14 @@ static Status SetupScanSpec(const NewScanRequestPB& scan_pb,
     const void* lower_bound = nullptr;
     const void* upper_bound = nullptr;
     if (pred_pb.has_lower_bound()) {
-      const void* val;
       RETURN_NOT_OK(ExtractPredicateValue(*col, pred_pb.lower_bound(),
                                           scanner->arena(),
-                                          &val));
-      lower_bound = val;
+                                          &lower_bound));
     }
     if (pred_pb.has_inclusive_upper_bound()) {
-      const void* val;
       RETURN_NOT_OK(ExtractPredicateValue(*col, pred_pb.inclusive_upper_bound(),
                                           scanner->arena(),
-                                          &val));
-      upper_bound = val;
+                                          &upper_bound));
     }
 
     auto pred = ColumnPredicate::InclusiveRange(*col, lower_bound, upper_bound, scanner->arena());
@@ -2452,6 +2609,7 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
                                          scan_pb.row_format_flags(),
                                          &scanner);
   TRACE("Created scanner $0 for tablet $1", scanner->id(), scanner->tablet_id());
+  auto scanner_lock = scanner->LockForAccess();
 
   // If we early-exit out of this function, automatically unregister
   // the scanner.
@@ -2496,7 +2654,7 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   }
 
   VLOG(3) << "Before optimizing scan spec: " << spec.ToString(tablet_schema);
-  spec.OptimizeScan(tablet_schema, scanner->arena(), scanner->autorelease_pool(), true);
+  spec.OptimizeScan(tablet_schema, scanner->arena(), true);
   VLOG(3) << "After optimizing scan spec: " << spec.ToString(tablet_schema);
 
   // Missing columns will contain the columns that are not mentioned in the
@@ -2506,12 +2664,6 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   // NOTE: We should build the missing column after optimizing scan which will
   // remove unnecessary predicates.
   vector<ColumnSchema> missing_cols = spec.GetMissingColumns(projection);
-
-  // Store the original projection.
-  {
-    unique_ptr<Schema> orig_projection(new Schema(projection));
-    scanner->set_client_projection_schema(std::move(orig_projection));
-  }
 
   // Build a new projection with the projection columns and the missing columns,
   // annotating each column as a key column appropriately.
@@ -2551,12 +2703,16 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
       CHECK_OK(projection_builder.AddColumn(col, /* is_key= */ false));
     }
   }
+
+  // Store the client's specified projection, prior to adding any missing
+  // columns for predicates, etc.
+  unique_ptr<Schema> client_projection(new Schema(std::move(projection)));
   projection = projection_builder.BuildWithoutIds();
   VLOG(3) << "Scan projection: " << projection.ToString(Schema::BASE_INFO);
 
   s = result_collector->InitSerializer(scan_pb.row_format_flags(),
                                        projection,
-                                       *scanner->client_projection_schema());
+                                       *client_projection);
   if (!s.ok()) {
     *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
     return s;
@@ -2684,7 +2840,7 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     return Status::OK();
   }
 
-  scanner->Init(std::move(iter), std::move(orig_spec));
+  scanner->Init(std::move(iter), std::move(orig_spec), std::move(client_projection));
 
   // Stop the scanner timer because ContinueScanRequest starts its own timer.
   scanner_timer.Stop();
@@ -2703,6 +2859,7 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     // from the first half that is no longer executed in this codepath.
     ScanRequestPB continue_req(*req);
     continue_req.set_scanner_id(scanner->id());
+    scanner_lock.Unlock();
     RETURN_NOT_OK(HandleContinueScanRequest(&continue_req, rpc_context, result_collector,
                                             has_more_results, error_code));
   } else {
@@ -2725,9 +2882,6 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
 
   size_t batch_size_bytes = GetMaxBatchSizeBytesHint(req);
 
-  // TODO(todd): need some kind of concurrency control on these scanner objects
-  // in case multiple RPCs hit the same scanner at the same time. Probably
-  // just a trylock and fail the RPC if it contends.
   SharedScanner scanner;
   TabletServerErrorPB::Code code = TabletServerErrorPB::UNKNOWN_ERROR;
   Status s = server_->scanner_manager()->LookupScanner(req->scanner_id(),
@@ -2744,6 +2898,10 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
     *error_code = code;
     return s;
   }
+  // TODO(todd) consider TryLockForAccess and return ServiceUnavailable in the case that
+  // another thread is already using the scanner? This should be rare in real
+  // circumstances -- only relevant when a client performs some retries on timeout.
+  auto scanner_lock = scanner->LockForAccess();
 
   if (PREDICT_FALSE(FLAGS_scanner_inject_service_unavailable_on_continue_scan)) {
     return Status::ServiceUnavailable("Injecting service unavailable status on Scan due to "
@@ -2765,6 +2923,9 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
 
   if (req->call_seq_id() != scanner->call_seq_id()) {
     *error_code = TabletServerErrorPB::INVALID_SCAN_CALL_SEQ_ID;
+    if (!FLAGS_scanner_unregister_on_invalid_seq_id) {
+      unreg_scanner.Cancel();
+    }
     return Status::InvalidArgument("Invalid call sequence ID in scan request");
   }
   scanner->IncrementCallSeqId();
@@ -2783,9 +2944,8 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
   // TODO(todd): could size the RowBlock based on the user's requested batch size?
   // If people had really large indirect objects, we would currently overshoot
   // their requested batch size by a lot.
-  Arena arena(32 * 1024);
-  RowBlock block(&iter->schema(),
-                 FLAGS_scanner_batch_size_rows, &arena);
+  RowBlockMemory mem(32 * 1024);
+  RowBlock block(&iter->schema(), FLAGS_scanner_batch_size_rows, &mem);
 
   // TODO(todd): in the future, use the client timeout to set a budget. For now,
   // just use a half second, which should be plenty to amortize call overhead.
@@ -2850,17 +3010,8 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
     return s;
   }
 
-  // Calculate the number of rows/cells/bytes actually processed. Here we have to dig
-  // into the per-column iterator stats, sum them up, and then subtract out the
-  // total that we already reported in a previous scan.
-  vector<IteratorStats> stats_by_col;
-  scanner->GetIteratorStats(&stats_by_col);
-  IteratorStats total_stats = std::accumulate(stats_by_col.begin(),
-                                              stats_by_col.end(),
-                                              IteratorStats());
-
-  IteratorStats delta_stats = total_stats - scanner->already_reported_stats();
-  scanner->set_already_reported_stats(total_stats);
+  // Calculate the number of rows/cells/bytes actually processed.
+  IteratorStats delta_stats = scanner->UpdateStatsAndGetDelta();
   TRACE_COUNTER_INCREMENT(SCANNER_BYTES_READ_METRIC_NAME, delta_stats.bytes_read);
 
   // Update metrics based on this scan request.
@@ -2878,6 +3029,7 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
     tablet->metrics()->scanner_rows_scanned->IncrementBy(rows_scanned);
     tablet->metrics()->scanner_cells_scanned_from_disk->IncrementBy(delta_stats.cells_read);
     tablet->metrics()->scanner_bytes_scanned_from_disk->IncrementBy(delta_stats.bytes_read);
+    tablet->metrics()->scanner_predicates_disabled->IncrementBy(delta_stats.predicates_disabled);
 
     // Last read timestamp.
     tablet->UpdateLastReadTime();
@@ -2957,7 +3109,7 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   if (PREDICT_TRUE(s.ok())) {
     // Wait for the in-flights in the snapshot to be finished.
     TRACE("Waiting for operations to commit");
-    s = tablet->mvcc_manager()->WaitForSnapshotWithAllCommitted(
+    s = tablet->mvcc_manager()->WaitForSnapshotWithAllApplied(
           tmp_snap_timestamp, &snap, client_deadline);
   }
 

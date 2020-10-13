@@ -154,10 +154,10 @@ to access the cluster.
 [[fine_grained_authz]]
 == Fine-Grained Authorization
 
-As of Kudu 1.10.0, Kudu can be configured to enforce fine-grained authorization
+As of Kudu 1.12.0, Kudu can be configured to enforce fine-grained authorization
 across servers. This ensures that users can see only the data they are
-explicitly authorized to see. Kudu currently supports this by leveraging
-policies defined in Apache Sentry 2.2 and later.
+explicitly authorized to see. Kudu supports this by leveraging policies defined
+in Apache Ranger 2.1 and later.
 
 WARNING: Fine-grained authorization policies are not enforced when accessing
 the web UI. User data may appear on various pages of the web UI (e.g. in logs,
@@ -165,27 +165,31 @@ metrics, scans, etc.). As such, it is recommended to either limit access to the
 web UI ports, or redact or disable the web UI entirely, as desired. See the
 <<web-ui,instructions for securing the web UI>> for more details.
 
-=== Apache Sentry
+=== Apache Ranger
 
-Apache Sentry models tabular objects in the following hierarchy:
+Apache Ranger models tabular objects stored in a Kudu cluster in the following
+hierarchy:
 
-* *Server* - indicated by the Kudu configuration flag `--server_name`.
-Everything stored in a Kudu cluster falls within the given "server".
+NOTE: Ranger allows you to add separate service repositories to manage privileges
+for different Kudu clusters. Depending on the value of the `ranger.plugin.kudu.service.name`
+configuration in Ranger client, Kudu knows which service repository to connect
+to. For more details about Ranger service repository, see the Apache Ranger
+link:https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=57901344[documentation].
 
-* *Database* - indicated as a prefix of table names with the format
-`<database>.<table>`.
+* *Database* - Kudu does not have the concept of a database. Therefore, a database
+is indicated as a prefix of table names with the format `<database>.<table>`.
+Since Kudu's only restriction on table names is that they be valid UTF-8 encoded
+strings, Kudu considers special characters to be valid parts of database or table
+names. For example, if a managed Kudu table created from Impala (see Kudu Impala
+integration <<kudu_impala_integration.adoc#managed_tables,documentation>>) is named
+`impala::bar.foo`, its database will be `impala::bar`.
 
 * *Table* - a single Kudu table.
 
 * *Column* - a column within a Kudu table.
 
-Each level of this hierarchy defines a "scope" on which privileges can be
-granted. Privileges granted on a higher scope imply privileges on a lower
-scope. For example, if a user has `SELECT` privilege on a database, that user
-implicitly has `SELECT` privileges on every table belonging to that database.
-
-Privileges are also associated with specific actions. Access to Kudu tables may
-rely on privileges on the following actions:
+In Ranger, privileges are also associated with specific actions. Access to Kudu
+tables may rely on privileges on the following actions:
 
 * `ALTER`
 * `CREATE`
@@ -195,44 +199,70 @@ rely on privileges on the following actions:
 * `UPDATE`
 * `SELECT`
 
-Additionally, there are three special actions recognized by Kudu: `ALL`,
-`OWNER`, and `METADATA`. If a user has the `ALL` or `OWNER` privileges on a
-given table, that user has all of the above privileges on the table.
-`METADATA` privilege is not an actual privilege per se, rather, it is a
-conceptual privilege with which Kudu models any privilege. If a user has any
-privilege on a given table, that user has `METADATA` privileges on the table,
-i.e. a privilege granted on any action on a table implies that the user has
-the `METADATA` privilege on that table.
+There are two additional access types:
 
-For more details about Sentry privileges, see the Apache Sentry
-link:https://cwiki.apache.org/confluence/display/SENTRY/Sentry+Privileges[documentation].
+* `ALL`
+* `METADATA`
 
-NOTE: Depending on the value of the `sentry.db.explicit.grants.permitted`
-configuration in Sentry, certain privileges may not be grantable in Sentry. For
-example, in Sentry deployments that don't support `UPDATE` privileges, to
-perform an operation that requires `UPDATE` privileges, a user must instead
-have `ALL` privileges.
+If a user has the `ALL` privilege on a resource, they implicitly have privileges
+to perform any action on that resource (except those that require users to be a
+delegated admin, see below). Also, if a user is granted any privilege, they are
+able to perform actions requiring `METADATA` (e.g. opening the table) without
+having to explicitly grant `METADATA` privilege to them.
 
-When a Kudu master receives a request, it consults Sentry to determine what
-privileges a user has. If the user is not authorized to perform the requested
-action, the request is rejected. Kudu leverages the authenticated identity of a
-user to decide whether to perform or reject a request.
+Finally, Ranger supports a `delegate admin` flag which is independent of the
+action types (it's not implied by `ALL` and doesn't imply `METADATA`). This is
+similar to the `GRANT OPTION` part of `ALL WITH GRANT OPTION` in SQL as it is
+required to modify privileges in Ranger and change the owner of a Kudu table.
+
+WARNING: A user with the `delegate admin` privilege on a resource can grant any
+privilege to themselves and others.
+
+While the action types are hierarchical, in terms of privilege evaluation,
+Ranger doesn't have the concept of hierarchy. For instance, if a user has
+`SELECT` privilege on a database, it does not imply that the user has `SELECT`
+privileges on every table belonging to that database. On the other hand, Ranger
+supports privilege wildcard matching. For example, `db=a->table=\*` matches all
+the tables that belong to database `a`. Therefore, in Ranger users actually need
+the `SELECT` privilege granted on `db=a->table=*->column=*` to allow `SELECT` on
+every table and every column in database `a`.
+
+Nevertheless, with Ranger integration, when a Kudu master receives a request,
+it consults Ranger to determine what privileges a user has. And the required
+policies documented in the <<security.adoc#policy-for-kudu-masters, policy section>>
+are enforced to determine whether the user is authorized to perform the requested
+action or not.
+
+NOTE: Even though Kudu table names remain case sensitive with Ranger integration,
+policy authorization is considered case-insensitive.
+
+In addition to granting privileges to a user by username, privileges can also be
+granted to table owners using the special `{OWNER}` username. These policies are
+evaluated only when a user tries to perform an action on a table that they own.
+For example, a policy can be defined for the `{OWNER}` user and `db=*->table=*`
+resource, and it will automatically be applied when any table is accessed by its
+owner. This way administrators don't need to choose between creating policies
+one by one for each table, and granting access to a wide range of users.
+
+WARNING: If a user has `ALL` and `delegate admin` privileges on a table only via
+ownership and no privileges by username, they can effectively lock themselves
+out by giving away ownership.
 
 === Authorization Tokens
 
-Rather than having every tablet server communicate directly with Sentry,
-privileges are propagated and checked via *authorization tokens*. These tokens
-encapsulate what privileges a user has on a given table. Tokens are generated
-by the master and returned to Kudu clients upon opening a Kudu table. Kudu
-clients automatically attach authorization tokens when sending requests to
-tablet servers.
+Rather than having every tablet server communicate directly with the underlying
+authorization service (Ranger), privileges are propagated and checked via
+*authorization tokens*. These tokens encapsulate what privileges a user has on a
+given table. Tokens are generated by the master and returned to Kudu clients
+upon opening a Kudu table. Kudu clients automatically attach authorization
+tokens when sending requests to tablet servers.
 
 NOTE: Authorization tokens are a means to limiting the number of nodes directly
-accessing Sentry to retrieve privileges. As such, since the expected number of
-tablet servers in a cluster is much higher than the number of Kudu masters,
-they are only used to authorize requests sent to tablet servers. Kudu masters
-fetch privileges directly from Sentry or cache. See <<privilege-caching>> for
-more details of Kudu's privilege cache.
+accessing the authorization service to retrieve privileges. As such, since the
+expected number of tablet servers in a cluster is much higher than the number of
+Kudu masters, they are only used to authorize requests sent to tablet servers.
+Kudu masters fetch privileges directly from the authorization service or cache.
+See <<privilege-caching>> for more details of Kudu's privilege cache.
 
 Similar to the validity interval for authentication tokens, to limit the
 window of potential unwanted access if a token becomes compromised,
@@ -251,14 +281,14 @@ operation, or if it is invalid (e.g. expired).
 It may be desirable to allow certain users to view and modify any data stored
 in Kudu. Such users can be specified via the `--trusted_user_acl` master
 configuration. Trusted users can perform any operation that would otherwise
-require fine-grained privileges, without Kudu consulting Sentry.
+require fine-grained privileges, without Kudu consulting the authorization service.
 
 Additionally, some services that interact with Kudu may authorize requests on
 behalf of their end users. For example, Apache Impala authorizes queries on
 behalf of its users, and sends requests to Kudu as the Impala service user,
 commonly "impala". Since Impala authorizes requests on its own, to avoid
-extraneous communication between Sentry and Kudu, the Impala service user
-should be listed as a trusted user.
+extraneous communication between the authorization service and Kudu, the
+Impala service user should be listed as a trusted user.
 
 NOTE: When accessing Kudu through Impala, Impala enforces its own fine-grained
 authorization policy. This policy is similar to Kudu's and can be found in
@@ -266,74 +296,138 @@ Impala's
 link:https://impala.apache.org/docs/build/html/topics/impala_authorization.html#authorization[authorization
 documentation].
 
-[[sentry-configuration]]
-=== Configuring the Integration with Apache Sentry
+[[ranger-configuration]]
+=== Configuring the Integration with Apache Ranger
 
-NOTE: Sentry is often configured with Kerberos authentication. See
+NOTE: Ranger is often configured with Kerberos authentication. See
 <<configuration>> for how to configure Kudu to authenticate via Kerberos.
 
-NOTE: In order to enable integration with Sentry, a cluster must first be
-integrated with the Apache Hive Metastore. See the
-<<hive_metastore.adoc#enabling-the-hive-metastore-integration,documentation>>
-for how to configure Kudu to synchronize its internal catalog with the Hive
-Metastore.
+* After building Kudu from source, find the `kudu-subprocess.jar` under the build
+directory (e.g. `build/release/bin`). Note its path, as it is the one to the
+JAR file containing the Ranger subprocess, which houses the Ranger client that
+Kudu will use to communicate with the Ranger server.
 
-The following configurations must be set on the master:
+* Use the `kudu table list` tool to find any table names in the cluster that are
+not Ranger-compatible, which are names that begin or end with a period. Also check
+that there are no two table names that only differ by case, since authorization
+is case-insensitive. For those tables that don't comply with the requirements,
+use the `kudu table rename_table` tool to rename the tables.
+
+* Create Ranger client `ranger-kudu-security.xml` configuration file, and note down
+the directory containing this file.
+
+```xml
+<property>
+  <name>ranger.plugin.kudu.policy.cache.dir</name>
+  <value>policycache</value>
+  <description>Directory where Ranger policies are cached after successful retrieval from the Ranger service</description>
+</property>
+<property>
+  <name>ranger.plugin.kudu.service.name</name>
+  <value>kudu</value>
+  <description>Name of the Ranger service repository storing policies for this Kudu cluster</description>
+</property>
+<property>
+  <name>ranger.plugin.kudu.policy.rest.url</name>
+  <value>http://host:port</value>
+  <description>Ranger Admin URL</description>
+</property>
+<property>
+  <name>ranger.plugin.kudu.policy.source.impl</name>
+  <value>org.apache.ranger.admin.client.RangerAdminRESTClient</value>
+  <description>Ranger client implementation to retrieve policies from the Ranger service</description>
+</property>
+<property>
+  <name>ranger.plugin.kudu.policy.rest.ssl.config.file</name>
+  <value>ranger-kudu-policymgr-ssl.xml</value>
+  <description>Path to the file containing SSL details to connect Ranger Admin</description>
+</property>
+<property>
+  <name>ranger.plugin.kudu.policy.pollIntervalMs</name>
+  <value>30000</value>
+  <description>Ranger client policy polling interval</description>
+</property>
+```
+
+* When Secure Socket Layer (SSL) is enabled for Ranger Admin, add `ranger-kudu-policymgr-ssl.xml`
+file to the Ranger client configuration directory with the following configurations:
+
+```xml
+<property>
+  <name>xasecure.policymgr.clientssl.keystore</name>
+  <value>[/path/to/keystore].jks</value>
+  <description>Java keystore files</description>
+</property>
+<property>
+  <name>xasecure.policymgr.clientssl.keystore.credential.file</name>
+  <value>jceks://file/[path/to/credentials].jceks</value>
+  <description>Java keystore credential file</description>
+</property>
+<property>
+  <name>xasecure.policymgr.clientssl.truststore</name>
+  <value>[/path/to/truststore].jks</value>
+  <description>Java truststore file</description>
+</property>
+<property>
+  <name>xasecure.policymgr.clientssl.truststore.credential.file</name>
+  <value>jceks://file/[path/to/credentials].jceks</value>
+  <description>Java truststore credential file</description>
+</property>
+```
+
+* Set the following configurations on the Kudu master:
 
 ```
---sentry_service_rpc_addresses=<Sentry RPC address>
---server_name=<value of HiveServer2's hive.sentry.server configuration>
---kudu_service_name=kudu
---sentry_service_kerberos_principal=sentry
---sentry_service_security_mode=kerberos
+# The path to directory containing Ranger client configuration. This example
+# assumes the path is '/kudu/ranger-config'.
+--ranger_config_path=/kudu/ranger-config
+
+# The path where the Java binary was installed. This example assumes
+# '$JAVA_HOME=/usr/local'
+--ranger_java_path=/usr/local/bin/java
+
+# The path to the JAR file containing the Ranger subprocess. This example
+# assumes '$KUDU_HOME=/kudu'
+--ranger_jar_path=/kudu/build/release/bin/kudu-subprocess.jar
 
 # This example ACL setup allows the 'impala' user to access all data stored in
-# Kudu, assuming Impala will authorize requests on its own. The 'hadoopadmin'
-# user is also granted access to all Kudu data, which may facilitate testing
-# and debugging.
---trusted_user_acl=impala,hadoopadmin
+# Kudu, assuming Impala will authorize requests on its own. The 'kudu' user is
+# also granted access to all Kudu data, which may facilitate testing and
+# debugging (such as running the 'kudu cluster ksck' tool).
+--trusted_user_acl=impala,kudu
 ```
 
-The following configurations must be set on the tablet servers:
+* Set the following configurations on the tablet servers:
 
 ```
 --tserver_enforce_access_control=true
 ```
 
-The following configurations must be set in `sentry-site.xml` on the Sentry servers:
+* Add a Kudu service repository with the following configurations via the Ranger
+Admin web UI:
+
 ```xml
 # This example setup configures the Kudu service user as a privileged user to be
-# able to retrieve authorization policies stored in Sentry.
-<property>
-  <name>sentry.service.allow.connect</name>
-  <value>kudu</value>
-</property>
+# able to retrieve authorization policies stored in Ranger.
 
 <property>
-  <name>sentry.service.admin.group</name>
+  <name>policy.download.auth.users</name>
   <value>kudu</value>
 </property>
 ```
+
 [[privilege-caching]]
-=== Caching
+=== Ranger Client Caching
+On the other hand, privilege cache in Kudu master is disabled with Ranger integration,
+since Ranger provides client side cache the use privileges and can periodically poll
+the privilege store for any changes. When a change is detected, the cache will be
+automatically updated.
 
-To avoid overwhelming Sentry with requests to fetch user privileges, the Kudu
-master can be configured to cache user privileges. A by-product of this caching
-is that when privileges are changed in Sentry, they may not be reflected in
-Kudu for a configurable amount of time, defined by the following Kudu master
-configurations:
+NOTE: Update the `ranger.plugin.kudu.policy.pollIntervalMs` property specified in
+`ranger-kudu-security.xml` to set how often the Ranger client cache refreshes
+the privileges from the Ranger service.
 
-`--sentry_privileges_cache_ttl_factor * --authz_token_validity_interval_secs`
-
-The default value is fifty minutes. If privilege updates need to be reflected
-in Kudu sooner than this, the Kudu CLI tool can be used to invalidate the
-cached privileges to force Kudu to fetch new ones from Sentry:
-
-[source,bash]
-----
-kudu master authz_cache reset <master-addresses>
-----
-
+[[policy-for-kudu-masters]]
 === Policy for Kudu Masters
 
 The following authorization policy is enforced by Kudu masters.
@@ -343,10 +437,12 @@ The following authorization policy is enforced by Kudu masters.
 |===
 | Operation | Required Privilege
 | `CreateTable` | `CREATE ON DATABASE`
-| `CreateTable` with a different owner specified than the requesting user | `ALL ON DATABASE` with the Sentry `GRANT OPTION` (see link:https://cwiki.apache.org/confluence/display/SENTRY/Support+Delegated+GRANT+and+REVOKE+in+Hive+and+Impala[here])
+| `CreateTable` with an owner different than the logged in user | `ALL ON
+DATABASE` and `delegate admin`
 | `DeleteTable` | `DROP ON TABLE`
 | `AlterTable` (with no rename) | `ALTER ON TABLE`
 | `AlterTable` (with rename) | `ALL ON TABLE <old-table>` and `CREATE ON DATABASE <new-database>`
+| `AlterTable` (with owner change) | `ALL ON TABLE` and `delegate admin`
 | `IsCreateTableDone` | `METADATA ON TABLE`
 | `IsAlterTableDone` | `METADATA ON TABLE`
 | `ListTables` | `METADATA ON TABLE`
@@ -465,8 +561,8 @@ tablet server) in order to ensure that a Kudu cluster is secure:
 --superuser_acl=hadoopadmin
 ```
 
-See <<sentry-configuration>> to see an example of how to enable fine-grained
-authorization via Apache Sentry.
+See <<ranger-configuration>> to see an example of how to enable fine-grained
+authorization via Apache Ranger.
 
 Further information about these flags can be found in the configuration
 flag reference.

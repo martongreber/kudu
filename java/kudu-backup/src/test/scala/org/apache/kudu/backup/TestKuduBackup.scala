@@ -39,7 +39,11 @@ import org.apache.kudu.util.HybridTimeUtil
 import org.apache.kudu.util.SchemaGenerator.SchemaGeneratorBuilder
 import org.apache.spark.scheduler.SparkListener
 import org.apache.spark.scheduler.SparkListenerJobEnd
-import org.junit.Assert._
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -300,10 +304,10 @@ class TestKuduBackup extends KuduTestSuite {
     assertTrue(runRestore(createRestoreOptions(Seq(table1Name, table2Name))))
 
     val rdd1 = kuduContext.kuduRDD(ss.sparkContext, s"$table1Name-restore", List("key"))
-    assertResult(numRows)(rdd1.count())
+    assertEquals(numRows, rdd1.count())
 
     val rdd2 = kuduContext.kuduRDD(ss.sparkContext, s"$table2Name-restore", List("key"))
-    assertResult(numRows)(rdd2.count())
+    assertEquals(numRows, rdd2.count())
   }
 
   @Test
@@ -319,9 +323,9 @@ class TestKuduBackup extends KuduTestSuite {
     assertTrue(runBackup(createBackupOptions(tableNames).copy(numParallelBackups = 3)))
     assertTrue(runRestore(createRestoreOptions(tableNames).copy(numParallelRestores = 4)))
 
-    tableNames.map { tableName =>
+    tableNames.foreach { tableName =>
       val rdd = kuduContext.kuduRDD(ss.sparkContext, s"$tableName-restore", List("key"))
-      assertResult(numRows)(rdd.count())
+      assertEquals(numRows, rdd.count())
     }
   }
 
@@ -409,6 +413,16 @@ class TestKuduBackup extends KuduTestSuite {
 
     backupAndValidateTable(tableName, rowCount)
     restoreAndValidateTable(tableName, rowCount)
+  }
+
+  @Test
+  def testBackupAndRestoreNoRestoreOwner(): Unit = {
+    val rowCount = 100
+    insertRows(table, rowCount)
+
+    backupAndValidateTable(tableName, rowCount, false)
+    assertTrue(runRestore(createRestoreOptions(Seq(tableName)).copy(restoreOwner = false)))
+    validateTablesMatch(tableName, s"$tableName-restore", false)
   }
 
   @Test
@@ -744,9 +758,15 @@ class TestKuduBackup extends KuduTestSuite {
     KuduRestore.run(options, ss)
   }
 
-  def validateTablesMatch(tableA: String, tableB: String): Unit = {
+  def validateTablesMatch(tableA: String, tableB: String, ownersMatch: Boolean = true): Unit = {
     val tA = kuduClient.openTable(tableA)
     val tB = kuduClient.openTable(tableB)
+    if (ownersMatch) {
+      assertEquals(tA.getOwner, tB.getOwner)
+    } else {
+      assertNotEquals(tA.getOwner, tB.getOwner)
+    }
+    assertNotEquals("", tA.getOwner);
     assertEquals(tA.getNumReplicas, tB.getNumReplicas)
     assertTrue(schemasMatch(tA.getSchema, tB.getSchema))
     assertTrue(partitionSchemasMatch(tA.getPartitionSchema, tB.getPartitionSchema))

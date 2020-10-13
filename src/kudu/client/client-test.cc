@@ -82,6 +82,7 @@
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/data_gen_util.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
@@ -125,11 +126,13 @@
 DECLARE_bool(allow_unsafe_replication_factor);
 DECLARE_bool(catalog_manager_support_live_row_count);
 DECLARE_bool(catalog_manager_support_on_disk_size);
+DECLARE_bool(client_use_unix_domain_sockets);
 DECLARE_bool(fail_dns_resolution);
 DECLARE_bool(location_mapping_by_uuid);
 DECLARE_bool(log_inject_latency);
 DECLARE_bool(master_support_connect_to_master_rpc);
 DECLARE_bool(mock_table_metrics_for_testing);
+DECLARE_bool(rpc_listen_on_unix_domain_socket);
 DECLARE_bool(rpc_trace_negotiation);
 DECLARE_bool(scanner_inject_service_unavailable_on_continue_scan);
 DECLARE_int32(flush_threshold_mb);
@@ -156,13 +159,14 @@ DECLARE_string(user_acl);
 DEFINE_int32(test_scan_num_rows, 1000, "Number of rows to insert and scan");
 
 METRIC_DECLARE_counter(block_manager_total_bytes_read);
-METRIC_DECLARE_counter(rpcs_queue_overflow);
 METRIC_DECLARE_counter(location_mapping_cache_hits);
 METRIC_DECLARE_counter(location_mapping_cache_queries);
+METRIC_DECLARE_counter(rpc_connections_accepted_unix_domain_socket);
+METRIC_DECLARE_counter(rpcs_queue_overflow);
 METRIC_DECLARE_histogram(handler_latency_kudu_master_MasterService_GetMasterRegistration);
-METRIC_DECLARE_histogram(handler_latency_kudu_master_MasterService_GetTabletLocations);
 METRIC_DECLARE_histogram(handler_latency_kudu_master_MasterService_GetTableLocations);
 METRIC_DECLARE_histogram(handler_latency_kudu_master_MasterService_GetTableSchema);
+METRIC_DECLARE_histogram(handler_latency_kudu_master_MasterService_GetTabletLocations);
 METRIC_DECLARE_histogram(handler_latency_kudu_tserver_TabletServerService_Scan);
 
 using base::subtle::Atomic32;
@@ -173,6 +177,7 @@ using boost::none;
 using google::protobuf::util::MessageDifferencer;
 using kudu::cluster::InternalMiniCluster;
 using kudu::cluster::InternalMiniClusterOptions;
+using kudu::itest::GetClusterId;
 using kudu::master::CatalogManager;
 using kudu::master::GetTableLocationsRequestPB;
 using kudu::master::GetTableLocationsResponsePB;
@@ -324,15 +329,6 @@ class ClientTest : public KuduTest {
     return resp.tablet_locations(0).tablet_id();
   }
 
-  void FlushTablet(const string& tablet_id) {
-    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-      scoped_refptr<TabletReplica> tablet_replica;
-      ASSERT_TRUE(cluster_->mini_tablet_server(i)->server()->tablet_manager()->LookupTablet(
-          tablet_id, &tablet_replica));
-      ASSERT_OK(tablet_replica->tablet()->Flush());
-    }
-  }
-
   void CheckNoRpcOverflow() {
     for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
       MiniTabletServer* server = cluster_->mini_tablet_server(i);
@@ -448,7 +444,7 @@ class ClientTest : public KuduTest {
     KuduScanner scanner(client_table_.get());
     string tablet_id = GetFirstTabletId(client_table_.get());
     // Flush to ensure we scan disk later
-    FlushTablet(tablet_id);
+    ASSERT_OK(cluster_->FlushTablet(tablet_id));
     ASSERT_OK(scanner.SetProjectedColumnNames({ "key" }));
     LOG_TIMING(INFO, "Scanning disk with no predicates") {
       ASSERT_OK(scanner.Open());
@@ -791,6 +787,17 @@ class ClientTest : public KuduTest {
 
 const char *ClientTest::kTableName = "client-testtb";
 const int32_t ClientTest::kNoBound = kint32max;
+
+TEST_F(ClientTest, TestClusterId) {
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  string cluster_id;
+  ASSERT_OK(GetClusterId(cluster_->master_proxy(leader_idx),
+                         MonoDelta::FromSeconds(30),
+                         &cluster_id));
+  ASSERT_TRUE(!cluster_id.empty());
+  ASSERT_EQ(cluster_id, client_->cluster_id());
+}
 
 TEST_F(ClientTest, TestListTables) {
   const char* kTable2Name = "client-testtb2";
@@ -1351,6 +1358,14 @@ TEST_F(ClientTest, TestScanPredicateNonKeyColNotProjected) {
   ASSERT_EQ(nrows, 6);
 }
 
+TEST_F(ClientTest, TestGetKuduTable) {
+  KuduScanner scanner(client_table_.get());
+  shared_ptr<KuduTable> table = scanner.GetKuduTable();
+  ASSERT_EQ(table->name(), client_table_->name());
+  ASSERT_EQ(table->id(), client_table_->id());
+  ASSERT_EQ(table->schema().ToString(), client_table_->schema().ToString());
+}
+
 // Test adding various sorts of invalid binary predicates.
 TEST_F(ClientTest, TestInvalidPredicates) {
   KuduScanner scanner(client_table_.get());
@@ -1548,7 +1563,7 @@ TEST_F(ClientTest, TestScanFaultTolerance) {
       // disk.
       if (with_flush) {
         string tablet_id = GetFirstTabletId(table.get());
-        FlushTablet(tablet_id);
+        ASSERT_OK(cluster_->FlushTablet(tablet_id));
       }
 
       // Test a few different recoverable server-side error conditions.
@@ -5378,6 +5393,37 @@ TEST_F(ClientTest, TestCreateAndAlterTableWithInvalidComment) {
   }
 }
 
+TEST_F(ClientTest, TestAlterTableChangeOwner) {
+  const string kTableName = "table_owner";
+  const string kOriginalOwner = "alice";
+  const string kNewOwner = "bob";
+
+  // Create table
+  KuduSchema schema;
+  KuduSchemaBuilder schema_builder;
+  schema_builder.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+  schema_builder.AddColumn("val")->Type(KuduColumnSchema::INT32);
+  ASSERT_OK(schema_builder.Build(&schema));
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kTableName)
+      .schema(&schema).num_replicas(1).set_range_partition_columns({ "key" })
+      .set_owner(kOriginalOwner).Create());
+  {
+    shared_ptr<KuduTable> table;
+    client_->OpenTable(kTableName, &table);
+    ASSERT_EQ(kOriginalOwner, table->owner());
+  }
+
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  table_alterer->SetOwner(kNewOwner);
+  ASSERT_OK(table_alterer->Alter());
+  {
+    shared_ptr<KuduTable> table;
+    client_->OpenTable(kTableName, &table);
+    ASSERT_EQ(kNewOwner, table->owner());
+  }
+}
+
 enum IntEncoding {
   kPlain,
   kBitShuffle,
@@ -6616,7 +6662,7 @@ TEST_F(ClientTest, TestProjectionPredicatesFuzz) {
     // Leave one row in the tablet's MRS so that the scan includes one rowset
     // without bounds. This affects the behavior of FT scans.
     if (i < kNumRows - 1 && rng.OneIn(2)) {
-      NO_FATALS(FlushTablet(GetFirstTabletId(table.get())));
+      ASSERT_OK(cluster_->FlushTablet(GetFirstTabletId(table.get())));
     }
   }
 
@@ -6644,6 +6690,29 @@ TEST_F(ClientTest, TestProjectionPredicatesFuzz) {
   ASSERT_OK(ScanToStrings(scanner.get(), &rows));
   ASSERT_EQ(unordered_set<string>(expected_rows.begin(), expected_rows.end()),
             unordered_set<string>(rows.begin(), rows.end())) << rows;
+}
+
+class ClientTestUnixSocket : public ClientTest {
+ public:
+  void SetUp() override {
+    FLAGS_rpc_listen_on_unix_domain_socket = true;
+    FLAGS_client_use_unix_domain_sockets = true;
+    ClientTest::SetUp();
+  }
+};
+
+TEST_F(ClientTestUnixSocket, TestConnectViaUnixSocket) {
+  static constexpr int kNumRows = 100;
+  NO_FATALS(InsertTestRows(client_table_.get(), kNumRows));
+  ASSERT_EQ(kNumRows, CountRowsFromClient(client_table_.get()));
+
+  int total_unix_conns = 0;
+  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+    auto counter = METRIC_rpc_connections_accepted_unix_domain_socket.Instantiate(
+        cluster_->mini_tablet_server(0)->server()->metric_entity());
+    total_unix_conns += counter->value();
+  }
+  ASSERT_EQ(1, total_unix_conns);
 }
 
 } // namespace client

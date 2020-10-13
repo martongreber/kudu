@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/util/net/net_util.h"
+
 #include <arpa/inet.h>
-#include <sys/socket.h>
 #include <ifaddrs.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -49,7 +51,6 @@
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/flag_tags.h"
-#include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 #include "kudu/util/scoped_cleanup.h"
@@ -283,7 +284,7 @@ Network::Network(uint32_t addr, uint32_t netmask)
   : addr_(addr), netmask_(netmask) {}
 
 bool Network::WithinNetwork(const Sockaddr& addr) const {
-  return ((addr.addr().sin_addr.s_addr & netmask_) ==
+  return ((addr.ipv4_addr().sin_addr.s_addr & netmask_) ==
           (addr_ & netmask_));
 }
 
@@ -302,7 +303,7 @@ Status Network::ParseCIDRString(const string& addr) {
 
   // Netmask in network byte order
   uint32_t netmask = NetworkByteOrder::FromHost32(~(0xffffffff >> bits));
-  addr_ = sockaddr.addr().sin_addr.s_addr;
+  addr_ = sockaddr.ipv4_addr().sin_addr.s_addr;
   netmask_ = netmask;
   return Status::OK();
 }
@@ -389,7 +390,7 @@ Status GetLocalNetworks(std::vector<Network>* net) {
     if (ifa->ifa_addr->sa_family == AF_INET) {
       Sockaddr addr(*reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr));
       Sockaddr netmask(*reinterpret_cast<struct sockaddr_in*>(ifa->ifa_netmask));
-      Network network(addr.addr().sin_addr.s_addr, netmask.addr().sin_addr.s_addr);
+      Network network(addr.ipv4_addr().sin_addr.s_addr, netmask.ipv4_addr().sin_addr.s_addr);
       net->push_back(network);
     }
   }
@@ -413,8 +414,10 @@ Status GetFQDN(string* hostname) {
     TRACE_EVENT0("net", "getaddrinfo");
     RETURN_NOT_OK(GetAddrInfo(*hostname, hints, op_description, &result));
   }
-
-  *hostname = result->ai_canonname;
+  // On macOS ai_cannonname returns null when FQDN doesn't have domain name (ex .local)
+  if (result->ai_canonname != nullptr) {
+    *hostname = result->ai_canonname;
+  }
   return Status::OK();
 }
 
@@ -448,7 +451,7 @@ Status GetRandomPort(const string& address, uint16_t* port) {
   Sockaddr sockaddr;
   sockaddr.ParseString(address, 0);
   Socket listener;
-  RETURN_NOT_OK(listener.Init(0));
+  RETURN_NOT_OK(listener.Init(sockaddr.family(), 0));
   RETURN_NOT_OK(listener.Bind(sockaddr));
   Sockaddr listen_address;
   RETURN_NOT_OK(listener.GetSocketAddress(&listen_address));

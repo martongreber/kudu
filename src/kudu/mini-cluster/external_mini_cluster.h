@@ -72,10 +72,6 @@ namespace rpc {
 class Messenger;
 } // namespace rpc
 
-namespace sentry {
-class MiniSentry;
-} // namespace sentry
-
 namespace ranger {
 class MiniRanger;
 } // namespace ranger
@@ -133,6 +129,10 @@ struct ExternalMiniClusterOptions {
   //
   // Default: 1.
   int num_masters;
+
+  // Whether to supply 'master_addresses' field for single master configuration.
+  // Default: False
+  bool supply_single_master_addr;
 
   // Number of TS to start.
   //
@@ -193,11 +193,6 @@ struct ExternalMiniClusterOptions {
   //
   // Default: HmsMode::NONE.
   HmsMode hms_mode;
-
-  // If true, set up a Sentry service as part of this ExternalMiniCluster.
-  //
-  // Default: false.
-  bool enable_sentry;
 
   // If true, set up a Ranger service as part of this ExternalMiniCluster.
   //
@@ -290,7 +285,7 @@ class ExternalMiniCluster : public MiniCluster {
   // Same as above but for a master.
   std::string GetBindIpForMaster(int index) const;
 
-  // Same as above but for a external server, e.g. Sentry service or Hive Metastore.
+  // Same as above but for a external server, e.g. Ranger service or Hive Metastore.
   std::string GetBindIpForExternalServer(int index) const;
 
   // Return a pointer to the running leader master. This may be NULL
@@ -353,10 +348,6 @@ class ExternalMiniCluster : public MiniCluster {
 
   hms::MiniHms* hms() const {
     return hms_.get();
-  }
-
-  sentry::MiniSentry* sentry() const {
-    return sentry_.get();
   }
 
   ranger::MiniRanger* ranger() const {
@@ -473,11 +464,12 @@ class ExternalMiniCluster : public MiniCluster {
   // files that reside in the log dir.
   std::string GetLogPath(const std::string& daemon_id) const;
 
+  // Adds a master to the ExternalMiniCluster when the new master has been added
+  // dynamically after bringing up the ExternalMiniCluster.
+  Status AddMaster(const scoped_refptr<ExternalMaster>& master);
+
  private:
   Status StartMasters();
-
-  Status StartSentry();
-  Status StopSentry();
 
   Status DeduceBinRoot(std::string* ret);
   Status HandleOptions();
@@ -495,7 +487,6 @@ class ExternalMiniCluster : public MiniCluster {
 #endif
   std::unique_ptr<MiniKdc> kdc_;
   std::unique_ptr<hms::MiniHms> hms_;
-  std::unique_ptr<sentry::MiniSentry> sentry_;
   std::unique_ptr<ranger::MiniRanger> ranger_;
 
   std::shared_ptr<rpc::Messenger> messenger_;

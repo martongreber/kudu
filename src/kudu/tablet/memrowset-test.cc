@@ -36,6 +36,7 @@
 #include "kudu/common/row.h"
 #include "kudu/common/row_changelist.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/consensus/log_anchor_registry.h"
@@ -125,7 +126,8 @@ class TestMemRowSet : public KuduTest {
                          const string &key, bool *present) {
     RowBuilder rb(&key_schema_);
     rb.AddString(Slice(key));
-    RowSetKeyProbe probe(rb.row());
+    Arena arena(64);
+    RowSetKeyProbe probe(rb.row(), &arena);
     ProbeStats stats;
 
     return mrs.CheckRowPresent(probe, nullptr, present, &stats);
@@ -146,13 +148,13 @@ class TestMemRowSet : public KuduTest {
   }
 
   Status InsertRow(MemRowSet *mrs, const string &key, uint32_t val) {
-    ScopedTransaction tx(&mvcc_, clock_.Now());
+    ScopedOp op(&mvcc_, clock_.Now());
     RowBuilder rb(&schema_);
     rb.AddString(key);
     rb.AddUint32(val);
-    tx.StartApplying();
-    Status s = mrs->Insert(tx.timestamp(), rb.row(), op_id_);
-    tx.Commit();
+    op.StartApplying();
+    Status s = mrs->Insert(op.timestamp(), rb.row(), op_id_);
+    op.FinishApplying();
     return s;
   }
 
@@ -160,8 +162,8 @@ class TestMemRowSet : public KuduTest {
                    const string &key,
                    uint32_t new_val,
                    OperationResultPB* result) {
-    ScopedTransaction tx(&mvcc_, clock_.Now());
-    tx.StartApplying();
+    ScopedOp op(&mvcc_, clock_.Now());
+    op.StartApplying();
 
     mutation_buf_.clear();
     RowChangeListEncoder update(&mutation_buf_);
@@ -169,22 +171,23 @@ class TestMemRowSet : public KuduTest {
 
     RowBuilder rb(&key_schema_);
     rb.AddString(Slice(key));
-    RowSetKeyProbe probe(rb.row());
+    Arena arena(64);
+    RowSetKeyProbe probe(rb.row(), &arena);
     ProbeStats stats;
-    Status s = mrs->MutateRow(tx.timestamp(),
+    Status s = mrs->MutateRow(op.timestamp(),
                               probe,
                               RowChangeList(mutation_buf_),
                               op_id_,
                               nullptr,
                               &stats,
                               result);
-    tx.Commit();
+    op.FinishApplying();
     return s;
   }
 
   Status DeleteRow(MemRowSet *mrs, const string &key, OperationResultPB* result) {
-    ScopedTransaction tx(&mvcc_, clock_.Now());
-    tx.StartApplying();
+    ScopedOp op(&mvcc_, clock_.Now());
+    op.StartApplying();
 
     mutation_buf_.clear();
     RowChangeListEncoder update(&mutation_buf_);
@@ -192,16 +195,17 @@ class TestMemRowSet : public KuduTest {
 
     RowBuilder rb(&key_schema_);
     rb.AddString(Slice(key));
-    RowSetKeyProbe probe(rb.row());
+    Arena arena(64);
+    RowSetKeyProbe probe(rb.row(), &arena);
     ProbeStats stats;
-    Status s = mrs->MutateRow(tx.timestamp(),
+    Status s = mrs->MutateRow(op.timestamp(),
                               probe,
                               RowChangeList(mutation_buf_),
                               op_id_,
                               nullptr,
                               &stats,
                               result);
-    tx.Commit();
+    op.FinishApplying();
     return s;
   }
 
@@ -209,10 +213,11 @@ class TestMemRowSet : public KuduTest {
     unique_ptr<MemRowSet::Iterator> iter(mrs->NewIterator(opts));
     CHECK_OK(iter->Init(nullptr));
 
-    Arena arena(1024);
-    RowBlock block(&schema_, 100, &arena);
+    RowBlockMemory mem(1024);
+    RowBlock block(&schema_, 100, &mem);
     int fetched = 0;
     while (iter->HasNext()) {
+      mem.Reset();
       CHECK_OK(iter->NextBlock(&block));
       fetched += block.selection_vector()->CountSelected();
     }
@@ -307,38 +312,38 @@ TEST_F(TestMemRowSet, TestInsertAndIterateCompoundKey) {
 
   RowBuilder rb(&compound_key_schema);
   {
-    ScopedTransaction tx(&mvcc_, clock_.Now());
-    tx.StartApplying();
+    ScopedOp op(&mvcc_, clock_.Now());
+    op.StartApplying();
     rb.AddString(string("hello world"));
     rb.AddInt32(1);
     rb.AddUint32(12345);
-    Status row1 = mrs->Insert(tx.timestamp(), rb.row(), op_id_);
+    Status row1 = mrs->Insert(op.timestamp(), rb.row(), op_id_);
     ASSERT_OK(row1);
-    tx.Commit();
+    op.FinishApplying();
   }
 
   {
-    ScopedTransaction tx2(&mvcc_, clock_.Now());
-    tx2.StartApplying();
+    ScopedOp op2(&mvcc_, clock_.Now());
+    op2.StartApplying();
     rb.Reset();
     rb.AddString(string("goodbye world"));
     rb.AddInt32(2);
     rb.AddUint32(54321);
-    Status row2 = mrs->Insert(tx2.timestamp(), rb.row(), op_id_);
+    Status row2 = mrs->Insert(op2.timestamp(), rb.row(), op_id_);
     ASSERT_OK(row2);
-    tx2.Commit();
+    op2.FinishApplying();
   }
 
   {
-    ScopedTransaction tx3(&mvcc_, clock_.Now());
-    tx3.StartApplying();
+    ScopedOp op3(&mvcc_, clock_.Now());
+    op3.StartApplying();
     rb.Reset();
     rb.AddString(string("goodbye world"));
     rb.AddInt32(1);
     rb.AddUint32(12345);
-    Status row3 = mrs->Insert(tx3.timestamp(), rb.row(), op_id_);
+    Status row3 = mrs->Insert(op3.timestamp(), rb.row(), op_id_);
     ASSERT_OK(row3);
-    tx3.Commit();
+    op3.FinishApplying();
   }
 
   ASSERT_EQ(3, mrs->entry_count());
@@ -544,22 +549,22 @@ TEST_F(TestMemRowSet, TestInsertionMVCC) {
                               MemTracker::GetRootTracker(), &mrs));
   vector<MvccSnapshot> snapshots;
 
-  // Insert 5 rows in tx 0 through 4
+  // Insert 5 rows in op 0 through 4
   for (uint32_t i = 0; i < 5; i++) {
     {
-      ScopedTransaction tx(&mvcc_, clock_.Now());
-      tx.StartApplying();
+      ScopedOp op(&mvcc_, clock_.Now());
+      op.StartApplying();
       RowBuilder rb(&schema_);
       char keybuf[256];
       rb.Reset();
-      snprintf(keybuf, sizeof(keybuf), "tx%d", i);
+      snprintf(keybuf, sizeof(keybuf), "op%d", i);
       rb.AddString(Slice(keybuf));
       rb.AddUint32(i);
-      ASSERT_OK_FAST(mrs->Insert(tx.timestamp(), rb.row(), op_id_));
-      tx.Commit();
+      ASSERT_OK_FAST(mrs->Insert(op.timestamp(), rb.row(), op_id_));
+      op.FinishApplying();
     }
 
-    // Transaction is committed. Save the snapshot after this commit.
+    // Op is committed. Save the snapshot after this commit.
     snapshots.emplace_back(mvcc_);
   }
   LOG(INFO) << "MemRowSet after inserts:";
@@ -575,7 +580,7 @@ TEST_F(TestMemRowSet, TestInsertionMVCC) {
     vector<string> rows;
     ASSERT_OK(DumpRowSet(*mrs, opts, &rows));
     ASSERT_EQ(1 + i, rows.size());
-    string expected = StringPrintf(R"((string key="tx%d", uint32 val=%d))", i, i);
+    string expected = StringPrintf(R"((string key="op%d", uint32 val=%d))", i, i);
     ASSERT_EQ(expected, rows[i]);
   }
 }
@@ -601,7 +606,7 @@ TEST_F(TestMemRowSet, TestUpdateMVCC) {
     ASSERT_EQ(1, result.mutated_stores_size());
     ASSERT_EQ(0L, result.mutated_stores(0).mrs_id());
 
-    // Transaction is committed. Save the snapshot after this commit.
+    // Op is committed. Save the snapshot after this commit.
     snapshots.emplace_back(mvcc_);
   }
 
@@ -742,7 +747,7 @@ TEST_F(TestMemRowSet, TestScanIncludeDeletedRows) {
 
   RowIteratorOptions opts;
   opts.projection = &schema_;
-  opts.snap_to_include = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
+  opts.snap_to_include = MvccSnapshot::CreateSnapshotIncludingAllOps();
   ASSERT_EQ(4, ScanAndCount(mrs.get(), opts));
 
   opts.include_deleted_rows = true;
@@ -766,7 +771,7 @@ TEST_F(TestMemRowSet, TestScanVirtualColumnIsDeleted) {
 
   RowIteratorOptions opts;
   opts.projection = &projection;
-  opts.snap_to_include = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
+  opts.snap_to_include = MvccSnapshot::CreateSnapshotIncludingAllOps();
   opts.include_deleted_rows = true;
   vector<string> rows;
   ASSERT_OK(DumpRowSet(*mrs, opts, &rows));

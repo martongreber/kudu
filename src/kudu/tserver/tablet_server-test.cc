@@ -73,6 +73,7 @@
 #include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/sysinfo.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
@@ -84,6 +85,7 @@
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/mini_tablet_server.h"
@@ -101,12 +103,12 @@
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/crc.h"
 #include "kudu/util/curl_util.h"
-#include "kudu/util/debug/sanitizer_scopes.h"
 #include "kudu/util/env.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/hdr_histogram.h"
 #include "kudu/util/jsonwriter.h"
 #include "kudu/util/logging_test_util.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
@@ -138,8 +140,11 @@ using kudu::tablet::Tablet;
 using kudu::tablet::TabletReplica;
 using kudu::tablet::TabletStatePB;
 using kudu::tablet::TabletSuperBlockPB;
+using std::endl;
+using std::make_shared;
 using std::map;
 using std::pair;
+using std::ostringstream;
 using std::set;
 using std::shared_ptr;
 using std::string;
@@ -165,25 +170,35 @@ DECLARE_bool(enable_flush_deltamemstores);
 DECLARE_bool(enable_flush_memrowset);
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_bool(enable_rowset_compaction);
+DECLARE_bool(enable_workload_score_for_perf_improvement_ops);
 DECLARE_bool(fail_dns_resolution);
 DECLARE_bool(rowset_metadata_store_keys);
+DECLARE_bool(scanner_unregister_on_invalid_seq_id);
 DECLARE_double(cfile_inject_corruption);
 DECLARE_double(env_inject_eio);
 DECLARE_double(env_inject_full);
+DECLARE_double(tablet_inject_kudu_2233);
+DECLARE_double(workload_score_upper_bound);
 DECLARE_int32(flush_threshold_mb);
 DECLARE_int32(flush_threshold_secs);
 DECLARE_int32(fs_data_dirs_available_space_cache_seconds);
 DECLARE_int32(fs_target_data_dirs_per_tablet);
+DECLARE_int32(maintenance_manager_inject_latency_ms);
 DECLARE_int32(maintenance_manager_num_threads);
 DECLARE_int32(maintenance_manager_polling_interval_ms);
 DECLARE_int32(memory_pressure_percentage);
 DECLARE_int32(metrics_retirement_age_ms);
+DECLARE_int32(rpc_service_queue_length);
 DECLARE_int32(scanner_batch_size_rows);
 DECLARE_int32(scanner_gc_check_interval_us);
 DECLARE_int32(scanner_ttl_ms);
+DECLARE_int32(tablet_inject_latency_on_apply_write_op_ms);
+DECLARE_int32(workload_stats_rate_collection_min_interval_ms);
+DECLARE_int32(workload_stats_metric_collection_interval_ms);
 DECLARE_string(block_manager);
 DECLARE_string(env_inject_eio_globs);
 DECLARE_string(env_inject_full_globs);
+DECLARE_uint32(tablet_apply_pool_overload_threshold_ms);
 
 // Declare these metrics prototypes for simpler unit testing of their behavior.
 METRIC_DECLARE_counter(block_manager_total_bytes_read);
@@ -191,6 +206,8 @@ METRIC_DECLARE_counter(log_block_manager_holes_punched);
 METRIC_DECLARE_counter(rows_inserted);
 METRIC_DECLARE_counter(rows_updated);
 METRIC_DECLARE_counter(rows_deleted);
+METRIC_DECLARE_counter(rpcs_queue_overflow);
+METRIC_DECLARE_counter(rpcs_timed_out_in_queue);
 METRIC_DECLARE_counter(scanners_expired);
 METRIC_DECLARE_gauge_uint64(log_block_manager_blocks_under_management);
 METRIC_DECLARE_gauge_uint64(log_block_manager_containers);
@@ -198,6 +215,9 @@ METRIC_DECLARE_gauge_size(active_scanners);
 METRIC_DECLARE_gauge_size(tablet_active_scanners);
 METRIC_DECLARE_gauge_size(num_rowsets_on_disk);
 METRIC_DECLARE_histogram(flush_dms_duration);
+METRIC_DECLARE_histogram(op_apply_queue_length);
+METRIC_DECLARE_histogram(op_apply_queue_time);
+
 
 namespace kudu {
 
@@ -659,6 +679,19 @@ TEST_F(TabletServerTest, TestTombstonedTabletOnWebUI) {
   ASSERT_STR_NOT_CONTAINS(s, mini_server_->bound_rpc_addr().ToString());
 }
 
+// When tablet server merge metrics by the same attributes, the metric
+// 'merged_entities_count_of_tablet' should be visible
+TEST_F(TabletServerTest, TestMergedEntitiesCount) {
+  EasyCurl c;
+  faststring buf;
+  const string addr = mini_server_->bound_http_addr().ToString();
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics", addr), &buf));
+  ASSERT_STR_NOT_CONTAINS(buf.ToString(), "merged_entities_count_of_tablet");
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics?merge_rules=tablet|table|table_name", addr),
+                       &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), "merged_entities_count_of_tablet");
+}
+
 class TabletServerDiskSpaceTest : public TabletServerTestBase,
                                   public testing::WithParamInterface<string> {
  public:
@@ -721,7 +754,8 @@ INSTANTIATE_TEST_CASE_P(BlockManager, TabletServerDiskSpaceTest,
 
 enum class ErrorType {
   DISK_FAILURE,
-  CFILE_CORRUPTION
+  CFILE_CORRUPTION,
+  KUDU_2233_CORRUPTION,
 };
 
 class TabletServerDiskErrorTest : public TabletServerTestBase,
@@ -743,32 +777,38 @@ class TabletServerDiskErrorTest : public TabletServerTestBase,
 };
 
 INSTANTIATE_TEST_CASE_P(ErrorType, TabletServerDiskErrorTest, ::testing::Values(
-    ErrorType::DISK_FAILURE, ErrorType::CFILE_CORRUPTION));
+    ErrorType::DISK_FAILURE, ErrorType::CFILE_CORRUPTION, ErrorType::KUDU_2233_CORRUPTION));
 
 // Test that applies random write operations to a tablet with a high
 // maintenance manager load and a non-zero error injection rate.
 TEST_P(TabletServerDiskErrorTest, TestRandomOpSequence) {
-  if (!AllowSlowTests()) {
-    LOG(INFO) << "Not running slow test. To run, use KUDU_ALLOW_SLOW_TESTS=1";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
   typedef vector<RowOperationsPB::Type> OpTypeList;
   const OpTypeList kOpsIfKeyNotPresent = { RowOperationsPB::INSERT, RowOperationsPB::UPSERT };
-  const OpTypeList kOpsIfKeyPresent = { RowOperationsPB::UPSERT, RowOperationsPB::UPDATE,
-                                        RowOperationsPB::DELETE };
-  const int kMaxKey = 100000;
 
+  // If testing KUDU-2233 corruption, reduce the key-space significantly to
+  // make it more likely that rows will have history to merge, and delete more
+  // frequently to ensure a row's history is strewn across multiple rowsets.
+  const bool is_kudu_2233 = GetParam() == ErrorType::KUDU_2233_CORRUPTION;
+  const OpTypeList kOpsIfKeyPresent = is_kudu_2233 ?
+      OpTypeList{ RowOperationsPB::DELETE } :
+      OpTypeList{ RowOperationsPB::UPSERT, RowOperationsPB::UPDATE, RowOperationsPB::DELETE };
+  const int kMaxKey = is_kudu_2233 ? 10 : 100000;
+  if (is_kudu_2233) {
+    // Failures from KUDU-2233 are only caught during compactions; disable them
+    // for now so we can start them only after we begin injecting errors.
+    FLAGS_enable_rowset_compaction = false;
+ }
   if (GetParam() == ErrorType::DISK_FAILURE) {
     // Set these way up-front so we can change a single value to actually start
     // injecting errors. Inject errors into all data dirs but one.
-    FLAGS_crash_on_eio = false;
     const vector<string> failed_dirs = { mini_server_->options()->fs_opts.data_roots.begin() + 1,
                                          mini_server_->options()->fs_opts.data_roots.end() };
     FLAGS_env_inject_eio_globs = JoinStrings(JoinPathSegmentsV(failed_dirs, "**"), ",");
   }
 
   set<int> keys;
-  const auto GetRandomString = [] {
+  const auto GetRandomString = [&] {
     return StringPrintf("%d", rand() % kMaxKey);
   };
 
@@ -784,13 +824,12 @@ TEST_P(TabletServerDiskErrorTest, TestRandomOpSequence) {
     RpcController controller;
     RowOperationsPB::Type op_type;
     int key = rand() % kMaxKey;
-    auto key_iter = keys.find(key);
-    if (key_iter == keys.end()) {
-      // If the key already exists, insert or upsert.
-      op_type = kOpsIfKeyNotPresent[rand() % kOpsIfKeyNotPresent.size()];
-    } else {
-      // ... else we can do anything but insert.
+    if (ContainsKey(keys, key)) {
+      // If the key already exists, update, upsert, or delete it.
       op_type = kOpsIfKeyPresent[rand() % kOpsIfKeyPresent.size()];
+    } else {
+      // ... otherwise, insert or upsert.
+      op_type = kOpsIfKeyNotPresent[rand() % kOpsIfKeyNotPresent.size()];
     }
 
     // Add the op to the request.
@@ -800,7 +839,7 @@ TEST_P(TabletServerDiskErrorTest, TestRandomOpSequence) {
       keys.insert(key);
     } else {
       AddTestKeyToPB(RowOperationsPB::DELETE, schema_, key, req.mutable_row_operations());
-      keys.erase(key_iter);
+      keys.erase(key);
     }
 
     // Finally, write to the server and log the response.
@@ -809,7 +848,8 @@ TEST_P(TabletServerDiskErrorTest, TestRandomOpSequence) {
     return resp.has_error() ?  StatusFromPB(resp.error().status()) : Status::OK();
   };
 
-  // Perform some arbitrarily large number of ops, with some pauses to encourage flushes.
+  // Perform some arbitrarily large number of ops, with some pauses to
+  // encourage flushes.
   for (int i = 0; i < 500; i++) {
     if (i % 10) {
       SleepFor(MonoDelta::FromMilliseconds(100));
@@ -824,6 +864,12 @@ TEST_P(TabletServerDiskErrorTest, TestRandomOpSequence) {
       break;
     case ErrorType::CFILE_CORRUPTION:
       FLAGS_cfile_inject_corruption = 0.01;
+      break;
+    case ErrorType::KUDU_2233_CORRUPTION:
+      // KUDU-2233 errors only get triggered with very specific compactions, so
+      // bump the failure rate all the way up.
+      FLAGS_tablet_inject_kudu_2233 = 1.0;
+      FLAGS_enable_rowset_compaction = true;
       break;
   }
 
@@ -872,6 +918,10 @@ TEST_F(TabletServerTest, TestEIODuringDelete) {
 // directories, and that removing directories fails tablets that are striped
 // across the removed directories.
 TEST_F(TabletServerTest, TestAddRemoveDirectory) {
+  if (FLAGS_block_manager == "file") {
+    LOG(INFO) << "Skipping test since the file block manager does not support updating directories";
+    return;
+  }
   // Start with multiple data dirs so the dirs are suffixed with numbers, and
   // so when we remove a data dirs, we'll be using the same set of dirs.
   NO_FATALS(ShutdownAndRebuildTablet(/*num_data_dirs*/2));
@@ -898,6 +948,23 @@ TEST_F(TabletServerTest, TestAddRemoveDirectory) {
     scoped_refptr<TabletReplica> replica2;
     ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kFooTablet2, &replica2));
     ASSERT_EQ(TabletStatePB::FAILED, replica2->state());
+  });
+}
+
+TEST_F(TabletServerTest, TestFailReplicaOnKUDU2233Corruption) {
+  FLAGS_tablet_inject_kudu_2233 = 1;
+  // Trigger the code paths that crash a server in the case of KUDU-2233
+  // compactions, i.e. where a compaction needs to merge the history of a
+  // single row across multiple rowsets.
+  NO_FATALS(InsertTestRowsRemote(1, 1));
+  NO_FATALS(DeleteTestRowsRemote(1, 1));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  NO_FATALS(InsertTestRowsRemote(1, 1));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  Status s = tablet_replica_->tablet()->Compact(Tablet::FORCE_COMPACT_ALL);
+  ASSERT_TRUE(s.IsCorruption());
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(tablet::FAILED, tablet_replica_->state());
   });
 }
 
@@ -940,10 +1007,6 @@ TEST_F(TabletServerMaintenanceMemoryPressureTest, TestDontStarveDMSWhileUnderMem
   thread insert_thread([&] {
     int cur_row = 2;
     while (keep_inserting) {
-      // Ignore TSAN warnings that complain about a race in gtest between this
-      // check for fatal failures and the check for fatal failures in the below
-      // AssertEventually.
-      debug::ScopedTSANIgnoreReadsAndWrites ignore_tsan;
       NO_FATALS(InsertTestRowsDirect(cur_row++, 1));
     }
   });
@@ -961,9 +1024,16 @@ TEST_F(TabletServerMaintenanceMemoryPressureTest, TestDontStarveDMSWhileUnderMem
   // since it anchors WALs.
   scoped_refptr<Histogram> dms_flushes =
       METRIC_flush_dms_duration.Instantiate(tablet_replica_->tablet()->GetMetricEntity());
-  ASSERT_EVENTUALLY([&] {
-    ASSERT_EQ(1, dms_flushes->histogram()->TotalCount());
-  });
+  // NOTE: we don't use ASSERT_EVENTUALLY because gtest may race with the
+  // NO_FATALS call in the inserter thread.
+  constexpr int kTimeoutSecs = 30;
+  const MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(kTimeoutSecs);
+  while (dms_flushes->histogram()->TotalCount() < 1) {
+    if (MonoTime::Now() > deadline) {
+      FAIL() << Substitute("Didn't flush DMS in $0 seconds", kTimeoutSecs);
+    }
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
 }
 
 // Regression test for KUDU-2929. Previously, when under memory pressure, we
@@ -1551,7 +1621,7 @@ TEST_F(TabletServerTest, TestRecoveryWithMutationsWhileFlushing) {
 
   InsertTestRowsRemote(1, 7);
 
-  shared_ptr<MyCommonHooks> hooks(new MyCommonHooks(this));
+  auto hooks(make_shared<MyCommonHooks>(this));
 
   tablet_replica_->tablet()->SetFlushHooksForTests(hooks);
   tablet_replica_->tablet()->SetCompactionHooksForTests(hooks);
@@ -1591,7 +1661,7 @@ TEST_F(TabletServerTest, TestRecoveryWithMutationsWhileFlushingAndCompacting) {
 
   InsertTestRowsRemote(1, 7);
 
-  shared_ptr<MyCommonHooks> hooks(new MyCommonHooks(this));
+  auto hooks(make_shared<MyCommonHooks>(this));
 
   tablet_replica_->tablet()->SetFlushHooksForTests(hooks);
   tablet_replica_->tablet()->SetCompactionHooksForTests(hooks);
@@ -2502,6 +2572,75 @@ TEST_F(TabletServerTest, TestScanYourWrites_PropagatedTimestampInTheFuture) {
   ASSERT_EQ(R"((int32 key=0, int32 int_val=0, string string_val="original0"))", results[0]);
 }
 
+// Test that, if multiple RPCs arrive concurrently for a single scanner, no state is
+// corrupted, etc. We expected errors but no crashes or TSAN issues.
+TEST_F(TabletServerTest, TestConcurrentAccessToOneScanner) {
+  constexpr int kNumRows = 1000;
+  constexpr int kNumThreads = 8;
+  // Perform a write.
+  InsertTestRowsRemote(0, kNumRows, 1, nullptr, kTabletId);
+
+  FLAGS_scanner_batch_size_rows = 10;
+  FLAGS_scanner_unregister_on_invalid_seq_id = false;
+  ScanResponsePB open_resp;
+  NO_FATALS(OpenScannerWithAllColumns(&open_resp));
+
+  std::atomic<bool> done { false };
+  vector<thread> threads;
+  // Add a thread which concurrently lists scans. The ListScans() function accesses
+  // scanners to expose diagnostic info such as stats, etc, so calling it in a loop can
+  // help uncover potential races in this code path.
+  threads.emplace_back(
+      [&]() {
+        while (!done) {
+          mini_server_->server()->scanner_manager()->ListScans();
+        }
+      });
+  std::atomic<int> next_seq_id { 1 };
+  std::atomic<int> total_rows { 0 };
+  for (int i = 0; i < kNumThreads; i++) {
+    threads.emplace_back(
+        [&]() {
+          while (!done) {
+            RpcController rpc;
+            rpc.set_timeout(MonoDelta::FromSeconds(10));
+            ScanRequestPB req;
+            ScanResponsePB resp;
+            req.set_scanner_id(open_resp.scanner_id());
+            // Try either the expected next sequence ID or the following one.
+            // We sometimes try the following one since otherwise the race of two
+            // RPCs processing concurrently is very very narrow -- we increment the
+            // call ID immediately after looking up the scanner.
+            req.set_call_seq_id(next_seq_id + (rand() % 2));
+            req.set_batch_size_bytes(100);
+            Status s = proxy_->Scan(req, &resp, &rpc);
+            CHECK_OK(s);
+            if (resp.has_error()) {
+              if (resp.error().code() == TabletServerErrorPB::SCANNER_EXPIRED) {
+                break;
+              }
+              CHECK(resp.error().code() == TabletServerErrorPB::INVALID_SCAN_CALL_SEQ_ID)
+                  << "unexpected error: " << resp.error().DebugString();
+              VLOG(1) << "Got an invalid seq id " << req.call_seq_id();
+            } else {
+              VLOG(1) << "Continued scan: " << resp.data().num_rows() << " rows";
+              total_rows += resp.data().num_rows();
+              next_seq_id++;
+              if (!resp.has_more_results()) {
+                VLOG(1) << "Finished scan";
+                done = true;
+              }
+            }
+          }
+        });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  ASSERT_EQ(total_rows, kNumRows);
+}
+
+
 TEST_F(TabletServerTest, TestScanWithStringPredicates) {
   InsertTestRowsDirect(0, 100);
 
@@ -2733,13 +2872,14 @@ TEST_F(TabletServerTest, TestScanWithEncodedPredicates) {
   // using encoded keys
   int32_t start_key_int = 51;
   int32_t stop_key_int = 60;
-  EncodedKeyBuilder ekb(&schema_);
+  Arena arena(64);
+  EncodedKeyBuilder ekb(&schema_, &arena);
   ekb.AddColumnKey(&start_key_int);
-  unique_ptr<EncodedKey> start_encoded(ekb.BuildEncodedKey());
+  EncodedKey* start_encoded = ekb.BuildEncodedKey();
 
   ekb.Reset();
   ekb.AddColumnKey(&stop_key_int);
-  unique_ptr<EncodedKey> stop_encoded(ekb.BuildEncodedKey());
+  EncodedKey* stop_encoded = ekb.BuildEncodedKey();
 
   scan->mutable_start_primary_key()->assign(
     reinterpret_cast<const char*>(start_encoded->encoded_key().data()),
@@ -3749,7 +3889,7 @@ TEST_F(TabletServerTest, TestWriteOutOfBounds) {
       "TestWriteOutOfBoundsTable", tabletId,
       partitions[1],
       tabletId, schema, partition_schema,
-      mini_server_->CreateLocalConfig(), boost::none, boost::none, nullptr));
+      mini_server_->CreateLocalConfig(), boost::none, boost::none, boost::none, nullptr));
 
   ASSERT_OK(WaitForTabletRunning(tabletId));
 
@@ -3906,7 +4046,7 @@ void CompactAsync(Tablet* tablet, CountDownLatch* flush_done_latch) {
 
 } // namespace
 
-// Tests that in flight transactions are committed and that commit messages
+// Tests that in flight ops are committed and that commit messages
 // are durable before a compaction is allowed to flush the tablet metadata.
 //
 // This test is in preparation for KUDU-120 and should pass before and after
@@ -3927,15 +4067,15 @@ TEST_F(TabletServerTest, TestKudu120PreRequisites) {
   // Add a hook so that we can make the log wait right after an append
   // (before the callback is triggered).
   log::Log* log = tablet_replica_->log();
-  shared_ptr<DelayFsyncLogHook> log_hook(new DelayFsyncLogHook);
+  auto log_hook(make_shared<DelayFsyncLogHook>());
   log->SetLogFaultHooksForTests(log_hook);
 
-  // Now start a transaction (delete) and stop just before commit.
+  // Now start an op (delete) and stop just before commit.
   thread delete_thread([this]() { this->DeleteTestRowsRemote(10, 1); });
 
   // Wait for the replicate message to arrive and continue.
   log_hook->Continue();
-  // Wait a few msecs to make sure that the transaction is
+  // Wait a few msecs to make sure that the op is
   // trying to commit.
   usleep(100* 1000); // 100 msecs
 
@@ -3946,20 +4086,20 @@ TEST_F(TabletServerTest, TestKudu120PreRequisites) {
     CompactAsync(tablet, &flush_done_latch);
   });
 
-  // At this point we have both a compaction and a transaction going on.
-  // If we allow the transaction to return before the commit message is
-  // durable (KUDU-120) that means that the mvcc transaction will no longer
+  // At this point we have both a compaction and an op going on.
+  // If we allow the op to return before the commit message is
+  // durable (KUDU-120) that means that the mvcc op will no longer
   // be in flight at this moment, nonetheless since we're blocking the WAL
   // and not allowing the commit message to go through, the compaction should
   // be forced to wait.
   //
   // We are thus testing two conditions:
-  // - That in-flight transactions are committed.
-  // - That commit messages for transactions that were in flight are durable.
+  // - That in-flight ops are committed.
+  // - That commit messages for ops that were in flight are durable.
   //
   // If these pre-conditions are not met, i.e. if the compaction is not forced
   // to wait here for the conditions to be true, then the below assertion
-  // will fail, since the transaction's commit write callback will only
+  // will fail, since the op's commit write callback will only
   // return when we allow it (in log_hook->Continue());
   CHECK(!flush_done_latch.WaitFor(MonoDelta::FromMilliseconds(300)));
 
@@ -4189,6 +4329,202 @@ TEST_F(TabletServerTest, TestScannerCheckMatchingUser) {
       SCOPED_TRACE(resp.DebugString());
       NO_FATALS(verify_authz_error(s));
     }
+  }
+}
+
+TEST_F(TabletServerTest, TestStarvePerfImprovementOpsInColdTablet) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  FLAGS_enable_maintenance_manager = true;
+  NO_FATALS(ShutdownAndRebuildTablet());
+
+  // Disable flushing and compactions to create overlapping rowsets.
+  FLAGS_enable_flush_memrowset = false;
+  FLAGS_enable_rowset_compaction = false;
+
+  // Create a cold tablet and insert sets of overlapping rows to it.
+  const char* kColdTablet = "cold_tablet";
+  ASSERT_OK(mini_server_->AddTestTablet(kTableId, kColdTablet, schema_));
+  ASSERT_OK(WaitForTabletRunning(kColdTablet));
+  scoped_refptr<TabletReplica> cold_replica;
+  ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kColdTablet, &cold_replica));
+  NO_FATALS(InsertTestRowsDirect(0, 1, kColdTablet));
+  NO_FATALS(InsertTestRowsDirect(2, 1, kColdTablet));
+  ASSERT_OK(cold_replica->tablet()->Flush());
+  NO_FATALS(InsertTestRowsDirect(1, 1, kColdTablet));
+  ASSERT_OK(cold_replica->tablet()->Flush());
+
+  // Make MRS flush op starts out with the highest adjusted perf score.
+  FLAGS_enable_flush_memrowset = true;
+  FLAGS_enable_workload_score_for_perf_improvement_ops = true;
+  FLAGS_workload_stats_rate_collection_min_interval_ms = 10;
+  FLAGS_workload_score_upper_bound = 10;
+  // Make maintenance manager find best op more slowly than a new MRS could flush,
+  // so there are always something to do in the hot tablet.
+  FLAGS_flush_threshold_secs = 1;
+  FLAGS_maintenance_manager_inject_latency_ms = 1000;
+
+  // Make the default tablet 'hot'.
+  std::atomic<bool> keep_inserting_and_scanning(true);
+  thread insert_thread([&] {
+    int cur_row = 0;
+    while (keep_inserting_and_scanning) {
+      NO_FATALS(InsertTestRowsDirect(cur_row, 1000));
+      cur_row += 1000;
+      ScanResponsePB resp;
+      NO_FATALS(OpenScannerWithAllColumns(&resp));
+      ASSERT_TRUE(!resp.scanner_id().empty());
+    }
+  });
+  SCOPED_CLEANUP({
+    keep_inserting_and_scanning = false;
+    insert_thread.join();
+  });
+
+  // Wait a bit to allow workload stats collection to begin.
+  SleepFor(MonoDelta::FromSeconds(1));
+  FLAGS_enable_rowset_compaction = true;
+  // Wait a couple seconds to test if we can starve compaction in the cold tablet even
+  // if the compaction op has a higher raw perf improvement score than that of time-based
+  // flushes in the hot tablet.
+  SleepFor(MonoDelta::FromSeconds(5));
+  ASSERT_EQ(0, cold_replica->tablet()->metrics()->compact_rs_duration->TotalCount());
+
+  // Disable workload score, now we can launch compaction in the cold tablet.
+  FLAGS_enable_workload_score_for_perf_improvement_ops = false;
+  // Compaction in the cold tablet will eventually complete.
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(1, cold_replica->tablet()->metrics()->compact_rs_duration->TotalCount());
+  });
+}
+
+class OpApplyQueueTest : public TabletServerTestBase {
+ public:
+  // Starts the tablet server, override to start it later.
+  void SetUp() override {
+
+    // Since scenarios of this test make bursts of requests, set the maximum
+    // length of the service queue to accomodate many requests.
+    FLAGS_rpc_service_queue_length = 1000;
+
+    // Set the overload threshold for the op apply queue. Since the threshold
+    // is two-fold of the injected latency and number of operations submitted
+    // at once much higher than the number of worker threads in the apply thread
+    // pool, the queue will gradually accumulate operations until becoming
+    // overloaded.
+    FLAGS_tablet_apply_pool_overload_threshold_ms = kInjectedLatencyMs;
+
+    NO_FATALS(TabletServerTestBase::SetUp());
+    NO_FATALS(StartTabletServer(/*num_data_dirs=*/1));
+  }
+
+  static constexpr const int32_t kInjectedLatencyMs = 100;
+};
+
+// This is a regression test for KUDU-1587.
+TEST_F(OpApplyQueueTest, ApplyQueueBackpressure) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  constexpr size_t kNumCalls = 1000;
+  const int num_cpus = base::NumCPUs();
+  WriteRequestPB req;
+  req.set_tablet_id(kTabletId);
+  ASSERT_OK(SchemaToPB(schema_, req.mutable_schema()));
+
+  // Inject latency into WriteOp::Apply().
+  FLAGS_tablet_inject_latency_on_apply_write_op_ms = kInjectedLatencyMs;
+
+  // Send many calls to tablet server, not awaiting for responses.
+  // After sending the first chunk, wait for some time to allow for propagating
+  // the operations to the apply queue and to have apply queue times growing.
+  vector<unique_ptr<RpcController>> controllers;
+  vector<unique_ptr<WriteResponsePB>> responses;
+  CountDownLatch latch(kNumCalls);
+  for (size_t idx = 0; idx < kNumCalls; ++idx) {
+    controllers.emplace_back(new RpcController);
+    responses.emplace_back(new WriteResponsePB);
+
+    req.clear_row_operations();
+    auto* data = req.mutable_row_operations();
+    AddTestRowWithNullableStringToPB(
+        RowOperationsPB::INSERT, schema_, idx, idx, nullptr, data);
+    proxy_->AsyncRequest("Write", req, responses.back().get(), controllers.back().get(),
+                         [&latch]() { latch.CountDown(); });
+    if (idx == 10 * num_cpus) {
+      // Allow to realize what current queue times are once ops reached
+      // the apply queue.
+      SleepFor(MonoDelta::FromMilliseconds(2 * kInjectedLatencyMs));
+    }
+  }
+
+  // Wait for calls to be processed before capturing the apply queue stats.
+  latch.Wait();
+
+  size_t num_ok = 0;
+  size_t num_error = 0;
+  for (const auto& ctl : controllers) {
+    if (ctl->status().ok()) {
+      ++num_ok;
+    } else {
+      ++num_error;
+    }
+  }
+  ASSERT_EQ(kNumCalls, num_ok + num_error);
+
+  // Not all request should succeed -- due to long apply times, some should be
+  // rejected.
+  EXPECT_GT(num_error, 0);
+
+  {
+    // No RPC queue overflows are expected.
+    auto rpc_queue_overflows = METRIC_rpcs_queue_overflow.Instantiate(
+        mini_server_->server()->metric_entity());
+    ASSERT_EQ(0, rpc_queue_overflows->value());
+  }
+
+  {
+    // No requests should timeout while in the queue.
+    auto timed_out_in_rpc_queue = METRIC_rpcs_timed_out_in_queue.Instantiate(
+        mini_server_->server()->metric_entity());
+    ASSERT_EQ(0, timed_out_in_rpc_queue->value());
+  }
+
+  {
+    // Some calls should be rejected due to overloaded apply queue,
+    // so the corresponding queue times should not get too close to the value of
+    // total_request * injected_latency / number_of_apply_threads.
+    auto qt = METRIC_op_apply_queue_time.Instantiate(
+        mini_server_->server()->metric_entity());
+    ostringstream ostr;
+    ostr << qt->prototype()->name() << ":" << endl;
+    const auto* h = qt->histogram();
+    h->DumpHumanReadable(&ostr);
+    LOG(INFO) << ostr.str();
+
+    // These are simple heuristics rather than exact theoretical thresholds.
+    // They depend on the injected latency and the 'overloaded' threshold
+    // for the apply queue.
+    EXPECT_LT(h->MaxValue(),
+              kInjectedLatencyMs * 1000 * kNumCalls * 4 / (4 * num_cpus));
+    EXPECT_LT(h->ValueAtPercentile(99),
+              kInjectedLatencyMs * 1000 * kNumCalls * 3 / (4 * num_cpus));
+    EXPECT_LT(h->ValueAtPercentile(75),
+              kInjectedLatencyMs * 1000 * kNumCalls * 2 / (4 * num_cpus));
+  }
+
+  {
+    // With current apply latency, the queue should not get too long.
+    auto ql = METRIC_op_apply_queue_length.Instantiate(
+        mini_server_->server()->metric_entity());
+    ostringstream ostr;
+    ostr << ql->prototype()->name() << ":" << endl;
+    const auto* h = ql->histogram();
+    h->DumpHumanReadable(&ostr);
+    LOG(INFO) << ostr.str();
+
+    // These are simple heuristics as well. They depend on the injected latency
+    // and the 'overloaded' threshold for the apply queue.
+    EXPECT_LT(h->MaxValue(), 3 * kNumCalls / 4);
+    EXPECT_LT(h->MeanValue(), kNumCalls / 2);
   }
 }
 

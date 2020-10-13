@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <atomic>
-#include <cstdlib>
 #include <functional>
-#include <initializer_list>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -34,7 +31,6 @@
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
-#include "kudu/common/common.pb.h"
 #include "kudu/common/table_util.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/stl_util.h"
@@ -42,24 +38,18 @@
 #include "kudu/hms/hms_client.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
-#include "kudu/integration-tests/hms_itest-base.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
-#include "kudu/master/sentry_authz_provider-test-base.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/ranger/mini_ranger.h"
 #include "kudu/ranger/ranger.pb.h"
 #include "kudu/rpc/rpc_controller.h"
-#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/security/test/mini_kdc.h"
-#include "kudu/sentry/mini_sentry.h"
-#include "kudu/sentry/sentry_client.h"
-#include "kudu/sentry/sentry_policy_service_types.h"
-#include "kudu/thrift/client.h"
+#include "kudu/transactions/txn_system_client.h"
 #include "kudu/util/decimal_util.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -81,15 +71,11 @@ using kudu::client::sp::shared_ptr;
 using kudu::cluster::ExternalMiniCluster;
 using kudu::cluster::ExternalMiniClusterOptions;
 using kudu::hms::HmsClient;
-using kudu::master::AlterRoleGrantPrivilege;
-using kudu::master::CreateRoleAndAddToGroups;
-using kudu::master::GetDatabasePrivilege;
 using kudu::master::GetTableLocationsResponsePB;
 using kudu::master::GetTabletLocationsResponsePB;
-using kudu::master::GetTablePrivilege;
+using kudu::master::RefreshAuthzCacheRequestPB;
+using kudu::master::RefreshAuthzCacheResponsePB;
 using kudu::master::MasterServiceProxy;
-using kudu::master::ResetAuthzCacheRequestPB;
-using kudu::master::ResetAuthzCacheResponsePB;
 using kudu::master::VOTER_REPLICA;
 using kudu::ranger::ActionPB;
 using kudu::ranger::AuthorizationPolicy;
@@ -97,10 +83,7 @@ using kudu::ranger::MiniRanger;
 using kudu::ranger::PolicyItem;
 using kudu::rpc::RpcController;
 using kudu::rpc::UserCredentials;
-using kudu::sentry::SentryClient;
-using sentry::TSentryGrantOption;
-using sentry::TSentryPrivilege;
-using std::atomic;
+using kudu::transactions::TxnSystemClient;
 using std::function;
 using std::move;
 using std::ostream;
@@ -112,13 +95,10 @@ using std::vector;
 using strings::Substitute;
 
 namespace {
-const char* const kAdminGroup = "admin";
 const char* const kAdminUser = "test-admin";
-const char* const kUserGroup = "user";
 const char* const kTestUser = "test-user";
+const char* const kSecondUser = "alice";
 const char* const kImpalaUser = "impala";
-const char* const kDevRole = "developer";
-const char* const kAdminRole = "ad";
 const char* const kDatabaseName = "db";
 const char* const kTableName = "table";
 const char* const kSecondTable = "second_table";
@@ -139,16 +119,11 @@ struct OperationParams {
 };
 
 enum HarnessEnum {
-  kSentry,
-  kSentryWithCache,
   kRanger,
 };
+
 string HarnessEnumToString(HarnessEnum h) {
   switch (h) {
-    case kSentry:
-      return "SentryNoCache";
-    case kSentryWithCache:
-      return "SentryWithCache";
     case kRanger:
       return "Ranger";
   }
@@ -159,12 +134,15 @@ string HarnessEnumToString(HarnessEnum h) {
 struct PrivilegeParams {
   // NOLINTNEXTLINE(google-explicit-constructor)
   PrivilegeParams(string db_name,
-                  string table_name = "")
+                  string table_name = "",
+                  string user_name = kTestUser)
       : db_name(std::move(db_name)),
-        table_name(std::move(table_name)) {
+        table_name(std::move(table_name)),
+        user_name(std::move(user_name)) {
   }
   const string db_name;
   const string table_name;
+  const string user_name;
 };
 
 class MasterAuthzITestHarness {
@@ -185,6 +163,18 @@ class MasterAuthzITestHarness {
                                     table_id, &table_locations);
   }
 
+  static Status RefreshAuthzPolicies(const unique_ptr<ExternalMiniCluster>& cluster) {
+    RefreshAuthzCacheRequestPB req;
+    RefreshAuthzCacheResponsePB resp;
+    RpcController rpc;
+    rpc.set_timeout(MonoDelta::FromSeconds(10));
+    RETURN_NOT_OK(cluster->master_proxy()->RefreshAuthzCache(req, &resp, &rpc));
+    if (resp.has_error()) {
+      return StatusFromPB(resp.error().status());
+    }
+    return Status::OK();
+  }
+
   static Status IsCreateTableDone(const OperationParams& p,
                                   const shared_ptr<KuduClient>& client) {
     bool in_progress = false;
@@ -201,6 +191,14 @@ class MasterAuthzITestHarness {
     unique_ptr<KuduTableAlterer> alterer(
         client->NewTableAlterer(p.table_name));
     return alterer->DropColumn("int32_val")->Alter();
+  }
+
+  static Status ChangeOwner(const OperationParams& p,
+                            const shared_ptr<KuduClient>& client) {
+    unique_ptr<KuduTableAlterer> alterer(
+        client->NewTableAlterer(p.table_name));
+
+    return alterer->SetOwner(kTestUser)->Alter();
   }
 
   static Status IsAlterTableDone(const OperationParams& p,
@@ -294,6 +292,7 @@ class MasterAuthzITestHarness {
         .schema(&schema)
         .num_replicas(1)
         .set_range_partition_columns({ "key" })
+        .set_owner(kTestUser)
         .Create();
   }
 
@@ -311,35 +310,54 @@ class MasterAuthzITestHarness {
   // Creates db.table and db.second_table.
   virtual Status SetUpTables(const unique_ptr<ExternalMiniCluster>& cluster,
                              const shared_ptr<KuduClient>& client) {
+    static const string kUser = kAdminUser;
     RETURN_NOT_OK(CreateKuduTable(kDatabaseName, kTableName, client));
     RETURN_NOT_OK(CreateKuduTable(kDatabaseName, kSecondTable, client));
-    CheckTable(kDatabaseName, kTableName,
-               make_optional<const string&>(kAdminUser), cluster, client);
-    CheckTable(kDatabaseName, kSecondTable,
-               make_optional<const string&>(kAdminUser), cluster, client);
+    CheckTable(kDatabaseName, kTableName, kUser, cluster, client);
+    CheckTable(kDatabaseName, kSecondTable, kUser, cluster, client);
     return Status::OK();
   }
 
   // Returns a set of opts appropriate for an authorization test.
   ExternalMiniClusterOptions GetClusterOpts() {
     ExternalMiniClusterOptions opts;
-    // Always enable Kerberos, as Sentry/Ranger deployments do not make sense
+    // Always enable Kerberos, as Authz deployments do not make sense
     // in non-Kerberized environments.
     opts.enable_kerberos = true;
     // Add 'impala' as trusted user who may access the cluster without being
     // authorized.
     opts.extra_master_flags.emplace_back("--trusted_user_acl=impala");
-    opts.extra_master_flags.emplace_back("--user_acl=test-user,impala");
+    opts.extra_master_flags.emplace_back("--user_acl=test-user,impala,alice");
     SetUpExternalMiniServiceOpts(&opts);
     return opts;
   }
 
-  virtual Status GrantCreateTablePrivilege(const PrivilegeParams& p) = 0;
-  virtual Status GrantDropTablePrivilege(const PrivilegeParams& p) = 0;
-  virtual Status GrantAlterTablePrivilege(const PrivilegeParams& p) = 0;
-  virtual Status GrantRenameTablePrivilege(const PrivilegeParams& p) = 0;
-  virtual Status GrantGetMetadataTablePrivilege(const PrivilegeParams& p) = 0;
-  virtual Status GrantGetMetadataDatabasePrivilege(const PrivilegeParams& p) = 0;
+  virtual Status GrantCreateTablePrivilege(const PrivilegeParams& p,
+                                           const unique_ptr<ExternalMiniCluster>& cluster) = 0;
+  virtual Status GrantDropTablePrivilege(const PrivilegeParams& p,
+                                         const unique_ptr<ExternalMiniCluster>& cluster) = 0;
+  virtual Status GrantAlterTablePrivilege(const PrivilegeParams& p,
+                                          const unique_ptr<ExternalMiniCluster>& cluster) = 0;
+  virtual Status GrantAlterWithGrantTablePrivilege(
+      const PrivilegeParams& p,
+      const unique_ptr<ExternalMiniCluster>& cluster) = 0;
+  virtual Status GrantRenameTablePrivilege(const PrivilegeParams& p,
+                                           const unique_ptr<ExternalMiniCluster>& cluster) = 0;
+  virtual Status GrantGetMetadataTablePrivilege(const PrivilegeParams& p,
+                                                const unique_ptr<ExternalMiniCluster>& cluster) = 0;
+  virtual Status GrantGetMetadataDatabasePrivilege(const PrivilegeParams& p,
+                                                   const unique_ptr<ExternalMiniCluster>& cluster)
+    = 0;
+  virtual Status GrantAllTablePrivilege(const PrivilegeParams& p,
+                                        const unique_ptr<ExternalMiniCluster>& cluster) = 0;
+  virtual Status GrantAllDatabasePrivilege(const PrivilegeParams& p,
+                                           const unique_ptr<ExternalMiniCluster>& cluster) = 0;
+  virtual Status GrantAllWithGrantTablePrivilege(const PrivilegeParams& p,
+                                                 const unique_ptr<ExternalMiniCluster>& cluster)
+    = 0;
+  virtual Status GrantAllWithGrantDatabasePrivilege(
+      const PrivilegeParams& p,
+      const unique_ptr<ExternalMiniCluster>& cluster) = 0;
   virtual Status CreateTable(const OperationParams& p,
                              const shared_ptr<KuduClient>& client) = 0;
   virtual void CheckTableDoesNotExist(const string& database_name, const string& table_name,
@@ -360,174 +378,33 @@ class MasterAuthzITestHarness {
   virtual Status SetUpCredentials() = 0;
 
   // Sets things up so we can begin sending requests to the authorization
-  // services (whether that setup is an actual SentryClient or the ability to
-  // send curl requests to MiniRanger).
+  // services.
   virtual Status SetUpExternalServiceClients(const unique_ptr<ExternalMiniCluster>& cluster) = 0;
-};
-
-// Test Master authorization enforcement with Sentry and HMS
-// integration enabled.
-class SentryITestHarness : public MasterAuthzITestHarness,
-                           public HmsITestHarness {
- public:
-  using MasterAuthzITestHarness::CreateKuduTable;
-  using HmsITestHarness::CheckTable;
-  Status StopAuthzProvider(const unique_ptr<ExternalMiniCluster>& cluster) override {
-    RETURN_NOT_OK(sentry_client_->Stop());
-    RETURN_NOT_OK(cluster->sentry()->Stop());
-    return Status::OK();
-  }
-
-  Status StartAuthzProvider(const unique_ptr<ExternalMiniCluster>& cluster) override {
-    RETURN_NOT_OK(cluster->sentry()->Start());
-    RETURN_NOT_OK(cluster->kdc()->Kinit("kudu"));
-    RETURN_NOT_OK(sentry_client_->Start());
-    return Status::OK();
-  }
-
-  void CheckTableDoesNotExist(const string& database_name, const string& table_name,
-                              shared_ptr<KuduClient> client) override {
-    return HmsITestHarness::CheckTableDoesNotExist(database_name, table_name, client);
-  }
-
-  Status GrantCreateTablePrivilege(const PrivilegeParams& p) override {
-    return AlterRoleGrantPrivilege(sentry_client_.get(), kDevRole,
-        GetDatabasePrivilege(p.db_name, "CREATE"));
-  }
-
-  Status GrantDropTablePrivilege(const PrivilegeParams& p) override {
-    return AlterRoleGrantPrivilege(sentry_client_.get(), kDevRole,
-        GetTablePrivilege(p.db_name, p.table_name, "DROP"));
-  }
-
-  Status GrantAlterTablePrivilege(const PrivilegeParams& p) override {
-    return AlterRoleGrantPrivilege(sentry_client_.get(), kDevRole,
-        GetTablePrivilege(p.db_name, p.table_name, "ALTER"));
-  }
-
-  Status GrantRenameTablePrivilege(const PrivilegeParams& p) override {
-    RETURN_NOT_OK(AlterRoleGrantPrivilege(sentry_client_.get(), kDevRole,
-        GetTablePrivilege(p.db_name, p.table_name, "ALL")));
-    return AlterRoleGrantPrivilege(sentry_client_.get(), kDevRole,
-        GetDatabasePrivilege(p.db_name, "CREATE"));
-  }
-
-  Status GrantGetMetadataTablePrivilege(const PrivilegeParams& p) override {
-    return AlterRoleGrantPrivilege(sentry_client_.get(), kDevRole,
-        GetTablePrivilege(p.db_name, p.table_name, "METADATA"));
-  }
-
-  Status GrantGetMetadataDatabasePrivilege(const PrivilegeParams& p) override {
-    return AlterRoleGrantPrivilege(sentry_client_.get(), kDevRole,
-        GetDatabasePrivilege(p.db_name, "METADATA"));
-  }
-
-  Status CreateTable(const OperationParams& p,
-                     const shared_ptr<KuduClient>& client) override {
-    Slice hms_database;
-    Slice hms_table;
-    RETURN_NOT_OK(ParseHiveTableIdentifier(p.table_name,
-                                           &hms_database, &hms_table));
-    return MasterAuthzITestHarness::CreateKuduTable(hms_database.ToString(),
-                                                    hms_table.ToString(), client);
-  }
-
-  Status SetUpTables(const unique_ptr<ExternalMiniCluster>& cluster,
-                     const shared_ptr<KuduClient>& client) override {
-    // First create database 'db' in the HMS.
-    RETURN_NOT_OK(CreateDatabase(kDatabaseName));
-    // Then create Kudu tables 'table' and 'second_table', owned by user
-    // 'test-admin'.
-    return MasterAuthzITestHarness::SetUpTables(cluster, client);
-  }
-
-  void TearDown() override {
-    if (sentry_client_) {
-      ASSERT_OK(sentry_client_->Stop());
-    }
-    if (hms_client_) {
-      ASSERT_OK(hms_client_->Stop());
-    }
-  }
-
-  void SetUpExternalMiniServiceOpts(ExternalMiniClusterOptions* opts) override {
-    opts->enable_sentry = true;
-    // Configure the timeout to reduce the run time of tests that involve
-    // re-connections.
-    const string timeout = AllowSlowTests() ? "5" : "2";
-    opts->hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
-    opts->extra_master_flags.emplace_back(
-       Substitute("$0=$1", "--sentry_service_send_timeout_seconds", timeout));
-    opts->extra_master_flags.emplace_back(
-       Substitute("$0=$1", "--sentry_service_recv_timeout_seconds", timeout));
-    // NOTE: this can be overwritten if another value is added to the end.
-    opts->extra_master_flags.emplace_back("--sentry_privileges_cache_capacity_mb=0");
-  }
-
-  Status SetUpExternalServiceClients(const unique_ptr<ExternalMiniCluster>& cluster) override {
-    thrift::ClientOptions hms_opts;
-    hms_opts.enable_kerberos = true;
-    hms_opts.service_principal = "hive";
-    RETURN_NOT_OK(HmsITestHarness::RestartHmsClient(cluster, hms_opts));
-
-    thrift::ClientOptions sentry_opts;
-    sentry_opts.enable_kerberos = true;
-    sentry_opts.service_principal = "sentry";
-    sentry_client_.reset(new SentryClient(cluster->sentry()->address(), sentry_opts));
-    return sentry_client_->Start();
-  }
-
-  Status SetUpCredentials() override {
-    // User to Role mapping:
-    // 1. user -> developer,
-    // 2. admin -> admin.
-    RETURN_NOT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kDevRole, kUserGroup));
-    RETURN_NOT_OK(CreateRoleAndAddToGroups(sentry_client_.get(), kAdminRole, kAdminGroup));
-
-    // Grant privilege 'ALL' on database 'db' to role admin.
-    TSentryPrivilege privilege = GetDatabasePrivilege(
-        kDatabaseName, "ALL",
-        TSentryGrantOption::DISABLED);
-    return AlterRoleGrantPrivilege(sentry_client_.get(), kAdminRole, privilege);
-  }
-
- protected:
-  unique_ptr<SentryClient> sentry_client_;
-};
-
-class SentryWithCacheITestHarness : public SentryITestHarness {
- public:
-  void SetUpExternalMiniServiceOpts(ExternalMiniClusterOptions* opts) override {
-    NO_FATALS(SentryITestHarness::SetUpExternalMiniServiceOpts(opts));
-    opts->extra_master_flags.emplace_back("--sentry_privileges_cache_capacity_mb=1");
-  }
 };
 
 class RangerITestHarness : public MasterAuthzITestHarness {
  public:
-  static constexpr int kSleepAfterNewPolicyMs = 1200;
+  static constexpr int kSleepAfterNewPolicyMs = 1400;
 
-  Status GrantCreateTablePrivilege(const PrivilegeParams& p) override {
+  Status GrantCreateTablePrivilege(const PrivilegeParams& p,
+                                   const unique_ptr<ExternalMiniCluster>& cluster) override {
     AuthorizationPolicy policy;
     policy.databases.emplace_back(p.db_name);
     // IsCreateTableDone() requires METADATA on the table level.
     policy.tables.emplace_back("*");
-    policy.items.emplace_back(PolicyItem({kTestUser}, {ActionPB::CREATE}));
+    policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::CREATE}, false));
     RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-
-    return Status::OK();
+    return RefreshAuthzPolicies(cluster);
   }
 
-  Status GrantDropTablePrivilege(const PrivilegeParams& p) override {
+  Status GrantDropTablePrivilege(const PrivilegeParams& p,
+                                 const unique_ptr<ExternalMiniCluster>& cluster) override {
     AuthorizationPolicy policy;
     policy.databases.emplace_back(p.db_name);
     policy.tables.emplace_back(p.table_name);
-    policy.items.emplace_back(PolicyItem({kTestUser}, {ActionPB::DROP}));
+    policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::DROP}, false));
     RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-
-    return Status::OK();
+    return RefreshAuthzPolicies(cluster);
   }
 
   void CheckTableDoesNotExist(const string& database_name, const string& table_name,
@@ -537,50 +414,111 @@ class RangerITestHarness : public MasterAuthzITestHarness {
     ASSERT_TRUE(s.IsNotFound()) << s.ToString();
   }
 
-  Status GrantAlterTablePrivilege(const PrivilegeParams& p) override {
+  Status GrantAlterTablePrivilege(const PrivilegeParams& p,
+                                  const unique_ptr<ExternalMiniCluster>& cluster) override {
     AuthorizationPolicy policy;
     policy.databases.emplace_back(p.db_name);
     policy.tables.emplace_back(p.table_name);
-    policy.items.emplace_back(PolicyItem({kTestUser}, {ActionPB::ALTER}));
+    policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::ALTER}, false));
     RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-    return Status::OK();
+    return RefreshAuthzPolicies(cluster);
   }
 
-  Status GrantRenameTablePrivilege(const PrivilegeParams& p) override {
+  Status GrantAlterWithGrantTablePrivilege(
+      const PrivilegeParams& p,
+      const unique_ptr<ExternalMiniCluster>& cluster) override {
+    AuthorizationPolicy policy;
+    policy.databases.emplace_back(p.db_name);
+    policy.tables.emplace_back(p.table_name);
+    policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::ALTER}, true));
+    RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
+    return RefreshAuthzPolicies(cluster);
+  }
+
+  Status GrantRenameTablePrivilege(const PrivilegeParams& p,
+                                   const unique_ptr<ExternalMiniCluster>& cluster) override {
     AuthorizationPolicy policy_new_table;
     policy_new_table.databases.emplace_back(p.db_name);
     // IsCreateTableDone() requires METADATA on the table level.
     policy_new_table.tables.emplace_back("*");
-    policy_new_table.items.emplace_back(PolicyItem({kTestUser}, {ActionPB::CREATE}));
+    policy_new_table.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::CREATE}, false));
     RETURN_NOT_OK(ranger_->AddPolicy(move(policy_new_table)));
 
     AuthorizationPolicy policy;
     policy.databases.emplace_back(p.db_name);
     policy.tables.emplace_back(p.table_name);
-    policy.items.emplace_back(PolicyItem({kTestUser}, {ActionPB::ALL}));
+    policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::ALL}, false));
     RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-    return Status::OK();
+    return RefreshAuthzPolicies(cluster);
   }
 
-  Status GrantGetMetadataDatabasePrivilege(const PrivilegeParams& p) override {
+  Status GrantGetMetadataDatabasePrivilege(const PrivilegeParams& p,
+                                           const unique_ptr<ExternalMiniCluster>& cluster)
+        override {
     AuthorizationPolicy policy;
     policy.databases.emplace_back(p.db_name);
-    policy.items.emplace_back(PolicyItem({kTestUser}, {ActionPB::METADATA}));
+    policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::METADATA}, false));
     RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-    return Status::OK();
+    return RefreshAuthzPolicies(cluster);
   }
 
-  Status GrantGetMetadataTablePrivilege(const PrivilegeParams& p) override {
+  Status GrantGetMetadataTablePrivilege(const PrivilegeParams& p,
+                                        const unique_ptr<ExternalMiniCluster>& cluster) override {
     AuthorizationPolicy policy;
     policy.databases.emplace_back(p.db_name);
     policy.tables.emplace_back(p.table_name);
-    policy.items.emplace_back(PolicyItem({kTestUser}, {ActionPB::METADATA}));
+    policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::METADATA}, false));
     RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-    return Status::OK();
+    return RefreshAuthzPolicies(cluster);
+  }
+
+  Status GrantAllTablePrivilege(const PrivilegeParams& p,
+                                const unique_ptr<ExternalMiniCluster>& cluster) override {
+    AuthorizationPolicy policy;
+    policy.databases.emplace_back(p.db_name);
+    policy.tables.emplace_back(p.table_name);
+    policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::ALL}, false));
+    RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
+    return RefreshAuthzPolicies(cluster);
+  }
+
+  Status GrantAllDatabasePrivilege(const PrivilegeParams& p,
+                                   const unique_ptr<ExternalMiniCluster>& cluster) override {
+    AuthorizationPolicy db_policy;
+    db_policy.databases.emplace_back(p.db_name);
+    db_policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::ALL}, false));
+    RETURN_NOT_OK(ranger_->AddPolicy(move(db_policy)));
+    AuthorizationPolicy tbl_policy;
+    tbl_policy.databases.emplace_back(p.db_name);
+    tbl_policy.tables.emplace_back("*");
+    tbl_policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::ALL}, false));
+    RETURN_NOT_OK(ranger_->AddPolicy(move(tbl_policy)));
+    return RefreshAuthzPolicies(cluster);
+  }
+
+  Status GrantAllWithGrantTablePrivilege(const PrivilegeParams& p,
+                                         const unique_ptr<ExternalMiniCluster>& cluster) override {
+    AuthorizationPolicy policy;
+    policy.databases.emplace_back(p.db_name);
+    policy.tables.emplace_back(p.table_name);
+    policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::ALL}, true));
+    RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
+    return RefreshAuthzPolicies(cluster);
+  }
+
+  Status GrantAllWithGrantDatabasePrivilege(
+      const PrivilegeParams& p,
+      const unique_ptr<ExternalMiniCluster>& cluster) override {
+    AuthorizationPolicy db_policy;
+    db_policy.databases.emplace_back(p.db_name);
+    db_policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::ALL}, true));
+    RETURN_NOT_OK(ranger_->AddPolicy(move(db_policy)));
+    AuthorizationPolicy tbl_policy;
+    tbl_policy.databases.emplace_back(p.db_name);
+    tbl_policy.tables.emplace_back("*");
+    tbl_policy.items.emplace_back(PolicyItem({p.user_name}, {ActionPB::ALL}, true));
+    RETURN_NOT_OK(ranger_->AddPolicy(move(tbl_policy)));
+    return RefreshAuthzPolicies(cluster);
   }
 
   Status CreateTable(const OperationParams& p,
@@ -616,10 +554,8 @@ class RangerITestHarness : public MasterAuthzITestHarness {
     AuthorizationPolicy policy;
     policy.databases.emplace_back(kDatabaseName);
     policy.tables.emplace_back("*");
-    policy.items.emplace_back(PolicyItem({kAdminUser}, {ActionPB::ALL}));
-    RETURN_NOT_OK(ranger_->AddPolicy(move(policy)));
-    SleepFor(MonoDelta::FromMilliseconds(kSleepAfterNewPolicyMs));
-    return Status::OK();
+    policy.items.emplace_back(PolicyItem({kAdminUser}, {ActionPB::ALL}, true));
+    return ranger_->AddPolicy(move(policy));
   }
 
  private:
@@ -628,8 +564,7 @@ class RangerITestHarness : public MasterAuthzITestHarness {
   MiniRanger* ranger_;
 };
 
-// Test basic master authorization enforcement with Sentry and HMS integration
-// enabled.
+// Test basic master authorization enforcement.
 class MasterAuthzITestBase : public ExternalMiniClusterITestBase {
  public:
   void SetUp() override {
@@ -638,12 +573,6 @@ class MasterAuthzITestBase : public ExternalMiniClusterITestBase {
 
   void SetUpCluster(HarnessEnum harness) {
     switch (harness) {
-      case kSentry:
-        harness_.reset(new SentryITestHarness());
-        break;
-      case kSentryWithCache:
-        harness_.reset(new SentryWithCacheITestHarness());
-        break;
       case kRanger:
         harness_.reset(new RangerITestHarness());
         break;
@@ -656,10 +585,12 @@ class MasterAuthzITestBase : public ExternalMiniClusterITestBase {
     // Create principals 'impala' and 'kudu'. Configure to use the latter.
     ASSERT_OK(cluster_->kdc()->CreateUserPrincipal(kImpalaUser));
     ASSERT_OK(cluster_->kdc()->CreateUserPrincipal("kudu"));
+    ASSERT_OK(cluster_->kdc()->CreateUserPrincipal(kSecondUser));
     ASSERT_OK(cluster_->kdc()->Kinit("kudu"));
 
     ASSERT_OK(harness_->SetUpExternalServiceClients(cluster_));
     ASSERT_OK(harness_->SetUpCredentials());
+    ASSERT_OK(harness_->RefreshAuthzPolicies(cluster_));
     ASSERT_OK(harness_->SetUpTables(cluster_, client_));
 
     // Log in as 'test-user' and reset the client to pick up the change in user.
@@ -678,27 +609,47 @@ class MasterAuthzITestBase : public ExternalMiniClusterITestBase {
   }
 
   Status GrantCreateTablePrivilege(const PrivilegeParams& p) {
-    return harness_->GrantCreateTablePrivilege(p);
+    return harness_->GrantCreateTablePrivilege(p, cluster_);
   }
 
   Status GrantDropTablePrivilege(const PrivilegeParams& p) {
-    return harness_->GrantDropTablePrivilege(p);
+    return harness_->GrantDropTablePrivilege(p, cluster_);
   }
 
   Status GrantAlterTablePrivilege(const PrivilegeParams& p) {
-    return harness_->GrantAlterTablePrivilege(p);
+    return harness_->GrantAlterTablePrivilege(p, cluster_);
   }
 
   Status GrantRenameTablePrivilege(const PrivilegeParams& p) {
-    return harness_->GrantRenameTablePrivilege(p);
+    return harness_->GrantRenameTablePrivilege(p, cluster_);
   }
 
   Status GrantGetMetadataTablePrivilege(const PrivilegeParams& p) {
-    return harness_->GrantGetMetadataTablePrivilege(p);
+    return harness_->GrantGetMetadataTablePrivilege(p, cluster_);
+  }
+
+  Status GrantAlterWithGrantTablePrivilege(const PrivilegeParams& p) {
+    return harness_->GrantAlterWithGrantTablePrivilege(p, cluster_);
+  }
+
+  Status GrantAllTablePrivilege(const PrivilegeParams& p) {
+    return harness_->GrantAllTablePrivilege(p, cluster_);
+  }
+
+  Status GrantAllDatabasePrivilege(const PrivilegeParams& p) {
+    return harness_->GrantAllDatabasePrivilege(p, cluster_);
+  }
+
+  Status GrantAllWithGrantTablePrivilege(const PrivilegeParams& p) {
+    return harness_->GrantAllWithGrantTablePrivilege(p, cluster_);
+  }
+
+  Status GrantAllWithGrantDatabasePrivilege(const PrivilegeParams& p) {
+    return harness_->GrantAllWithGrantDatabasePrivilege(p, cluster_);
   }
 
   Status GrantGetMetadataDatabasePrivilege(const PrivilegeParams& p) {
-    return harness_->GrantGetMetadataDatabasePrivilege(p);
+    return harness_->GrantGetMetadataDatabasePrivilege(p, cluster_);
   }
 
   Status CreateTable(const OperationParams& p) {
@@ -719,6 +670,10 @@ class MasterAuthzITestBase : public ExternalMiniClusterITestBase {
 
   Status IsAlterTableDone(const OperationParams& p) {
     return harness_->IsAlterTableDone(p, client_);
+  }
+
+  Status ChangeOwner(const OperationParams& p) {
+    return harness_->ChangeOwner(p, client_);
   }
 
   Status RenameTable(const OperationParams& p) {
@@ -777,10 +732,38 @@ class MasterAuthzITest : public MasterAuthzITestBase,
 };
 
 INSTANTIATE_TEST_CASE_P(AuthzProviders, MasterAuthzITest,
-    ::testing::Values(/*kSentry,*/ kRanger),
+    ::testing::Values(kRanger),
     [] (const testing::TestParamInfo<MasterAuthzITest::ParamType>& info) {
       return HarnessEnumToString(info.param);
     });
+
+// Test that creation of the transaction status table foregoes fine-grained
+// authorization.
+TEST_P(MasterAuthzITest, TestCreateTransactionStatusTable) {
+  // Create a transaction status table and add a range. Both requests should
+  // succeed, despite no privileges being granted in Ranger.
+  vector<string> master_addrs;
+  for (const auto& hp : cluster_->master_rpc_addrs()) {
+    master_addrs.emplace_back(hp.ToString());
+  }
+  ASSERT_OK(this->cluster_->kdc()->Kinit(kTestUser));
+  // Attempting to call system client DDL as a non-admin should result in a
+  // NotAuthorized error.
+  {
+    unique_ptr<TxnSystemClient> non_admin_client;
+    ASSERT_OK(TxnSystemClient::Create(master_addrs, &non_admin_client));
+    Status s = non_admin_client->CreateTxnStatusTable(100);
+    ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+    s = non_admin_client->AddTxnStatusTableRange(100, 200);
+    ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+  }
+  // But as service user, we should have no trouble making the calls.
+  ASSERT_OK(this->cluster_->kdc()->Kinit(kAdminUser));
+  unique_ptr<TxnSystemClient> txn_sys_client;
+  ASSERT_OK(TxnSystemClient::Create(master_addrs, &txn_sys_client));
+  ASSERT_OK(txn_sys_client->CreateTxnStatusTable(100));
+  ASSERT_OK(txn_sys_client->AddTxnStatusTableRange(100, 200));
+}
 
 TEST_P(MasterAuthzITest, TestCreateTableAuthorized) {
   ASSERT_OK(cluster_->kdc()->Kinit(kAdminUser));
@@ -818,6 +801,35 @@ TEST_P(MasterAuthzITest, TestCreateTableUnauthorized) {
     .Create().IsNotAuthorized());
 }
 
+TEST_P(MasterAuthzITest, TestCreateTableDifferentOwner) {
+  ASSERT_OK(cluster_->kdc()->Kinit(kTestUser));
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
+
+  KuduSchemaBuilder b;
+  b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()
+                    ->PrimaryKey();
+  KuduSchema schema;
+  ASSERT_OK(b.Build(&schema));
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+
+  const string kTableName = "another_table";
+  PrivilegeParams p = { kDatabaseName, kTableName };
+  this->GrantAllDatabasePrivilege(p);
+  this->GrantAllTablePrivilege(p);
+  this->GrantAllWithGrantTablePrivilege(p);
+  ASSERT_TRUE(table_creator->table_name(Substitute("$0.$1", kDatabaseName,
+                                                   kTableName))
+    .schema(&schema)
+    .num_replicas(1)
+    .set_range_partition_columns({"key"})
+    .set_owner("another_user")
+    .Create().IsNotAuthorized());
+
+  this->GrantAllWithGrantDatabasePrivilege(p);
+
+  ASSERT_OK(table_creator->Create());
+}
+
 // Test that the trusted user can access the cluster without being authorized.
 TEST_P(MasterAuthzITest, TestTrustedUserAcl) {
   // Log in as 'impala' and reset the client to pick up the change in user.
@@ -832,8 +844,25 @@ TEST_P(MasterAuthzITest, TestTrustedUserAcl) {
             tables_set);
 
   ASSERT_OK(this->CreateKuduTable(kDatabaseName, "new_table"));
-  NO_FATALS(this->CheckTable(kDatabaseName, "new_table",
-                             make_optional<const string&>(kImpalaUser)));
+
+  // Create another table with a different owner
+  KuduSchemaBuilder b;
+  b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()
+                    ->PrimaryKey();
+  KuduSchema schema;
+  ASSERT_OK(b.Build(&schema));
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+
+  const string kTableName = "another_table";
+  ASSERT_OK(table_creator->table_name(Substitute("$0.$1", kDatabaseName,
+                                                 kTableName))
+    .schema(&schema)
+    .num_replicas(1)
+    .set_range_partition_columns({"key"})
+    .set_owner("another_user")
+    .Create());
+  const string user = kImpalaUser;
+  NO_FATALS(this->CheckTable(kDatabaseName, "new_table", user));
 }
 
 TEST_P(MasterAuthzITest, TestAuthzListTables) {
@@ -854,7 +883,8 @@ TEST_P(MasterAuthzITest, TestAuthzListTables) {
   ASSERT_EQ(vector<string>({ table_name }), tables);
 
   tables.clear();
-  ASSERT_OK(this->GrantGetMetadataTablePrivilege({ kDatabaseName, kSecondTable }));
+  ASSERT_OK(this->GrantGetMetadataTablePrivilege(
+      {kDatabaseName, kSecondTable, "{OWNER}"}));
   ASSERT_OK(this->client_->ListTables(&tables));
   unordered_set<string> tables_set(tables.begin(), tables.end());
   ASSERT_EQ(unordered_set<string>({ table_name, sec_table_name }), tables_set);
@@ -885,13 +915,99 @@ TEST_P(MasterAuthzITest, TestAuthzListTablesConcurrentRename) {
   ASSERT_EQ(sec_table_name, tables[0]);
 }
 
+TEST_P(MasterAuthzITest, TestAuthzGiveAwayOwnership) {
+  this->GrantAllWithGrantTablePrivilege({ kDatabaseName, kTableName, "{OWNER}"});
+
+  // We need to grant metadata permissions to the user, otherwise the ownership
+  // change would time out due to lack of privileges when checking the alter
+  // table progress.
+  this->GrantGetMetadataTablePrivilege({ kDatabaseName, kTableName, kTestUser });
+  const string table_name = Substitute("$0.$1", kDatabaseName, kTableName);
+
+  // Change table owner.
+  {
+    unique_ptr<KuduTableAlterer> alterer(
+        this->client_->NewTableAlterer(table_name));
+    ASSERT_OK(alterer->SetOwner(kSecondUser)->Alter());
+  }
+
+  // Attempt to drop a column after as a non-owner.
+  {
+    unique_ptr<KuduTableAlterer> alterer(
+        this->client_->NewTableAlterer(table_name));
+    Status s = alterer->DropColumn("int8_val")->Alter();
+    ASSERT_TRUE(s.IsNotAuthorized());
+  }
+
+  // Login as the new owner, create a new client, and alter the table.
+  {
+    ASSERT_OK(this->cluster_->kdc()->Kinit(kSecondUser));
+    ASSERT_OK(this->cluster_->CreateClient(nullptr, &this->client_));
+    unique_ptr<KuduTableAlterer> alterer(
+        this->client_->NewTableAlterer(table_name));
+    ASSERT_OK(alterer->DropColumn("int8_val")->Alter());
+  }
+}
+
+TEST_P(MasterAuthzITest, TestChangeOwnerWithoutDelegateAdmin) {
+  this->GrantAllDatabasePrivilege({kDatabaseName, kTableName});
+  const string table_name = Substitute("$0.$1", kDatabaseName, kTableName);
+
+  unique_ptr<KuduTableAlterer> alterer(this->client_->NewTableAlterer(table_name));
+  Status s = alterer->SetOwner(kSecondUser)->Alter();
+  ASSERT_TRUE(s.IsNotAuthorized());
+}
+
+TEST_P(MasterAuthzITest, TestChangeOwnerWithoutAll) {
+  this->GrantAlterWithGrantTablePrivilege({kDatabaseName, kTableName});
+  const string table_name = Substitute("$0.$1", kDatabaseName, kTableName);
+
+  unique_ptr<KuduTableAlterer> alterer(this->client_->NewTableAlterer(table_name));
+  Status s = alterer->SetOwner(kSecondUser)->Alter();
+  ASSERT_TRUE(s.IsNotAuthorized());
+}
+
+TEST_P(MasterAuthzITest, TestAlterAndChangeOwner) {
+  this->GrantAlterTablePrivilege({kDatabaseName, kTableName});
+  const string table_name = Substitute("$0.$1", kDatabaseName, kTableName);
+
+  unique_ptr<KuduTableAlterer> alterer(this->client_->NewTableAlterer(table_name));
+  alterer->SetOwner(kSecondUser)->DropColumn("int8_val");
+  Status s = alterer->Alter();
+  ASSERT_TRUE(s.IsNotAuthorized());
+
+  this->GrantAllWithGrantTablePrivilege({kDatabaseName, kTableName});
+  ASSERT_OK(alterer->Alter());
+}
+
+class MasterAuthzOwnerITest : public MasterAuthzITestBase,
+                              public ::testing::WithParamInterface<std::tuple<HarnessEnum,
+                                                                              std::string>> {
+ public:
+  void SetUp() override {
+    NO_FATALS(MasterAuthzITestBase::SetUp());
+    NO_FATALS(SetUpCluster(std::get<0>(GetParam())));
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(
+    AuthzProvidersWithOwner, MasterAuthzOwnerITest,
+    ::testing::Combine(::testing::Values(kRanger),
+                       ::testing::Values(kTestUser, "{OWNER}")),
+    [](const testing::TestParamInfo<MasterAuthzOwnerITest::ParamType>& info) {
+      string user = std::get<1>(info.param) == "{OWNER}" ? "owner" : "nonowner";
+      return Substitute("$0_$1", HarnessEnumToString(std::get<0>(info.param)),
+                        user);
+    });
+
 // Test that when the client passes a table identifier with the table name
 // and table ID refer to different tables, the client needs permission on
 // both tables for returning TABLE_NOT_FOUND error to avoid leaking table
 // existence.
-TEST_P(MasterAuthzITest, TestMismatchedTable) {
+TEST_P(MasterAuthzOwnerITest, TestMismatchedTable) {
   const auto table_name_a = Substitute("$0.$1", kDatabaseName, kTableName);
   const auto table_name_b = Substitute("$0.$1", kDatabaseName, kSecondTable);
+  const string& kUsername = std::get<1>(GetParam());
 
   // Log in as 'test-admin' to get the tablet ID.
   ASSERT_OK(this->cluster_->kdc()->Kinit(kAdminUser));
@@ -899,7 +1015,7 @@ TEST_P(MasterAuthzITest, TestMismatchedTable) {
   ASSERT_OK(this->cluster_->CreateClient(nullptr, &client));
   shared_ptr<KuduTable> table;
   ASSERT_OK(client->OpenTable(table_name_a, &table));
-  optional<const string&> table_id_a = make_optional<const string&>(table->id());
+  optional<const string&> table_id_a = table->id();
 
   // Log back as 'test-user'.
   ASSERT_OK(this->cluster_->kdc()->Kinit(kTestUser));
@@ -908,12 +1024,12 @@ TEST_P(MasterAuthzITest, TestMismatchedTable) {
   ASSERT_TRUE(s.IsNotAuthorized());
   ASSERT_STR_MATCHES(s.ToString(), "[Uu]nauthorized action");
 
-  ASSERT_OK(this->GrantGetMetadataTablePrivilege({ kDatabaseName, kTableName }));
+  ASSERT_OK(this->GrantGetMetadataTablePrivilege({ kDatabaseName, kTableName, kUsername }));
   s = this->GetTableLocationsWithTableId(table_name_b, table_id_a);
   ASSERT_TRUE(s.IsNotAuthorized());
   ASSERT_STR_MATCHES(s.ToString(), "[Uu]nauthorized action");
 
-  ASSERT_OK(this->GrantGetMetadataTablePrivilege({ kDatabaseName, kSecondTable }));
+  ASSERT_OK(this->GrantGetMetadataTablePrivilege({ kDatabaseName, kSecondTable, kUsername }));
   s = this->GetTableLocationsWithTableId(table_name_b, table_id_a);
   ASSERT_TRUE(s.IsNotFound());
   ASSERT_STR_CONTAINS(s.ToString(), "the table ID refers to a different table");
@@ -956,7 +1072,7 @@ ostream& operator <<(ostream& out, const AuthzDescriptor& d) {
 
 class TestAuthzTable :
     public MasterAuthzITestBase,
-    public ::testing::WithParamInterface<std::tuple<HarnessEnum, AuthzDescriptor>> {
+    public ::testing::WithParamInterface<std::tuple<HarnessEnum, AuthzDescriptor, std::string>> {
  public:
   void SetUp() override {
     NO_FATALS(MasterAuthzITestBase::SetUp());
@@ -966,11 +1082,18 @@ class TestAuthzTable :
 
 TEST_P(TestAuthzTable, TestAuthorizeTable) {
   const AuthzDescriptor& desc = std::get<1>(GetParam());
+  const string& owner = std::get<2>(GetParam());
+  if (desc.funcs.description == "CreateTable" && owner == "{OWNER}") {
+    // This case doesn't make sense semantically as we don't have database
+    // owners which would be required to create a table.
+    return;
+  }
   const auto table_name = Substitute("$0.$1", desc.database, desc.table_name);
   const auto new_table_name = Substitute("$0.$1",
                                          desc.database, desc.new_table_name);
   const OperationParams action_params = { table_name, new_table_name };
-  const PrivilegeParams privilege_params = { desc.database, desc.table_name };
+  const PrivilegeParams privilege_params = { desc.database, desc.table_name,
+                                             std::get<2>(GetParam()) };
 
   // User 'test-user' attempts to operate on the table without proper privileges.
   Status s = desc.funcs.do_action(this, action_params);
@@ -981,7 +1104,7 @@ TEST_P(TestAuthzTable, TestAuthorizeTable) {
   ASSERT_OK(desc.funcs.grant_privileges(this, privilege_params));
   ASSERT_OK(desc.funcs.do_action(this, action_params));
 
-  // Ensure that operating on a table while the Sentry is unreachable fails.
+  // Ensure that operating on a table while the Authz service is unreachable fails.
   // No such guarantee exists for Ranger, which caches policies in its clients.
   if (std::get<0>(GetParam()) != kRanger) {
     ASSERT_OK(StopAuthzProvider());
@@ -1081,65 +1204,27 @@ static const AuthzDescriptor kAuthzCombinations[] = {
       kTableName,
       ""
     },
+    {
+      {
+        &MasterAuthzITestBase::ChangeOwner,
+        &MasterAuthzITestBase::GrantAllWithGrantTablePrivilege,
+        "ChangeOwner",
+      },
+      kDatabaseName,
+      kTableName,
+    },
 };
-INSTANTIATE_TEST_CASE_P(AuthzCombinations,
-                        TestAuthzTable,
-                        ::testing::Combine(
-                            ::testing::Values(/*kSentry,*/ kRanger),
-                            ::testing::ValuesIn(kAuthzCombinations)),
-                        [] (const testing::TestParamInfo<TestAuthzTable::ParamType>& info) {
-                          return Substitute("$0_$1", HarnessEnumToString(std::get<0>(info.param)),
-                                            std::get<1>(info.param).funcs.description);
-                        });
-
-class DISABLED_MasterSentryITest : public MasterAuthzITestBase {
- public:
-  void SetUp() override {
-    NO_FATALS(MasterAuthzITestBase::SetUp());
-    NO_FATALS(SetUpCluster(kSentry));
-  }
-};
-
-// Checks the user with table ownership automatically has ALL privilege on the
-// table. User 'test-user' can delete the same table without specifically
-// granting 'DROP ON TABLE'. Note that ownership population between the HMS and
-// the Sentry service happens synchronously, therefore, the table deletion
-// should succeed right after the table creation.
-// NOTE: this behavior is specific to Sentry,  so we don't parameterize.
-TEST_F(DISABLED_MasterSentryITest, TestTableOwnership) {
-  ASSERT_OK(GrantCreateTablePrivilege({ kDatabaseName }));
-  ASSERT_OK(CreateKuduTable(kDatabaseName, "new_table"));
-  NO_FATALS(CheckTable(kDatabaseName, "new_table",
-                       make_optional<const string&>(kTestUser)));
-
-  // TODO(hao): test create a table with a different owner than the client’s username?
-  ASSERT_OK(client_->DeleteTable(Substitute("$0.$1", kDatabaseName, "new_table")));
-  NO_FATALS(CheckTableDoesNotExist(kDatabaseName, "new_table"));
-}
-
-// Checks Sentry privileges are synchronized upon table rename in the HMS.
-TEST_F(DISABLED_MasterSentryITest, TestRenameTablePrivilegeTransfer) {
-  ASSERT_OK(GrantRenameTablePrivilege({ kDatabaseName, kTableName }));
-  ASSERT_OK(RenameTable({ Substitute("$0.$1", kDatabaseName, kTableName),
-                          Substitute("$0.$1", kDatabaseName, "b") }));
-  NO_FATALS(CheckTable(kDatabaseName, "b",
-                       make_optional<const string&>(kAdminUser)));
-
-  unique_ptr<KuduTableAlterer> alterer(client_->NewTableAlterer(
-      Substitute("$0.$1", kDatabaseName, "b")));
-  alterer->DropColumn("int16_val");
-
-  // Note that unlike table creation, there could be a delay between the table renaming
-  // in Kudu and the privilege renaming in Sentry. Because Kudu uses the transactional
-  // listener of the HMS to get notification of table alteration events, while Sentry
-  // uses post event listener (which is executed outside the HMS transaction). There
-  // is a chance that Kudu already finish the table renaming but the privilege renaming
-  // hasn't been reflected in the Sentry service.
-  ASSERT_EVENTUALLY([&] {
-    ASSERT_OK(alterer->Alter());
-  });
-  NO_FATALS(CheckTable(kDatabaseName, "b", make_optional<const string&>(kAdminUser)));
-}
+INSTANTIATE_TEST_CASE_P(
+    AuthzCombinations, TestAuthzTable,
+    ::testing::Combine(::testing::Values(kRanger),
+                       ::testing::ValuesIn(kAuthzCombinations),
+                       ::testing::Values(kTestUser, "{OWNER}")),
+    [](const testing::TestParamInfo<TestAuthzTable::ParamType>& info) {
+      string user = std::get<2>(info.param) == "{OWNER}" ? "owner" : "nonowner";
+      return Substitute("$0_$1_$2",
+                        HarnessEnumToString(std::get<0>(info.param)),
+                        std::get<1>(info.param).funcs.description, user);
+    });
 
 class AuthzErrorHandlingTest :
     public MasterAuthzITestBase,
@@ -1166,7 +1251,7 @@ TEST_P(AuthzErrorHandlingTest, TestNonExistentTable) {
   ASSERT_TRUE(s.IsNotAuthorized());
   ASSERT_STR_MATCHES(s.ToString(), "[Uu]nauthorized action");
 
-  // Ensure that operating on a non-existent table fails while Sentry is
+  // Ensure that operating on a non-existent table fails while the Authz service is
   // unreachable. No such guarantee exists for Ranger.
   if (std::get<0>(GetParam()) != kRanger) {
     ASSERT_OK(StopAuthzProvider());
@@ -1178,8 +1263,6 @@ TEST_P(AuthzErrorHandlingTest, TestNonExistentTable) {
     ASSERT_OK(StartAuthzProvider());
   }
   ASSERT_EVENTUALLY([&] {
-    // SentryAuthzProvider throttles reconnections, so it's necessary to wait
-    // out the backoff.
     ASSERT_OK(funcs.grant_privileges(this, privilege_params));
   });
   s = funcs.do_action(this, action_params);
@@ -1227,356 +1310,11 @@ static const AuthzFuncs kAuthzFuncCombinations[] = {
 INSTANTIATE_TEST_CASE_P(AuthzFuncCombinations,
                         AuthzErrorHandlingTest,
                         ::testing::Combine(
-                            ::testing::Values(/*kSentry,*/ kRanger),
+                            ::testing::Values(kRanger),
                             ::testing::ValuesIn(kAuthzFuncCombinations)),
                         [] (const testing::TestParamInfo<AuthzErrorHandlingTest::ParamType>& info) {
                           return Substitute("$0_$1", HarnessEnumToString(std::get<0>(info.param)),
                                             std::get<1>(info.param).description);
                         });
-
-// Class for test scenarios verifying functionality of managing AuthzProvider's
-// privileges cache via Kudu RPC.
-class DISABLED_SentryAuthzProviderCacheITest : public MasterAuthzITestBase {
- public:
-  void SetUp() override {
-    NO_FATALS(MasterAuthzITestBase::SetUp());
-    NO_FATALS(SetUpCluster(kSentryWithCache));
-  }
-
-  Status ResetCache() {
-    // ResetAuthzCache() RPC requires admin/superuser credentials, so this
-    // method calls Kinit(kAdminUser) to authenticate appropriately. However,
-    // it's necessary to return back the credentials of the regular user after
-    // resetting the cache since the rest of the scenario is supposed to run
-    // without superuser credentials.
-    SCOPED_CLEANUP({
-      WARN_NOT_OK(cluster_->kdc()->Kinit(kTestUser),
-                  "could not restore Kerberos credentials");
-    });
-    RETURN_NOT_OK(cluster_->kdc()->Kinit(kAdminUser));
-    std::shared_ptr<MasterServiceProxy> proxy = cluster_->master_proxy();
-    UserCredentials user_credentials;
-    user_credentials.set_real_user(kAdminUser);
-    proxy->set_user_credentials(user_credentials);
-
-    RpcController ctl;
-    ResetAuthzCacheResponsePB res;
-    RETURN_NOT_OK(proxy->ResetAuthzCache(
-        ResetAuthzCacheRequestPB(), &res, &ctl));
-    return res.has_error() ? StatusFromPB(res.error().status()) : Status::OK();
-  }
-};
-
-// This test scenario uses AlterTable() to make sure AuthzProvider's cache
-// empties upon successful ResetAuthzCache() RPC.
-TEST_F(DISABLED_SentryAuthzProviderCacheITest, AlterTable) {
-  const auto table_name = Substitute("$0.$1", kDatabaseName, kTableName);
-  ASSERT_OK(GrantAlterTablePrivilege({ kDatabaseName, kTableName }));
-  {
-    unique_ptr<KuduTableAlterer> table_alterer(
-        client_->NewTableAlterer(table_name)->DropColumn("int8_val"));
-    auto s = table_alterer->Alter();
-    ASSERT_TRUE(s.ok()) << s.ToString();
-  }
-  ASSERT_OK(StopAuthzProvider());
-  {
-    unique_ptr<KuduTableAlterer> table_alterer(
-        client_->NewTableAlterer(table_name)->DropColumn("int16_val"));
-    auto s = table_alterer->Alter();
-    ASSERT_TRUE(s.ok()) << s.ToString();
-  }
-  ASSERT_OK(ResetCache());
-  {
-    // After resetting the cache, it should not be possible to perform another
-    // ALTER TABLE operation: no entries are in the cache, so authz provider
-    // needs to fetch information from Sentry directly.
-    unique_ptr<KuduTableAlterer> table_alterer(
-        client_->NewTableAlterer(table_name)->DropColumn("int32_val"));
-    auto s = table_alterer->Alter();
-    ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
-  }
-
-  // Try to do the same after starting Sentry back. It should be a success.
-  ASSERT_OK(StartAuthzProvider());
-  {
-    unique_ptr<KuduTableAlterer> table_alterer(
-        client_->NewTableAlterer(table_name)->DropColumn("int32_val"));
-    auto s = table_alterer->Alter();
-    ASSERT_TRUE(s.ok()) << s.ToString();
-  }
-}
-
-// This test scenario calls a couple of authz methods of SentryAuthzProvider
-// while resetting its fetcher's cache in parallel using master's
-// ResetAuthzCache() RPC.
-TEST_F(DISABLED_SentryAuthzProviderCacheITest, ResetAuthzCacheConcurrentAlterTable) {
-  constexpr const auto num_threads = 16;
-  const auto run_interval = AllowSlowTests() ? MonoDelta::FromSeconds(8)
-                                             : MonoDelta::FromSeconds(1);
-  ASSERT_OK(GrantCreateTablePrivilege({ kDatabaseName }));
-  for (auto idx = 0; idx < num_threads; ++idx) {
-    ASSERT_OK(CreateTable(Substitute("$0.$1", kDatabaseName, idx)));
-    ASSERT_OK(GrantAlterTablePrivilege({ kDatabaseName, Substitute("$0", idx) }));
-  }
-
-  vector<Status> threads_task_status(num_threads);
-  {
-    atomic<bool> stopped(false);
-    vector<thread> threads;
-
-    SCOPED_CLEANUP({
-      stopped = true;
-      for (auto& thread : threads) {
-        thread.join();
-      }
-    });
-
-    for (auto idx = 0; idx < num_threads; ++idx) {
-      const auto thread_idx = idx;
-      threads.emplace_back([&, thread_idx] () {
-        const auto table_name = Substitute("$0.$1", kDatabaseName, thread_idx);
-
-        while (!stopped) {
-          SleepFor(MonoDelta::FromMicroseconds((rand() % 2 + 1) * thread_idx));
-          {
-            unique_ptr<KuduTableAlterer> table_alterer(
-               client_->NewTableAlterer(table_name));
-            table_alterer->DropColumn("int8_val");
-
-            auto s = table_alterer->Alter();
-            if (!s.ok()) {
-              threads_task_status[thread_idx] = s;
-              return;
-            }
-          }
-
-          SleepFor(MonoDelta::FromMicroseconds((rand() % 3 + 1) * thread_idx));
-          {
-            unique_ptr<KuduTableAlterer> table_alterer(
-                client_->NewTableAlterer(table_name));
-            table_alterer->AddColumn("int8_val")->Type(KuduColumnSchema::INT8);
-            auto s = table_alterer->Alter();
-            if (!s.ok()) {
-              threads_task_status[thread_idx] = s;
-              return;
-            }
-          }
-        }
-      });
-    }
-
-    const auto time_beg = MonoTime::Now();
-    const auto time_end = time_beg + run_interval;
-    while (MonoTime::Now() < time_end) {
-      SleepFor(MonoDelta::FromMilliseconds((rand() % 3)));
-      ASSERT_OK(ResetCache());
-    }
-  }
-  for (auto idx = 0; idx < threads_task_status.size(); ++idx) {
-    SCOPED_TRACE(Substitute("results for thread $0", idx));
-    const auto& s = threads_task_status[idx];
-    EXPECT_TRUE(s.ok()) << s.ToString();
-  }
-}
-
-// This test scenario documents an artifact of the Kudu+HMS+Sentry integration
-// when authz cache is enabled (the cache is enabled by default). In essence,
-// information on the ownership of a table created during a short period of
-// Sentry's unavailability will not ever appear in Sentry. That might be
-// misleading because CreateTable() reports a success to the client. The created
-// table indeed exists and is fully functional otherwise, but the corresponding
-// owner privilege record is absent in Sentry.
-//
-// TODO(aserbin): clarify why it works with HEAD of the master branches
-//                of Sentry/Hive but fails with Sentry 2.1.0 and Hive 2.1.1.
-TEST_F(DISABLED_SentryAuthzProviderCacheITest, DISABLED_CreateTables) {
-  constexpr const char* const kGhostTables[] = { "t10", "t11" };
-
-  // Grant CREATE TABLE and METADATA privileges on the database.
-  ASSERT_OK(GrantCreateTablePrivilege({ kDatabaseName }));
-  ASSERT_OK(GrantGetMetadataDatabasePrivilege({ kDatabaseName }));
-
-  // Make sure it's possible to create a table in the database. This also
-  // populates the privileges cache with information on the privileges
-  // granted on the database.
-  ASSERT_OK(CreateKuduTable(kDatabaseName, "t0"));
-
-  // An attempt to open a not-yet-existing table will fetch the information
-  // on the granted privileges on the table into the privileges cache.
-  for (const auto& t : kGhostTables) {
-    shared_ptr<KuduTable> kudu_table;
-    const auto s = client_->OpenTable(Substitute("$0.$1", kDatabaseName, t),
-                                      &kudu_table);
-    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
-  }
-
-  ASSERT_OK(StopAuthzProvider());
-
-  // CreateTable() with operation timeout longer than HMS --> Sentry
-  // communication timeout successfully completes. After failing to push
-  // the information on the newly created table to Sentry due to the logic
-  // implemented in the SentrySyncHMSNotificationsPostEventListener plugin,
-  // HMS sends success response to Kudu master and Kudu successfully completes
-  // the rest of the steps.
-  ASSERT_OK(CreateKuduTable(kDatabaseName, kGhostTables[0]));
-
-  // In this case, the timeout for the CreateTable RPC is set to be lower than
-  // the HMS --> Sentry communication timeout (see corresponding parameters
-  // of the MiniHms::EnableSentry() method). CreateTable() successfully passes
-  // the authz phase since the information on privileges is cached and no
-  // Sentry RPC calls are attempted. However, since Sentry is down,
-  // CreateTable() takes a long time on the HMS's side and the client's
-  // request times out, while the creation of the table continues in the
-  // background.
-  {
-    const auto s = CreateKuduTable(kDatabaseName, kGhostTables[1],
-                                   MonoDelta::FromSeconds(1));
-    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
-  }
-
-  // Before starting Sentry, make sure the abandoned request to create the
-  // latter table succeeded even if CreateKuduTable() reported timeout.
-  // This is to make sure HMS stopped trying to push notification
-  // on table creation to Sentry anymore via the metastore plugin
-  // SentrySyncHMSNotificationsPostEventListener.
-  ASSERT_EVENTUALLY([&]{
-    bool exists;
-    ASSERT_OK(client_->TableExists(
-        Substitute("$0.$1", kDatabaseName, kGhostTables[1]), &exists));
-    ASSERT_TRUE(exists);
-  });
-
-  ASSERT_OK(ResetCache());
-
-  // After resetting the cache, it should not be possible to create another
-  // table: authz provider needs to fetch information on privileges directly
-  // from Sentry, but it's still down.
-  {
-    const auto s = CreateKuduTable(kDatabaseName, "t2");
-    ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
-  }
-
-  ASSERT_OK(StartAuthzProvider());
-
-  // Try to create the table after starting Sentry back: it should be a success.
-  ASSERT_OK(CreateKuduTable(kDatabaseName, "t2"));
-
-  // Once table has been created, it should be possible to perform DDL operation
-  // on it since the user is the owner of the table.
-  {
-    unique_ptr<KuduTableAlterer> table_alterer(
-        client_->NewTableAlterer(Substitute("$0.$1", kDatabaseName, "t2")));
-    table_alterer->AddColumn("new_int8_columun")->Type(KuduColumnSchema::INT8);
-    ASSERT_OK(table_alterer->Alter());
-  }
-
-  // Try to run DDL against the tables created during Sentry's downtime. These
-  // should not be authorized since Sentry didn't received information on the
-  // ownership of those tables from HMS during their creation and there isn't
-  // any catch up for those events made after Sentry started.
-  for (const auto& t : kGhostTables) {
-    unique_ptr<KuduTableAlterer> table_alterer(
-        client_->NewTableAlterer(Substitute("$0.$1", kDatabaseName, t)));
-    table_alterer->AddColumn("new_int8_columun")->Type(KuduColumnSchema::INT8);
-    auto s = table_alterer->Alter();
-    ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
-
-    // After granting the ALTER TABLE privilege the alteration should be
-    // successful. One caveat: it's necessary to reset the cache since the cache
-    // will not have the new record till the current entry hasn't yet expired.
-    ASSERT_OK(GrantAlterTablePrivilege({ kDatabaseName, t }));
-    ASSERT_OK(ResetCache());
-    ASSERT_OK(table_alterer->Alter());
-  }
-}
-
-// Basic test to verify access control and functionality of
-// the ResetAuthzCache(); integration with Sentry is not enabled.
-class DISABLED_AuthzCacheControlTest : public ExternalMiniClusterITestBase {
- public:
-  void SetUp() override {
-    ExternalMiniClusterITestBase::SetUp();
-    ExternalMiniClusterOptions opts;
-    opts.enable_kerberos = true;
-    StartClusterWithOpts(opts);
-  }
-
-  // Utility method to call master's ResetAuthzCache RPC under the credentials
-  // of the specified 'user'. The credentials should have been set appropriately
-  // before calling this method (e.g., call kinit if necessary).
-  Status ResetCache(const string& user,
-                    RpcController* ctl,
-                    ResetAuthzCacheResponsePB* resp) {
-    RETURN_NOT_OK(cluster_->kdc()->Kinit(user));
-    std::shared_ptr<MasterServiceProxy> proxy = cluster_->master_proxy();
-    UserCredentials user_credentials;
-    user_credentials.set_real_user(user);
-    proxy->set_user_credentials(user_credentials);
-
-    ResetAuthzCacheRequestPB req;
-    return proxy->ResetAuthzCache(req, resp, ctl);
-  }
-};
-
-TEST_F(DISABLED_AuthzCacheControlTest, ResetCacheNoSentryIntegration) {
-  // Non-admin users (i.e. those not in --superuser_acl) are not allowed
-  // to reset authz cache.
-  for (const auto& user : { "test-user", "joe-interloper", }) {
-    ASSERT_OK(cluster_->kdc()->Kinit(user));
-    ResetAuthzCacheResponsePB resp;
-    RpcController ctl;
-    auto s = ResetCache(user, &ctl, &resp);
-    ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
-    ASSERT_FALSE(resp.has_error());
-
-    const auto* err_status = ctl.error_response();
-    ASSERT_NE(nullptr, err_status);
-    ASSERT_TRUE(err_status->has_code());
-    ASSERT_EQ(rpc::ErrorStatusPB::ERROR_APPLICATION, err_status->code());
-    ASSERT_STR_CONTAINS(err_status->message(),
-                        "unauthorized access to method: ResetAuthzCache");
-  }
-
-  // The cache can be reset with credentials of a super-user. However, in
-  // case if integration with Sentry is not enabled, the AuthzProvider
-  // doesn't have any cache.
-  {
-    ResetAuthzCacheResponsePB resp;
-    RpcController ctl;
-    const auto s = ResetCache("test-admin", &ctl, &resp);
-    ASSERT_TRUE(s.ok()) << s.ToString();
-    ASSERT_EQ(nullptr, ctl.error_response());
-    ASSERT_TRUE(resp.has_error()) << resp.error().DebugString();
-    const auto app_s = StatusFromPB(resp.error().status());
-    ASSERT_TRUE(app_s.IsNotSupported()) << app_s.ToString();
-    ASSERT_STR_CONTAINS(app_s.ToString(),
-                        "provider does not have privileges cache");
-  }
-}
-
-// A test for the ValidateSentryServiceRpcAddresses group flag validator.
-// The only existing test scenario covers only the negative case, while
-// several other Sentry-related (and not) tests provide good coverage
-// for all the positive cases.
-class DISABLED_MasterSentryAndHmsFlagsTest : public KuduTest {
-};
-
-TEST_F(DISABLED_MasterSentryAndHmsFlagsTest, MasterRefuseToStart) {
-  // The code below results in setting the --sentry_service_rpc_addresses flag
-  // to the mini-sentry's RPC address, but leaving the --hive_metastore_uris
-  // flag unset (i.e. its value is an empty string). Such a combination of flag
-  // settings makes it impossible to start Kudu master.
-  cluster::ExternalMiniClusterOptions opts;
-  opts.enable_kerberos = true;
-  opts.enable_sentry = true;
-  opts.hms_mode = HmsMode::NONE;
-
-  cluster::ExternalMiniCluster cluster(std::move(opts));
-  const auto s = cluster.Start();
-  const auto msg = s.ToString();
-  ASSERT_TRUE(s.IsRuntimeError()) << msg;
-  ASSERT_STR_CONTAINS(msg, "failed to start masters: Unable to start Master");
-  ASSERT_STR_CONTAINS(msg, "kudu-master: process exited with non-zero status 1");
-}
 
 } // namespace kudu

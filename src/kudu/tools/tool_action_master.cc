@@ -45,6 +45,7 @@
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/master_runner.h"
+#include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
@@ -62,8 +63,8 @@ using kudu::master::ListMastersRequestPB;
 using kudu::master::ListMastersResponsePB;
 using kudu::master::Master;
 using kudu::master::MasterServiceProxy;
-using kudu::master::ResetAuthzCacheRequestPB;
-using kudu::master::ResetAuthzCacheResponsePB;
+using kudu::master::RefreshAuthzCacheRequestPB;
+using kudu::master::RefreshAuthzCacheResponsePB;
 using kudu::consensus::RaftPeerPB;
 using kudu::rpc::RpcController;
 using std::cout;
@@ -156,6 +157,10 @@ Status ListMasters(const RunnerContext& context) {
       for (const auto& master : masters) {
         values.push_back(master.instance_id().permanent_uuid());
       }
+    } else if (boost::iequals(column, "cluster_id")) {
+      for (const auto& master : masters) {
+        values.emplace_back(master.has_cluster_id() ? master.cluster_id() : "");
+      }
     } else if (boost::iequals(column, "seqno")) {
       for (const auto& master : masters) {
         values.push_back(std::to_string(master.instance_id().instance_seqno()));
@@ -183,6 +188,10 @@ Status ListMasters(const RunnerContext& context) {
     } else if (boost::iequals(column, "role")) {
       for (const auto& master : masters) {
         values.emplace_back(RaftPeerPB::Role_Name(master.role()));
+      }
+    } else if (boost::iequals(column, "member_type")) {
+      for (const auto& master : masters) {
+        values.emplace_back(RaftPeerPB::MemberType_Name(master.member_type()));
       }
     } else {
       return Status::InvalidArgument("unknown column (--columns)", column);
@@ -260,23 +269,23 @@ Status VerifyMasterAddressList(const vector<string>& master_addresses) {
   return Status::OK();
 }
 
-Status ResetAuthzCacheAtMaster(const string& master_address) {
+Status RefreshAuthzCacheAtMaster(const string& master_address) {
   unique_ptr<MasterServiceProxy> proxy;
   RETURN_NOT_OK(BuildProxy(master_address, Master::kDefaultPort, &proxy));
 
   RpcController ctl;
   ctl.set_timeout(MonoDelta::FromMilliseconds(FLAGS_timeout_ms));
 
-  ResetAuthzCacheRequestPB req;
-  ResetAuthzCacheResponsePB resp;
-  RETURN_NOT_OK(proxy->ResetAuthzCache(req, &resp, &ctl));
+  RefreshAuthzCacheRequestPB req;
+  RefreshAuthzCacheResponsePB resp;
+  RETURN_NOT_OK(proxy->RefreshAuthzCache(req, &resp, &ctl));
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
   }
   return Status::OK();
 }
 
-Status ResetAuthzCache(const RunnerContext& context) {
+Status RefreshAuthzCache(const RunnerContext& context) {
   vector<string> master_addresses;
   RETURN_NOT_OK(ParseMasterAddresses(context, &master_addresses));
 
@@ -286,13 +295,13 @@ Status ResetAuthzCache(const RunnerContext& context) {
     RETURN_NOT_OK(VerifyMasterAddressList(master_addresses));
   }
 
-  // It makes sense to reset privileges cache at every master in the cluster.
-  // Otherwise, SentryAuthzProvider might return inconsistent results for authz
-  // requests upon master leadership change.
+  // It makes sense to refresh privileges cache at every master in the cluster.
+  // Otherwise, the authorization provider might return inconsistent results for
+  // authz requests upon master leadership change.
   vector<Status> statuses;
   statuses.reserve(master_addresses.size());
   for (const auto& address : master_addresses) {
-    auto status = ResetAuthzCacheAtMaster(address);
+    auto status = RefreshAuthzCacheAtMaster(address);
     statuses.emplace_back(std::move(status));
   }
   DCHECK_EQ(master_addresses.size(), statuses.size());
@@ -310,7 +319,6 @@ Status ResetAuthzCache(const RunnerContext& context) {
   }
   return Status::Incomplete(err_str);
 }
-
 } // anonymous namespace
 
 unique_ptr<Mode> BuildMasterMode() {
@@ -318,20 +326,21 @@ unique_ptr<Mode> BuildMasterMode() {
   builder.Description("Operate on a Kudu Master");
 
   {
-    unique_ptr<Action> action_reset =
-        ActionBuilder("reset", &ResetAuthzCache)
-        .Description("Reset the privileges cache")
-        .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
-        .AddOptionalParameter(
-            "force",
-            boost::none,
-            string("Ignore mismatches of the specified and the actual lists "
-                   "of master addresses in the cluster"))
-        .Build();
+    unique_ptr<Action> action_refresh =
+        ActionBuilder("refresh", &RefreshAuthzCache)
+            .Description("Refresh the authorization policies")
+            .AddRequiredParameter(
+                {kMasterAddressesArg, kMasterAddressesArgDesc})
+            .AddOptionalParameter(
+                "force", boost::none,
+                string(
+                    "Ignore mismatches of the specified and the actual lists "
+                    "of master addresses in the cluster"))
+            .Build();
 
     unique_ptr<Mode> mode_authz_cache = ModeBuilder("authz_cache")
-        .Description("Operate on the authz cache of a Kudu Master")
-        .AddAction(std::move(action_reset))
+        .Description("Operate on the authz caches of the Kudu Masters")
+        .AddAction(std::move(action_refresh))
         .Build();
     builder.AddMode(std::move(mode_authz_cache));
   }
@@ -417,7 +426,7 @@ unique_ptr<Mode> BuildMasterMode() {
             "columns",
             string("uuid,rpc-addresses,role"),
             string("Comma-separated list of master info fields to "
-                   "include in output.\nPossible values: uuid, "
+                   "include in output.\nPossible values: uuid, cluster_id"
                    "rpc-addresses, http-addresses, version, seqno, "
                    "start_time and role"))
         .AddOptionalParameter("format")

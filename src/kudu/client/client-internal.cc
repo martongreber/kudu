@@ -219,28 +219,32 @@ RemoteTabletServer* KuduClient::Data::SelectTServer(
         break;
       }
       // Choose a replica as follows:
-      // 1. If there is a replica local to the client, pick it. If there are
-      // multiple, pick a random one.
-      // 2. Otherwise, if there is a replica in the same location, pick it. If
-      // there are multiple, pick a random one.
+      // 1. If there is a replica local to the client according to its IP and
+      //    assigned location, pick it. If there are multiple, pick a random one.
+      // 2. Otherwise, if there is a replica in the same assigned location,
+      //    pick it. If there are multiple, pick a random one.
       // 3. If there are no local replicas or replicas in the same location,
-      // pick a random replica.
+      //    pick a random replica.
       // TODO(wdberkeley): Eventually, the client might use the hierarchical
       // structure of a location to determine proximity.
+      // NOTE: this is the same logic implemented in RemoteTablet.java.
       const string client_location = location();
       small_vector<RemoteTabletServer*, 1> local;
       small_vector<RemoteTabletServer*, 3> same_location;
       local.reserve(filtered.size());
       same_location.reserve(filtered.size());
       for (RemoteTabletServer* rts : filtered) {
-        if (IsTabletServerLocal(*rts)) {
-          local.push_back(rts);
-        }
-        if (!client_location.empty()) {
-          const string replica_location = rts->location();
-          if (client_location == replica_location) {
-            same_location.push_back(rts);
+        bool ts_same_location = !client_location.empty() && client_location == rts->location();
+        // Only consider a server "local" if the client is in the same
+        // location, or if there is missing location info.
+        if (client_location.empty() || rts->location().empty() ||
+            ts_same_location) {
+          if (IsTabletServerLocal(*rts)) {
+            local.push_back(rts);
           }
+        }
+        if (ts_same_location) {
+          same_location.push_back(rts);
         }
       }
       if (!local.empty()) {
@@ -443,7 +447,14 @@ Status KuduClient::Data::InitLocalHostNames() {
 }
 
 bool KuduClient::Data::IsLocalHostPort(const HostPort& hp) const {
-  return ContainsKey(local_host_names_, hp.host());
+  if (ContainsKey(local_host_names_, hp.host())) {
+    return true;
+  }
+
+  // It may be that HostPort is a numeric form (non-reversable) address like
+  // 127.0.1.1, etc. In that case we can still consider it local.
+  Sockaddr addr;
+  return addr.ParseFromNumericHostPort(hp).ok() && addr.IsAnyLocalAddress();
 }
 
 bool KuduClient::Data::IsTabletServerLocal(const RemoteTabletServer& rts) const {
@@ -488,6 +499,7 @@ Status KuduClient::Data::OpenTable(KuduClient* client,
   string table_id;
   string table_name;
   int num_replicas;
+  string owner;
   PartitionSchema partition_schema;
   map<string, string> extra_configs;
   MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout_;
@@ -499,6 +511,7 @@ Status KuduClient::Data::OpenTable(KuduClient* client,
                                &table_id,
                                &table_name,
                                &num_replicas,
+                               &owner,
                                &extra_configs));
 
   // When the table name is specified, use the caller-provided table name.
@@ -512,7 +525,7 @@ Status KuduClient::Data::OpenTable(KuduClient* client,
   //                   map to reuse KuduTable instances.
   table->reset(new KuduTable(client->shared_from_this(),
                              effective_table_name, table_id, num_replicas,
-                             schema, partition_schema, extra_configs));
+                             owner, schema, partition_schema, extra_configs));
 
   // When opening a table, clear the existing cached non-covered range entries.
   // This avoids surprises where a new table instance won't be able to see the
@@ -530,6 +543,7 @@ Status KuduClient::Data::GetTableSchema(KuduClient* client,
                                         std::string* table_id,
                                         std::string* table_name,
                                         int* num_replicas,
+                                        std::string* owner,
                                         map<string, string>* extra_configs) {
   GetTableSchemaRequestPB req;
   GetTableSchemaResponsePB resp;
@@ -569,6 +583,9 @@ Status KuduClient::Data::GetTableSchema(KuduClient* client,
   }
   if (num_replicas) {
     *num_replicas = resp.num_replicas();
+  }
+  if (owner) {
+    *owner = resp.owner();
   }
   if (extra_configs) {
     map<string, string> result(resp.extra_configs().begin(), resp.extra_configs().end());
@@ -643,6 +660,7 @@ void KuduClient::Data::ConnectedToClusterCb(
       hive_metastore_uuid_ = hive_config.hms_uuid();
 
       location_ = connect_response.client_location();
+      cluster_id_ = connect_response.cluster_id();
 
       master_proxy_.reset(new MasterServiceProxy(messenger_, leader_addr, leader_hostname));
       master_proxy_->set_user_credentials(user_credentials_);
@@ -791,6 +809,11 @@ vector<HostPort> KuduClient::Data::master_hostports() const {
 string KuduClient::Data::location() const {
   std::lock_guard<simple_spinlock> l(leader_master_lock_);
   return location_;
+}
+
+string KuduClient::Data::cluster_id() const {
+  std::lock_guard<simple_spinlock> l(leader_master_lock_);
+  return cluster_id_;
 }
 
 shared_ptr<master::MasterServiceProxy> KuduClient::Data::master_proxy() const {

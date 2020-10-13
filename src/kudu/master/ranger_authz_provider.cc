@@ -18,6 +18,8 @@
 #include "kudu/master/ranger_authz_provider.h"
 
 #include <ostream>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -39,6 +41,7 @@ using kudu::ranger::ActionPB;
 using kudu::ranger::ActionHash;
 using kudu::ranger::RangerClient;
 using std::string;
+using std::unordered_map;
 using std::unordered_set;
 using strings::Substitute;
 
@@ -81,7 +84,7 @@ Status RangerAuthzProvider::Start() {
 
 Status RangerAuthzProvider::AuthorizeCreateTable(const string& table_name,
                                                  const string& user,
-                                                 const string& /*owner*/) {
+                                                 const string& owner) {
   if (IsTrustedUser(user)) {
     return Status::OK();
   }
@@ -92,9 +95,16 @@ Status RangerAuthzProvider::AuthorizeCreateTable(const string& table_name,
   RETURN_NOT_OK(ParseTableIdentifier(table_name, &db, &tbl));
 
   bool authorized;
-  // Table creation requires 'CREATE ON DATABASE' privilege.
-  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::CREATE, db, tbl, &authorized,
-                                        RangerClient::Scope::DATABASE));
+  bool requires_delegate_admin = user != owner;
+  // Table creation requires 'CREATE ON DATABASE' privilege. If the user creates
+  // a table with a different owner, 'ALL' and delegate admin are required
+  // (similar to ALL WITH GRANT OPTION). This also matches the old behavior with
+  // Sentry: https://issues.apache.org/jira/browse/SENTRY-2151
+  RETURN_NOT_OK(client_.AuthorizeAction(user, requires_delegate_admin
+                                                ? ActionPB::ALL
+                                                : ActionPB::CREATE,
+                                        db, tbl, /*is_owner=*/false, requires_delegate_admin,
+                                        &authorized, RangerClient::Scope::DATABASE));
 
   if (PREDICT_FALSE(!authorized)) {
     LOG(WARNING) << Substitute("User $0 is not authorized to CREATE $1", user, table_name);
@@ -105,7 +115,8 @@ Status RangerAuthzProvider::AuthorizeCreateTable(const string& table_name,
 }
 
 Status RangerAuthzProvider::AuthorizeDropTable(const string& table_name,
-                                               const string& user) {
+                                               const string& user,
+                                               bool is_owner) {
   if (IsTrustedUser(user)) {
     return Status::OK();
   }
@@ -115,7 +126,8 @@ Status RangerAuthzProvider::AuthorizeDropTable(const string& table_name,
 
   RETURN_NOT_OK(ParseTableIdentifier(table_name, &db, &tbl));
   bool authorized;
-  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::DROP, db, tbl, &authorized));
+  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::DROP, db, tbl, is_owner,
+                                        /*requires_delegate_admin=*/false, &authorized));
 
   if (PREDICT_FALSE(!authorized)) {
     LOG(WARNING) << Substitute("User $0 is not authorized to DROP $1", user, table_name);
@@ -127,7 +139,8 @@ Status RangerAuthzProvider::AuthorizeDropTable(const string& table_name,
 
 Status RangerAuthzProvider::AuthorizeAlterTable(const string& old_table,
                                                 const string& new_table,
-                                                const string& user) {
+                                                const string& user,
+                                                bool is_owner) {
   if (IsTrustedUser(user)) {
     return Status::OK();
   }
@@ -139,7 +152,8 @@ Status RangerAuthzProvider::AuthorizeAlterTable(const string& old_table,
   // Table alteration (without table rename) requires ALTER ON TABLE.
   bool authorized;
   if (old_table == new_table) {
-    RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::ALTER, old_db, old_tbl, &authorized));
+    RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::ALTER, old_db, old_tbl, is_owner,
+                                          /*requires_delegate_admin=*/false, &authorized));
 
     if (PREDICT_FALSE(!authorized)) {
       LOG(WARNING) << Substitute("User $0 is not authorized to ALTER $1", user, old_table);
@@ -151,7 +165,8 @@ Status RangerAuthzProvider::AuthorizeAlterTable(const string& old_table,
 
   // To prevent privilege escalation we require ALL on the old TABLE
   // and CREATE on the new DATABASE for table rename.
-  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::ALL, old_db, old_tbl, &authorized));
+  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::ALL, old_db, old_tbl, is_owner,
+                                        /*requires_delegate_admin=*/false, &authorized));
   if (PREDICT_FALSE(!authorized)) {
     LOG(WARNING) << Substitute("User $0 is not authorized to perform ALL on $1", user, old_table);
     return Status::NotAuthorized(kUnauthorizedAction);
@@ -161,7 +176,8 @@ Status RangerAuthzProvider::AuthorizeAlterTable(const string& old_table,
   string new_tbl;
 
   RETURN_NOT_OK(ParseTableIdentifier(new_table, &new_db, &new_tbl));
-  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::CREATE, new_db, new_tbl, &authorized,
+  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::CREATE, new_db, new_tbl, is_owner,
+                                        /*requires_delegate_admin=*/false, &authorized,
                                         RangerClient::Scope::DATABASE));
 
   if (PREDICT_FALSE(!authorized)) {
@@ -173,7 +189,8 @@ Status RangerAuthzProvider::AuthorizeAlterTable(const string& old_table,
 }
 
 Status RangerAuthzProvider::AuthorizeGetTableMetadata(const string& table_name,
-                                                      const string& user) {
+                                                      const string& user,
+                                                      bool is_owner) {
   if (IsTrustedUser(user)) {
     return Status::OK();
   }
@@ -184,7 +201,8 @@ Status RangerAuthzProvider::AuthorizeGetTableMetadata(const string& table_name,
   RETURN_NOT_OK(ParseTableIdentifier(table_name, &db, &tbl));
   bool authorized;
   // Get table metadata requires 'METADATA ON TABLE' privilege.
-  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::METADATA, db, tbl, &authorized));
+  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::METADATA, db, tbl, is_owner,
+                                        /*requires_delegate_admin=*/false, &authorized));
 
   if (PREDICT_FALSE(!authorized)) {
     LOG(WARNING) << Substitute("User $0 is not authorized to access METADATA on $1", user,
@@ -196,7 +214,7 @@ Status RangerAuthzProvider::AuthorizeGetTableMetadata(const string& table_name,
 }
 
 Status RangerAuthzProvider::AuthorizeListTables(const string& user,
-                                                unordered_set<string>* table_names,
+                                                unordered_map<string, bool>* is_owner_by_table_name,
                                                 bool* checked_table_names) {
   if (IsTrustedUser(user)) {
     *checked_table_names = false;
@@ -206,16 +224,17 @@ Status RangerAuthzProvider::AuthorizeListTables(const string& user,
   *checked_table_names = true;
 
   // Return immediately if there is no tables to authorize against.
-  if (table_names->empty()) {
+  if (is_owner_by_table_name->empty()) {
     return Status::OK();
   }
 
   // List tables requires 'METADATA ON TABLE' privilege on all tables being listed.
-  return client_.AuthorizeActionMultipleTables(user, ActionPB::METADATA, table_names);
+  return client_.AuthorizeActionMultipleTables(user, ActionPB::METADATA, is_owner_by_table_name);
 }
 
 Status RangerAuthzProvider::AuthorizeGetTableStatistics(const string& table_name,
-                                                        const string& user) {
+                                                        const string& user,
+                                                        bool is_owner) {
   if (IsTrustedUser(user)) {
     return Status::OK();
   }
@@ -226,7 +245,8 @@ Status RangerAuthzProvider::AuthorizeGetTableStatistics(const string& table_name
   bool authorized;
   // Statistics contain data (e.g. number of rows) that requires the 'SELECT ON TABLE'
   // privilege.
-  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::SELECT, db, tbl, &authorized));
+  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::SELECT, db, tbl, is_owner,
+                                        /*requires_delegate_admin=*/false, &authorized));
 
   if (PREDICT_FALSE(!authorized)) {
     LOG(WARNING) << Substitute("User $0 is not authorized to SELECT on $1", user, table_name);
@@ -238,6 +258,7 @@ Status RangerAuthzProvider::AuthorizeGetTableStatistics(const string& table_name
 
 Status RangerAuthzProvider::FillTablePrivilegePB(const string& table_name,
                                                  const string& user,
+                                                 bool is_owner,
                                                  const SchemaPB& schema_pb,
                                                  TablePrivilegePB* pb) {
   DCHECK(pb);
@@ -251,7 +272,8 @@ Status RangerAuthzProvider::FillTablePrivilegePB(const string& table_name,
   if (IsTrustedUser(user)) {
     authorized = true;
   } else {
-    RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::ALL, db, tbl, &authorized));
+    RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::ALL, db, tbl, is_owner,
+                                          /*requires_delegate_admin=*/false, &authorized));
   }
   if (authorized) {
     pb->set_delete_privilege(true);
@@ -270,7 +292,7 @@ Status RangerAuthzProvider::FillTablePrivilegePB(const string& table_name,
 
   // Check if the user has any table-level privileges. If yes, we set them. If
   // select is included, we can also return.
-  RETURN_NOT_OK(client_.AuthorizeActions(user, db, tbl, &actions));
+  RETURN_NOT_OK(client_.AuthorizeActions(user, db, tbl, is_owner, &actions));
   for (const ActionPB& action : actions) {
     switch (action) {
       case ActionPB::DELETE:
@@ -307,7 +329,7 @@ Status RangerAuthzProvider::FillTablePrivilegePB(const string& table_name,
 
   // TODO(abukor): revisit if it's worth merging this into the previous request
   RETURN_NOT_OK(client_.AuthorizeActionMultipleColumns(user, ActionPB::SELECT, db, tbl,
-                                                       &column_names));
+                                                       is_owner, &column_names));
 
   for (const auto& col : schema_pb.columns()) {
     if (ContainsKey(column_names, col.name())) {
@@ -315,6 +337,34 @@ Status RangerAuthzProvider::FillTablePrivilegePB(const string& table_name,
     }
   }
 
+
+  return Status::OK();
+}
+
+Status RangerAuthzProvider::RefreshPolicies() {
+  return client_.RefreshPolicies();
+}
+
+Status RangerAuthzProvider::AuthorizeChangeOwner(const string& table_name,
+                                                 const string& user,
+                                                 bool is_owner) {
+  if (IsTrustedUser(user)) {
+    return Status::OK();
+  }
+
+  string db;
+  string tbl;
+
+  RETURN_NOT_OK(ParseTableIdentifier(table_name, &db, &tbl));
+
+  bool authorized;
+  RETURN_NOT_OK(client_.AuthorizeAction(user, ActionPB::ALL, db, tbl, is_owner,
+                                        /*requires_delegate_admin=*/true, &authorized));
+
+  if (PREDICT_FALSE(!authorized)) {
+    LOG(WARNING) << Substitute("User $0 is not authorized to change owner of $1", user, table_name);
+    return Status::NotAuthorized(kUnauthorizedAction);
+  }
 
   return Status::OK();
 }

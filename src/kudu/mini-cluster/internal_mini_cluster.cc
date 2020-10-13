@@ -26,6 +26,7 @@
 #include "kudu/client/client.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
@@ -34,9 +35,12 @@
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tablet_server_options.h"
+#include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/env.h"
 #include "kudu/util/monotime.h"
@@ -69,6 +73,7 @@ using tserver::TabletServerServiceProxy;
 
 InternalMiniClusterOptions::InternalMiniClusterOptions()
   : num_masters(1),
+    supply_single_master_addr(false),
     num_tablet_servers(1),
     num_data_dirs(1),
     bind_mode(kDefaultBindMode) {
@@ -146,8 +151,9 @@ Status InternalMiniCluster::StartMasters() {
               << HostPort::ToCommaSeparatedString(master_rpc_addrs);
 
     for (int i = 0; i < num_masters; i++) {
-      shared_ptr<MiniMaster> mini_master(new MiniMaster(GetMasterFsRoot(i), master_rpc_addrs[i]));
-      if (num_masters > 1) {
+      auto mini_master(std::make_shared<MiniMaster>(
+          GetMasterFsRoot(i), master_rpc_addrs[i]));
+      if (num_masters > 1 || opts_.supply_single_master_addr) {
         mini_master->SetMasterAddresses(master_rpc_addrs);
       }
       mini_masters_.emplace_back(std::move(mini_master));
@@ -270,6 +276,23 @@ string InternalMiniCluster::GetMasterFsRoot(int idx) const {
 
 string InternalMiniCluster::GetTabletServerFsRoot(int idx) const {
   return JoinPathSegments(opts_.cluster_root, Substitute("ts-$0-root", idx));
+}
+
+Status InternalMiniCluster::FlushTablet(const string& tablet_id) {
+  // Flag to ensure specified tablet is found and flushed on at least one of the tablet servers.
+  bool tablet_found = false;
+  for (const auto& ts : mini_tablet_servers_) {
+    scoped_refptr<tablet::TabletReplica> tablet_replica;
+    if (ts->server()->tablet_manager()->LookupTablet(tablet_id, &tablet_replica)) {
+      tablet_found = true;
+      RETURN_NOT_OK(tablet_replica->tablet()->Flush());
+    }
+  }
+  if (!tablet_found) {
+    return Status::NotFound(Substitute("Tablet $0 not found on any of the tablet servers",
+                                       tablet_id));
+  }
+  return Status::OK();
 }
 
 Status InternalMiniCluster::WaitForTabletServerCount(int count) const {

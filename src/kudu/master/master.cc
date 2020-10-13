@@ -28,7 +28,6 @@
 #include <glog/logging.h>
 
 #include "kudu/cfile/block_cache.h"
-#include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/metadata.pb.h"
@@ -107,7 +106,59 @@ using std::vector;
 using strings::Substitute;
 
 namespace kudu {
+namespace rpc {
+class RpcContext;
+}  // namespace rpc
+}  // namespace kudu
+
+namespace kudu {
 namespace master {
+
+namespace {
+constexpr const char* kReplaceMasterMessage =
+    "this master may return incorrect results and should be replaced";
+void CrashMasterOnDiskError(const string& uuid) {
+  LOG(FATAL) << Substitute("Disk error detected on data directory $0: $1",
+                           uuid, kReplaceMasterMessage);
+}
+void CrashMasterOnCFileCorruption(const string& tablet_id) {
+  LOG(FATAL) << Substitute("CFile corruption detected on system catalog $0: $1",
+                           tablet_id, kReplaceMasterMessage);
+}
+void CrashMasterOnKudu2233Corruption(const string& tablet_id) {
+  LOG(FATAL) << Substitute("KUDU-2233 corruption detected on system catalog $0: $1 ",
+                           tablet_id, kReplaceMasterMessage);
+}
+
+// TODO(Alex Feinberg) this method should be moved to a separate class (along with
+// ListMasters), so that it can also be used in TS and client when
+// bootstrapping.
+Status GetMasterEntryForHost(const shared_ptr<rpc::Messenger>& messenger,
+                             const HostPort& hostport,
+                             ServerEntryPB* e) {
+  Sockaddr sockaddr;
+  RETURN_NOT_OK(SockaddrFromHostPort(hostport, &sockaddr));
+  MasterServiceProxy proxy(messenger, sockaddr, hostport.host());
+  GetMasterRegistrationRequestPB req;
+  GetMasterRegistrationResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(MonoDelta::FromMilliseconds(FLAGS_master_registration_rpc_timeout_ms));
+  RETURN_NOT_OK(proxy.GetMasterRegistration(req, &resp, &controller));
+  e->mutable_instance_id()->CopyFrom(resp.instance_id());
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  e->mutable_registration()->CopyFrom(resp.registration());
+  e->set_role(resp.role());
+  if (resp.has_cluster_id()) {
+    e->set_cluster_id(resp.cluster_id());
+  }
+  if (resp.has_member_type()) {
+    e->set_member_type(resp.member_type());
+  }
+  return Status::OK();
+}
+} // anonymous namespace
 
 Master::Master(const MasterOptions& opts)
   : KuduServer("Master", opts, "kudu.master"),
@@ -171,6 +222,8 @@ Status Master::StartAsync() {
                                       &CrashMasterOnDiskError);
   fs_manager_->SetErrorNotificationCb(ErrorHandlerType::CFILE_CORRUPTION,
                                       &CrashMasterOnCFileCorruption);
+  fs_manager_->SetErrorNotificationCb(ErrorHandlerType::KUDU_2233_CORRUPTION,
+                                      &CrashMasterOnKudu2233Corruption);
 
   RETURN_NOT_OK(maintenance_manager_->Start());
 
@@ -291,64 +344,32 @@ void Master::ShutdownImpl() {
   state_ = kStopped;
 }
 
-void Master::CrashMasterOnDiskError(const string& uuid) {
-  LOG(FATAL) << Substitute("Disk error detected on data directory $0", uuid);
-}
-
-void Master::CrashMasterOnCFileCorruption(const string& tablet_id) {
-  LOG(FATAL) << Substitute("CFile corruption detected on system catalog $0", tablet_id);
-}
-
-namespace {
-
-// TODO(Alex Feinberg) this method should be moved to a separate class (along with
-// ListMasters), so that it can also be used in TS and client when
-// bootstrapping.
-Status GetMasterEntryForHost(const shared_ptr<rpc::Messenger>& messenger,
-                             const HostPort& hostport,
-                             ServerEntryPB* e) {
-  Sockaddr sockaddr;
-  RETURN_NOT_OK(SockaddrFromHostPort(hostport, &sockaddr));
-  MasterServiceProxy proxy(messenger, sockaddr, hostport.host());
-  GetMasterRegistrationRequestPB req;
-  GetMasterRegistrationResponsePB resp;
-  rpc::RpcController controller;
-  controller.set_timeout(MonoDelta::FromMilliseconds(FLAGS_master_registration_rpc_timeout_ms));
-  RETURN_NOT_OK(proxy.GetMasterRegistration(req, &resp, &controller));
-  e->mutable_instance_id()->CopyFrom(resp.instance_id());
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
-  }
-  e->mutable_registration()->CopyFrom(resp.registration());
-  e->set_role(resp.role());
-  return Status::OK();
-}
-
-} // anonymous namespace
-
 Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
-  if (!opts_.IsDistributed()) {
-    ServerEntryPB local_entry;
-    local_entry.mutable_instance_id()->CopyFrom(catalog_manager_->NodeInstance());
-    RETURN_NOT_OK(GetMasterRegistration(local_entry.mutable_registration()));
-    local_entry.set_role(RaftPeerPB::LEADER);
-    masters->emplace_back(std::move(local_entry));
-    return Status::OK();
-  }
-
   auto consensus = catalog_manager_->master_consensus();
   if (!consensus) {
     return Status::IllegalState("consensus not running");
   }
   const auto config = consensus->CommittedConfig();
-
   masters->clear();
+  DCHECK_GE(config.peers_size(), 1);
+  // Optimized code path that doesn't involve reaching out to other
+  // masters over network for single master configuration.
+  if (config.peers_size() == 1) {
+    ServerEntryPB local_entry;
+    local_entry.mutable_instance_id()->CopyFrom(catalog_manager_->NodeInstance());
+    RETURN_NOT_OK(GetMasterRegistration(local_entry.mutable_registration()));
+    local_entry.set_role(RaftPeerPB::LEADER);
+    local_entry.set_cluster_id(catalog_manager_->GetClusterId());
+    local_entry.set_member_type(RaftPeerPB::VOTER);
+    masters->emplace_back(std::move(local_entry));
+    return Status::OK();
+  }
+
+  // For distributed master configuration.
   for (const auto& peer : config.peers()) {
+    HostPort hp = HostPortFromPB(peer.last_known_addr());
     ServerEntryPB peer_entry;
-    HostPort hp;
-    Status s = HostPortFromPB(peer.last_known_addr(), &hp).AndThen([&] {
-      return GetMasterEntryForHost(messenger_, hp, &peer_entry);
-    });
+    Status s = GetMasterEntryForHost(messenger_, hp, &peer_entry);
     if (!s.ok()) {
       s = s.CloneAndPrepend(
           Substitute("Unable to get registration information for peer $0 ($1)",
@@ -369,7 +390,7 @@ Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
   return Status::OK();
 }
 
-Status Master::GetMasterHostPorts(vector<HostPortPB>* hostports) const {
+Status Master::GetMasterHostPorts(vector<HostPort>* hostports) const {
   auto consensus = catalog_manager_->master_consensus();
   if (!consensus) {
     return Status::IllegalState("consensus not running");
@@ -377,21 +398,42 @@ Status Master::GetMasterHostPorts(vector<HostPortPB>* hostports) const {
 
   hostports->clear();
   consensus::RaftConfigPB config = consensus->CommittedConfig();
-  for (auto& peer : *config.mutable_peers()) {
+  for (const auto& peer : *config.mutable_peers()) {
     if (peer.member_type() == consensus::RaftPeerPB::VOTER) {
-      // In non-distributed master configurations, we don't store our own
+      // In non-distributed master configurations, we may not store our own
       // last known address in the Raft config. So, we'll fill it in from
       // the server Registration instead.
       if (!peer.has_last_known_addr()) {
         DCHECK_EQ(config.peers_size(), 1);
         DCHECK(registration_initialized_.load());
-        hostports->emplace_back(registration_.rpc_addresses(0));
+        DCHECK_GT(registration_.rpc_addresses_size(), 0);
+        hostports->emplace_back(HostPortFromPB(registration_.rpc_addresses(0)));
       } else {
-        hostports->emplace_back(std::move(*peer.mutable_last_known_addr()));
+        hostports->emplace_back(HostPortFromPB(peer.last_known_addr()));
       }
     }
   }
   return Status::OK();
+}
+
+Status Master::AddMaster(const HostPort& hp, rpc::RpcContext* rpc) {
+  // Ensure requested master to be added is not already part of list of masters.
+  vector<HostPort> masters;
+  // Here the check is made against committed config with voters only.
+  RETURN_NOT_OK(GetMasterHostPorts(&masters));
+  if (std::find(masters.begin(), masters.end(), hp) != masters.end()) {
+    return Status::AlreadyPresent("Master already present");
+  }
+
+  // Check whether the master to be added is reachable and fetch its uuid.
+  ServerEntryPB peer_entry;
+  RETURN_NOT_OK(GetMasterEntryForHost(messenger_, hp, &peer_entry));
+  const auto& peer_uuid = peer_entry.instance_id().permanent_uuid();
+
+  // No early validation for whether a config change is in progress.
+  // If it's in progress, on initiating config change Raft will return error.
+  return catalog_manager()->InitiateMasterChangeConfig(CatalogManager::kAddMaster, hp, peer_uuid,
+                                                       rpc);
 }
 
 } // namespace master

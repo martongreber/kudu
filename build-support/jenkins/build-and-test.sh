@@ -26,7 +26,7 @@
 #
 #   KUDU_USE_CDH_ECOSYSTEM  Default: 0
 #     If non-zero, use the CDH packages for Hadoop ecosystem components
-#     (e.g. Hadoop, Hive, Sentry).
+#     (e.g. Hadoop, Hive).
 #
 #   KUDU_ALLOW_SLOW_TESTS   Default: 1
 #     Runs the "slow" version of the unit tests. Set to 0 to
@@ -199,6 +199,7 @@ if [ -n "$BUILD_ID" ]; then
   trap cleanup EXIT
 fi
 
+ARTIFACT_ARCH=$(uname -m)
 # Configure the build
 #
 # ASAN/TSAN can't build the Python bindings because the exported Kudu client
@@ -207,6 +208,12 @@ if [ "$BUILD_TYPE" = "ASAN" ]; then
   USE_CLANG=1
   CMAKE_BUILD=fastdebug
   EXTRA_BUILD_FLAGS="-DKUDU_USE_ASAN=1 -DKUDU_USE_UBSAN=1"
+  # workaround for github.com/google/sanitizers/issues/1208
+  # ASAN with dynamic linking cause all tests fail on aarch64,
+  # we don't apply ENABLE_DIST_TEST on aarch64, so use static linking.
+  if [ "$ARTIFACT_ARCH" = "aarch64" ]; then
+    EXTRA_BUILD_FLAGS="$EXTRA_BUILD_FLAGS -DKUDU_LINK=static"
+  fi
   BUILD_PYTHON=0
   BUILD_PYTHON3=0
 elif [ "$BUILD_TYPE" = "TSAN" ]; then
@@ -414,10 +421,18 @@ if [ "$BUILD_TYPE" = "LINT" ]; then
   LINT_RESULT=0
 
   if [ "$BUILD_JAVA" == "1" ]; then
+    # Run Java static code analysis via Gradle.
     pushd $SOURCE_ROOT/java
     if ! ./gradlew $EXTRA_GRADLE_FLAGS clean check -x test $EXTRA_GRADLE_TEST_FLAGS; then
       LINT_RESULT=1
       LINT_FAILURES="$LINT_FAILURES"$'Java Gradle check failed\n'
+    fi
+
+    # Verify the contents of the JARs to ensure the shading and
+    # packaging is correct.
+    if ! $SOURCE_ROOT/build-support/verify_jars.pl .; then
+      LINT_RESULT=1
+      LINT_FAILURES="$LINT_FAILURES"$'Java verify Jars check failed\n'
     fi
     popd
   fi
@@ -539,17 +554,11 @@ if [ "$BUILD_JAVA" == "1" ]; then
       FAILURES="$FAILURES"$'Could not submit Java distributed test job\n'
     fi
   else
-    # TODO: Run `gradle check` in BUILD_TYPE DEBUG when static code analysis is fixed
     if ! ./gradlew $EXTRA_GRADLE_FLAGS clean test $EXTRA_GRADLE_TEST_FLAGS; then
       TESTS_FAILED=1
       FAILURES="$FAILURES"$'Java Gradle build/test failed\n'
     fi
   fi
-
-  # Run a script to verify the contents of the JARs to ensure the shading and
-  # packaging is correct.
-  $SOURCE_ROOT/build-support/verify_jars.pl .
-
   set +x
   popd
 fi

@@ -34,6 +34,7 @@
 #include "kudu/clock/hybrid_clock.h"
 #include "kudu/clock/logical_clock.h"
 #include "kudu/codegen/compilation_manager.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
@@ -102,7 +103,6 @@ TAG_FLAG(max_negotiation_threads, advanced);
 DEFINE_int64(rpc_negotiation_timeout_ms, 3000,
              "Timeout for negotiating an RPC connection.");
 TAG_FLAG(rpc_negotiation_timeout_ms, advanced);
-TAG_FLAG(rpc_negotiation_timeout_ms, runtime);
 
 DEFINE_bool(webserver_enabled, true, "Whether to enable the web server on this daemon. "
             "NOTE: disabling the web server is also likely to prevent monitoring systems "
@@ -149,6 +149,12 @@ DEFINE_string(rpc_encryption, "optional",
               "Secure clusters should use 'required'.");
 TAG_FLAG(rpc_authentication, evolving);
 TAG_FLAG(rpc_encryption, evolving);
+
+DEFINE_bool(rpc_listen_on_unix_domain_socket, false,
+            "Whether the RPC server should listen on a Unix domain socket. If enabled, "
+            "the RPC server will bind to a socket in the \"abstract namespace\" using "
+            "a name which uniquely identifies the server instance.");
+TAG_FLAG(rpc_listen_on_unix_domain_socket, experimental);
 
 DEFINE_string(rpc_tls_ciphers,
               kudu::security::SecurityDefaults::kDefaultTlsCiphers,
@@ -225,9 +231,6 @@ using std::vector;
 using strings::Substitute;
 
 namespace kudu {
-
-class HostPortPB;
-
 namespace server {
 
 namespace {
@@ -528,6 +531,22 @@ Status ServerBase::Init() {
   });
 
   RETURN_NOT_OK(rpc_server_->Init(messenger_));
+
+  if (FLAGS_rpc_listen_on_unix_domain_socket) {
+    VLOG(1) << "Enabling listening on unix domain socket.";
+    Sockaddr addr;
+#if !defined(__APPLE__)
+    RETURN_NOT_OK_PREPEND(addr.ParseUnixDomainPath(Substitute("@kudu-$0", fs_manager_->uuid())),
+                          "unable to parse provided UNIX socket path");
+#else
+    RETURN_NOT_OK_PREPEND(addr.ParseUnixDomainPath(Substitute("/tmp/kudu-$0", fs_manager_->uuid())),
+                          "unable to parse provided UNIX socket path");
+#endif
+    RETURN_NOT_OK_PREPEND(rpc_server_->AddBindAddress(addr),
+                          "unable to add configured UNIX socket path to list of bind addresses "
+                          "for RPC server");
+  }
+
   RETURN_NOT_OK(rpc_server_->Bind());
 
   RETURN_NOT_OK_PREPEND(StartMetricsLogging(), "Could not enable metrics logging");
@@ -589,9 +608,7 @@ Status ServerBase::GetStatusPB(ServerStatusPB* status) const {
       HostPort hp;
       RETURN_NOT_OK_PREPEND(HostPortFromSockaddrReplaceWildcard(addr, &hp),
                             "could not get RPC hostport");
-      HostPortPB* pb = status->add_bound_rpc_addresses();
-      RETURN_NOT_OK_PREPEND(HostPortToPB(hp, pb),
-                            "could not convert RPC hostport");
+      *status->add_bound_rpc_addresses() = HostPortToPB(hp);
     }
   }
 
@@ -604,9 +621,7 @@ Status ServerBase::GetStatusPB(ServerStatusPB* status) const {
       HostPort hp;
       RETURN_NOT_OK_PREPEND(HostPortFromSockaddrReplaceWildcard(addr, &hp),
                             "could not get web hostport");
-      HostPortPB* pb = status->add_bound_http_addresses();
-      RETURN_NOT_OK_PREPEND(HostPortToPB(hp, pb),
-                            "could not convert web hostport");
+      *status->add_bound_http_addresses() = HostPortToPB(hp);
     }
   }
 
@@ -622,6 +637,10 @@ void ServerBase::LogUnauthorizedAccess(rpc::RpcContext* rpc) const {
 
 bool ServerBase::IsFromSuperUser(const rpc::RpcContext* rpc) {
   return superuser_acl_.UserAllowed(rpc->remote_user().username());
+}
+
+bool ServerBase::IsServiceUserOrSuperUser(const string& user) {
+  return service_acl_.UserAllowed(user) || superuser_acl_.UserAllowed(user);
 }
 
 bool ServerBase::Authorize(rpc::RpcContext* rpc, uint32_t allowed_roles) {

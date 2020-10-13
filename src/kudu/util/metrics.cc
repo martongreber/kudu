@@ -426,6 +426,9 @@ Status MetricEntity::CollectTo(MergedEntityMetrics* collections,
     scoped_refptr<Metric> entry = FindPtrOrNull(entity_collection, prototype);
     if (!entry) {
       scoped_refptr<Metric> new_metric = metric->snapshot();
+      if (!new_metric->invalid_for_merge_) {
+        new_metric->UpdateModificationEpoch();
+      }
       InsertOrDie(&entity_collection, new_metric->prototype(), new_metric);
     } else {
       entry->MergeFrom(metric);
@@ -797,6 +800,7 @@ void StringGauge::WriteValue(JsonWriter* writer) const {
 scoped_refptr<Metric> MeanGauge::snapshot() const {
   std::lock_guard<simple_spinlock> l(lock_);
   auto p = new MeanGauge(down_cast<const GaugePrototype<double>*>(prototype_));
+  p->set_value(total_sum_, total_count_);
   p->m_epoch_.store(m_epoch_);
   p->invalid_for_merge_ = invalid_for_merge_;
   p->retire_time_ = retire_time_;

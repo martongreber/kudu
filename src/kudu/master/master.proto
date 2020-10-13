@@ -195,6 +195,13 @@ message SysTablesEntryPB {
   optional int64 alter_timestamp = 11;
   // The table's extra configuration properties.
   optional TableExtraConfigPB extra_config = 12;
+
+  // The user that owns the table.
+  optional string owner = 13;
+
+  // The table type. If not set, it is assumed this table is a user-defined
+  // table, rather than a system table.
+  optional TableTypePB table_type = 14;
 }
 
 // The on-disk entry in the sys.catalog table ("metadata" column) to represent
@@ -222,6 +229,12 @@ message SysTskEntryPB {
 // the latest processed Hive Metastore notification log event ID.
 message SysNotificationLogEventIdPB {
   optional int64 latest_notification_log_event_id = 1;
+}
+
+// The on-disk entry in the sys.catalog table ("metadata" column) to represent
+// the cluster ID.
+message SysClusterIdEntryPB {
+  optional string cluster_id = 1;
 }
 
 // The on-disk entry in the sys.catalog table to represent the existence of
@@ -431,6 +444,11 @@ message TSInfoPB {
   repeated HostPortPB rpc_addresses = 2;
 
   optional string location = 3;
+
+  // The path of a UNIX domain socket where the server is listening.
+  // An '@' prefix indicates the abstract namespace. May be missing
+  // if this feature is not enabled.
+  optional string unix_domain_socket_path = 4;
 }
 
 // Selector to specify policy for listing tablet replicas in
@@ -482,8 +500,8 @@ message CreateTableRequestPB {
   optional PartitionSchemaPB partition_schema = 7;
   optional int32 num_replicas = 4;
 
-  // If set, uses the provided value as the table owner when creating the table
-  // in external catalogs such as the Hive Metastore.
+  // If set, uses the provided value as the table owner when creating the table.
+  // Otherwise, the owner is defaulted to the user that created the table.
   optional string owner = 8;
 
   // The table's extra configuration properties.
@@ -493,6 +511,10 @@ message CreateTableRequestPB {
   // dimension-specific placement of tablet replicas corresponding to the partitions of
   // the newly created table.
   optional string dimension_label = 10;
+
+  // The table type. If not set, it is assumed this table is a user-defined
+  // table, rather than a system table.
+  optional TableTypePB table_type = 11;
 }
 
 message CreateTableResponsePB {
@@ -530,6 +552,11 @@ message DeleteTableResponsePB {
 message ListTablesRequestPB {
   // When used, only returns tables that satisfy a substring match on name_filter.
   optional string name_filter = 1;
+
+  // The filter for the table types to return. If not set or empty, it is
+  // interpreted as if it were set to [TableTypePB::DEFAULT_TABLE], meaning
+  // to include only user-defined tables.
+  repeated TableTypePB type_filter = 2;
 }
 
 message ListTablesResponsePB {
@@ -671,6 +698,8 @@ message AlterTableRequestPB {
   optional bool modify_external_catalogs = 5 [default = true];
 
   map<string, string> new_extra_configs = 6;
+
+  optional string new_table_owner = 7;
 }
 
 message AlterTableResponsePB {
@@ -734,6 +763,9 @@ message GetTableSchemaResponsePB {
 
   // The table's extra configuration properties.
   map<string, string> extra_configs = 9;
+
+  // The user that owns the table.
+  optional string owner = 10;
 }
 
 message ConnectToMasterRequestPB {
@@ -777,6 +809,9 @@ message ConnectToMasterResponsePB {
 
   // The location of the client assigned by the master.
   optional string client_location = 7;
+
+  // The cluster ID of this master.
+  optional string cluster_id = 8;
 }
 
 // Hive Metastore integration options and configuration.
@@ -882,6 +917,14 @@ message ChangeTServerStateResponsePB {
   optional MasterErrorPB error = 1;
 }
 
+message AddMasterRequestPB {
+  optional HostPortPB rpc_addr = 1;
+}
+
+message AddMasterResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
 // GetMasterRegistrationRequest/Response: get the instance id and
 // HTTP/RPC addresses for this Master server.
 message GetMasterRegistrationRequestPB {
@@ -900,6 +943,12 @@ message GetMasterRegistrationResponsePB {
 
   // Set if there an error retrieving the registration information.
   optional MasterErrorPB error = 4;
+
+  // The unique cluster ID of the cluster this server belongs too.
+  optional string cluster_id = 5;
+
+  // This server's membership type in the consensus configuration.
+  optional consensus.RaftPeerPB.MemberType member_type = 6;
 }
 
 // ListMastersRequest/Response: get information about all of the known
@@ -932,12 +981,12 @@ message ReplaceTabletResponsePB {
   optional bytes replacement_tablet_id = 2;
 }
 
-// ResetAuthzCache{Request/Result}PB: reset the authz privileges cache,
-// clearing it of all existing entries.
-message ResetAuthzCacheRequestPB {
+// RefreshAuthzCache{Request/Result}PB: refresh the authz privileges cache,
+// download new policies (does not guarantee the old cache is invalidated).
+message RefreshAuthzCacheRequestPB {
 }
 
-message ResetAuthzCacheResponsePB {
+message RefreshAuthzCacheResponsePB {
   optional MasterErrorPB error = 1;
 }
 
@@ -956,6 +1005,8 @@ enum MasterFeatures {
   REPLICA_MANAGEMENT = 4;
   // The master supports generating and dispensing authz tokens.
   GENERATE_AUTHZ_TOKEN = 5;
+  // The master supports dynamic addition/removal of masters
+  DYNAMIC_MULTI_MASTER = 6;
 }
 
 service MasterService {
@@ -983,20 +1034,20 @@ service MasterService {
   }
 
   rpc CreateTable(CreateTableRequestPB) returns (CreateTableResponsePB) {
-    option (kudu.rpc.authz_method) = "AuthorizeClient";
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
   }
   rpc IsCreateTableDone(IsCreateTableDoneRequestPB) returns (IsCreateTableDoneResponsePB) {
-    option (kudu.rpc.authz_method) = "AuthorizeClient";
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
   }
   rpc DeleteTable(DeleteTableRequestPB) returns (DeleteTableResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeClient";
   }
 
   rpc AlterTable(AlterTableRequestPB) returns (AlterTableResponsePB) {
-    option (kudu.rpc.authz_method) = "AuthorizeClient";
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
   }
   rpc IsAlterTableDone(IsAlterTableDoneRequestPB) returns (IsAlterTableDoneResponsePB) {
-    option (kudu.rpc.authz_method) = "AuthorizeClient";
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
   }
 
   rpc ListTables(ListTablesRequestPB) returns (ListTablesResponsePB) {
@@ -1028,12 +1079,16 @@ service MasterService {
   rpc ReplaceTablet(ReplaceTabletRequestPB) returns (ReplaceTabletResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
   }
-  rpc ResetAuthzCache(ResetAuthzCacheRequestPB) returns
-      (ResetAuthzCacheResponsePB) {
+  rpc RefreshAuthzCache(RefreshAuthzCacheRequestPB) returns (RefreshAuthzCacheResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
   }
   rpc ChangeTServerState(ChangeTServerStateRequestPB) returns
       (ChangeTServerStateResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
+  }
+
+  // Add a new master to existing cluster.
+  rpc AddMaster(AddMasterRequestPB) returns (AddMasterResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
   }
 

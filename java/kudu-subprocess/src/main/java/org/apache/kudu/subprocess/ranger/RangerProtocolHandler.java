@@ -17,12 +17,12 @@
 
 package org.apache.kudu.subprocess.ranger;
 
-import com.google.common.base.Preconditions;
 import org.apache.ranger.plugin.policyengine.RangerAccessResult;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.kudu.ranger.Ranger;
 import org.apache.kudu.ranger.Ranger.RangerRequestListPB;
 import org.apache.kudu.ranger.Ranger.RangerResponseListPB;
 import org.apache.kudu.ranger.Ranger.RangerResponsePB;
@@ -36,8 +36,6 @@ import org.apache.kudu.subprocess.ranger.authorization.RangerKuduAuthorizer;
 @InterfaceAudience.Private
 class RangerProtocolHandler extends ProtocolHandler<RangerRequestListPB,
                                                     RangerResponseListPB> {
-  private static final Logger LOG = LoggerFactory.getLogger(RangerProtocolHandler.class);
-
   // The Ranger Kudu authorizer plugin. This field is not final
   // as it is used in the mock test.
   @InterfaceAudience.LimitedPrivate("Test")
@@ -49,18 +47,12 @@ class RangerProtocolHandler extends ProtocolHandler<RangerRequestListPB,
 
   @Override
   protected RangerResponseListPB executeRequest(RangerRequestListPB requests) {
-    RangerResponseListPB.Builder responses = RangerResponseListPB.newBuilder();
-    for (RangerAccessResult result : authz.authorize(requests)) {
-      // The result can be null when Ranger plugin fails to load the policies
-      // from the Ranger admin server.
-      // TODO(Hao): add a test for the above case.
-      boolean isAllowed = (result != null && result.getIsAllowed());
-      RangerResponsePB.Builder response = RangerResponsePB.newBuilder();
-      response.setAllowed(isAllowed);
-      responses.addResponses(response);
-      if (LOG.isDebugEnabled()) {
-        LOG.debug(String.format("RangerAccessRequest [%s] receives result [%s]",
-                                result.getAccessRequest().toString(), result.toString()));
+    RangerResponseListPB.Builder responses = authz.authorize(requests);
+    if (requests.hasControlRequest()) {
+      if (requests.getControlRequest().getRefreshPolicies()) {
+        authz.refreshPolicies();
+        responses.setControlResponse(Ranger.RangerControlResponsePB.newBuilder()
+            .setSuccess(true).build());
       }
     }
     return responses.build();

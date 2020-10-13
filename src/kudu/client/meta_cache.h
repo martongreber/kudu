@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 #include <gtest/gtest_prod.h>
 
@@ -50,11 +51,13 @@ class Sockaddr;
 
 namespace tserver {
 class TabletServerServiceProxy;
+class TabletServerAdminServiceProxy;
 } // namespace tserver
 
 namespace master {
 class TSInfoPB;
 class TabletLocationsPB;
+class GetTableLocationsResponsePB;
 } // namespace master
 
 namespace client {
@@ -98,6 +101,7 @@ class RemoteTabletServer {
   // Return the current proxy to this tablet server. Requires that InitProxy()
   // be called prior to this.
   std::shared_ptr<tserver::TabletServerServiceProxy> proxy() const;
+  std::shared_ptr<tserver::TabletServerAdminServiceProxy> admin_proxy();
 
   std::string ToString() const;
 
@@ -124,7 +128,14 @@ class RemoteTabletServer {
   std::string location_;
 
   std::vector<HostPort> rpc_hostports_;
+
+  // The path on which this server is listening for unix domain socket connections.
+  // This should only be used in the case that it can be determined that the tablet
+  // server is local to the client.
+  boost::optional<std::string> unix_domain_socket_path_;
+
   std::shared_ptr<tserver::TabletServerServiceProxy> proxy_;
+  std::shared_ptr<tserver::TabletServerAdminServiceProxy> admin_proxy_;
 
   DISALLOW_COPY_AND_ASSIGN(RemoteTabletServer);
 };
@@ -330,6 +341,10 @@ class MetaCacheEntry {
     }
   }
 
+  const MonoTime& expiration_time() const {
+    return expiration_time_;
+  }
+
   void refresh_expiration_time(MonoTime expiration_time) {
     DCHECK(Initialized());
     DCHECK(expiration_time.Initialized());
@@ -408,6 +423,19 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
                          scoped_refptr<RemoteTablet>* remote_tablet,
                          const StatusCallback& callback);
 
+  // Lookup the given tablet by key, only consulting local information.
+  // Returns true and sets *entry if successful.
+  bool LookupEntryByKeyFastPath(const KuduTable* table,
+                                const std::string& partition_key,
+                                MetaCacheEntry* entry);
+
+  Status ProcessGetTableLocationsResponse(const KuduTable* table,
+                                          const std::string& partition_key,
+                                          bool is_exact_lookup,
+                                          const master::GetTableLocationsResponsePB& resp,
+                                          MetaCacheEntry* cache_entry,
+                                          int max_returned_locations);
+
   // Clears the non-covered range entries from a table's meta cache.
   void ClearNonCoveredRangeEntries(const std::string& table_id);
 
@@ -440,12 +468,6 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   Status ProcessLookupResponse(const LookupRpc& rpc,
                                MetaCacheEntry* cache_entry,
                                int max_returned_locations);
-
-  // Lookup the given tablet by key, only consulting local information.
-  // Returns true and sets *entry if successful.
-  bool LookupEntryByKeyFastPath(const KuduTable* table,
-                                const std::string& partition_key,
-                                MetaCacheEntry* entry);
 
   // Perform the complete fast-path lookup. Returns:
   //  - NotFound if the lookup hits a non-covering range.

@@ -112,13 +112,14 @@ Status Peer::NewRemotePeer(RaftPeerPB peer_pb,
                            shared_ptr<Messenger> messenger,
                            shared_ptr<Peer>* peer) {
 
-  shared_ptr<Peer> new_peer(new Peer(std::move(peer_pb),
-                                     std::move(tablet_id),
-                                     std::move(leader_uuid),
-                                     queue,
-                                     raft_pool_token,
-                                     std::move(proxy),
-                                     std::move(messenger)));
+  auto new_peer(Peer::make_shared(
+      std::move(peer_pb),
+      std::move(tablet_id),
+      std::move(leader_uuid),
+      queue,
+      raft_pool_token,
+      std::move(proxy),
+      std::move(messenger)));
   RETURN_NOT_OK(new_peer->Init());
   *peer = std::move(new_peer);
   return Status::OK();
@@ -580,8 +581,7 @@ RpcPeerProxyFactory::RpcPeerProxyFactory(shared_ptr<Messenger> messenger,
 
 Status RpcPeerProxyFactory::NewProxy(const RaftPeerPB& peer_pb,
                                      unique_ptr<PeerProxy>* proxy) {
-  HostPort hostport;
-  RETURN_NOT_OK(HostPortFromPB(peer_pb.last_known_addr(), &hostport));
+  HostPort hostport = HostPortFromPB(peer_pb.last_known_addr());
   unique_ptr<ConsensusServiceProxy> new_proxy;
   RETURN_NOT_OK(CreateConsensusServiceProxyForHost(
       hostport, messenger_, dns_resolver_, &new_proxy));
@@ -594,8 +594,7 @@ Status SetPermanentUuidForRemotePeer(
     DnsResolver* resolver,
     RaftPeerPB* remote_peer) {
   DCHECK(!remote_peer->has_permanent_uuid());
-  HostPort hostport;
-  RETURN_NOT_OK(HostPortFromPB(remote_peer->last_known_addr(), &hostport));
+  HostPort hostport = HostPortFromPB(remote_peer->last_known_addr());
   unique_ptr<ConsensusServiceProxy> proxy;
   RETURN_NOT_OK(CreateConsensusServiceProxyForHost(
       hostport, messenger, resolver, &proxy));

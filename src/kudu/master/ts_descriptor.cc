@@ -33,6 +33,7 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.proxy.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/net/dns_resolver.h"
@@ -93,12 +94,8 @@ static bool HostPortPBsEqual(const google::protobuf::RepeatedPtrField<HostPortPB
   std::unordered_set<HostPort, HostPortHasher, HostPortEqualityPredicate> hostports1;
   std::unordered_set<HostPort, HostPortHasher, HostPortEqualityPredicate> hostports2;
   for (int i = 0; i < pb1.size(); i++) {
-    HostPort hp1;
-    HostPort hp2;
-    if (!HostPortFromPB(pb1.Get(i), &hp1).ok()) return false;
-    if (!HostPortFromPB(pb2.Get(i), &hp2).ok()) return false;
-    hostports1.insert(hp1);
-    hostports2.insert(hp2);
+    hostports1.emplace(HostPortFromPB(pb1.Get(i)));
+    hostports2.emplace(HostPortFromPB(pb2.Get(i)));
   }
   return hostports1 == hostports2;
 }
@@ -216,6 +213,19 @@ void TSDescriptor::GetRegistration(ServerRegistrationPB* reg) const {
   shared_lock<rw_spinlock> l(lock_);
   CHECK(registration_) << "No registration";
   CHECK_NOTNULL(reg)->CopyFrom(*registration_);
+}
+
+void TSDescriptor::GetTSInfoPB(TSInfoPB* tsinfo_pb) const {
+  shared_lock<rw_spinlock> l(lock_);
+  CHECK(registration_);
+  const auto& reg = *registration_;
+  tsinfo_pb->mutable_rpc_addresses()->CopyFrom(reg.rpc_addresses());
+  if (reg.has_unix_domain_socket_path()) {
+    tsinfo_pb->set_unix_domain_socket_path(reg.unix_domain_socket_path());
+  }
+  if (location_) {
+    tsinfo_pb->set_location(*location_);
+  }
 }
 
 void TSDescriptor::GetNodeInstancePB(NodeInstancePB* instance_pb) const {

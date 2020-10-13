@@ -57,10 +57,11 @@ class HmsClientTest : public KuduTest,
                       public ::testing::WithParamInterface<optional<SaslProtection::Type>> {
  public:
 
-  Status CreateTable(HmsClient* client,
+  static Status CreateTable(HmsClient* client,
                      const string& database_name,
                      const string& table_name,
-                     const string& table_id) {
+                     const string& table_id,
+                     const string& cluster_id) {
     hive::Table table;
     table.dbName = database_name;
     table.tableName = table_name;
@@ -68,6 +69,7 @@ class HmsClientTest : public KuduTest,
     table.__set_parameters({
         make_pair(HmsClient::kKuduTableIdKey, table_id),
         make_pair(HmsClient::kKuduTableNameKey, table_name),
+        make_pair(HmsClient::kKuduClusterIdKey, cluster_id),
         make_pair(HmsClient::kKuduMasterAddrsKey, string("TODO")),
         make_pair(HmsClient::kStorageHandlerKey, HmsClient::kKuduStorageHandler)
     });
@@ -129,6 +131,11 @@ TEST_P(HmsClientTest, TestHmsOperations) {
     hms_client_opts.service_principal = "hive";
   }
 
+  // Set the `KUDU_HMS_SYNC_ENABLED` environment variable in the
+  // HMS environment to manually enable HMS synchronization checks.
+  // This means we don't need to stand up a Kudu Cluster for this test.
+  hms.AddEnvVar("KUDU_HMS_SYNC_ENABLED", "1");
+
   ASSERT_OK(hms.Start());
 
   HmsClient client(hms.address(), hms_client_opts);
@@ -156,14 +163,16 @@ TEST_P(HmsClientTest, TestHmsOperations) {
 
   string table_name = "my_table";
   string table_id = "table-id";
+  string cluster_id = "cluster-id";
 
   // Check that the HMS rejects Kudu tables without a table ID.
-  ASSERT_STR_CONTAINS(CreateTable(&client, database_name, table_name, "").ToString(),
+  ASSERT_STR_CONTAINS(CreateTable(&client, database_name, table_name, "", cluster_id).ToString(),
                       "Kudu table entry must contain a table ID");
 
   // Create a table.
-  ASSERT_OK(CreateTable(&client, database_name, table_name, table_id));
-  ASSERT_TRUE(CreateTable(&client, database_name, table_name, table_id).IsAlreadyPresent());
+  ASSERT_OK(CreateTable(&client, database_name, table_name, table_id, cluster_id));
+  ASSERT_TRUE(CreateTable(&client, database_name, table_name,
+      table_id, cluster_id).IsAlreadyPresent());
 
   // Retrieve a table.
   hive::Table my_table;
@@ -171,6 +180,7 @@ TEST_P(HmsClientTest, TestHmsOperations) {
   EXPECT_EQ(database_name, my_table.dbName) << "my_table: " << my_table;
   EXPECT_EQ(table_name, my_table.tableName);
   EXPECT_EQ(table_id, my_table.parameters[HmsClient::kKuduTableIdKey]);
+  EXPECT_EQ(cluster_id, my_table.parameters[HmsClient::kKuduClusterIdKey]);
   EXPECT_EQ(HmsClient::kKuduStorageHandler, my_table.parameters[HmsClient::kStorageHandlerKey]);
   EXPECT_EQ(HmsClient::kManagedTable, my_table.tableType);
 
@@ -201,10 +211,12 @@ TEST_P(HmsClientTest, TestHmsOperations) {
 
   // Create a table with an uppercase name.
   string uppercase_table_name = "my_UPPERCASE_Table";
-  ASSERT_OK(CreateTable(&client, database_name, uppercase_table_name, "uppercase-table-id"));
+  ASSERT_OK(CreateTable(&client, database_name, uppercase_table_name,
+      "uppercase-table-id", cluster_id));
 
   // Create a table with an illegal utf-8 name.
-  ASSERT_TRUE(CreateTable(&client, database_name, "☃ sculptures 😉", table_id).IsInvalidArgument());
+  ASSERT_TRUE(CreateTable(&client, database_name, "☃ sculptures 😉",
+      table_id, cluster_id).IsInvalidArgument());
 
   // Create a non-Kudu table.
   hive::Table non_kudu_table;
@@ -408,7 +420,7 @@ TEST_F(HmsClientTest, TestHmsConnect) {
   // Listening, but not accepting socket.
   Sockaddr listening;
   Socket listening_socket;
-  ASSERT_OK(listening_socket.Init(0));
+  ASSERT_OK(listening_socket.Init(loopback.family(), 0));
   ASSERT_OK(listening_socket.BindAndListen(loopback, 1));
   listening_socket.GetSocketAddress(&listening);
   ASSERT_TRUE(start_client(listening).IsTimedOut());
@@ -416,7 +428,7 @@ TEST_F(HmsClientTest, TestHmsConnect) {
   // Bound, but not listening socket.
   Sockaddr bound;
   Socket bound_socket;
-  ASSERT_OK(bound_socket.Init(0));
+  ASSERT_OK(bound_socket.Init(loopback.family(), 0));
   ASSERT_OK(bound_socket.Bind(loopback));
   bound_socket.GetSocketAddress(&bound);
   ASSERT_TRUE(start_client(bound).IsNetworkError());
@@ -424,7 +436,7 @@ TEST_F(HmsClientTest, TestHmsConnect) {
   // Unbound socket.
   Sockaddr unbound;
   Socket unbound_socket;
-  ASSERT_OK(unbound_socket.Init(0));
+  ASSERT_OK(unbound_socket.Init(loopback.family(), 0));
   ASSERT_OK(unbound_socket.Bind(loopback));
   unbound_socket.GetSocketAddress(&unbound);
   ASSERT_OK(unbound_socket.Close());
@@ -442,6 +454,12 @@ TEST_F(HmsClientTest, TestDeserializeJsonTable) {
 TEST_F(HmsClientTest, TestCaseSensitivity) {
   MiniKdc kdc;
   MiniHms hms;
+
+  // Set the `KUDU_HMS_SYNC_ENABLED` environment variable in the
+  // HMS environment to manually enable HMS synchronization checks.
+  // This means we don't need to stand up a Kudu Cluster for this test.
+  hms.AddEnvVar("KUDU_HMS_SYNC_ENABLED", "1");
+
   ASSERT_OK(hms.Start());
 
   HmsClient client(hms.address(), thrift::ClientOptions());
@@ -453,7 +471,7 @@ TEST_F(HmsClientTest, TestCaseSensitivity) {
   ASSERT_OK(client.CreateDatabase(db));
 
   // Create a table.
-  ASSERT_OK(CreateTable(&client, "my_db", "Foo", "abc123"));
+  ASSERT_OK(CreateTable(&client, "my_db", "Foo", "abc123", "Bar"));
 
   hive::Table table;
   ASSERT_OK(client.GetTable("my_db", "Foo", &table));

@@ -411,8 +411,9 @@ Status PeerMessageQueue::AppendOperations(vector<ReplicateRefPtr> msgs,
   }
 
   // Update safe time in the TimeManager if we're leader.
-  // This will 'unpin' safe time advancement, which had stopped since we assigned a timestamp to
-  // the message.
+  // This will 'unpin' safe time advancement, which had stopped since we
+  // assigned a timestamp to the message.
+  //
   // Until we have leader leases, replicas only call this when the message is committed.
   if (queue_state_.mode == LEADER) {
     time_manager_->AdvanceSafeTimeWithMessage(*msgs.back()->get());
@@ -693,7 +694,7 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
 
     // The batch of messages to send to the peer.
     vector<ReplicateRefPtr> messages;
-    int max_batch_size = FLAGS_consensus_max_batch_size_bytes - request->ByteSize();
+    int64_t max_batch_size = FLAGS_consensus_max_batch_size_bytes - request->ByteSizeLong();
 
     // We try to get the follower's next_index from our log.
     Status s = log_cache_.ReadOps(peer_copy.next_index - 1,

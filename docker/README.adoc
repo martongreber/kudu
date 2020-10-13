@@ -30,8 +30,11 @@ NOTE: These sample commands assume running from the project root directory.
 Build all the images for the default OS:
 [source,bash]
 ----
-$ ./docker/docker-build.sh
+$ ./docker/docker-build.py
 ----
+
+NOTE: You can pass `--help` to the build script to see usage details and
+all the available parameters.
 
 == Running an image
 
@@ -157,6 +160,13 @@ Remove images by tag pattern:
 ----
 $ TAG_PATTERN="apache/kudu:*"
 $ docker rmi $(docker images -q "$TAG_PATTERN" --format "{{.Repository}}:{{.Tag}}")
+----
+
+View and remove cache mounts (ccache and Gradle cache):
+[source,bash]
+----
+$ docker system df -v | grep exec.cachemount
+$ docker builder prune --filter type=exec.cachemount
 ----
 
 === Using the cache from pre-built images

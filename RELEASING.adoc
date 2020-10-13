@@ -329,9 +329,16 @@ in its summary tab
 Note: You can upload to the test PyPi by adding
 `--repository-url https://test.pypi.org/legacy/` to the twine command.
 
-. Generate the version-specific documentation from that branch following these
-  link:https://github.com/apache/kudu/#updating-the-kudu-web-site-documentation[instructions].
+. Add the previous release notes to the `prior_release_notes.adoc` and submit the changes.
 
+. Generate the version-specific documentation from that branch following these
+  <<README.adoc#updating-the-site,instructions>>.
++
+
+WARNING: The site *MUST NOT* be built on Mac. See the
+<<README.adoc#building-docs,documentation building instructions>> for details.
+
++
 . Update the `index.md` file in the `releases` directory. Add a line about
   the newly released version into the `Latest release` section, move line
   about the previous one into the `Previous releases`. Overall, update
@@ -366,7 +373,10 @@ Note: You can upload to the test PyPi by adding
 . Submit these changes to the `gh-pages` Gerrit branch and get them reviewed.
 
 . Once the review is finished and the commit is pushed, update the website following
-  these link:https://github.com/apache/kudu/#deploying-changes-to-the-apache-kudu-web-site[instructions].
+  these <<README.adoc#deploying-changes-to-the-apache-kudu-web-site,instructions>>.
+
+. Add a release blog post about the new release, similar to
+  link:https://kudu.apache.org/2019/07/09/apache-kudu-1-10-0-release.html[this].
 
 . About 24 hours after all artifacts have been published, send an email to
   user@kudu.apache.org, dev@kudu.apache.org, and announce@apache.org to
@@ -394,3 +404,10 @@ Note: You can upload to the test PyPi by adding
   `1.7.1`). If releasing a maintenance version, delete the previous maintenance
   branch (e.g. if you released `1.2.1`, delete `1.2.0`). Also delete any
   release candidates from the dev SVN.
+
+. Set the release date for the just released version in
+  link:https://issues.apache.org[Apache JIRA] or ask someone with permission
+  to do so. After logging in, in the left sidebar switch to the `Releases` item.
+  Once at the `Releases` page, apply the `Unreleased` filter. In the row
+  corresponding to the new release, click at the ellipsis in the `Action`
+  column and select the `Release` item, setting the appropriate release date.

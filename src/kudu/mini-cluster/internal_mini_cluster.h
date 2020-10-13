@@ -63,6 +63,10 @@ struct InternalMiniClusterOptions {
   // Default: 1
   int num_masters;
 
+  // Whether to supply 'master_addresses' field for single master configuration.
+  // Default: False
+  bool supply_single_master_addr;
+
   // Number of TS to start.
   // Default: 1
   int num_tablet_servers;
@@ -159,6 +163,9 @@ class InternalMiniCluster : public MiniCluster {
   std::string GetMasterFsRoot(int idx) const;
 
   std::string GetTabletServerFsRoot(int idx) const;
+
+  // Flush the specified tablet on all tablet replicas in the cluster.
+  Status FlushTablet(const std::string& tablet_id);
 
   // Wait until the number of registered tablet servers reaches the given
   // count on all masters. Returns Status::TimedOut if the desired count is not

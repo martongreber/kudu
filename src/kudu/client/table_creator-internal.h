@@ -60,11 +60,15 @@ class KuduTableCreator::Data {
 
   PartitionSchemaPB partition_schema_;
 
+  boost::optional<std::string> owner_;
+
   boost::optional<int> num_replicas_;
 
   boost::optional<std::string> dimension_label_;
 
   boost::optional<std::map<std::string, std::string>> extra_configs_;
+
+  boost::optional<TableTypePB> table_type_;
 
   MonoDelta timeout_;
 

@@ -123,6 +123,9 @@ class ServerBase {
   // Returns whether or not the rpc is from a super-user.
   bool IsFromSuperUser(const rpc::RpcContext* rpc);
 
+  // Returns true if the given user is a service- or super-user.
+  bool IsServiceUserOrSuperUser(const std::string& user);
+
   // Authorize an RPC. 'allowed_roles' is a bitset of which roles from the above
   // enum should be allowed to make hthe RPC.
   //
@@ -163,8 +166,8 @@ class ServerBase {
   // issues. Here are a few that I observed:
   // - tserver heartbeater threads access acceptor pool socket state.
   // - Shutting down TabletReplicas invokes RPC callbacks for aborted
-  //   transactions, but Messenger::Shutdown has already destroyed too much
-  //   necessary RPC state.
+  //   ops, but Messenger::Shutdown has already destroyed too much necessary
+  //   RPC state.
   //
   // TODO(adar): this should also shutdown the webserver, but it isn't safe to
   // do that before before shutting down the tserver heartbeater.

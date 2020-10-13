@@ -107,6 +107,7 @@ const char* const HmsClient::kLegacyKuduStorageHandler =
   "com.cloudera.kudu.hive.KuduStorageHandler";
 const char* const HmsClient::kLegacyTablePrefix = "impala::";
 const char* const HmsClient::kKuduTableIdKey = "kudu.table_id";
+const char* const HmsClient::kKuduClusterIdKey = "kudu.cluster_id";
 const char* const HmsClient::kKuduTableNameKey = "kudu.table_name";
 const char* const HmsClient::kKuduMasterAddrsKey = "kudu.master_addresses";
 const char* const HmsClient::kKuduMasterEventKey = "kudu.master_event";
@@ -391,7 +392,7 @@ Status HmsClient::GetPartitions(const string& database_name,
 
 
 Status HmsClient::DeserializeJsonTable(Slice json, hive::Table* table)  {
-  shared_ptr<TMemoryBuffer> membuffer(new TMemoryBuffer(json.size()));
+  auto membuffer(std::make_shared<TMemoryBuffer>(json.size()));
   membuffer->write(json.data(), json.size());
   TJSONProtocol protocol(membuffer);
   HMS_RET_NOT_OK(table->read(&protocol), "failed to deserialize JSON table");

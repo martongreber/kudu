@@ -182,13 +182,14 @@ class TestRowSet : public KuduRowSetTest {
     Schema proj_key = schema_.CreateKeyProjection();
     RowBuilder rb(&proj_key);
     BuildRowKey(&rb, row_idx);
-    RowSetKeyProbe probe(rb.row());
+    Arena arena(64);
+    RowSetKeyProbe probe(rb.row(), &arena);
 
     ProbeStats stats;
-    ScopedTransaction tx(&mvcc_, clock_.Now());
-    tx.StartApplying();
-    Status s = rs->MutateRow(tx.timestamp(), probe, mutation, op_id_, nullptr, &stats, result);
-    tx.Commit();
+    ScopedOp op(&mvcc_, clock_.Now());
+    op.StartApplying();
+    Status s = rs->MutateRow(op.timestamp(), probe, mutation, op_id_, nullptr, &stats, result);
+    op.FinishApplying();
     return s;
   }
 
@@ -196,7 +197,8 @@ class TestRowSet : public KuduRowSetTest {
     Schema proj_key = schema_.CreateKeyProjection();
     RowBuilder rb(&proj_key);
     BuildRowKey(&rb, row_idx);
-    RowSetKeyProbe probe(rb.row());
+    Arena arena(64);
+    RowSetKeyProbe probe(rb.row(), &arena);
     ProbeStats stats;
     return rs.CheckRowPresent(probe, nullptr, present, &stats);
   }
@@ -219,13 +221,13 @@ class TestRowSet : public KuduRowSetTest {
     std::unique_ptr<RowwiseIterator> row_iter;
     CHECK_OK(rs.NewRowIterator(opts, &row_iter));
     CHECK_OK(row_iter->Init(nullptr));
-    Arena arena(1024);
+    RowBlockMemory mem(1024);
     int batch_size = 10000;
-    RowBlock dst(&proj_val, batch_size, &arena);
+    RowBlock dst(&proj_val, batch_size, &mem);
 
     int i = 0;
     while (row_iter->HasNext()) {
-      arena.Reset();
+      mem.Reset();
       CHECK_OK(row_iter->NextBlock(&dst));
       VerifyUpdatedBlock(proj_val.ExtractColumnFromRow<UINT32>(dst.row(0), 0),
                          i, dst.nrows(), updated);
@@ -256,11 +258,10 @@ class TestRowSet : public KuduRowSetTest {
   void VerifyRandomRead(const DiskRowSet& rs, const Slice& row_key,
                         const std::string& expected_val) {
     Arena arena(256);
-    AutoReleasePool pool;
     ScanSpec spec;
     auto pred = ColumnPredicate::Equality(schema_.column(0), &row_key);
     spec.AddPredicate(pred);
-    spec.OptimizeScan(schema_, &arena, &pool, true);
+    spec.OptimizeScan(schema_, &arena, true);
 
     RowIteratorOptions opts;
     opts.projection = &schema_;
@@ -284,13 +285,13 @@ class TestRowSet : public KuduRowSetTest {
     CHECK_OK(row_iter->Init(nullptr));
 
     int batch_size = 1000;
-    Arena arena(1024);
-    RowBlock dst(&schema, batch_size, &arena);
+    RowBlockMemory mem(1024);
+    RowBlock dst(&schema, batch_size, &mem);
 
     int i = 0;
     int log_interval = expected_rows/20 / batch_size;
     while (row_iter->HasNext()) {
-      arena.Reset();
+      mem.Reset();
       CHECK_OK(row_iter->NextBlock(&dst));
       i += dst.nrows();
 

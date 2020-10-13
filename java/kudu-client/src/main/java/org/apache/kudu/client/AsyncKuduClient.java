@@ -315,6 +315,8 @@ public class AsyncKuduClient implements AutoCloseable {
 
   private final HashedWheelTimer timer;
 
+  private final String clientId;
+
   /**
    * Timestamp required for HybridTime external consistency through timestamp
    * propagation.
@@ -336,6 +338,15 @@ public class AsyncKuduClient implements AutoCloseable {
    * If no location is assigned, will be an empty string.
    */
   private String location = "";
+
+  /**
+   * The ID of the cluster that this client is connected to.
+   *
+   * It will be an empty string if the client is not connected
+   * or the client is connected to a cluster that doesn't support
+   * cluster IDs
+   */
+  private String clusterId = "";
 
   /**
    * Semaphore used to rate-limit master lookups
@@ -372,13 +383,14 @@ public class AsyncKuduClient implements AutoCloseable {
     this.bootstrap = b.createBootstrap();
     this.masterAddresses = b.masterAddresses;
     this.masterTable = new KuduTable(this, MASTER_TABLE_NAME_PLACEHOLDER,
-        MASTER_TABLE_NAME_PLACEHOLDER, null, null, 1, null);
+        MASTER_TABLE_NAME_PLACEHOLDER, null, null, 1, null, null);
     this.defaultOperationTimeoutMs = b.defaultOperationTimeoutMs;
     this.defaultAdminOperationTimeoutMs = b.defaultAdminOperationTimeoutMs;
     this.statisticsDisabled = b.statisticsDisabled;
     this.statistics = statisticsDisabled ? null : new Statistics();
     this.timer = b.timer;
-    this.requestTracker = new RequestTracker(UUID.randomUUID().toString().replace("-", ""));
+    this.clientId = UUID.randomUUID().toString().replace("-", "");
+    this.requestTracker = new RequestTracker(clientId);
 
     this.securityContext = new SecurityContext();
     this.connectionCache = new ConnectionCache(securityContext, bootstrap);
@@ -473,6 +485,7 @@ public class AsyncKuduClient implements AutoCloseable {
         }
         synchronized (AsyncKuduClient.this) {
           location = masterResponsePB.getClientLocation();
+          clusterId = masterResponsePB.getClusterId();
         }
         return null;
       }
@@ -523,8 +536,20 @@ public class AsyncKuduClient implements AutoCloseable {
    *
    * @return a string representation of this client's location
    */
-  public String getLocationString() {
+  public synchronized String getLocationString() {
     return location;
+  }
+
+  /**
+   * Returns the ID of the cluster that this client is connected to.
+   * It will be an empty string if the client is not connected or
+   * the client is connected to a cluster that doesn't support
+   * cluster IDs.
+   *
+   * @return the ID of the cluster that this client is connected to
+   */
+  public synchronized String getClusterId() {
+    return clusterId;
   }
 
   /**
@@ -535,6 +560,14 @@ public class AsyncKuduClient implements AutoCloseable {
    */
   Timer getTimer() {
     return timer;
+  }
+
+  /**
+   * Returns the unique client id assigned to this client.
+   * @return the unique client id assigned to this client.
+   */
+  String getClientId() {
+    return clientId;
   }
 
   /**
@@ -781,7 +814,8 @@ public class AsyncKuduClient implements AutoCloseable {
                            resp.getSchema(),
                            resp.getPartitionSchema(),
                            resp.getNumReplicas(),
-                           resp.getExtraConfig());
+                           resp.getExtraConfig(),
+                           resp.getOwner());
     });
   }
 
@@ -1795,6 +1829,7 @@ public class AsyncKuduClient implements AutoCloseable {
               synchronized (AsyncKuduClient.this) {
                 AsyncKuduClient.this.hiveMetastoreConfig = hiveMetastoreConfig;
                 location = respPb.getClientLocation();
+                clusterId = respPb.getClusterId();
               }
 
               hasConnectedToMaster = true;
@@ -2277,18 +2312,7 @@ public class AsyncKuduClient implements AutoCloseable {
     String tableId = table.getTableId();
     String tableName = table.getName();
 
-    // Doing a get first instead of putIfAbsent to avoid creating unnecessary
-    // table locations caches because in the most common case the table should
-    // already be present.
-    TableLocationsCache locationsCache = tableLocations.get(tableId);
-    if (locationsCache == null) {
-      locationsCache = new TableLocationsCache();
-      TableLocationsCache existingLocationsCache =
-          tableLocations.putIfAbsent(tableId, locationsCache);
-      if (existingLocationsCache != null) {
-        locationsCache = existingLocationsCache;
-      }
-    }
+    TableLocationsCache locationsCache = getOrCreateTableLocationsCache(tableId);
 
     // Build the list of discovered remote tablet instances. If we have
     // already discovered the tablet, its locations are refreshed.
@@ -2372,6 +2396,22 @@ public class AsyncKuduClient implements AutoCloseable {
       throw new NoLeaderFoundException(
           Status.NotFound("Tablet " + entry.toString() + " doesn't have a leader"));
     }
+  }
+
+  TableLocationsCache getOrCreateTableLocationsCache(String tableId) {
+    // Doing a get first instead of putIfAbsent to avoid creating unnecessary
+    // table locations caches because in the most common case the table should
+    // already be present.
+    TableLocationsCache locationsCache = tableLocations.get(tableId);
+    if (locationsCache == null) {
+      locationsCache = new TableLocationsCache();
+      TableLocationsCache existingLocationsCache =
+          tableLocations.putIfAbsent(tableId, locationsCache);
+      if (existingLocationsCache != null) {
+        locationsCache = existingLocationsCache;
+      }
+    }
+    return locationsCache;
   }
 
   /**

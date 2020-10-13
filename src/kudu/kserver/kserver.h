@@ -23,16 +23,13 @@
 
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/kserver/kserver_options.h"
 #include "kudu/server/server_base.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/threadpool.h"
 
 namespace kudu {
 class Status;
-
-namespace server {
-struct ServerBaseOptions;
-}
 
 namespace kserver {
 
@@ -46,7 +43,7 @@ class KuduServer : public server::ServerBase {
   // Constructs a new KuduServer instance and performs all no-fail member
   // initializations.
   KuduServer(std::string name,
-             const server::ServerBaseOptions& options,
+             const KuduServerOptions& opts,
              const std::string& metric_namespace);
 
   // Finalizes the initialization of a KuduServer by performing any member
@@ -59,17 +56,19 @@ class KuduServer : public server::ServerBase {
   // Shuts down a KuduServer instance.
   void Shutdown() override;
 
-  ThreadPool* tablet_prepare_pool() const { return tablet_prepare_pool_.get(); }
-  ThreadPool* tablet_apply_pool() const { return tablet_apply_pool_.get(); }
-  ThreadPool* raft_pool() const { return raft_pool_.get(); }
-  scoped_refptr<AtomicGauge<int32_t>> num_raft_leaders() const { return num_raft_leaders_; }
+  ThreadPool* tablet_prepare_pool() { return tablet_prepare_pool_.get(); }
+  ThreadPool* tablet_apply_pool() { return tablet_apply_pool_.get(); }
+  ThreadPool* raft_pool() { return raft_pool_.get(); }
+  scoped_refptr<AtomicGauge<int32_t>> num_raft_leaders() { return num_raft_leaders_; }
 
  private:
+  // The options that this server was created with.
+  const KuduServerOptions opts_;
 
-  // Thread pool for preparing transactions, shared between all tablets.
+  // Thread pool for preparing ops, shared between all tablets.
   std::unique_ptr<ThreadPool> tablet_prepare_pool_;
 
-  // Thread pool for applying transactions, shared between all tablets.
+  // Thread pool for applying ops, shared between all tablets.
   std::unique_ptr<ThreadPool> tablet_apply_pool_;
 
   // Thread pool for Raft-related operations, shared between all tablets.

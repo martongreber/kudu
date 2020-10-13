@@ -38,15 +38,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include <sparsehash/dense_hash_map>
 
-#include "kudu/common/rowid.h"
-#include "kudu/cfile/block_encodings.h"
 #include "kudu/cfile/binary_plain_block.h"
+#include "kudu/cfile/block_encodings.h"
+#include "kudu/cfile/block_handle.h"
+#include "kudu/common/rowid.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/memory/arena.h"
@@ -66,7 +69,6 @@ namespace cfile {
 
 class CFileFooterPB;
 class CFileWriter;
-
 struct WriterOptions;
 
 // Header Mode type
@@ -89,7 +91,7 @@ class BinaryDictBlockBuilder final : public BlockBuilder {
 
   int Add(const uint8_t* vals, size_t count) OVERRIDE;
 
-  Slice Finish(rowid_t ordinal_pos) OVERRIDE;
+  void Finish(rowid_t ordinal_pos, std::vector<Slice>* slices) OVERRIDE;
 
   void Reset() OVERRIDE;
 
@@ -107,7 +109,8 @@ class BinaryDictBlockBuilder final : public BlockBuilder {
   ATTRIBUTE_COLD
   bool AddToDict(Slice val, uint32_t* codeword);
 
-  faststring buffer_;
+  // Buffer used in Finish() for holding the encoded header.
+  faststring header_buffer_;
   bool finished_;
   const WriterOptions* options_;
 
@@ -137,7 +140,7 @@ class CFileIterator;
 
 class BinaryDictBlockDecoder final : public BlockDecoder {
  public:
-  explicit BinaryDictBlockDecoder(Slice slice, CFileIterator* iter);
+  explicit BinaryDictBlockDecoder(scoped_refptr<BlockHandle> block, CFileIterator* iter);
 
   virtual Status ParseHeader() OVERRIDE;
   virtual void SeekToPositionInBlock(uint pos) OVERRIDE;
@@ -169,6 +172,7 @@ class BinaryDictBlockDecoder final : public BlockDecoder {
  private:
   Status CopyNextDecodeStrings(size_t* n, ColumnDataView* dst);
 
+  scoped_refptr<BlockHandle> block_;
   Slice data_;
   bool parsed_;
 

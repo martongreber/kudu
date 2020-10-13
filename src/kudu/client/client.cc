@@ -29,6 +29,7 @@
 #include <vector>
 
 #include <boost/optional/optional.hpp>
+#include <boost/type_traits/decay.hpp>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/common.h>
 
@@ -89,7 +90,6 @@
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/async_util.h"
-#include "kudu/util/block_bloom_filter.h"
 #include "kudu/util/debug-util.h"
 #include "kudu/util/init.h"
 #include "kudu/util/logging.h"
@@ -99,6 +99,10 @@
 #include "kudu/util/oid_generator.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/version_info.h"
+
+namespace kudu {
+class BlockBloomFilter;
+}  // namespace kudu
 
 using kudu::consensus::RaftPeerPB;
 using kudu::master::AlterTableRequestPB;
@@ -447,6 +451,7 @@ Status KuduClient::GetTableSchema(const string& table_name,
                                nullptr, // table id
                                nullptr, // table name
                                nullptr, // number of replicas
+                               nullptr, // owner
                                nullptr); // extra configs
 }
 
@@ -457,8 +462,7 @@ Status KuduClient::ListTabletServers(vector<KuduTabletServer*>* tablet_servers) 
   RETURN_NOT_OK(data_->ListTabletServers(this, deadline, req, &resp));
   for (int i = 0; i < resp.servers_size(); i++) {
     const ListTabletServersResponsePB_Entry& e = resp.servers(i);
-    HostPort hp;
-    RETURN_NOT_OK(HostPortFromPB(e.registration().rpc_addresses(0), &hp));
+    HostPort hp = HostPortFromPB(e.registration().rpc_addresses(0));
     unique_ptr<KuduTabletServer> ts(new KuduTabletServer);
     ts->data_ = new KuduTabletServer::Data(e.instance_id().permanent_uuid(), hp, e.location());
     tablet_servers->push_back(ts.release());
@@ -555,8 +559,7 @@ Status KuduClient::GetTablet(const string& tablet_id, KuduTablet** tablet) {
           "No RPC addresses found for tserver $0",
           ts_info.permanent_uuid()));
     }
-    HostPort hp;
-    RETURN_NOT_OK(HostPortFromPB(ts_info.rpc_addresses(0), &hp));
+    HostPort hp = HostPortFromPB(ts_info.rpc_addresses(0));
     unique_ptr<KuduTabletServer> ts(new KuduTabletServer);
     ts->data_ = new KuduTabletServer::Data(ts_info.permanent_uuid(), hp, ts_info.location());
 
@@ -681,6 +684,10 @@ string KuduClient::location() const {
   return data_->location();
 }
 
+string KuduClient::cluster_id() const {
+  return data_->cluster_id();
+}
+
 ////////////////////////////////////////////////////////////
 // KuduTableCreator
 ////////////////////////////////////////////////////////////
@@ -733,6 +740,11 @@ KuduTableCreator& KuduTableCreator::set_range_partition_columns(const vector<str
 
 KuduTableCreator& KuduTableCreator::add_range_partition_split(KuduPartialRow* split_row) {
   data_->range_partition_splits_.emplace_back(split_row);
+  return *this;
+}
+
+KuduTableCreator& KuduTableCreator::set_owner(const string& owner) {
+  data_->owner_ = owner;
   return *this;
 }
 
@@ -809,6 +821,9 @@ Status KuduTableCreator::Create() {
     req.mutable_extra_configs()->insert(data_->extra_configs_->begin(),
                                         data_->extra_configs_->end());
   }
+  if (data_->owner_ != boost::none) {
+    req.set_owner(data_->owner_.get());
+  }
   RETURN_NOT_OK_PREPEND(SchemaToPB(*data_->schema_->schema_, req.mutable_schema(),
                                    SCHEMA_PB_WITHOUT_WRITE_DEFAULT),
                         "Invalid schema");
@@ -842,6 +857,10 @@ Status KuduTableCreator::Create() {
   }
 
   req.mutable_partition_schema()->CopyFrom(data_->partition_schema_);
+
+  if (data_->table_type_) {
+    req.set_table_type(*data_->table_type_);
+  }
 
   MonoTime deadline = MonoTime::Now();
   if (data_->timeout_.Initialized()) {
@@ -900,10 +919,11 @@ KuduTable::KuduTable(const shared_ptr<KuduClient>& client,
                      const string& name,
                      const string& id,
                      int num_replicas,
+                     const string& owner,
                      const KuduSchema& schema,
                      const PartitionSchema& partition_schema,
                      const map<string, string>& extra_configs)
-  : data_(new KuduTable::Data(client, name, id, num_replicas,
+  : data_(new KuduTable::Data(client, name, id, num_replicas, owner,
                               schema, partition_schema, extra_configs)) {
 }
 
@@ -925,6 +945,10 @@ const KuduSchema& KuduTable::schema() const {
 
 int KuduTable::num_replicas() const {
   return data_->num_replicas_;
+}
+
+const string& KuduTable::owner() const {
+  return data_->owner_;
 }
 
 KuduInsert* KuduTable::NewInsert() {
@@ -1008,7 +1032,6 @@ KuduPredicate* KuduTable::NewInBloomFilterPredicate(const Slice& col_name,
 }
 
 KuduPredicate* KuduTable::NewInBloomFilterPredicate(const Slice& col_name,
-                                                    const Slice& allocator,
                                                     const vector<Slice>& bloom_filters) {
   // Empty vector of bloom filters will select all rows. Hence disallowed.
   if (bloom_filters.empty()) {
@@ -1016,26 +1039,15 @@ KuduPredicate* KuduTable::NewInBloomFilterPredicate(const Slice& col_name,
         new ErrorPredicateData(Status::InvalidArgument("No Bloom filters supplied")));
   }
 
-  // In this case, the Block Bloom filters and allocator are supplied as opaque pointers
-  // and the predicate will convert them to well-defined pointer types
-  // but will NOT take ownership of those pointers. Hence a custom deleter,
-  // DirectBloomFilterDataDeleter, is used that gives control over ownership.
-
-  // Extract the allocator.
-  auto* bbf_allocator =
-      // const_cast<> can be avoided with mutable_data() on a Slice. However mutable_data() is a
-      // non-const function which can't be used with the const allocator Slice.
-      // Same for BlockBloomFilter below.
-      reinterpret_cast<BlockBloomFilterBufferAllocatorIf*>(const_cast<uint8_t*>(allocator.data()));
-  std::shared_ptr<BlockBloomFilterBufferAllocatorIf> bbf_allocator_shared(
-      bbf_allocator,
-      DirectBloomFilterDataDeleter<BlockBloomFilterBufferAllocatorIf>(false /*owned*/));
-
   // Extract the Block Bloom filters.
   vector<DirectBlockBloomFilterUniqPtr> bbf_vec;
   for (const auto& bf_slice : bloom_filters) {
     auto* bbf =
         reinterpret_cast<BlockBloomFilter*>(const_cast<uint8_t*>(bf_slice.data()));
+    // In this case, the Block Bloom filters are supplied as opaque pointers
+    // and the predicate will convert them to well-defined pointer types
+    // but will NOT take ownership of those pointers. Hence a custom deleter,
+    // DirectBloomFilterDataDeleter, is used that gives control over ownership.
     DirectBlockBloomFilterUniqPtr bf_uniq_ptr(
         bbf, DirectBloomFilterDataDeleter<BlockBloomFilter>(false /*owned*/));
     bbf_vec.emplace_back(std::move(bf_uniq_ptr));
@@ -1043,8 +1055,7 @@ KuduPredicate* KuduTable::NewInBloomFilterPredicate(const Slice& col_name,
 
   return data_->MakePredicate(col_name, [&](const ColumnSchema& col_schema) {
     return new KuduPredicate(
-        new InDirectBloomFilterPredicateData(col_schema, std::move(bbf_allocator_shared),
-                                             std::move(bbf_vec)));
+        new InDirectBloomFilterPredicateData(col_schema, std::move(bbf_vec)));
   });
 }
 
@@ -1248,6 +1259,11 @@ KuduTableAlterer::~KuduTableAlterer() {
 
 KuduTableAlterer* KuduTableAlterer::RenameTo(const string& new_name) {
   data_->rename_to_ = new_name;
+  return this;
+}
+
+KuduTableAlterer* KuduTableAlterer::SetOwner(const string& new_owner) {
+  data_->set_owner_to_ = new_owner;
   return this;
 }
 
@@ -1561,6 +1577,10 @@ Status KuduScanner::SetCacheBlocks(bool cache_blocks) {
 
 KuduSchema KuduScanner::GetProjectionSchema() const {
   return KuduSchema::FromSchema(*data_->configuration().projection());
+}
+
+shared_ptr<KuduTable> KuduScanner::GetKuduTable() {
+  return data_->table_;
 }
 
 Status KuduScanner::SetRowFormatFlags(uint64_t flags) {
@@ -1920,6 +1940,16 @@ Status KuduScanTokenBuilder::SetSelection(KuduClient::ReplicaSelection selection
 
 Status KuduScanTokenBuilder::SetTimeoutMillis(int millis) {
   data_->mutable_configuration()->SetTimeoutMillis(millis);
+  return Status::OK();
+}
+
+Status KuduScanTokenBuilder::IncludeTableMetadata(bool include_metadata) {
+  data_->IncludeTableMetadata(include_metadata);
+  return Status::OK();
+}
+
+Status KuduScanTokenBuilder::IncludeTabletMetadata(bool include_metadata) {
+  data_->IncludeTabletMetadata(include_metadata);
   return Status::OK();
 }
 

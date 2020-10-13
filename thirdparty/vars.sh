@@ -38,7 +38,7 @@ PREFIX_COMMON=$TP_DIR/installed/common
 PREFIX_DEPS=$TP_DIR/installed/uninstrumented
 PREFIX_DEPS_TSAN=$TP_DIR/installed/tsan
 
-GFLAGS_VERSION=2.2.0
+GFLAGS_VERSION=2.2.2
 GFLAGS_NAME=gflags-$GFLAGS_VERSION
 GFLAGS_SOURCE=$TP_SOURCE_DIR/$GFLAGS_NAME
 
@@ -54,7 +54,7 @@ GPERFTOOLS_VERSION=2.6.90
 GPERFTOOLS_NAME=gperftools-$GPERFTOOLS_VERSION
 GPERFTOOLS_SOURCE=$TP_SOURCE_DIR/$GPERFTOOLS_NAME
 
-PROTOBUF_VERSION=3.4.1
+PROTOBUF_VERSION=3.12.3
 PROTOBUF_NAME=protobuf-$PROTOBUF_VERSION
 PROTOBUF_SOURCE=$TP_SOURCE_DIR/$PROTOBUF_NAME
 
@@ -64,21 +64,20 @@ CMAKE_VERSION=3.16.4
 CMAKE_NAME=cmake-$CMAKE_VERSION
 CMAKE_SOURCE=$TP_SOURCE_DIR/$CMAKE_NAME
 
-SNAPPY_VERSION=1.1.4
+SNAPPY_VERSION=1.1.8
 SNAPPY_NAME=snappy-$SNAPPY_VERSION
 SNAPPY_SOURCE=$TP_SOURCE_DIR/$SNAPPY_NAME
 
-LZ4_VERSION=1.9.1
+LZ4_VERSION=1.9.2
 LZ4_NAME=lz4-$LZ4_VERSION
 LZ4_SOURCE=$TP_SOURCE_DIR/$LZ4_NAME
 
 # from https://github.com/kiyo-masui/bitshuffle
-# Hash of git: 55f9b4caec73fa21d13947cacea1295926781440
-BITSHUFFLE_VERSION=55f9b4c
+BITSHUFFLE_VERSION=0.3.5
 BITSHUFFLE_NAME=bitshuffle-$BITSHUFFLE_VERSION
 BITSHUFFLE_SOURCE=$TP_SOURCE_DIR/$BITSHUFFLE_NAME
 
-ZLIB_VERSION=1.2.8
+ZLIB_VERSION=1.2.11
 ZLIB_NAME=zlib-$ZLIB_VERSION
 ZLIB_SOURCE=$TP_SOURCE_DIR/$ZLIB_NAME
 
@@ -138,7 +137,7 @@ CRCUTIL_VERSION=81f8a60f67190ff1e0c9f2f6e5a07f650671a646
 CRCUTIL_NAME=crcutil-$CRCUTIL_VERSION
 CRCUTIL_SOURCE=$TP_SOURCE_DIR/$CRCUTIL_NAME
 
-LIBUNWIND_VERSION=1.3.1
+LIBUNWIND_VERSION=1.4.0
 LIBUNWIND_NAME=libunwind-$LIBUNWIND_VERSION
 LIBUNWIND_SOURCE=$TP_SOURCE_DIR/$LIBUNWIND_NAME
 
@@ -167,7 +166,7 @@ TRACE_VIEWER_VERSION=21d76f8350fea2da2aa25cb6fd512703497d0c11
 TRACE_VIEWER_NAME=kudu-trace-viewer-$TRACE_VIEWER_VERSION
 TRACE_VIEWER_SOURCE=$TP_SOURCE_DIR/$TRACE_VIEWER_NAME
 
-BOOST_VERSION=1_61_0
+BOOST_VERSION=1_74_0
 BOOST_NAME=boost_$BOOST_VERSION
 BOOST_SOURCE=$TP_SOURCE_DIR/$BOOST_NAME
 
@@ -198,7 +197,7 @@ THRIFT_VERSION=0.11.0
 THRIFT_NAME=thrift-$THRIFT_VERSION
 THRIFT_SOURCE=$TP_SOURCE_DIR/$THRIFT_NAME
 
-BISON_VERSION=3.0.5
+BISON_VERSION=3.5.4
 BISON_NAME=bison-$BISON_VERSION
 BISON_SOURCE=$TP_SOURCE_DIR/$BISON_NAME
 
@@ -214,17 +213,8 @@ HADOOP_VERSION=3.2.0
 HADOOP_NAME=hadoop-$HADOOP_VERSION
 HADOOP_SOURCE=$TP_SOURCE_DIR/$HADOOP_NAME
 
-# TODO(dan): bump to a release version once SENTRY-2371, SENTRY-2440, SENTRY-2471
-# and SENTRY-2522 are published. The SHA below is the current head of the master branch.
-# Note: Sentry releases source code only. To build the binary tarball, use `dist`
-# maven profile. For example, `mvn clean install -Pdist`. After a successful build,
-# the tarball will be available under sentry-dist/target.
-SENTRY_VERSION=b71a78ed960702536b35e1f048dc40dfc79992d4
-SENTRY_NAME=sentry-$SENTRY_VERSION
-SENTRY_SOURCE=$TP_SOURCE_DIR/$SENTRY_NAME
-
 # If opting to use the CDH ecosystem, pull the Hadoop ecosystem components
-# (e.g. Hadoop, Hive, Sentry) from the most recently published
+# (e.g. Hadoop, Hive) from the most recently published
 # 'impala-minicluster-tarballs' package.
 if [[ "$KUDU_USE_CDH_ECOSYSTEM" -ne 0 ]]; then
   # This URL corresponds to Cloudera's CDH distribution.
@@ -268,22 +258,18 @@ if [[ "$KUDU_USE_CDH_ECOSYSTEM" -ne 0 ]]; then
   #   kudu-1.10.0-cdh6.x-1041528-sles12.tar.gz
   #   kudu-1.10.0-cdh6.x-1041528-ubuntu1604.tar.gz
   #   kudu-1.10.0-cdh6.x-1041528-ubuntu1804.tar.gz
-  #   sentry-2.1.0-cdh6.x-1041528.tar.gz
   while read line; do
     if [[ $line == hive* ]]; then
       HIVE_NUMBER=$(echo $line | cut -d'-' -f2)
-    fi
-    if [[ $line == sentry* ]]; then
-      SENTRY_NUMBER=$(echo $line | cut -d'-' -f2)
     fi
     if [[ $line == hadoop* ]]; then
       HADOOP_NUMBER=$(echo $line | cut -d'-' -f2)
     fi
   done <<< "$TARBALL_FILES"
 
-  if [[ -z "$HIVE_NUMBER" ]] || [[ -z "$SENTRY_NUMBER" ]] || [[ -z "$HADOOP_NUMBER" ]]; then
+  if [[ -z "$HIVE_NUMBER" ]] || [[ -z "$HADOOP_NUMBER" ]]; then
     echo "Error: failed to fetch version numbers"
-    echo "Hive: ${HIVE_NUMBER}, Sentry: ${SENTRY_NUMBER}, Hadoop: ${HADOOP_NUMBER}"
+    echo "Hive: ${HIVE_NUMBER}, Hadoop: ${HADOOP_NUMBER}"
     echo "Files list: ${TARBALL_FILES}"
     exit 1
   fi
@@ -295,10 +281,6 @@ if [[ "$KUDU_USE_CDH_ECOSYSTEM" -ne 0 ]]; then
   HADOOP_VERSION="${HADOOP_NUMBER}-cdh${CDH_VERSION}"
   HADOOP_NAME="hadoop-${HADOOP_VERSION}-${KUDU_CDH_GBN}"
   HADOOP_SOURCE="$TP_SOURCE_DIR/$HADOOP_NAME"
-
-  SENTRY_VERSION="${SENTRY_NUMBER}-cdh${CDH_VERSION}"
-  SENTRY_NAME="sentry-${SENTRY_VERSION}-${KUDU_CDH_GBN}"
-  SENTRY_SOURCE="$TP_SOURCE_DIR/$SENTRY_NAME"
 fi
 
 YAML_VERSION=0.6.2

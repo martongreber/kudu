@@ -46,7 +46,7 @@ using std::string;
 using std::vector;
 using strings::Substitute;
 
-static constexpr int kRangerStartTimeoutMs = 60000;
+static constexpr int kRangerStartTimeoutMs = 90000;
 
 namespace kudu {
 namespace ranger {
@@ -226,10 +226,11 @@ Status MiniRanger::StartRanger() {
         { "RANGER_USER", "miniranger" },
     });
     RETURN_NOT_OK(process_->Start());
-    const string ip = "127.0.0.1";
     uint16_t port;
-    RETURN_NOT_OK(WaitForTcpBind(process_->pid(), &port, ip,
-                  MonoDelta::FromMilliseconds(kRangerStartTimeoutMs)));
+    RETURN_NOT_OK(WaitForTcpBind(process_->pid(),
+                                 &port,
+                                 { "0.0.0.0", "127.0.0.1", },
+                                 MonoDelta::FromMilliseconds(kRangerStartTimeoutMs)));
     LOG(INFO) << "Ranger bound to " << port;
     LOG(INFO) << "Ranger admin URL: " << ranger_admin_url_;
   }
@@ -307,12 +308,13 @@ Status MiniRanger::AddPolicy(AuthorizationPolicy policy) {
     EasyJson item = policy_items.PushBack(EasyJson::kObject);
 
     EasyJson users = item.Set("users", EasyJson::kArray);
-    for (const string& user : policy_item.first) {
+    for (const string& user : std::get<0>(policy_item)) {
       users.PushBack(user);
     }
 
+    item.Set("delegateAdmin", std::get<2>(policy_item));
     EasyJson accesses = item.Set("accesses", EasyJson::kArray);
-    for (const ActionPB& action : policy_item.second) {
+    for (const ActionPB& action : std::get<1>(policy_item)) {
       EasyJson access = accesses.PushBack(EasyJson::kObject);
       access.Set("type", ActionPB_Name(action));
       access.Set("isAllowed", true);

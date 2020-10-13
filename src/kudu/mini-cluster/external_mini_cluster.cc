@@ -53,7 +53,6 @@
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/security/test/mini_kdc.h"
-#include "kudu/sentry/mini_sentry.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -113,12 +112,12 @@ static double kMasterCatalogManagerTimeoutSeconds = 60.0;
 
 ExternalMiniClusterOptions::ExternalMiniClusterOptions()
     : num_masters(1),
+      supply_single_master_addr(false),
       num_tablet_servers(1),
       bind_mode(kDefaultBindMode),
       num_data_dirs(1),
       enable_kerberos(false),
       hms_mode(HmsMode::NONE),
-      enable_sentry(false),
       enable_ranger(false),
       logtostderr(true),
       start_process_timeout(MonoDelta::FromSeconds(70)),
@@ -212,30 +211,6 @@ Status ExternalMiniCluster::AddTimeSourceFlags(
   return Status::OK();
 }
 
-Status ExternalMiniCluster::StartSentry() {
-  sentry_->SetDataRoot(opts_.cluster_root);
-
-  if (hms_) {
-    sentry_->EnableHms(hms_->uris());
-  }
-
-  if (opts_.enable_kerberos) {
-    string spn = Substitute("sentry/$0", sentry_->address().host());
-    string ktpath;
-    RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(spn, &ktpath),
-                          "could not create keytab");
-    sentry_->EnableKerberos(kdc_->GetEnvVars()["KRB5_CONFIG"],
-                            Substitute("$0@KRBTEST.COM", spn),
-                            ktpath);
-  }
-
-  return sentry_->Start();
-}
-
-Status ExternalMiniCluster::StopSentry() {
-  return sentry_->Stop();
-}
-
 Status ExternalMiniCluster::Start() {
   CHECK(masters_.empty()) << "Masters are not empty (size: " << masters_.size()
       << "). Maybe you meant Restart()?";
@@ -302,43 +277,9 @@ Status ExternalMiniCluster::Start() {
   }
 #endif // #if !defined(NO_CHRONY) ...
 
-  // Start the Sentry service and the HMS in the following steps, in order
-  // to deal with the circular dependency in terms of configuring each
-  // with the other's IP/port.
-  // 1. Pick a bind IP using UNIQUE_LOOPBACK mode for the Sentry service.
-  //    Statically choose a random port. Since the Sentry service will
-  //    live on its own IP address, there's no danger of collision.
-  // 2. Start the HMS, configured to talk to the Sentry service. Find out
-  //    which port it's on.
-  // 3. Start the Sentry service with the chosen address/port from step 1.
-  //
-  // We can also pick a random port for the HMS in step 2, however, due to
-  // HIVE-18998 (which is addressed in Hive 4.0.0 by HIVE-20794), this is not
-  // an option.
-  // TODO(hao): Pick a static port for the HMS to bind to when we move to Hive 4.
-  //
-  // Note that when UNIQUE_LOOPBACK mode is not supported (i.e. on macOS),
-  // we cannot choose a port at random as that can cause a port collision.
-  // In that case, we start the Sentry service with the picked IP address
-  // and port 0 in step 1. Find out which port it's on by polling lsof.
-  // In step 3, restart the Sentry service and reconfigure it to talk to
-  // the HMS's port.
-
-  if (opts_.enable_sentry) {
-    sentry_.reset(new sentry::MiniSentry());
-    string host = GetBindIpForExternalServer(0);
-    uint16_t port = opts_.bind_mode == BindMode::UNIQUE_LOOPBACK ? 10000 : 0;
-    sentry_->SetAddress(HostPort(host, port));
-    if (opts_.bind_mode != BindMode::UNIQUE_LOOPBACK) {
-      RETURN_NOT_OK_PREPEND(StartSentry(), "Failed to start the Sentry service");
-    }
-  }
-
   if (opts_.enable_ranger) {
     string host = GetBindIpForExternalServer(0);
     ranger_.reset(new ranger::MiniRanger(cluster_root(), host));
-    // We're using the same service index as Sentry as they can't be both
-    // started at the same time.
     if (opts_.enable_kerberos) {
 
       // The SPNs match the ones defined in mini_ranger_configs.h.
@@ -390,23 +331,8 @@ Status ExternalMiniCluster::Start() {
                            rpc::SaslProtection::kAuthentication);
     }
 
-    if (opts_.enable_sentry) {
-      string sentry_spn = Substitute("sentry/$0@KRBTEST.COM", sentry_->address().host());
-      hms_->EnableSentry(sentry_->address(), sentry_spn);
-    }
-
     RETURN_NOT_OK_PREPEND(hms_->Start(),
                           "Failed to start the Hive Metastore");
-
-    // (Re)start Sentry with the HMS address.
-    if (opts_.enable_sentry) {
-      if (opts_.bind_mode != BindMode::UNIQUE_LOOPBACK) {
-        RETURN_NOT_OK_PREPEND(StopSentry(),
-                              "Failed to stop the Sentry service");
-      }
-      RETURN_NOT_OK_PREPEND(StartSentry(),
-                            "Failed to start the Sentry service");
-    }
   }
 
   RETURN_NOT_OK_PREPEND(StartMasters(), "failed to start masters");
@@ -570,7 +496,10 @@ Status ExternalMiniCluster::StartMasters() {
 
   vector<string> flags;
   flags.emplace_back("--rpc_reuseport=true");
-  if (num_masters > 1) {
+  // Setting --master_addresses flag for a single master configuration is now supported but not
+  // mandatory. Not setting the flag helps test existing kudu deployments that don't specify
+  // the --master_addresses flag for single master configuration.
+  if (num_masters > 1 || opts_.supply_single_master_addr) {
     flags.emplace_back(Substitute("--master_addresses=$0",
                                   HostPort::ToCommaSeparatedString(master_rpc_addrs)));
   }
@@ -634,13 +563,7 @@ Status ExternalMiniCluster::StartMasters() {
         opts.extra_flags.emplace_back("--hive_metastore_sasl_enabled=true");
       }
     }
-    if (opts_.enable_sentry) {
-      opts.extra_flags.emplace_back(Substitute("--sentry_service_rpc_addresses=$0",
-                                               sentry_->address().ToString()));
-      if (!opts_.enable_kerberos) {
-        opts.extra_flags.emplace_back("--sentry_service_security_mode=none");
-      }
-    } else if (opts_.enable_ranger) {
+    if (opts_.enable_ranger) {
       opts.extra_flags.emplace_back(Substitute("--ranger_config_path=$0",
                                                JoinPathSegments(cluster_root(),
                                                                 "ranger-client")));
@@ -838,6 +761,7 @@ Status ExternalMiniCluster::GetLeaderMasterIndex(int* idx) {
   Synchronizer sync;
   vector<pair<Sockaddr, string>> addrs_with_names;
   Sockaddr leader_master_addr;
+  string leader_master_hostname;
   MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(5);
 
   for (const scoped_refptr<ExternalMaster>& master : masters_) {
@@ -845,9 +769,10 @@ Status ExternalMiniCluster::GetLeaderMasterIndex(int* idx) {
   }
   const auto& cb = [&](const Status& status,
                        const pair<Sockaddr, string>& leader_master,
-                       const master::ConnectToMasterResponsePB& resp) {
+                       const master::ConnectToMasterResponsePB& /*resp*/) {
     if (status.ok()) {
       leader_master_addr = leader_master.first;
+      leader_master_hostname = leader_master.second;
     }
     sync.StatusCB(status);
   };
@@ -863,7 +788,13 @@ Status ExternalMiniCluster::GetLeaderMasterIndex(int* idx) {
   RETURN_NOT_OK(sync.Wait());
   bool found = false;
   for (int i = 0; i < masters_.size(); i++) {
-    if (masters_[i]->bound_rpc_hostport().port() == leader_master_addr.port()) {
+    const auto& bound_hp = masters_[i]->bound_rpc_hostport();
+    // If using BindMode::UNIQUE_LOOPBACK mode, in rare cases different masters
+    // might bind to different local IP addresses but use same port numbers.
+    // So, it's necessary to check both the returned hostnames and IP addresses
+    // to point to leader master.
+    if (bound_hp.port() == leader_master_addr.port() &&
+        bound_hp.host() == leader_master_hostname) {
       found = true;
       *idx = i;
       break;
@@ -991,6 +922,20 @@ string ExternalMiniCluster::WalRootForTS(int ts_idx) const {
 
 string ExternalMiniCluster::UuidForTS(int ts_idx) const {
   return tablet_server(ts_idx)->uuid();
+}
+
+Status ExternalMiniCluster::AddMaster(const scoped_refptr<ExternalMaster>& new_master) {
+  const auto& new_master_uuid = new_master->instance_id().permanent_uuid();
+  for (const auto& m : masters_) {
+    if (m->instance_id().permanent_uuid() == new_master_uuid) {
+      CHECK(m->bound_rpc_hostport() == new_master->bound_rpc_hostport());
+      return Status::AlreadyPresent(Substitute(
+          "Master $0, uuid: $1 already present in ExternalMiniCluster",
+          m->bound_rpc_hostport().ToString(), new_master_uuid));
+    }
+  }
+  masters_.emplace_back(new_master);
+  return Status::OK();
 }
 
 //------------------------------------------------------------
@@ -1377,9 +1322,7 @@ void ExternalDaemon::CheckForLeaks() {
 HostPort ExternalDaemon::bound_rpc_hostport() const {
   CHECK(status_);
   CHECK_GE(status_->bound_rpc_addresses_size(), 1);
-  HostPort ret;
-  CHECK_OK(HostPortFromPB(status_->bound_rpc_addresses(0), &ret));
-  return ret;
+  return HostPortFromPB(status_->bound_rpc_addresses(0));
 }
 
 Sockaddr ExternalDaemon::bound_rpc_addr() const {
@@ -1395,9 +1338,7 @@ HostPort ExternalDaemon::bound_http_hostport() const {
   if (status_->bound_http_addresses_size() == 0) {
     return HostPort();
   }
-  HostPort ret;
-  CHECK_OK(HostPortFromPB(status_->bound_http_addresses(0), &ret));
-  return ret;
+  return HostPortFromPB(status_->bound_http_addresses(0));
 }
 
 const NodeInstancePB& ExternalDaemon::instance_id() const {

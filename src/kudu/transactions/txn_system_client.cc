@@ -59,6 +59,7 @@ namespace transactions {
 
 Status TxnSystemClient::Create(const vector<string>& master_addrs,
                                unique_ptr<TxnSystemClient>* sys_client) {
+  DCHECK(!master_addrs.empty());
   KuduClientBuilder builder;
   builder.master_server_addrs(master_addrs);
   client::sp::shared_ptr<KuduClient> client;
@@ -137,11 +138,8 @@ Status TxnSystemClient::BeginTransaction(int64_t txn_id,
                                            s.AsStatusCallback(),
                                            &result));
   const auto ret = s.Wait();
-  if (ret.ok() || ret.IsInvalidArgument()) {
-    DCHECK(result.has_highest_seen_txn_id());
-    if (highest_seen_txn_id) {
-      *highest_seen_txn_id = result.highest_seen_txn_id();
-    }
+  if (result.has_highest_seen_txn_id() && highest_seen_txn_id) {
+    *highest_seen_txn_id = result.highest_seen_txn_id();
   }
   return ret;
 }
@@ -220,6 +218,7 @@ Status TxnSystemClient::CoordinateTransactionAsync(CoordinatorOpPB coordinate_tx
                                                    const MonoDelta& timeout,
                                                    const StatusCallback& cb,
                                                    CoordinatorOpResultPB* result) {
+  DCHECK(txn_status_table_);
   const MonoTime deadline = MonoTime::Now() + timeout;
   unique_ptr<TxnStatusTabletContext> ctx(
       new TxnStatusTabletContext({

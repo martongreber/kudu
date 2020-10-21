@@ -111,7 +111,9 @@
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/oid_generator.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/scoped_cleanup.h"
@@ -164,6 +166,9 @@ DEFINE_int32(single_threaded_insert_latency_bench_insert_rows, 1000,
 
 DEFINE_int32(delete_tablet_bench_num_flushes, 200,
              "Number of disk row sets to flush in the delete tablet benchmark");
+
+DEFINE_int32(num_tablets, 5, "Number of tablets to create for tests");
+DEFINE_int32(num_rowsets_per_tablet, 10, "Number of rowsets to create per tablet");
 
 DECLARE_bool(crash_on_eio);
 DECLARE_bool(enable_flush_deltamemstores);
@@ -4329,6 +4334,78 @@ TEST_F(TabletServerTest, TestScannerCheckMatchingUser) {
       SCOPED_TRACE(resp.DebugString());
       NO_FATALS(verify_authz_error(s));
     }
+  }
+}
+
+// Regression test for KUDU-3195 that ensures that as long as there are DMSs
+// older than the flush threshold, we will schedule DMS flushes.
+TEST_F(TabletServerTest, TestTimeBasedFlushDMS) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  FLAGS_enable_maintenance_manager = false;
+  NO_FATALS(ShutdownAndRebuildTablet());
+  // We're going to generate a bunch of DMSs, and for that, we need multiple
+  // rowsets, so disable merge compactions.
+  FLAGS_enable_rowset_compaction = false;
+
+  constexpr const int kNumRowsets = 100;
+  constexpr const int kRowsPerRowset = 1;
+  for (int i = 0; i < kNumRowsets; i++) {
+    NO_FATALS(InsertTestRowsDirect(i * kRowsPerRowset, kRowsPerRowset));
+    ASSERT_OK(tablet_replica_->tablet()->Flush());
+  }
+  for (int i = 0; i < kNumRowsets * kRowsPerRowset; i++) {
+    NO_FATALS(UpdateTestRowRemote(i, 0));
+  }
+  ASSERT_FALSE(tablet_replica_->tablet()->DeltaMemRowSetEmpty());
+
+  // We want to see how quickly we can flush DMSs, so speed up time-based
+  // flushing.
+  FLAGS_enable_maintenance_manager = true;
+  FLAGS_maintenance_manager_polling_interval_ms = 1;
+  FLAGS_flush_threshold_secs = 1;
+  NO_FATALS(ShutdownAndRebuildTablet());
+  // We should be able to wait for the flush threshold and very quickly see all
+  // DMSs get flushed. We'll wait 5x the flush threshold, which should be ample
+  // time given how little we're writing.
+  // NOTE: There are 100 DMSs to flush -- we shouldn't be doing anything silly
+  // like waiting a full flush threshold between flushes, which would take 100
+  // seconds!
+  SleepFor(MonoDelta::FromSeconds(5 * FLAGS_flush_threshold_secs));
+  ASSERT_TRUE(tablet_replica_->tablet()->DeltaMemRowSetEmpty());
+}
+
+TEST_F(TabletServerTest, StartupWithConcurrentOpsBenchmark) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  FLAGS_enable_maintenance_manager = false;
+  NO_FATALS(ShutdownAndRebuildTablet());
+
+  // Create a bunch of tablets with a bunch of rowsets.
+  ObjectIdGenerator oid;
+  for (int i = 0; i < FLAGS_num_tablets; i++) {
+    const auto tablet_id = oid.Next();
+    ASSERT_OK(mini_server_->AddTestTablet(kTableId, tablet_id, schema_));
+    ASSERT_OK(WaitForTabletRunning(tablet_id.c_str()));
+    for (int r = 0; r < FLAGS_num_rowsets_per_tablet; r++) {
+      NO_FATALS(InsertTestRowsDirect(r, 1, tablet_id));
+      scoped_refptr<TabletReplica> replica;
+      ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(tablet_id, &replica));
+      ASSERT_OK(replica->tablet()->Flush());
+    }
+  }
+  ShutdownTablet();
+  // With a large number of tablets and rowsets, the maintenance manager
+  // scheduler thread will spend a lot of time computing the best op to
+  // perform. With many maintenance threads, finding the best op may contend
+  // with on-going compactions. Per KUDU-3149, this shouldn't interfere with op
+  // registration and bootstrapping.
+  FLAGS_enable_maintenance_manager = true;
+  FLAGS_maintenance_manager_polling_interval_ms = 1;
+  FLAGS_maintenance_manager_num_threads = 10;
+  mini_server_.reset(new MiniTabletServer(GetTestPath("TabletServerTest-fsroot"),
+                                          HostPort("127.0.0.1", 0), 1));
+  ASSERT_OK(mini_server_->Start());
+  LOG_TIMING(INFO, "waiting for all bootstraps to finish") {
+    ASSERT_OK(mini_server_->server()->tablet_manager()->WaitForAllBootstrapsToFinish());
   }
 }
 

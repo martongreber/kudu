@@ -83,7 +83,20 @@
              <Bug pattern="SE_NO_SERIALVERSIONID"/>
              <!-- HE_HASHCODE_USE_OBJECT_EQUALS: Class defines hashCode() and uses Object.equals(). -->
              <Bug pattern="HE_HASHCODE_USE_OBJECT_EQUALS"/>
+             <!-- MS_PKGPROTECT: Field should be package protected -->
+             <Bug pattern="MS_PKGPROTECT"/>
          </Or>
+    </Match>
+    <Match>
+        <!-- Spotbugs can trigger false positives for redundant null checks on JDK 11+.
+         See https://github.com/spotbugs/spotbugs/issues/756
+         This is fixed in SpotBugs 4.1.3, but we can't upgrade yet due to
+         https://github.com/spotbugs/spotbugs/issues/1272
+         -->
+        <Or>
+            <Bug pattern="RCN_REDUNDANT_NULLCHECK_OF_NONNULL_VALUE" />
+            <Bug pattern="RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE" />
+        </Or>
     </Match>
     <Match>
         <!-- Disable warnings about mutable objects and the use of public fields.
@@ -142,6 +155,15 @@
             <Field name="table" />
         </Or>
         <Bug pattern="SE_TRANSIENT_FIELD_NOT_RESTORED" />
+    </Match>
+    <Match>
+        <!-- The casts in these methods are known and safe. -->
+        <Class name="org.apache.kudu.backup.KuduBackupRDD"/>
+        <Or>
+            <Method name="compute" />
+            <Method name="getPreferredLocations" />
+        </Or>
+        <Bug pattern="BC_UNCONFIRMED_CAST" />
     </Match>
 
     <!-- kudu-client exclusions -->
@@ -291,6 +313,15 @@
             <Field name="table"/>
         </Or>
         <Bug pattern="SE_TRANSIENT_FIELD_NOT_RESTORED" />
+    </Match>
+    <Match>
+        <!-- The casts in these methods are known and safe. -->
+        <Class name="org.apache.kudu.spark.kudu.KuduRDD"/>
+        <Or>
+            <Method name="compute" />
+            <Method name="getPreferredLocations" />
+        </Or>
+        <Bug pattern="BC_UNCONFIRMED_CAST" />
     </Match>
     <Match>
         <!-- These fields don't need to be restored in this case. -->

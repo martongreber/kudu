@@ -65,6 +65,10 @@
       "extensionId": "ranger_plugin",
       "pluginType": "KUDU",
       "repositoryStrategy" : "uniquePerService"
+    },
+    {
+      "type": "clusterInfo",
+      "extensionId": "cluster_info"
     }
   ],
   "kerberos" : "${enable_security}",
@@ -621,6 +625,10 @@
               {
                 "key": "xasecure.policymgr.clientssl.truststore.credential.file",
                 "value": "{{RANGER_PLUGIN_TRUSTSTORE_CRED_FILE}}"
+              },
+              {
+                "key": "xasecure.policymgr.clientssl.truststore.type",
+                "value": "${keystore_type}"
               }
             ]
           },

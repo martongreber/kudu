@@ -193,7 +193,12 @@ public class TestKuduSession {
     session.flush();
 
     for (PartialRow row : rows) {
-      Delete del = table.newDelete();
+      Operation del;
+      if (row.getInt(0) % 2 == 0) {
+        del = table.newDelete();
+      } else {
+        del = table.newDeleteIgnore();
+      }
       del.setRow(row);
       session.apply(del);
     }
@@ -239,7 +244,12 @@ public class TestKuduSession {
     session.flush();
 
     for (PartialRow row : rows) {
-      Delete del = table.newDelete();
+      Operation del;
+      if (row.getInt(0) % 2 == 0) {
+        del = table.newDelete();
+      } else {
+        del = table.newDeleteIgnore();
+      }
       del.setRow(row);
       session.apply(del);
     }
@@ -423,6 +433,44 @@ public class TestKuduSession {
   }
 
   @Test(timeout = 10000)
+  public void testUpdateIgnore() throws Exception {
+    KuduTable table = client.createTable(tableName, basicSchema, getBasicCreateTableOptions());
+    KuduSession session = client.newSession();
+
+    // Test update ignore does not return a row error.
+    assertFalse(session.apply(createUpdateIgnore(table, 1, 1, false)).hasRowError());
+    assertEquals(0, scanTableToStrings(table).size());
+
+    assertFalse(session.apply(createInsert(table, 1)).hasRowError());
+    assertEquals(1, scanTableToStrings(table).size());
+
+    // Test update ignore implements normal update.
+    assertFalse(session.apply(createUpdateIgnore(table, 1, 2, false)).hasRowError());
+    List<String> rowStrings = scanTableToStrings(table);
+    assertEquals(1, rowStrings.size());
+    assertEquals(
+        "INT32 key=1, INT32 column1_i=2, INT32 column2_i=3, " +
+            "STRING column3_s=a string, BOOL column4_b=true",
+        rowStrings.get(0));
+  }
+
+  @Test(timeout = 10000)
+  public void testDeleteIgnore() throws Exception {
+    KuduTable table = client.createTable(tableName, basicSchema, getBasicCreateTableOptions());
+    KuduSession session = client.newSession();
+
+    // Test delete ignore does not return a row error.
+    assertFalse(session.apply(createDeleteIgnore(table, 1)).hasRowError());
+
+    assertFalse(session.apply(createInsert(table, 1)).hasRowError());
+    assertEquals(1, scanTableToStrings(table).size());
+
+    // Test delete ignore implements normal delete.
+    assertFalse(session.apply(createDeleteIgnore(table, 1)).hasRowError());
+    assertEquals(0, scanTableToStrings(table).size());
+  }
+
+  @Test(timeout = 10000)
   public void testInsertManualFlushNonCoveredRange() throws Exception {
     CreateTableOptions createOptions = getBasicTableOptionsWithNonCoveredRange();
     createOptions.setNumReplicas(1);
@@ -551,7 +599,18 @@ public class TestKuduSession {
 
   private Upsert createUpsert(KuduTable table, int key, int secondVal, boolean hasNull) {
     Upsert upsert = table.newUpsert();
-    PartialRow row = upsert.getRow();
+    populateUpdateRow(upsert.getRow(), key, secondVal, hasNull);
+    return upsert;
+  }
+
+  private UpdateIgnore createUpdateIgnore(KuduTable table, int key, int secondVal,
+                                          boolean hasNull) {
+    UpdateIgnore updateIgnore = table.newUpdateIgnore();
+    populateUpdateRow(updateIgnore.getRow(), key, secondVal, hasNull);
+    return updateIgnore;
+  }
+
+  private void populateUpdateRow(PartialRow row, int key, int secondVal, boolean hasNull) {
     row.addInt(0, key);
     row.addInt(1, secondVal);
     row.addInt(2, 3);
@@ -561,7 +620,6 @@ public class TestKuduSession {
       row.addString(3, "a string");
     }
     row.addBoolean(4, true);
-    return upsert;
   }
 
   private Delete createDelete(KuduTable table, int key) {
@@ -569,6 +627,13 @@ public class TestKuduSession {
     PartialRow row = delete.getRow();
     row.addInt(0, key);
     return delete;
+  }
+
+  private DeleteIgnore createDeleteIgnore(KuduTable table, int key) {
+    DeleteIgnore deleteIgnore = table.newDeleteIgnore();
+    PartialRow row = deleteIgnore.getRow();
+    row.addInt(0, key);
+    return deleteIgnore;
   }
 
   protected InsertIgnore createInsertIgnore(KuduTable table, int key) {

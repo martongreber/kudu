@@ -73,7 +73,9 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
         (byte) RowOperationsPB.Type.EXCLUSIVE_RANGE_LOWER_BOUND.getNumber()),
     INCLUSIVE_RANGE_UPPER_BOUND(
         (byte) RowOperationsPB.Type.INCLUSIVE_RANGE_UPPER_BOUND.getNumber()),
-    INSERT_IGNORE((byte) RowOperationsPB.Type.INSERT_IGNORE.getNumber());
+    INSERT_IGNORE((byte) RowOperationsPB.Type.INSERT_IGNORE.getNumber()),
+    UPDATE_IGNORE((byte) RowOperationsPB.Type.UPDATE_IGNORE.getNumber()),
+    DELETE_IGNORE((byte) RowOperationsPB.Type.DELETE_IGNORE.getNumber());
 
     ChangeType(byte encodedByte) {
       this.encodedByte = encodedByte;
@@ -97,6 +99,11 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
   boolean ignoreAllDuplicateRows = false;
   /** See {@link SessionConfiguration#setIgnoreAllNotFoundRows(boolean)} */
   boolean ignoreAllNotFoundRows = false;
+  /**
+   * Transaction identifier for the generated WriteRequestPB. Applicable only
+   * if set to a valid value.
+   */
+  long txnId = AsyncKuduClient.INVALID_TXN_ID;
 
   /**
    * Package-private constructor. Subclasses need to be instantiated via AsyncKuduSession
@@ -132,6 +139,16 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
   /** See {@link SessionConfiguration#setIgnoreAllNotFoundRows(boolean)} */
   void setIgnoreAllNotFoundRows(boolean ignoreAllNotFoundRows) {
     this.ignoreAllNotFoundRows = ignoreAllNotFoundRows;
+  }
+
+  /**
+   * Set transaction identifier for this operation. If set, the transaction
+   * identifier is propagated into the generated WriteRequestPB.
+   *
+   * @param txnId transaction identifier to set
+   */
+  void setTxnId(long txnId) {
+    this.txnId = txnId;
   }
 
   /**
@@ -185,6 +202,9 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
     }
     if (authzToken != null) {
       builder.setAuthzToken(authzToken);
+    }
+    if (this.txnId != AsyncKuduClient.INVALID_TXN_ID) {
+      builder.setTxnId(this.txnId);
     }
     return builder.build();
   }
@@ -363,7 +383,7 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
       BitSet nullsBitSet = row.getNullsBitSet();
 
       // If this is a DELETE operation only the key columns should to be set.
-      if (type == ChangeType.DELETE) {
+      if (type == ChangeType.DELETE || type == ChangeType.DELETE_IGNORE) {
         columnCount = row.getSchema().getPrimaryKeyColumnCount();
         // Clear the bits indicating any non-key fields are set.
         columnsBitSet.clear(schema.getPrimaryKeyColumnCount(), columnsBitSet.size());

@@ -87,6 +87,8 @@ done
 # Build the java modules.
 pushd java
 ./gradlew install -PskipSigning=true
+# Build again with Spark 2
+./gradlew install -PskipSigning=true -Pspark2
 popd
 
 # Copy the published artifacts to a versioned staging directory.

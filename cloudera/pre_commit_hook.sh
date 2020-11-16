@@ -21,34 +21,64 @@
 set -ex
 ROOT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.."  && pwd )"
 
-sudo add-apt-repository ppa:openjdk-r/ppa
-sudo apt-get update
-num_attempts=5
-# Some packages, by default, prompt the user for input; avoid this by setting
-# DEBIAN_FRONTEND and the -y configuration.
-for i in $(seq 1 $num_attempts); do
-  if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-      autoconf automake curl ccache flex g++ gcc gdb git krb5-admin-server \
-      krb5-kdc krb5-user libkrb5-dev libsasl2-dev libsasl2-modules libsasl2-modules-gssapi-mit \
-      libssl-dev libtool lsb-release lsof make maven ninja-build nscd ntp openjdk-8-jdk openssl \
-      patch pkg-config python python3-dev rsync unzip vim-common ; then
-    break;
-  fi
-  echo "Failed to apt-get install required packages after $i attempt(s)"
-  if [ $i -eq $num_attempts ]; then
-    echo "Retries exhausted!"
-    exit ${EXECUTION_SETUP_FAILURE}
-  fi
-  echo Sleeping and retrying...
-  sleep 60
-done
+# Install the prerequisite libraries, if they are not installed.
+# CentOS/RHEL
+if [[ -f "/usr/bin/yum" ]]; then
+  sudo yum update -y
+  num_attempts=5
+  for i in $(seq 1 $num_attempts); do
+    if sudo yum install -y autoconf automake curl ccache cyrus-sasl-devel cyrus-sasl-gssapi \
+        cyrus-sasl-plain flex gcc gcc-c++ gdb git java-1.8.0-openjdk-devel \
+        krb5-server krb5-workstation libtool lsof make maven ninja-build nscd ntp openssl-devel \
+        patch pkgconfig python python3-dev python-virtualenv redhat-lsb-core rsync unzip vim-common which ; then
+      break;
+    fi
+    echo "Failed to yum install required packages after $i attempt(s)"
+    if [ $i -eq $num_attempts ]; then
+      echo "Retries exhausted!"
+      exit ${EXECUTION_SETUP_FAILURE}
+    fi
+    echo Sleeping and retrying...
+    sleep 60
+  done
+  export JAVA8_HOME=/usr/lib/jvm/java-1.8.0-openjdk/
+# Ubuntu/Debian
+elif [[ -f "/usr/bin/apt-get" ]]; then
+  sudo add-apt-repository ppa:openjdk-r/ppa
+  sudo apt-get update
+  num_attempts=5
+  # Some packages, by default, prompt the user for input; avoid this by setting
+  # DEBIAN_FRONTEND and the -y configuration.
+  for i in $(seq 1 $num_attempts); do
+    if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        autoconf automake curl ccache flex g++ gcc gdb git krb5-admin-server \
+        krb5-kdc krb5-user libkrb5-dev libsasl2-dev libsasl2-modules libsasl2-modules-gssapi-mit \
+        libssl-dev libtool lsb-release lsof make maven ninja-build nscd ntp openjdk-8-jdk openssl \
+        patch pkg-config python python3-dev python-virtualenv rsync unzip vim-common ; then
+      break;
+    fi
+    echo "Failed to apt-get install required packages after $i attempt(s)"
+    if [ $i -eq $num_attempts ]; then
+      echo "Retries exhausted!"
+      exit ${EXECUTION_SETUP_FAILURE}
+    fi
+    echo Sleeping and retrying...
+    sleep 60
+  done
+  export JAVA8_HOME=/usr/lib/jvm/java-1.8.0-openjdk-amd64
+else
+  echo "Unsupported OS"
+  exit 1
+fi
 
 # Pull the requirements to run via dist test.
 pushd $ROOT_DIR
+rm -rf isolate-bin
 mkdir isolate-bin
 curl -fLSs http://cloudera-thirdparty-libs.s3.amazonaws.com/isolate \
     --output isolate-bin/isolate --retry 5
 chmod 755 isolate-bin/isolate
+rm -rf dist_test
 git clone git://github.com/cloudera/dist_test.git
 popd
 
@@ -61,7 +91,6 @@ export DIST_TEST_PASSWORD='Beo3shei'
 export KUDU_FLAKY_TEST_ATTEMPTS=3
 export TEST_RESULT_SERVER=dist-test.cloudera.org:8080
 
-export JAVA8_HOME=/usr/lib/jvm/java-1.8.0-openjdk-amd64
 export PATH=$ROOT_DIR/isolate-bin:$PATH
 # Pre-commits are always run on 4 CPU core YCloud instance.
 export PARALLEL=4

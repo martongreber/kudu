@@ -31,10 +31,8 @@
 #include <string>
 #include <vector>
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -42,7 +40,6 @@
 #include "kudu/util/debug/leakcheck_disabler.h"
 #endif
 #include "kudu/util/errno.h"
-#include "kudu/util/flag_tags.h"
 #include "kudu/util/flags.h"
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 #include "kudu/util/mutex.h"
@@ -50,16 +47,9 @@
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
-
-DEFINE_bool(
-    openssl_defensive_locking,
-    true,
-    "If enabled, cryptographic methods lock more defensively in FIPS approved mode to work around "
-    "thread safety issues in certain OpenSSL versions. This makes Kudu servers or clients more "
-    "stable when running on an affected OpenSSL version, sacrificing some performance.");
-TAG_FLAG(openssl_defensive_locking, unsafe);
-TAG_FLAG(openssl_defensive_locking, hidden);
-TAG_FLAG(openssl_defensive_locking, runtime);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#include "kudu/util/thread.h"
+#endif
 
 using std::ostringstream;
 using std::string;
@@ -84,15 +74,6 @@ bool g_ssl_is_initialized = false;
 // - written by DisableOpenSSLInitialization (must not be concurrent with above)
 bool g_disable_ssl_init = false;
 
-// If true, then FIPS mode is enabled.
-//
-// Thread safety:
-// - read by OpenSSLMutex constructor (must be used only after OpenSSL is
-// initialized)
-// - written by CheckFIPSMode (called in DoInitializeOpenSSL when initializing
-// or CheckOpenSSLInitialized when OpenSSL was initialized outside of Kudu).
-bool g_fips_enabled = false;
-
 // Array of locks used by OpenSSL.
 // We use an intentionally-leaked C-style array here to avoid non-POD static data.
 //
@@ -110,18 +91,22 @@ void LockingCB(int mode, int type, const char* /*file*/, int /*line*/) {
     m->unlock();
   }
 }
+
+void ThreadIdCB(CRYPTO_THREADID* tid) {
+  CRYPTO_THREADID_set_numeric(tid, Thread::UniqueThreadId());
+}
 #endif
 
 void CheckFIPSMode() {
-  g_fips_enabled = FIPS_mode();
+  auto fips_mode = FIPS_mode();
   // If the environment variable KUDU_REQUIRE_FIPS_MODE is set to "1", we
   // check if FIPS approved mode is enabled. If not, we crash the process.
   // As this is used in clients as well, we can't use gflags to set this.
   if (GetBooleanEnvironmentVariable("KUDU_REQUIRE_FIPS_MODE")) {
-    CHECK(g_fips_enabled) << "FIPS mode required by environment variable "
-                             "KUDU_REQUIRE_FIPS_MODE, but it is not enabled.";
+    CHECK(fips_mode) << "FIPS mode required by environment variable "
+                        "KUDU_REQUIRE_FIPS_MODE, but it is not enabled.";
   }
-  VLOG(2) << "FIPS mode is " << (g_fips_enabled ? "enabled" : "disabled.");
+  VLOG(2) << "FIPS mode is " << (fips_mode ? "enabled" : "disabled.");
 }
 
 Status CheckOpenSSLInitialized() {
@@ -222,6 +207,8 @@ void DoInitializeOpenSSL() {
 
     // Callbacks used by OpenSSL required in a multi-threaded setting.
     CRYPTO_set_locking_callback(LockingCB);
+
+    CRYPTO_THREADID_set_callback(ThreadIdCB);
   }
 #endif
   CheckFIPSMode();
@@ -381,28 +368,6 @@ Status GetPasswordFromShellCommand(const string& cmd, string* password) {
   StripTrailingWhitespace(&stdout);
   *password = stdout;
   return Status::OK();
-}
-
-OpenSSLMutex::OpenSSLMutex()
-    : locking_enabled_(FLAGS_openssl_defensive_locking && g_fips_enabled) {}
-
-void OpenSSLMutex::lock() {
-  if (locking_enabled_) {
-    mutex_.lock();
-  }
-}
-
-bool OpenSSLMutex::try_lock() {
-  if (locking_enabled_) {
-    return mutex_.try_lock();
-  }
-  return true;
-}
-
-void OpenSSLMutex::unlock() {
-  if (locking_enabled_) {
-    mutex_.unlock();
-  }
 }
 
 } // namespace security

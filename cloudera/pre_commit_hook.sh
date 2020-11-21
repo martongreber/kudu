@@ -71,6 +71,9 @@ else
   exit 1
 fi
 
+# Make sure /usr/sbin and /sbin is on the path to ensure lsof is found on CentOS.
+export PATH=$PATH:/usr/sbin:/sbin
+
 # Pull the requirements to run via dist test.
 pushd $ROOT_DIR
 rm -rf isolate-bin

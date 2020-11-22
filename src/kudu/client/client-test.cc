@@ -102,6 +102,7 @@
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/txn_coordinator.h"
+#include "kudu/tablet/txn_participant-test-util.h"
 #include "kudu/transactions/transactions.pb.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/scanners.h"
@@ -109,6 +110,7 @@
 #include "kudu/tserver/tablet_server_options.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/util/array_view.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/barrier.h"
@@ -162,6 +164,7 @@ DECLARE_int64(on_disk_size_for_testing);
 DECLARE_string(location_mapping_cmd);
 DECLARE_string(superuser_acl);
 DECLARE_string(user_acl);
+DECLARE_uint32(txn_manager_status_table_num_replicas);
 DEFINE_int32(test_scan_num_rows, 1000, "Number of rows to insert and scan");
 
 METRIC_DECLARE_counter(block_manager_total_bytes_read);
@@ -193,6 +196,9 @@ using kudu::client::sp::shared_ptr;
 using kudu::tablet::TabletReplica;
 using kudu::transactions::TxnTokenPB;
 using kudu::tserver::MiniTabletServer;
+using kudu::tserver::ParticipantOpPB;
+using kudu::tserver::ParticipantRequestPB;
+using kudu::tserver::ParticipantResponsePB;
 using std::function;
 using std::map;
 using std::pair;
@@ -231,6 +237,9 @@ class ClientTest : public KuduTest {
 
     // Enable TxnManager in Kudu master.
     FLAGS_txn_manager_enabled = true;
+    // Basic txn-related scenarios in this test assume there is only one
+    // replica of the transaction status table.
+    FLAGS_txn_manager_status_table_num_replicas = 1;
 
     SetLocationMappingCmd();
 
@@ -347,6 +356,24 @@ class ClientTest : public KuduTest {
         ASSERT_EQ(0, server->server()->rpc_server()->
                   service_pool("kudu.tserver.TabletServerService")->
                   RpcsQueueOverflowMetric()->value());
+      }
+    }
+  }
+
+  // TODO(awong): automatically begin transactions when trying to write to a
+  //              transaction for the first time.
+  void BeginTxnOnParticipants(int64_t txn_id) {
+    for (auto i = 0; i < cluster_->num_tablet_servers(); ++i) {
+      auto* tm = cluster_->mini_tablet_server(i)->server()->tablet_manager();
+      vector<scoped_refptr<TabletReplica>> replicas;
+      tm->GetTabletReplicas(&replicas);
+      for (auto& r : replicas) {
+        // Skip partitions of the transaction status manager.
+        if (r->txn_coordinator()) continue;
+        ParticipantResponsePB resp;
+        WARN_NOT_OK(CallParticipantOp(
+            r.get(), txn_id, ParticipantOpPB::BEGIN_TXN, -1, &resp),
+            "failed to start transaction on participant");;
       }
     }
   }
@@ -7026,6 +7053,9 @@ TEST_F(ClientTest, TxnToken) {
   ASSERT_OK(serdes_txn->Serialize(&serdes_txn_token));
   ASSERT_EQ(txn_token, serdes_txn_token);
 
+  // TODO(awong): remove once we register participants automatically before
+  // inserting.
+  BeginTxnOnParticipants(txn_id);
   {
     static constexpr auto kNumRows = 10;
     shared_ptr<KuduSession> session;

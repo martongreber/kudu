@@ -30,7 +30,7 @@ if [[ -f "/usr/bin/yum" ]]; then
     if sudo yum install -y autoconf automake curl ccache cyrus-sasl-devel cyrus-sasl-gssapi \
         cyrus-sasl-plain flex gcc gcc-c++ gdb git java-1.8.0-openjdk-devel \
         krb5-server krb5-workstation libtool lsof make maven ninja-build nscd ntp openssl-devel \
-        patch pkgconfig python python3-dev python-virtualenv redhat-lsb-core rsync unzip vim-common which ; then
+        patch pkgconfig python python3-devel python-virtualenv redhat-lsb-core rsync unzip vim-common which ; then
       break;
     fi
     echo "Failed to yum install required packages after $i attempt(s)"

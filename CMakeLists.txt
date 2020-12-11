@@ -24,6 +24,14 @@ cmake_minimum_required(VERSION 3.11.2)
 
 project(Kudu)
 
+
+if (APPLE)
+  # Print out the CMAKE_OSX_* variables to help debug Apple build issues.
+  message(STATUS "Using CMAKE_OSX_ARCHITECTURES: ${CMAKE_OSX_ARCHITECTURES}")
+  message(STATUS "Using CMAKE_OSX_DEPLOYMENT_TARGET: ${CMAKE_OSX_DEPLOYMENT_TARGET}")
+  message(STATUS "Using CMAKE_OSX_SYSROOT: ${CMAKE_OSX_SYSROOT}")
+endif()
+
 # Prevent builds from the top-level source directory. This ensures that build
 # output is well isolated from the source tree.
 #
@@ -152,6 +160,13 @@ include(CompilerInfo)
 
 # compiler flags that are common across debug/release builds
 execute_process(COMMAND uname -m OUTPUT_VARIABLE ARCH_NAME)
+message(STATUS "Found ARCH_NAME: ${ARCH_NAME}")
+# The Apple backend for aarch64 is called arm64.
+# Rename to aarch64 to simplify all of our build checks.
+if("${ARCH_NAME}" MATCHES "arm64")
+  set(ARCH_NAME "aarch64")
+endif()
+message(STATUS "Using ARCH_NAME: ${ARCH_NAME}")
 if("${ARCH_NAME}" MATCHES "aarch64")
   # Certain platforms such as ARM do not use signed chars by default
   # which causes issues with certain bounds checks.
@@ -306,21 +321,11 @@ if ("${COMPILER_FAMILY}" STREQUAL "clang")
     message("Running without a controlling terminal or in a dumb terminal")
   endif()
 elseif("${COMPILER_FAMILY}" STREQUAL "gcc")
-  # Disallow GCC < 4.8, since it doesn't support the C++11 standard
-  # well enough for us.
-  if ("${COMPILER_VERSION}" VERSION_LESS "4.8")
-    message(FATAL_ERROR "GCC <4.8 not supported. Consider using "
+  # Disallow GCC < 7.0, since it doesn't support the C++17 standard
+  # well enough for us. https://en.cppreference.com/w/cpp/compiler_support
+  if ("${COMPILER_VERSION}" VERSION_LESS "7.0")
+    message(FATAL_ERROR "GCC <7.0 not supported. Consider using "
         "thirdparty/clang-toolchain/ to build on older hosts.")
-  endif()
-
-  # GCC 4.8's tree vectorizer has a bug which causes hard-to-debug incorrect
-  # code. Disable this option on release builds, where it would otherwise
-  # be enabled by -O3.
-  if ("${COMPILER_VERSION}" MATCHES "^4.8" AND
-      "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
-    message("Running release build on gcc 4.8. The tree-vectorize optimization "
-      "in this version of gcc is known to be buggy. Disabling it.")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-tree-vectorize")
   endif()
 endif()
 
@@ -365,7 +370,7 @@ endif()
 
 # For any C code, use the same flags.
 set(CMAKE_C_FLAGS "${CMAKE_CXX_FLAGS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
 
 # Enable the Clang undefined behavior (UB) sanitizer.
 if (${KUDU_USE_UBSAN})

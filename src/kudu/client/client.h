@@ -808,13 +808,18 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class tools::RemoteKsckCluster;
 
   FRIEND_TEST(kudu::ClientStressTest, TestUniqueClientIds);
+  FRIEND_TEST(ClientTest, ClearCacheAndConcurrentWorkload);
   FRIEND_TEST(ClientTest, ConnectionNegotiationTimeout);
+  FRIEND_TEST(ClientTest, TestBasicIdBasedLookup);
   FRIEND_TEST(ClientTest, TestCacheAuthzTokens);
   FRIEND_TEST(ClientTest, TestGetSecurityInfoFromMaster);
   FRIEND_TEST(ClientTest, TestGetTabletServerBlacklist);
   FRIEND_TEST(ClientTest, TestMasterDown);
   FRIEND_TEST(ClientTest, TestMasterLookupPermits);
   FRIEND_TEST(ClientTest, TestMetaCacheExpiry);
+  FRIEND_TEST(ClientTest, TestMetaCacheExpiryById);
+  FRIEND_TEST(ClientTest, TestMetaCacheExpiryWithKeysAndIds);
+  FRIEND_TEST(ClientTest, TestMetaCacheWithKeysAndIds);
   FRIEND_TEST(ClientTest, TestNonCoveringRangePartitions);
   FRIEND_TEST(ClientTest, TestRetrieveAuthzTokenInParallel);
   FRIEND_TEST(ClientTest, TestReplicatedTabletWritesWithLeaderElection);

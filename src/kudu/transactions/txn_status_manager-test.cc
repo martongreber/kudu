@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
@@ -31,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -66,6 +68,8 @@ using std::unique_ptr;
 using std::unordered_set;
 using std::vector;
 
+DECLARE_uint32(txn_keepalive_interval_ms);
+DECLARE_uint32(txn_staleness_tracker_interval_ms);
 METRIC_DECLARE_entity(tablet);
 
 namespace kudu {
@@ -85,12 +89,22 @@ class TxnStatusManagerTest : public TabletReplicaTestBase {
       : TabletReplicaTestBase(TxnStatusTablet::GetSchemaWithoutIds()) {}
 
   void SetUp() override {
+    // Using shorter intervals for transaction staleness tracking to speed up
+    // test scenarios verifying related functionality.
+    FLAGS_txn_keepalive_interval_ms = 200;
+    FLAGS_txn_staleness_tracker_interval_ms = 50;
+
     NO_FATALS(TabletReplicaTestBase::SetUp());
     ConsensusBootstrapInfo info;
     ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
-    txn_manager_.reset(new TxnStatusManager(tablet_replica_.get()));
-    ASSERT_OK(txn_manager_->LoadFromTablet());
+    ASSERT_OK(ResetTxnStatusManager());
   }
+
+  Status ResetTxnStatusManager() {
+    txn_manager_.reset(new TxnStatusManager(tablet_replica_.get()));
+    return txn_manager_->LoadFromTablet();
+  }
+
  protected:
   unique_ptr<TxnStatusManager> txn_manager_;
 };
@@ -161,13 +175,10 @@ TEST_F(TxnStatusManagerTest, TestStartTransactions) {
 
   // Now rebuild the underlying replica and rebuild the TxnStatusManager.
   ASSERT_OK(RestartReplica());
-  {
-    TxnStatusManager txn_manager_reloaded(tablet_replica_.get());
-    ASSERT_OK(txn_manager_reloaded.LoadFromTablet());
-    ASSERT_EQ(expected_prts_by_txn_id,
-              txn_manager_reloaded.GetParticipantsByTxnIdForTests());
-    ASSERT_EQ(3, txn_manager_reloaded.highest_txn_id());
-  }
+  NO_FATALS(ResetTxnStatusManager());
+  ASSERT_EQ(expected_prts_by_txn_id,
+            txn_manager_->GetParticipantsByTxnIdForTests());
+  ASSERT_EQ(3, txn_manager_->highest_txn_id());
 
   // Verify that TxnStatusManager methods return Status::ServiceUnavailable()
   // if the transaction status tablet's data is not loaded yet.
@@ -192,7 +203,7 @@ TEST_F(TxnStatusManagerTest, TestStartTransactions) {
       ASSERT_TRUE(s.IsServiceUnavailable());
       ASSERT_STR_CONTAINS(s.ToString(), kErrMsg);
 
-      s = tsm.FinalizeCommitTransaction(txn_id);
+      s = tsm.FinalizeCommitTransaction(txn_id, &ts_error);
       ASSERT_TRUE(s.IsServiceUnavailable());
       ASSERT_STR_CONTAINS(s.ToString(), kErrMsg);
 
@@ -200,8 +211,12 @@ TEST_F(TxnStatusManagerTest, TestStartTransactions) {
       ASSERT_TRUE(s.IsServiceUnavailable());
       ASSERT_STR_CONTAINS(s.ToString(), kErrMsg);
 
-      transactions::TxnStatusEntryPB txn_status;
-      s = tsm.GetTransactionStatus(txn_id, kOwner, &txn_status);
+      TxnStatusEntryPB txn_status;
+      s = tsm.GetTransactionStatus(txn_id, kOwner, &txn_status, &ts_error);
+      ASSERT_TRUE(s.IsServiceUnavailable());
+      ASSERT_STR_CONTAINS(s.ToString(), kErrMsg);
+
+      s = tsm.KeepTransactionAlive(txn_id, kOwner, &ts_error);
       ASSERT_TRUE(s.IsServiceUnavailable());
       ASSERT_STR_CONTAINS(s.ToString(), kErrMsg);
 
@@ -224,7 +239,8 @@ TEST_F(TxnStatusManagerTest, TestStartTransactionsConcurrently) {
   for (int i = 0; i < kBatchesToStart; i++) {
     vector<int64_t> txns_in_batch(kParallelTxnsPerBatch);
     std::iota(txns_in_batch.begin(), txns_in_batch.end(), i * kParallelTxnsPerBatch);
-    std::random_shuffle(txns_in_batch.begin(), txns_in_batch.end());
+    std::mt19937 gen(SeedRandom());
+    std::shuffle(txns_in_batch.begin(), txns_in_batch.end(), gen);
     txns_to_insert.emplace_back(std::move(txns_in_batch));
   }
 
@@ -370,7 +386,7 @@ TEST_F(TxnStatusManagerTest, TestUpdateStateConcurrently) {
           statuses[i] = txn_manager_->BeginCommitTransaction(txn_id, kOwner, &ts_error);
           break;
         case TxnStatePB::COMMITTED:
-          statuses[i] = txn_manager_->FinalizeCommitTransaction(txn_id);
+          statuses[i] = txn_manager_->FinalizeCommitTransaction(txn_id, &ts_error);
           break;
         default:
           FAIL() << "bad update";
@@ -422,25 +438,38 @@ TEST_F(TxnStatusManagerTest, TestUpdateStateConcurrently) {
 // TxnStatusManager::GetTransactionStatus() method.
 TEST_F(TxnStatusManagerTest, GetTransactionStatus) {
   {
+    TxnStatusEntryPB txn_status;
+    TabletServerErrorPB ts_error;
+    auto s = txn_manager_->GetTransactionStatus(
+        1, kOwner, &txn_status, &ts_error);
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "transaction ID 1 not found");
+    ASSERT_FALSE(txn_status.has_state());
+    ASSERT_FALSE(txn_status.has_user());
+  }
+  {
     TabletServerErrorPB ts_error;
     ASSERT_OK(txn_manager_->BeginTransaction(1, kOwner, nullptr, &ts_error));
 
     TxnStatusEntryPB txn_status;
-    ASSERT_OK(txn_manager_->GetTransactionStatus(1, kOwner, &txn_status));
+    ASSERT_OK(txn_manager_->GetTransactionStatus(
+        1, kOwner, &txn_status, &ts_error));
     ASSERT_TRUE(txn_status.has_state());
     ASSERT_EQ(TxnStatePB::OPEN, txn_status.state());
     ASSERT_TRUE(txn_status.has_user());
     ASSERT_EQ(kOwner, txn_status.user());
 
     ASSERT_OK(txn_manager_->BeginCommitTransaction(1, kOwner, &ts_error));
-    ASSERT_OK(txn_manager_->GetTransactionStatus(1, kOwner, &txn_status));
+    ASSERT_OK(txn_manager_->GetTransactionStatus(
+        1, kOwner, &txn_status, &ts_error));
     ASSERT_TRUE(txn_status.has_state());
     ASSERT_EQ(TxnStatePB::COMMIT_IN_PROGRESS, txn_status.state());
     ASSERT_TRUE(txn_status.has_user());
     ASSERT_EQ(kOwner, txn_status.user());
 
-    ASSERT_OK(txn_manager_->FinalizeCommitTransaction(1));
-    ASSERT_OK(txn_manager_->GetTransactionStatus(1, kOwner, &txn_status));
+    ASSERT_OK(txn_manager_->FinalizeCommitTransaction(1, &ts_error));
+    ASSERT_OK(txn_manager_->GetTransactionStatus(
+        1, kOwner, &txn_status, &ts_error));
     ASSERT_TRUE(txn_status.has_state());
     ASSERT_EQ(TxnStatePB::COMMITTED, txn_status.state());
     ASSERT_TRUE(txn_status.has_user());
@@ -453,7 +482,8 @@ TEST_F(TxnStatusManagerTest, GetTransactionStatus) {
     ASSERT_OK(txn_manager_->AbortTransaction(2, kOwner, &ts_error));
 
     TxnStatusEntryPB txn_status;
-    ASSERT_OK(txn_manager_->GetTransactionStatus(2, kOwner, &txn_status));
+    ASSERT_OK(txn_manager_->GetTransactionStatus(
+        2, kOwner, &txn_status, &ts_error));
     ASSERT_TRUE(txn_status.has_state());
     ASSERT_EQ(TxnStatePB::ABORTED, txn_status.state());
     ASSERT_TRUE(txn_status.has_user());
@@ -470,31 +500,37 @@ TEST_F(TxnStatusManagerTest, GetTransactionStatus) {
 
   // Make the TxnStatusManager start from scratch.
   ASSERT_OK(RestartReplica());
+  NO_FATALS(ResetTxnStatusManager());
 
   // Committed, aborted, and in-flight transactions should be known to the
   // TxnStatusManager even after restarting the underlying replica and
   // rebuilding the TxnStatusManager from scratch.
   {
     TxnStatusEntryPB txn_status;
-    ASSERT_OK(txn_manager_->GetTransactionStatus(1, kOwner, &txn_status));
+    TabletServerErrorPB ts_error;
+    ASSERT_OK(txn_manager_->GetTransactionStatus(
+        1, kOwner, &txn_status, &ts_error));
     ASSERT_TRUE(txn_status.has_state());
     ASSERT_EQ(TxnStatePB::COMMITTED, txn_status.state());
     ASSERT_TRUE(txn_status.has_user());
     ASSERT_EQ(kOwner, txn_status.user());
 
-    ASSERT_OK(txn_manager_->GetTransactionStatus(2, kOwner, &txn_status));
+    ASSERT_OK(txn_manager_->GetTransactionStatus(
+        2, kOwner, &txn_status, &ts_error));
     ASSERT_TRUE(txn_status.has_state());
     ASSERT_EQ(TxnStatePB::ABORTED, txn_status.state());
     ASSERT_TRUE(txn_status.has_user());
     ASSERT_EQ(kOwner, txn_status.user());
 
-    ASSERT_OK(txn_manager_->GetTransactionStatus(3, kOwner, &txn_status));
+    ASSERT_OK(txn_manager_->GetTransactionStatus(
+        3, kOwner, &txn_status, &ts_error));
     ASSERT_TRUE(txn_status.has_state());
     ASSERT_EQ(TxnStatePB::COMMIT_IN_PROGRESS, txn_status.state());
     ASSERT_TRUE(txn_status.has_user());
     ASSERT_EQ(kOwner, txn_status.user());
 
-    ASSERT_OK(txn_manager_->GetTransactionStatus(4, kOwner, &txn_status));
+    ASSERT_OK(txn_manager_->GetTransactionStatus(
+        4, kOwner, &txn_status, &ts_error));
     ASSERT_TRUE(txn_status.has_state());
     ASSERT_EQ(TxnStatePB::OPEN, txn_status.state());
     ASSERT_TRUE(txn_status.has_user());
@@ -504,22 +540,172 @@ TEST_F(TxnStatusManagerTest, GetTransactionStatus) {
   // Supplying wrong user.
   {
     TxnStatusEntryPB txn_status;
-    auto s = txn_manager_->GetTransactionStatus(1, "stranger", &txn_status);
+    TabletServerErrorPB ts_error;
+    auto s = txn_manager_->GetTransactionStatus(
+        1, "stranger", &txn_status, &ts_error);
     ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
   }
 
   // Supplying not-yet-used transaction ID.
   {
     TxnStatusEntryPB txn_status;
-    auto s = txn_manager_->GetTransactionStatus(0, kOwner, &txn_status);
+    TabletServerErrorPB ts_error;
+    auto s = txn_manager_->GetTransactionStatus(
+        0, kOwner, &txn_status, &ts_error);
     ASSERT_TRUE(s.IsNotFound()) << s.ToString();
   }
 
   // Supplying wrong user and not-yet-used transaction ID.
   {
     TxnStatusEntryPB txn_status;
-    auto s = txn_manager_->GetTransactionStatus(0, "stranger", &txn_status);
+    TabletServerErrorPB ts_error;
+    auto s = txn_manager_->GetTransactionStatus(
+        0, "stranger", &txn_status, &ts_error);
     ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+  }
+}
+
+// This test scenario verifies basic functionality of the
+// TxnStatusManager::KeepTransactionAlive() method w.r.t. state of the
+// transaction.
+TEST_F(TxnStatusManagerTest, KeepTransactionAlive) {
+  // Supplying not-yet-registered transaction ID.
+  {
+    TabletServerErrorPB ts_error;
+    auto s = txn_manager_->KeepTransactionAlive(1, kOwner, &ts_error);
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "transaction ID 1 not found");
+  }
+
+  // OPEN --> COMMIT_IN_PROGRESS --> COMMITTED
+  {
+    TabletServerErrorPB ts_error;
+    ASSERT_OK(txn_manager_->BeginTransaction(1, kOwner, nullptr, &ts_error));
+    ASSERT_OK(txn_manager_->KeepTransactionAlive(1, kOwner, &ts_error));
+    // Supplying wrong user for transaction in OPEN state.
+    {
+      auto s = txn_manager_->KeepTransactionAlive(1, "stranger", &ts_error);
+      ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+      ASSERT_STR_CONTAINS(s.ToString(),
+                          "transaction ID 1 not owned by stranger");
+    }
+
+    ASSERT_OK(txn_manager_->BeginCommitTransaction(1, kOwner, &ts_error));
+    auto s = txn_manager_->KeepTransactionAlive(1, kOwner, &ts_error);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "transaction ID 1 is in commit phase");
+    // Supplying wrong user for transaction in COMMIT_IN_PROGRESS state.
+    {
+      auto s = txn_manager_->KeepTransactionAlive(1, "stranger", &ts_error);
+      ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+      ASSERT_STR_CONTAINS(s.ToString(),
+                          "transaction ID 1 not owned by stranger");
+    }
+
+    ASSERT_OK(txn_manager_->FinalizeCommitTransaction(1, &ts_error));
+    s = txn_manager_->KeepTransactionAlive(1, kOwner, &ts_error);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "transaction ID 1 is already in terminal state");
+    // Supplying wrong user for transaction in COMMITTED state.
+    {
+      auto s = txn_manager_->KeepTransactionAlive(1, "stranger", &ts_error);
+      ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+      ASSERT_STR_CONTAINS(s.ToString(),
+                          "transaction ID 1 not owned by stranger");
+    }
+  }
+
+  // OPEN --> COMMIT_IN_PROGRESS --> ABORTED
+  {
+    TabletServerErrorPB ts_error;
+    ASSERT_OK(txn_manager_->BeginTransaction(2, kOwner, nullptr, &ts_error));
+    ASSERT_OK(txn_manager_->KeepTransactionAlive(2, kOwner, &ts_error));
+
+    ASSERT_OK(txn_manager_->BeginCommitTransaction(2, kOwner, &ts_error));
+    auto s = txn_manager_->KeepTransactionAlive(2, kOwner, &ts_error);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "transaction ID 2 is in commit phase");
+
+    ASSERT_OK(txn_manager_->AbortTransaction(2, kOwner, &ts_error));
+    s = txn_manager_->KeepTransactionAlive(2, kOwner, &ts_error);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "transaction ID 2 is already in terminal state");
+    // Supplying wrong user for transaction in ABORTED state.
+    {
+      auto s = txn_manager_->KeepTransactionAlive(2, "stranger", &ts_error);
+      ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+      ASSERT_STR_CONTAINS(s.ToString(), "transaction ID 2 not owned by stranger");
+    }
+  }
+
+  // OPEN --> ABORTED
+  {
+    TabletServerErrorPB ts_error;
+    ASSERT_OK(txn_manager_->BeginTransaction(3, kOwner, nullptr, &ts_error));
+    ASSERT_OK(txn_manager_->KeepTransactionAlive(3, kOwner, &ts_error));
+
+    ASSERT_OK(txn_manager_->AbortTransaction(3, kOwner, &ts_error));
+    auto s = txn_manager_->KeepTransactionAlive(3, kOwner, &ts_error);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "transaction ID 3 is already in terminal state");
+  }
+
+  // Open a new transaction just before restarting the TxnStatusManager.
+  {
+    TabletServerErrorPB ts_error;
+    ASSERT_OK(txn_manager_->BeginTransaction(4, kOwner, nullptr, &ts_error));
+  }
+
+  // Make the TxnStatusManager start from scratch.
+  ASSERT_OK(RestartReplica());
+  NO_FATALS(ResetTxnStatusManager());
+
+  // Committed, aborted, and in-flight transactions should be known to the
+  // TxnStatusManager even after restarting the underlying replica and
+  // rebuilding the TxnStatusManager from scratch, so KeepTransactionAlive()
+  // should behave the same as if no restart has happened.
+  {
+    TabletServerErrorPB ts_error;
+    auto s = txn_manager_->KeepTransactionAlive(1, kOwner, &ts_error);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "transaction ID 1 is already in terminal state");
+    // Supplying wrong user for transaction in COMMITTED state.
+    {
+      auto s = txn_manager_->KeepTransactionAlive(1, "stranger", &ts_error);
+      ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+      ASSERT_STR_CONTAINS(s.ToString(),
+                          "transaction ID 1 not owned by stranger");
+    }
+  }
+  {
+    TabletServerErrorPB ts_error;
+    auto s = txn_manager_->KeepTransactionAlive(2, kOwner, &ts_error);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "transaction ID 2 is already in terminal state");
+    // Supplying wrong user for transaction in ABORTED state.
+    {
+      auto s = txn_manager_->KeepTransactionAlive(2, "stranger", &ts_error);
+      ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+      ASSERT_STR_CONTAINS(s.ToString(), "transaction ID 2 not owned by stranger");
+    }
+  }
+  {
+    TabletServerErrorPB ts_error;
+    ASSERT_OK(txn_manager_->KeepTransactionAlive(4, kOwner, &ts_error));
+    // Supplying wrong user for transaction in OPEN state.
+    {
+      auto s = txn_manager_->KeepTransactionAlive(4, "stranger", &ts_error);
+      ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+      ASSERT_STR_CONTAINS(s.ToString(),
+                          "transaction ID 4 not owned by stranger");
+    }
   }
 }
 
@@ -571,23 +757,23 @@ TEST_F(TxnStatusManagerTest, TestUpdateTransactionState) {
   // We can't begin or finalize a commit if we've aborted.
   Status s = txn_manager_->BeginCommitTransaction(kTxnId1, kOwner, &ts_error);
   ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
-  s = txn_manager_->FinalizeCommitTransaction(kTxnId1);
+  s = txn_manager_->FinalizeCommitTransaction(kTxnId1, &ts_error);
   ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
 
   // We can't finalize a commit that hasn't begun committing.
   const int64_t kTxnId2 = 2;
   ASSERT_OK(txn_manager_->BeginTransaction(kTxnId2, kOwner, nullptr, &ts_error));
-  s = txn_manager_->FinalizeCommitTransaction(kTxnId2);
+  s = txn_manager_->FinalizeCommitTransaction(kTxnId2, &ts_error);
   ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
 
   // We can't abort a transaction that has finished committing.
   ASSERT_OK(txn_manager_->BeginCommitTransaction(kTxnId2, kOwner, &ts_error));
-  ASSERT_OK(txn_manager_->FinalizeCommitTransaction(kTxnId2));
+  ASSERT_OK(txn_manager_->FinalizeCommitTransaction(kTxnId2, &ts_error));
   s = txn_manager_->AbortTransaction(kTxnId2, kOwner, &ts_error);
   ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
 
   // Redundant finalize calls are also benign.
-  ASSERT_OK(txn_manager_->FinalizeCommitTransaction(kTxnId2));
+  ASSERT_OK(txn_manager_->FinalizeCommitTransaction(kTxnId2, &ts_error));
 
   // Calls to begin committing should return an error if we've already
   // finalized the commit.
@@ -617,7 +803,7 @@ TEST_F(TxnStatusManagerTest, TestRegisterParticipantsWithStates) {
   ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
 
   // We can't register participants when we've finished committnig.
-  ASSERT_OK(txn_manager_->FinalizeCommitTransaction(kTxnId1));
+  ASSERT_OK(txn_manager_->FinalizeCommitTransaction(kTxnId1, &ts_error));
   s = txn_manager_->RegisterParticipant(kTxnId1, ParticipantId(2), kOwner, &ts_error);
   ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
 

@@ -60,7 +60,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <boost/optional/optional_io.hpp> // IWYU pragma: keep
-#include <boost/type_traits/decay.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/arena.h>
@@ -1722,7 +1721,8 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
 
   // Create partitions based on specified partition schema and split rows.
   vector<Partition> partitions;
-  RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, range_bounds, schema, &partitions));
+  RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, range_bounds,
+                                                  {}, schema, &partitions));
 
   // If they didn't specify a num_replicas, set it based on the default.
   if (!req.has_num_replicas()) {
@@ -2472,7 +2472,7 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
 
     vector<Partition> partitions;
     RETURN_NOT_OK(partition_schema.CreatePartitions(
-        {}, {{ *ops[0].split_row, *ops[1].split_row }}, schema, &partitions));
+        {}, {{ *ops[0].split_row, *ops[1].split_row }}, {}, schema, &partitions));
     switch (step.type()) {
       case AlterTableRequestPB::ADD_RANGE_PARTITION: {
         for (const Partition& partition : partitions) {

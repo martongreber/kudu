@@ -276,13 +276,18 @@ build_llvm() {
         TOOLS_ARGS="$TOOLS_ARGS -DGCC_INSTALL_PREFIX=$GCC_INSTALL_PREFIX"
       fi
 
-      # Xcode 12.2 fails to buld the sanitizers and they are not needed.
-      # We disable them as a workaround to the build issues.
       if [ -n "$OS_OSX" ]; then
+        # Xcode 12.2 fails to build the sanitizers and they are not needed.
+        # We disable them as a workaround to the build issues.
         # Disable the sanitizers and xray to prevent sanitizer_common compilation.
         # See https://github.com/llvm-mirror/compiler-rt/blob/749af53928a31afa3111f27cc41fd15849d86667/lib/CMakeLists.txt#L11-L14
         TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_BUILD_SANITIZERS=OFF"
         TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_BUILD_XRAY=OFF"
+
+        # Disable Apple platforms the we do not support.
+        TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_ENABLE_IOS=OFF"
+        TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_ENABLE_WATCHOS=OFF"
+        TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_ENABLE_TVOS=OFF"
       fi
 
       # Depend on zlib from the thirdparty tree. It's an optional dependency for
@@ -337,7 +342,6 @@ build_llvm() {
     -DLLVM_INCLUDE_UTILS=OFF \
     -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
     -DLLVM_ENABLE_RTTI=ON \
-    -DCMAKE_OSX_ARCHITECTURES="x86_64" \
     -DCMAKE_CXX_FLAGS="$CLANG_CXXFLAGS" \
     -DCMAKE_EXE_LINKER_FLAGS="$CLANG_LDFLAGS" \
     -DCMAKE_MODULE_LINKER_FLAGS="$CLANG_LDFLAGS" \
@@ -659,7 +663,7 @@ build_mustache() {
   mkdir -p $MUSTACHE_BDIR
   pushd $MUSTACHE_BDIR
   # We add $PREFIX/include for boost and $PREFIX_COMMON/include for rapidjson.
-  ${CXX:-g++} -std=c++11 $EXTRA_CXXFLAGS -I$PREFIX/include -I$PREFIX_COMMON/include -O3 -DNDEBUG -fPIC -c "$MUSTACHE_SOURCE/mustache.cc"
+  ${CXX:-g++} -std=c++17 $EXTRA_CXXFLAGS -I$PREFIX/include -I$PREFIX_COMMON/include -O3 -DNDEBUG -fPIC -c "$MUSTACHE_SOURCE/mustache.cc"
   ar rs libmustache.a mustache.o
   cp libmustache.a $PREFIX/lib/
   cp $MUSTACHE_SOURCE/mustache.h $PREFIX/include/

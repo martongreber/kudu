@@ -40,6 +40,7 @@
 #include "kudu/transactions/transactions.pb.h"
 #include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/util/async_util.h"
+#include "kudu/util/net/net_util.h"
 
 using kudu::client::KuduClient;
 using kudu::client::KuduSchema;
@@ -57,11 +58,15 @@ using std::vector;
 namespace kudu {
 namespace transactions {
 
-Status TxnSystemClient::Create(const vector<string>& master_addrs,
+Status TxnSystemClient::Create(const vector<HostPort>& master_addrs,
                                unique_ptr<TxnSystemClient>* sys_client) {
+  vector<string> master_strings;
+  for (const auto& hp : master_addrs) {
+    master_strings.emplace_back(hp.ToString());
+  }
   DCHECK(!master_addrs.empty());
   KuduClientBuilder builder;
-  builder.master_server_addrs(master_addrs);
+  builder.master_server_addrs(master_strings);
   client::sp::shared_ptr<KuduClient> client;
   RETURN_NOT_OK(builder.Build(&client));
   sys_client->reset(new TxnSystemClient(std::move(client)));
@@ -222,6 +227,20 @@ Status TxnSystemClient::GetTransactionStatus(int64_t txn_id,
     *txn_status = std::move(ret);
   }
   return ret;
+}
+
+Status TxnSystemClient::KeepTransactionAlive(int64_t txn_id,
+                                             const string& user,
+                                             MonoDelta timeout) {
+  CoordinatorOpPB coordinate_txn_op;
+  coordinate_txn_op.set_type(CoordinatorOpPB::KEEP_TXN_ALIVE);
+  coordinate_txn_op.set_txn_id(txn_id);
+  coordinate_txn_op.set_user(user);
+  Synchronizer s;
+  RETURN_NOT_OK(CoordinateTransactionAsync(std::move(coordinate_txn_op),
+                                           timeout,
+                                           s.AsStatusCallback()));
+  return s.Wait();
 }
 
 Status TxnSystemClient::CoordinateTransactionAsync(CoordinatorOpPB coordinate_txn_op,

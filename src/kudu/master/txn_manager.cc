@@ -230,12 +230,11 @@ Status TxnManager::AbortTransaction(int64_t txn_id,
   return txn_sys_client_->AbortTransaction(txn_id, username, ToDelta(deadline));
 }
 
-Status TxnManager::KeepTransactionAlive(int64_t /* txn_id */,
-                                        const string& /* username */,
+Status TxnManager::KeepTransactionAlive(int64_t txn_id,
+                                        const string& username,
                                         const MonoTime& deadline) {
   RETURN_NOT_OK(CheckInitialized(deadline));
-  // TODO(aserbin): call txn_sys_client_ once the functionality is there
-  return Status::NotSupported("KeepTransactionAlive is not supported yet");
+  return txn_sys_client_->KeepTransactionAlive(txn_id, username, ToDelta(deadline));
 }
 
 // This method isn't supposed to be called concurrently, so there isn't any
@@ -247,12 +246,7 @@ Status TxnManager::Init() {
   }
   vector<HostPort> hostports;
   RETURN_NOT_OK(server_->GetMasterHostPorts(&hostports));
-  vector<string> master_addrs;
-  master_addrs.reserve(hostports.size());
-  for (const auto& hp : hostports) {
-    master_addrs.emplace_back(hp.ToString());
-  }
-  RETURN_NOT_OK(TxnSystemClient::Create(master_addrs, &txn_sys_client_));
+  RETURN_NOT_OK(TxnSystemClient::Create(hostports, &txn_sys_client_));
   DCHECK(txn_sys_client_);
   auto s = txn_sys_client_->CreateTxnStatusTable(
       FLAGS_txn_manager_status_table_range_partition_span,

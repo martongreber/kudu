@@ -57,7 +57,6 @@
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/net/net_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -66,7 +65,7 @@
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 DECLARE_string(superuser_acl);
 DECLARE_string(user_acl);
-DECLARE_uint32(transaction_keepalive_interval_ms);
+DECLARE_uint32(txn_keepalive_interval_ms);
 
 using kudu::client::AuthenticationCredentialsPB;
 using kudu::client::KuduClient;
@@ -108,11 +107,7 @@ class TxnStatusTableITest : public KuduTest {
     ASSERT_OK(cluster_->Start());
 
     // Create the txn system client with which to communicate with the cluster.
-    vector<string> master_addrs;
-    for (const auto& hp : cluster_->master_rpc_addrs()) {
-      master_addrs.emplace_back(hp.ToString());
-    }
-    ASSERT_OK(TxnSystemClient::Create(master_addrs, &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
   }
 
   // Ensures that all replicas have the right table type set.
@@ -356,7 +351,7 @@ TEST_F(TxnStatusTableITest, TestSystemClientFindTablets) {
   ASSERT_OK(txn_sys_client_->OpenTxnStatusTable());
   uint32_t txn_keepalive_ms;
   ASSERT_OK(txn_sys_client_->BeginTransaction(1, kUser, &txn_keepalive_ms));
-  ASSERT_EQ(FLAGS_transaction_keepalive_interval_ms, txn_keepalive_ms);
+  ASSERT_EQ(FLAGS_txn_keepalive_interval_ms, txn_keepalive_ms);
   ASSERT_OK(txn_sys_client_->AbortTransaction(1, kUser));
 
   // If we write out of range, we should see an error.
@@ -370,7 +365,7 @@ TEST_F(TxnStatusTableITest, TestSystemClientFindTablets) {
     ASSERT_EQ(-1, highest_seen_txn_id);
     // txn_keepalive_ms isn't assigned in case of non-OK status.
     ASSERT_EQ(0, txn_keepalive_ms);
-    ASSERT_NE(0, FLAGS_transaction_keepalive_interval_ms);
+    ASSERT_NE(0, FLAGS_txn_keepalive_interval_ms);
   }
   {
     auto s = txn_sys_client_->BeginCommitTransaction(100, kUser);
@@ -436,7 +431,7 @@ TEST_F(TxnStatusTableITest, TestSystemClientBeginTransactionErrors) {
   ASSERT_OK(txn_sys_client_->BeginTransaction(
       1, kUser, &txn_keepalive_ms, &highest_seen_txn_id));
   ASSERT_EQ(1, highest_seen_txn_id);
-  ASSERT_EQ(FLAGS_transaction_keepalive_interval_ms, txn_keepalive_ms);
+  ASSERT_EQ(FLAGS_txn_keepalive_interval_ms, txn_keepalive_ms);
 
   // Trying to start another transaction with a used ID should yield an error.
   {
@@ -631,11 +626,7 @@ class MultiServerTxnStatusTableITest : public TxnStatusTableITest {
     opts.num_tablet_servers = 4;
     cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
     ASSERT_OK(cluster_->Start());
-    vector<string> master_addrs;
-    for (const auto& hp : cluster_->master_rpc_addrs()) {
-      master_addrs.emplace_back(hp.ToString());
-    }
-    ASSERT_OK(TxnSystemClient::Create(master_addrs, &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
 
     // Create the initial transaction status table partitions and start an
     // initial transaction.
@@ -703,8 +694,8 @@ TEST_F(MultiServerTxnStatusTableITest, TestSystemClientLeadershipChange) {
     string new_leader_uuid;
     ASSERT_OK(FindLeaderId(tablet_id, &new_leader_uuid));
     ASSERT_NE(new_leader_uuid, orig_leader_uuid);
+    ASSERT_OK(txn_sys_client_->BeginTransaction(2, kUser));
   });
-  ASSERT_OK(txn_sys_client_->BeginTransaction(2, kUser));
 }
 
 TEST_F(MultiServerTxnStatusTableITest, TestSystemClientCrashedNodes) {

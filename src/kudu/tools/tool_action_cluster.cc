@@ -26,7 +26,6 @@
 #include <tuple>
 #include <vector>
 
-#include <boost/algorithm/string/predicate.hpp>
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -44,9 +43,11 @@
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/tools/tool_replica_util.h"
 #include "kudu/util/status.h"
+#include "kudu/util/string_case.h"
 #include "kudu/util/version_util.h"
 
 using kudu::rebalance::Rebalancer;
+using kudu::iequals;
 using std::cout;
 using std::endl;
 using std::make_shared;
@@ -157,7 +158,7 @@ static bool ValidateMoveSingleReplicas(const char* flag_name,
   const vector<string> allowed_values = { "auto", "enabled", "disabled" };
   if (std::find_if(allowed_values.begin(), allowed_values.end(),
                    [&](const string& allowed_value) {
-                     return boost::iequals(allowed_value, flag_value);
+                     return iequals(allowed_value, flag_value);
                    }) != allowed_values.end()) {
     return true;
   }
@@ -218,11 +219,11 @@ bool VersionSupportsRF1Movement(const string& version_str) {
 Status EvaluateMoveSingleReplicasFlag(const vector<string>& master_addresses,
                                       bool* move_single_replicas) {
   DCHECK(move_single_replicas);
-  if (!boost::iequals(FLAGS_move_single_replicas, "auto")) {
-    if (boost::iequals(FLAGS_move_single_replicas, "enabled")) {
+  if (!iequals(FLAGS_move_single_replicas, "auto")) {
+    if (iequals(FLAGS_move_single_replicas, "enabled")) {
       *move_single_replicas = true;
     } else {
-      DCHECK(boost::iequals(FLAGS_move_single_replicas, "disabled"));
+      DCHECK(iequals(FLAGS_move_single_replicas, "disabled"));
       *move_single_replicas = false;
     }
     return Status::OK();
@@ -375,10 +376,9 @@ unique_ptr<Mode> BuildClusterMode() {
         "to output detailed information on cluster status even if no "
         "inconsistency is found in metadata.";
 
-    unique_ptr<Action> ksck = ActionBuilder("ksck", &RunKsck)
+    unique_ptr<Action> ksck = ClusterActionBuilder("ksck", &RunKsck)
         .Description(desc)
         .ExtraDescription(extra_desc)
-        .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
         .AddOptionalParameter("checksum_cache_blocks")
         .AddOptionalParameter("checksum_scan")
         .AddOptionalParameter("checksum_scan_concurrency")
@@ -406,13 +406,12 @@ unique_ptr<Mode> BuildClusterMode() {
         "balance the count of replicas per table on each tablet server, "
         "and after that attempting to balance the total number of replicas "
         "per tablet server.";
-    unique_ptr<Action> rebalance = ActionBuilder("rebalance", &RunRebalance)
+    unique_ptr<Action> rebalance = ClusterActionBuilder("rebalance", &RunRebalance)
         .Description(desc)
         .ExtraDescription(extra_desc)
-        .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
-        .AddOptionalParameter("disable_policy_fixer")
         .AddOptionalParameter("disable_cross_location_rebalancing")
         .AddOptionalParameter("disable_intra_location_rebalancing")
+        .AddOptionalParameter("disable_policy_fixer")
         .AddOptionalParameter("fetch_info_concurrency")
         .AddOptionalParameter("ignored_tservers")
         .AddOptionalParameter("load_imbalance_threshold")

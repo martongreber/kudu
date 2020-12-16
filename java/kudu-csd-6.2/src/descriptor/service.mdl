@@ -3969,5 +3969,11 @@
         }
     ],
     "nameForCrossEntityAggregateMetrics": "kudus",
-    "metricDefinitions": []
+    "metricDefinitions": [],
+    "compatibility" : {
+        "cdhVersion" : {
+            "min" : "6.2.0",
+            "max" : "6.3.0"
+        }
+    }
 }

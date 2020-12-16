@@ -33,16 +33,36 @@ try:
 except:
   import json
 import os
+import re
 import subprocess
 import sys
 
-BINARIES=["kudu-master", "kudu-tserver"]
+BINARIES = ["kudu-master", "kudu-tserver"]
+SDL_FILENAME = "src/descriptor/service.sdl"
+
+# Compiled regex that matches a comment line, which isn't valid JSON, but is
+# valid for SDL files. Removal of such lines allows us to parse SDL as JSON.
+COMMENT_RE = re.compile(r"\s*//.*")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RELATIVE_BUILD_DIR="../../build/latest/bin"
 
 DEPRECATION_MESSAGE = " This metric is no longer produced in " + \
                       "current versions of Kudu."
+def load_compatibility():
+  """
+  Load the SDL file for the current version and look for its "compatibility"
+  field, returning it as a JSON field.
+  """
+  path = os.path.join(BASE_DIR, SDL_FILENAME)
+  if not os.path.exists(path):
+    raise Exception("Cannot find SDL file %s" % path)
+  f = open(path)
+  # SDL files are JSON-like, but they support comments; do some cleanup when
+  # reading so we can extract the compatibility info.
+  f_no_comments = [l for l in f.readlines() if not COMMENT_RE.match(l)]
+  j = json.loads("\n".join(f_no_comments))
+  return j["compatibility"]
 
 def find_binary(bin_name):
   build_dir = os.path.join(BASE_DIR, RELATIVE_BUILD_DIR)
@@ -94,7 +114,7 @@ def load_historical_metrics():
     if not path.endswith(".json") or path.startswith("."):
       continue
     j = json.load(open(os.path.join(old_dir, path)))
-    old_metrics.update((m['name'], m) for m in j['metrics'])
+    old_metrics.update((m["name"], m) for m in j["metrics"])
   return old_metrics.values()
 
 
@@ -174,13 +194,23 @@ def metrics_to_mdl(metrics, historical_metrics):
 
 
 def main():
+  compat_json = load_compatibility()
   current_metrics = load_current_metrics()
   historical_metrics = load_historical_metrics()
   metrics_by_entity = metrics_to_mdl(current_metrics, historical_metrics)
   server_metrics = metrics_by_entity['server']
   tablet_metrics = metrics_by_entity['tablet']
+  if "max" in compat_json["cdhVersion"]:
+    # Forked CSDs should already have the "min" and "max" version fields set.
+    compatibility_dict = dict(cdhVersion=dict(min=compat_json["cdhVersion"]["min"],
+                                              max=compat_json["cdhVersion"]["max"]))
+  else:
+    # The latest CSD doesn't set the "max" version field.
+    compatibility_dict = dict(cdhVersion=dict(min=compat_json["cdhVersion"]["min"]))
+
 
   output = dict(
+    compatibility=compatibility_dict,
     name="KUDU",
     version="0.6.0",
     metricDefinitions=[],

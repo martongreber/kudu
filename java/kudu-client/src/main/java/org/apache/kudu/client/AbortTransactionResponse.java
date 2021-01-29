@@ -1,4 +1,3 @@
-//
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -16,22 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import sbt._
+package org.apache.kudu.client;
 
-ThisBuild / scalaVersion := "2.12.12"
-ThisBuild / version := "0.1.0-SNAPSHOT"
-ThisBuild / organization := "org.apache.kudu"
-ThisBuild / organizationName := "Apache Kudu"
+import com.google.common.base.Preconditions;
+import org.apache.yetus.audience.InterfaceAudience;
 
-lazy val root = (project in file("."))
-  .configs(IntegrationTest)
-  .enablePlugins(OsDetectorPlugin)
-  .settings(
-    Defaults.itSettings,
-    name := "sbt-int-test-example",
-    libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.2" % "it,test",
-    libraryDependencies += "org.apache.kudu" % "kudu-client" % "1.14.0",
-    libraryDependencies += "org.apache.kudu" % "kudu-test-utils" % "1.14.0" % "it",
-    libraryDependencies += "org.apache.kudu" % "kudu-binary" % "1.14.0" % "it" classifier osDetectorClassifier.value,
-    libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.2.3",
-  )
+@InterfaceAudience.Private
+public class AbortTransactionResponse extends KuduRpcResponse {
+  /**
+   * @param elapsedMillis time in milliseconds since RPC creation to now
+   * @param serverUUID UUID of the server that sent the response
+   */
+  AbortTransactionResponse(long elapsedMillis, String serverUUID) {
+    super(elapsedMillis, serverUUID);
+  }
+}

@@ -74,9 +74,9 @@ tasks.withType(ScalaCompile) {
   }
 }
 
-// Errorprone doesn't support Java 12+
+// Errorprone doesn't support Java 11+
 // https://github.com/google/error-prone/issues/1106
-if(!JavaVersion.current().isJava12Compatible()) {
+if(!JavaVersion.current().isJava11Compatible()) {
   apply plugin: "net.ltgt.errorprone" // Performs static code analysis to look for bugs in Java code.
 
   // Configure error-prone.
@@ -98,6 +98,25 @@ if(!JavaVersion.current().isJava12Compatible()) {
     // Configure Error Prone to use it's own static javac as described here:
     // https://github.com/tbroyer/gradle-errorprone-plugin#jdk-8-support
     errorproneJavac libs.errorProneJavac
+  }
+}
+
+// Don't enable code coverage for kudu-proto given it is exclusively generated code.
+// Don't enable code coverage for kudu-jepsen given it is exclusively test code.
+if (project.name != "kudu-proto" && project.name != "kudu-jepsen") {
+  apply plugin: "jacoco" // Provides code coverage metrics for Java code.
+  jacoco {
+    toolVersion = versions.jacoco
+  }
+  tasks.withType(JacocoReport) {
+    reports {
+      csv.enabled false
+      xml.enabled true
+      html.enabled true
+    }
+  }
+  jacocoTestReport {
+    dependsOn test // tests are required to run before generating the report
   }
 }
 

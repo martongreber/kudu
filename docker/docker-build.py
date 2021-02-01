@@ -64,7 +64,7 @@ import sys
 ME = os.path.abspath(__file__)
 ROOT = os.path.abspath(os.path.join(os.path.dirname(ME), ".."))
 
-DEFAULT_OS = 'ubuntu:xenial'
+DEFAULT_OS = 'ubuntu:bionic'
 DEFAULT_TARGETS = ['kudu','kudu-python']
 DEFAULT_REPOSITORY = 'apache/kudu'
 DEFAULT_ACTION = 'load'
@@ -77,20 +77,20 @@ def parse_args():
   parser = argparse.ArgumentParser(description='Build the Apache Kudu Docker images',
                                    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
   parser.add_argument('--platforms', nargs='+', choices=[
-                      'linux/amd64', 'linux/arm64', ],
+                      'linux/amd64', 'linux/arm64'],
                       help='The platforms to build with. If unspecified, the platform of your '
                            'build machine will be used.')
   parser.add_argument('--bases', nargs='+', default=DEFAULT_OS, choices=[
-                      'centos:6', 'centos:7', 'centos:8',
-                      'debian:jessie', 'debian:stretch',
-                      'ubuntu:trusty', 'ubuntu:xenial', 'ubuntu:bionic'],
+                      'centos:7', 'centos:8',
+                      'ubuntu:bionic', 'ubuntu:focal',
+                      'opensuse/leap:15'],
                       help='The base operating systems to build with')
   # These targets are defined in the Dockerfile. Dependent targets of a passed image will be built,
   # but not tagged. Note that if a target is not tagged it is subject removal by Dockers system
   # and image pruning.
   parser.add_argument('--targets', nargs='+', default=DEFAULT_TARGETS, choices=[
                       'runtime', 'dev', 'thirdparty', 'build',
-                      'kudu', 'kudu-python', 'impala-build', 'impala' ],
+                      'kudu', 'kudu-python', 'impala-build', 'impala'],
                       help='The targets to build and tag')
   parser.add_argument('--repository', default=DEFAULT_REPOSITORY,
                       help='The repository string to use when tagging the image')
@@ -161,8 +161,13 @@ def get_os_tag(base):
       The operating system is described with the version name.
       If the operating system version is numeric, the version will also be appended.
   """
-  os_name = base.split(':')[0]
-  os_version = base.split(':')[1]
+  # If the base contains a "/" remove the prefix. ex: `opensuse/leap:15`
+  if "/" in base:
+    short_base = base.split('/')[1]
+  else:
+    short_base = base
+  os_name = short_base.split(':')[0]
+  os_version = short_base.split(':')[1]
   os_tag = os_name
   if os_version.isdigit():
     os_tag += os_version

@@ -68,6 +68,7 @@
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/txn_coordinator.h"
+#include "kudu/transactions/txn_status_manager.h"
 #include "kudu/transactions/txn_status_tablet.h"
 #include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/mini_tablet_server.h"
@@ -140,6 +141,7 @@ using kudu::rpc::RpcController;
 using kudu::tablet::TabletReplica;
 using kudu::tablet::ParticipantIdsByTxnId;
 using kudu::tablet::TxnCoordinator;
+using kudu::transactions::TxnStatusManager;
 using kudu::transactions::TxnStatusTablet;
 using kudu::tserver::MiniTabletServer;
 using kudu::ClusterVerifier;
@@ -1016,7 +1018,7 @@ Status GetPartitionForTxnStatusTablet(int64_t start_txn_id, int64_t end_txn_id,
   RETURN_NOT_OK(upper_bound.SetInt64(TxnStatusTablet::kTxnIdColName, end_txn_id));
   vector<Partition> ps;
   RETURN_NOT_OK(pschema.CreatePartitions(/*split_rows=*/{},
-      { std::make_pair(lower_bound, upper_bound) }, schema, &ps));
+      { std::make_pair(lower_bound, upper_bound) }, {}, schema, &ps));
   *partition = ps[0];
   *partition_schema = pschema;
   return Status::OK();
@@ -1110,6 +1112,9 @@ class TxnStatusTabletManagementTest : public TsTabletManagerITest {
   }
 
   static Status StartTransactions(const ParticipantIdsByTxnId& txns, TxnCoordinator* coordinator) {
+    TxnStatusManager* txn_status_manager =
+        dynamic_cast<TxnStatusManager*>(coordinator);
+    TxnStatusManager::ScopedLeaderSharedLock l(txn_status_manager);
     TabletServerErrorPB ts_error;
     for (const auto& txn_id_and_prt_ids : txns) {
       const auto& txn_id = txn_id_and_prt_ids.first;
@@ -1212,8 +1217,18 @@ TEST_F(TxnStatusTabletManagementTest, TestCopyTransactionStatusTablet) {
     ASSERT_OK(replica->WaitUntilConsensusRunning(MonoDelta::FromSeconds(3)));
     TxnCoordinator* coordinator = replica->txn_coordinator();
     ASSERT_NE(nullptr, coordinator);
+  }
+  // Restart the tserver and ensure the transactions information is
+  // correctly reloaded.
+  {
+    ts0->Shutdown();
+    ASSERT_OK(ts0->Restart());
     // Wait for the contents of the tablet to be loaded into memory.
     ASSERT_EVENTUALLY([&] {
+      scoped_refptr<TabletReplica> replica;
+      ASSERT_TRUE(ts0->server()->tablet_manager()->LookupTablet(
+          kTxnStatusTabletId, &replica));
+      TxnCoordinator* coordinator = replica->txn_coordinator();
       ASSERT_EQ(kExpectedTxns, coordinator->GetParticipantsByTxnIdForTests());
     });
   }
@@ -1226,12 +1241,14 @@ TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCalls) {
   FLAGS_superuser_acl = kSuperUser;
   FLAGS_trusted_user_acl = kTrustedUser;
   NO_FATALS(StartCluster({}));
-  auto* ts = cluster_->mini_tablet_server(0);
+  constexpr const int kTServerIdx = 0;
+  auto* ts = cluster_->mini_tablet_server(kTServerIdx);
   ASSERT_OK(CreateTxnStatusTablet(ts));
   // Put together a sequence of ops that should succeed.
   const vector<CoordinatorOpPB::CoordinatorOpType> kOpSequence = {
     CoordinatorOpPB::BEGIN_TXN,
     CoordinatorOpPB::REGISTER_PARTICIPANT,
+    CoordinatorOpPB::KEEP_TXN_ALIVE,
     CoordinatorOpPB::BEGIN_COMMIT_TXN,
     CoordinatorOpPB::ABORT_TXN,
     CoordinatorOpPB::GET_TXN_STATUS,
@@ -1241,9 +1258,7 @@ TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCalls) {
   // the logged-in user (this user is the service user, since we just restarted
   // the server).
   const auto perform_ops = [&] (int64_t txn_id, const string& user, bool expect_success) {
-    unique_ptr<TabletServerAdminServiceProxy> admin_proxy(
-        new TabletServerAdminServiceProxy(client_messenger_, ts->bound_rpc_addr(),
-                                          ts->bound_rpc_addr().host()));
+    auto admin_proxy = cluster_->tserver_admin_proxy(kTServerIdx);
     if (!user.empty()) {
       rpc::UserCredentials user_creds;
       user_creds.set_real_user(user);
@@ -1283,10 +1298,8 @@ TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCalls) {
 TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCallErrors) {
   NO_FATALS(StartCluster({}));
   auto* ts = cluster_->mini_tablet_server(0);
+  auto admin_proxy = cluster_->tserver_admin_proxy(0);
   ASSERT_OK(CreateTxnStatusTablet(ts));
-  unique_ptr<TabletServerAdminServiceProxy> admin_proxy(
-      new TabletServerAdminServiceProxy(client_messenger_, ts->bound_rpc_addr(),
-                                        ts->bound_rpc_addr().host()));
   // If the request is missing fields, it should be rejected.
   {
     CoordinateTransactionRequestPB req;

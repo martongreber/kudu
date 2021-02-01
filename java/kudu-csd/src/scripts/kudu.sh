@@ -202,7 +202,8 @@ if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
   set +x
   if [ -n "${KUDU_TRUSTSTORE_LOCATION}" ] && [ -n "${KUDU_TRUSTORE_PASSWORD}" ]; then
     perl -pi -e "s#\{\{RANGER_PLUGIN_TRUSTSTORE}}#${KUDU_TRUSTSTORE_LOCATION}#g" "${CONF_DIR}"/ranger-kudu-policymgr-ssl.xml
-    RANGER_PLUGIN_TRUSTSTORE_CRED_FILE="jceks://file${CONF_DIR}/rangerpluginssl.jceks"
+    STORETYPE="${KUDU_KEYSTORE_TYPE:-jceks}"
+    RANGER_PLUGIN_TRUSTSTORE_CRED_FILE="${STORETYPE}://file${CONF_DIR}/rangerpluginssl.${STORETYPE}"
 
     # Use jars from Ranger admin package to generate the trsustore credential file.
     RANGER_ADMIN_CRED_LIB="${PARCELS_ROOT}/${PARCEL_DIRNAMES}/lib/ranger-admin/cred/lib/"

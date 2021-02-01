@@ -81,6 +81,7 @@ class ServerStatusPB;
 } // namespace server
 
 namespace tserver {
+class TabletServerAdminServiceProxy;
 class TabletServerServiceProxy;
 } // namespace tserver
 
@@ -92,6 +93,12 @@ class ExternalTabletServer;
 
 // Location --> number of tablet servers in location.
 typedef std::map<std::string, int> LocationInfo;
+
+
+struct TabletIdAndTableName {
+  const std::string tablet_id;
+  const std::string table_name;
+};
 
 #if !defined(NO_CHRONY)
 // The enumeration below describes the way Kudu's built-in NTP client is
@@ -385,6 +392,8 @@ class ExternalMiniCluster : public MiniCluster {
   std::shared_ptr<master::MasterServiceProxy> master_proxy() const override;
   std::shared_ptr<master::MasterServiceProxy> master_proxy(int idx) const override;
   std::shared_ptr<tserver::TabletServerServiceProxy> tserver_proxy(int idx) const override;
+  std::shared_ptr<tserver::TabletServerAdminServiceProxy> tserver_admin_proxy(
+      int idx) const override;
 
   std::string block_manager_type() const {
     return opts_.block_manager_type;
@@ -405,8 +414,11 @@ class ExternalMiniCluster : public MiniCluster {
   // If 'min_tablet_count' is not -1, will also wait for at least that many
   // RUNNING tablets to appear before returning (potentially timing out if that
   // number is never reached).
-  Status WaitForTabletsRunning(ExternalTabletServer* ts, int min_tablet_count,
-                               const MonoDelta& timeout);
+  Status WaitForTabletsRunning(
+      ExternalTabletServer* ts,
+      int min_tablet_count,
+      const MonoDelta& timeout,
+      std::vector<TabletIdAndTableName>* tablets_info = nullptr);
 
   // Create a client configured to talk to this cluster.
   // Builder may contain override options for the client. The master address will

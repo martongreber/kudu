@@ -27,11 +27,11 @@
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -2992,7 +2992,8 @@ TEST_F(TabletServerTest, TestDiffScan) {
 
   // Update some random rows.
   LocalTabletWriter writer(tablet_replica_->tablet(), &schema_);
-  std::random_shuffle(keys.begin(), keys.end());
+  std::mt19937 gen(SeedRandom());
+  std::shuffle(keys.begin(), keys.end(), gen);
   for (int i = 0; i < kNumToUpdate; i++) {
     KuduPartialRow row(&schema_);
     int32_t key = keys[i];
@@ -3004,7 +3005,7 @@ TEST_F(TabletServerTest, TestDiffScan) {
   }
 
   // Delete some random rows.
-  std::random_shuffle(keys.begin(), keys.end());
+  std::shuffle(keys.begin(), keys.end(), gen);
   for (int i = 0; i < kNumToDelete; i++) {
     KuduPartialRow row(&schema_);
     int32_t key = keys[i];
@@ -3886,7 +3887,7 @@ TEST_F(TabletServerTest, TestWriteOutOfBounds) {
   ASSERT_OK(end_row.SetInt32("key", 20));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ start_row, end_row }, {}, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ start_row, end_row }, {}, {}, schema, &partitions));
 
   ASSERT_EQ(3, partitions.size());
 

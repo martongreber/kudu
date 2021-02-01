@@ -34,14 +34,13 @@ function install_python_packages() {
   # We use get-pip.py to bootstrap pip outside of system packages.
   # This prevents issues with the platform package manager knowing
   # about only some of the python packages.
-  if [[ "$PYTHON_MAJOR" == "2" && "$PYTHON_MINOR" == "6" ]]; then
-    # Beginning with pip 10, Python 2.6 is no longer supported.
-    curl https://bootstrap.pypa.io/2.6/get-pip.py | python
+  if [[ "$PYTHON_MAJOR" == "2" && "$PYTHON_MINOR" == "7" ]]; then
+    # The standard get-pip.py URL no longer supports Python 2.7,
+    # so we need to use the version specific one.
+    curl https://bootstrap.pypa.io/2.7/get-pip.py | python
   else
-    # Use a stable version of pip that works with the remaining
-    # versions of Python 2 and 3. pip 19.1 doesn't support Python 3.4,
-    # which is the version of Python 3 shipped with Ubuntu 14.04.
-    curl https://bootstrap.pypa.io/get-pip.py | python - "pip < 19.0"
+    # Use a stable version of pip that works with Python 2 and 3.
+    curl https://bootstrap.pypa.io/get-pip.py | python - "pip < 20.3.4"
   fi
   pip install --upgrade \
     cython \
@@ -100,6 +99,22 @@ elif [[ -f "/usr/bin/apt-get" ]]; then
   rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
   unset DEBIAN_FRONTEND
+# OpenSUSE/SLES
+elif [[ -f "/usr/bin/zypper" ]]; then
+  # Update the repo.
+  zypper update -y
+
+  # Install curl, used when installing pip.
+  zypper install -y ca-certificates curl
+
+  # Install python development packages.
+  # g++ is required to check for int128 support in setup.py.
+  zypper install -y gcc gcc-c++ python-devel python-xml
+  install_python_packages
+
+  # Reduce the image size by cleaning up after the install.
+  zypper clean --all
+  rm -rf /var/lib/zypp/* /tmp/* /var/tmp/*
 else
   echo "Unsupported OS"
   exit 1

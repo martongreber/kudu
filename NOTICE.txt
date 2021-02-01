@@ -8,18 +8,12 @@ Apache Avro 1.8.2.7.1.1.0-565 : Apache License 2.0
 Apache Commons Lang 2.6.0 : Apache License 2.0
 Apache Commons Math 3.6.1 : Apache License 2.0
 Apache Hadoop 0.8.0 : Apache License 2.0
-Apache Impala 2.10.0-rc1 : Apache License 2.0
-Apache Impala 3.0.1-rc1 : Apache License 2.0
-Apache Impala cdh6.1.0-release : Apache License 2.0
-Apache Solr Solrj 7.7.3 : Apache License 2.0
 Apache Xerces2 J 2.11.1 : Apache License 2.0
 Apache ZooKeeper 3.5.5 : Apache License 2.0
 Checker Qual 2.8.0 : MIT License
 Common library for Plugins 2.0.0 : Apache License 2.0
-Common library for Plugins 2.0.0.7.1.1.0-565 : Apache License 2.0
 Curator Framework 4.2.0 : Apache License 2.0
 D3.js 2.10.0 : BSD 3-clause "New" or "Revised" License
-Daikon main shared library 2.0.2 : Apache License 2.0
 EclipseLink ASM 2.3.4-M6 : Eclipse Distribution License - v 1.0
 EclipseLink DBWS 2.5.2 : Eclipse Distribution License - v 1.0
 fastly/epoch 0.5.2 : MIT License
@@ -30,7 +24,6 @@ Google Java Format 1.8 : Apache License 2.0
 GroupBy - Common - HTTP 135 : MIT License
 grouper GROUPER_2_1_3 : Apache License 2.0
 hadoop-common 3.1.1.7.1.1.0-565 : Apache License 2.0
-HBase - Server 5.0.0.7.1.1.0-565 : Apache License 2.0
 htrace-core 4.1.0-incubating : Apache License 2.0
 jackson-core 1.9.13 : Apache License 2.0
 Java Native Access (JNA) 5.3.1 : Apache License 2.0
@@ -39,20 +32,14 @@ JBoss Web 2.1.1.CR7 : Apache License 2.0
 JCIP Annotations under Apache License 1.0-1 : Apache License 2.0
 Jettison - Json Stax implementation 1.1 : Apache License 2.0
 linkerd/linkerd 1.7.3 : Apache License 2.0
-Meecrowave :: Core 1.2.8 : Apache License 2.0
 Netty Project netty-4.1.50.Final : Apache License 2.0
 org.tukaani.xz 0.3 : Public Domain
 os-maven-plugin 1.6.2 : Apache License 2.0
-Pinot Avro 0.3.0 : Apache License 2.0
-Pinot Batch Ingestion Common 0.3.0 : Apache License 2.0
-Pinot Kafka 2.0 0.3.0 : Apache License 2.0
 Protocol Buffer Java API 3.11.0-rc-2 : BSD 3-clause "New" or "Revised" License
 Randoop v4.2.0 : MIT License
 Ranger Gaian Plugin 1.5 : Apache License 2.0
 re2j 1.2 : BSD 3-clause "New" or "Revised" License
 road-onramp-client 6.0.13 : Apache License 2.0
-SDO API 2.1.1 : Eclipse Distribution License - v 1.0
-SendGrid 4.5.0 : MIT License
 SLF4J API Module 1.7.30 : MIT License
 snappy-java 1.1.7.4 : Apache License 2.0
 StAX 1.0 : Apache License 2.0
@@ -63,7 +50,7 @@ XZ for Java 1.6 : Apache License 2.0
 Licenses: 
 
 Apache License 2.0
-(Apache Avro 1.8.2.7.1.1.0-565, Apache Commons Lang 2.6.0, Apache Commons Math 3.6.1, Apache Hadoop 0.8.0, Apache Impala 2.10.0-rc1, Apache Impala 3.0.1-rc1, Apache Impala cdh6.1.0-release, Apache Solr Solrj 7.7.3, Apache Xerces2 J 2.11.1, Apache ZooKeeper 3.5.5, Common library for Plugins 2.0.0, Common library for Plugins 2.0.0.7.1.1.0-565, Curator Framework 4.2.0, Daikon main shared library 2.0.2, flink-runtime 1.9.1-csa1.1.0.0, garmadon-agent 1.3.1, Google Java Format 1.8, grouper GROUPER_2_1_3, hadoop-common 3.1.1.7.1.1.0-565, HBase - Server 5.0.0.7.1.1.0-565, htrace-core 4.1.0-incubating, jackson-core 1.9.13, Java Native Access (JNA) 5.3.1, JBind: A Java-XML Data Binding Framework jBind-1.0, JBoss Web 2.1.1.CR7, JCIP Annotations under Apache License 1.0-1, Jettison - Json Stax implementation 1.1, linkerd/linkerd 1.7.3, Meecrowave :: Core 1.2.8, Netty Project netty-4.1.50.Final, os-maven-plugin 1.6.2, Pinot Avro 0.3.0, Pinot Batch Ingestion Common 0.3.0, Pinot Kafka 2.0 0.3.0, Ranger Gaian Plugin 1.5, road-onramp-client 6.0.13, snappy-java 1.1.7.4, StAX 1.0, XZ for Java 1.6)
+(Apache Avro 1.8.2.7.1.1.0-565, Apache Commons Lang 2.6.0, Apache Commons Math 3.6.1, Apache Hadoop 0.8.0, Apache Impala 2.10.0-rc1, Apache Impala 3.0.1-rc1, Apache Xerces2 J 2.11.1, Apache ZooKeeper 3.5.5, Common library for Plugins 2.0.0, Curator Framework 4.2.0, flink-runtime 1.9.1-csa1.1.0.0, garmadon-agent 1.3.1, Google Java Format 1.8, grouper GROUPER_2_1_3, hadoop-common 3.1.1.7.1.1.0-565, htrace-core 4.1.0-incubating, jackson-core 1.9.13, Java Native Access (JNA) 5.3.1, JBind: A Java-XML Data Binding Framework jBind-1.0, JBoss Web 2.1.1.CR7, JCIP Annotations under Apache License 1.0-1, Jettison - Json Stax implementation 1.1, linkerd/linkerd 1.7.3, Netty Project netty-4.1.50.Final, os-maven-plugin 1.6.2, Ranger Gaian Plugin 1.5, road-onramp-client 6.0.13, snappy-java 1.1.7.4, StAX 1.0, XZ for Java 1.6)
 
 Apache License
 Version 2.0, January 2004

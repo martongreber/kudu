@@ -73,12 +73,10 @@ DEFINE_int64(txn_manager_status_table_range_partition_span, 1000000,
 TAG_FLAG(txn_manager_status_table_range_partition_span, advanced);
 TAG_FLAG(txn_manager_status_table_range_partition_span, experimental);
 
-DEFINE_uint32(transaction_keep_alive_interval_ms, 3000,
-              "Maximum interval (in milliseconds) between subsequent "
-              "keep-alive heartbeats from client to TxnManager to let it know "
-              "that a transaction is alive");
-TAG_FLAG(transaction_keep_alive_interval_ms, runtime);
-TAG_FLAG(transaction_keep_alive_interval_ms, experimental);
+DEFINE_uint32(txn_manager_status_table_num_replicas, 3,
+              "Number of replicas for transaction status table");
+TAG_FLAG(txn_manager_status_table_num_replicas, advanced);
+TAG_FLAG(txn_manager_status_table_num_replicas, experimental);
 
 namespace kudu {
 namespace transactions {
@@ -124,9 +122,9 @@ TxnManager::~TxnManager() {
 Status TxnManager::BeginTransaction(const string& username,
                                     const MonoTime& deadline,
                                     int64_t* txn_id,
-                                    int32_t* keep_alive_interval_ms) {
+                                    uint32_t* txn_keepalive_ms) {
   DCHECK(txn_id);
-  DCHECK(keep_alive_interval_ms);
+  DCHECK(txn_keepalive_ms);
   RETURN_NOT_OK(CheckInitialized(deadline));
 
   // TxnManager uses next_txn_id_ as a hint for next transaction identifier.
@@ -142,11 +140,13 @@ Status TxnManager::BeginTransaction(const string& username,
   //                the response and passed back to be used here as a hint for
   //                txn ID on the next request.
   int64_t try_txn_id = next_txn_id_++;
+  uint32_t keepalive_ms = 0;
   auto s = Status::TimedOut("timed out while trying to find txn_id");
   while (MonoTime::Now() < deadline) {
     int64_t highest_seen_txn_id = -1;
     s = txn_sys_client_->BeginTransaction(
-        try_txn_id, username, &highest_seen_txn_id, ToDelta(deadline));
+        try_txn_id, username, &keepalive_ms,
+        &highest_seen_txn_id, ToDelta(deadline));
     if (s.ok()) {
       DCHECK_GE(highest_seen_txn_id, 0);
       // The idea is to make the thread that has gotten a transaction reserved
@@ -197,8 +197,10 @@ Status TxnManager::BeginTransaction(const string& username,
     break;
   }
   if (s.ok()) {
+    DCHECK_GT(try_txn_id, -1);
+    DCHECK_GT(keepalive_ms, 0);
     *txn_id = try_txn_id;
-    *keep_alive_interval_ms = FLAGS_transaction_keep_alive_interval_ms;
+    *txn_keepalive_ms = keepalive_ms;
   }
   return s;
 }
@@ -228,12 +230,11 @@ Status TxnManager::AbortTransaction(int64_t txn_id,
   return txn_sys_client_->AbortTransaction(txn_id, username, ToDelta(deadline));
 }
 
-Status TxnManager::KeepTransactionAlive(int64_t /* txn_id */,
-                                        const string& /* username */,
+Status TxnManager::KeepTransactionAlive(int64_t txn_id,
+                                        const string& username,
                                         const MonoTime& deadline) {
   RETURN_NOT_OK(CheckInitialized(deadline));
-  // TODO(aserbin): call txn_sys_client_ once the functionality is there
-  return Status::NotSupported("KeepTransactionAlive is not supported yet");
+  return txn_sys_client_->KeepTransactionAlive(txn_id, username, ToDelta(deadline));
 }
 
 // This method isn't supposed to be called concurrently, so there isn't any
@@ -245,15 +246,11 @@ Status TxnManager::Init() {
   }
   vector<HostPort> hostports;
   RETURN_NOT_OK(server_->GetMasterHostPorts(&hostports));
-  vector<string> master_addrs;
-  master_addrs.reserve(hostports.size());
-  for (const auto& hp : hostports) {
-    master_addrs.emplace_back(hp.ToString());
-  }
-  RETURN_NOT_OK(TxnSystemClient::Create(master_addrs, &txn_sys_client_));
+  RETURN_NOT_OK(TxnSystemClient::Create(hostports, &txn_sys_client_));
   DCHECK(txn_sys_client_);
   auto s = txn_sys_client_->CreateTxnStatusTable(
-      FLAGS_txn_manager_status_table_range_partition_span);
+      FLAGS_txn_manager_status_table_range_partition_span,
+      FLAGS_txn_manager_status_table_num_replicas);
   if (!s.ok() && !s.IsAlreadyPresent()) {
     // Status::OK() is expected only on the very first call to Init() before
     // the transaction status table is created.

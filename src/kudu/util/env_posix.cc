@@ -248,8 +248,11 @@ int fallocate(int fd, int mode, off_t offset, off_t len) {
   return 0;
 }
 
+// Implementations for `preadv` and `pwritev` are available in the MacOSX11+ SDK.
+// However, we still use the simulated implementations in order to support older versions.
+
 // Simulates Linux's preadv API on OS X.
-ssize_t preadv(int fd, const struct iovec* iovec, int count, off_t offset) {
+ssize_t preadvsim(int fd, const struct iovec* iovec, int count, off_t offset) {
   ssize_t total_read_bytes = 0;
   for (int i = 0; i < count; i++) {
     ssize_t r;
@@ -267,7 +270,7 @@ ssize_t preadv(int fd, const struct iovec* iovec, int count, off_t offset) {
 }
 
 // Simulates Linux's pwritev API on OS X.
-ssize_t pwritev(int fd, const struct iovec* iovec, int count, off_t offset) {
+ssize_t pwritevsim(int fd, const struct iovec* iovec, int count, off_t offset) {
   ssize_t total_written_bytes = 0;
   for (int i = 0; i < count; i++) {
     ssize_t r;
@@ -283,6 +286,7 @@ ssize_t pwritev(int fd, const struct iovec* iovec, int count, off_t offset) {
   }
   return total_written_bytes;
 }
+
 #endif
 
 void DoClose(int fd) {
@@ -411,8 +415,11 @@ Status DoReadV(int fd, const string& filename, uint64_t offset,
     // Never request more than IOV_MAX in one request
     size_t iov_count = std::min(iov_size - completed_iov, static_cast<size_t>(IOV_MAX));
     ssize_t r;
+#if defined(__APPLE__)
+    RETRY_ON_EINTR(r, preadvsim(fd, iov + completed_iov, iov_count, cur_offset));
+#else
     RETRY_ON_EINTR(r, preadv(fd, iov + completed_iov, iov_count, cur_offset));
-
+#endif
     // Fake a short read for testing
     if (PREDICT_FALSE(FLAGS_env_inject_short_read_bytes > 0 && rem == bytes_req)) {
       DCHECK_LT(FLAGS_env_inject_short_read_bytes, r);
@@ -477,8 +484,11 @@ Status DoWriteV(int fd, const string& filename, uint64_t offset, ArrayView<const
     // Never request more than IOV_MAX in one request.
     size_t iov_count = std::min(iov_size - completed_iov, static_cast<size_t>(IOV_MAX));
     ssize_t w;
+#if defined(__APPLE__)
+    RETRY_ON_EINTR(w, pwritevsim(fd, iov + completed_iov, iov_count, cur_offset));
+#else
     RETRY_ON_EINTR(w, pwritev(fd, iov + completed_iov, iov_count, cur_offset));
-
+#endif
     // Fake a short write for testing.
     if (PREDICT_FALSE(FLAGS_env_inject_short_write_bytes > 0 && rem == bytes_req)) {
       DCHECK_LT(FLAGS_env_inject_short_write_bytes, w);

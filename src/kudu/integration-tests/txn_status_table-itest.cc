@@ -57,15 +57,21 @@
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/net/net_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+DECLARE_bool(raft_enable_pre_election);
+DECLARE_bool(txn_status_tablet_failover_inject_timeout_error);
+DECLARE_bool(txn_status_tablet_inject_load_failure_error);
+DECLARE_bool(txn_status_tablet_inject_uninitialized_leader_status_error);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+DECLARE_int32(consensus_inject_latency_ms_in_notifications);
+DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_string(superuser_acl);
 DECLARE_string(user_acl);
+DECLARE_uint32(txn_keepalive_interval_ms);
 
 using kudu::client::AuthenticationCredentialsPB;
 using kudu::client::KuduClient;
@@ -107,11 +113,7 @@ class TxnStatusTableITest : public KuduTest {
     ASSERT_OK(cluster_->Start());
 
     // Create the txn system client with which to communicate with the cluster.
-    vector<string> master_addrs;
-    for (const auto& hp : cluster_->master_rpc_addrs()) {
-      master_addrs.emplace_back(hp.ToString());
-    }
-    ASSERT_OK(TxnSystemClient::Create(master_addrs, &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
   }
 
   // Ensures that all replicas have the right table type set.
@@ -353,16 +355,23 @@ TEST_F(TxnStatusTableITest, TestTxnStatusTableColocatedWithTables) {
 TEST_F(TxnStatusTableITest, TestSystemClientFindTablets) {
   ASSERT_OK(txn_sys_client_->CreateTxnStatusTable(100));
   ASSERT_OK(txn_sys_client_->OpenTxnStatusTable());
-  ASSERT_OK(txn_sys_client_->BeginTransaction(1, kUser));
+  uint32_t txn_keepalive_ms;
+  ASSERT_OK(txn_sys_client_->BeginTransaction(1, kUser, &txn_keepalive_ms));
+  ASSERT_EQ(FLAGS_txn_keepalive_interval_ms, txn_keepalive_ms);
   ASSERT_OK(txn_sys_client_->AbortTransaction(1, kUser));
 
   // If we write out of range, we should see an error.
   {
     int64_t highest_seen_txn_id = -1;
-    auto s = txn_sys_client_->BeginTransaction(100, kUser, &highest_seen_txn_id);
+    uint32_t txn_keepalive_ms = 0;
+    auto s = txn_sys_client_->BeginTransaction(
+        100, kUser, &txn_keepalive_ms, &highest_seen_txn_id);
     ASSERT_TRUE(s.IsNotFound()) << s.ToString();
     // The 'highest_seen_txn_id' should be left untouched.
     ASSERT_EQ(-1, highest_seen_txn_id);
+    // txn_keepalive_ms isn't assigned in case of non-OK status.
+    ASSERT_EQ(0, txn_keepalive_ms);
+    ASSERT_NE(0, FLAGS_txn_keepalive_interval_ms);
   }
   {
     auto s = txn_sys_client_->BeginCommitTransaction(100, kUser);
@@ -376,7 +385,8 @@ TEST_F(TxnStatusTableITest, TestSystemClientFindTablets) {
   // Once we add a new range, we should be able to leverage it.
   ASSERT_OK(txn_sys_client_->AddTxnStatusTableRange(100, 200));
   int64_t highest_seen_txn_id = -1;
-  ASSERT_OK(txn_sys_client_->BeginTransaction(100, kUser, &highest_seen_txn_id));
+  ASSERT_OK(txn_sys_client_->BeginTransaction(
+      100, kUser, nullptr /* txn_keepalive_ms */, &highest_seen_txn_id));
   ASSERT_EQ(100, highest_seen_txn_id);
   ASSERT_OK(txn_sys_client_->BeginCommitTransaction(100, kUser));
   ASSERT_OK(txn_sys_client_->AbortTransaction(100, kUser));
@@ -393,7 +403,8 @@ TEST_F(TxnStatusTableITest, TestSystemClientTServerDown) {
   {
     int64_t highest_seen_txn_id = -1;
     auto s = txn_sys_client_->BeginTransaction(
-        1, kUser, &highest_seen_txn_id, MonoDelta::FromMilliseconds(100));
+        1, kUser, nullptr /* txn_keepalive_ms */, &highest_seen_txn_id,
+        MonoDelta::FromMilliseconds(100));
     ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
     // The 'highest_seen_txn_id' should be left untouched.
     ASSERT_EQ(-1, highest_seen_txn_id);
@@ -413,7 +424,8 @@ TEST_F(TxnStatusTableITest, TestSystemClientTServerDown) {
 
   int64_t highest_seen_txn_id = -1;
   ASSERT_OK(txn_sys_client_->BeginTransaction(
-      1, kUser, &highest_seen_txn_id, MonoDelta::FromSeconds(3)));
+      1, kUser, nullptr /* txn_keepalive_ms */, &highest_seen_txn_id,
+      MonoDelta::FromSeconds(3)));
   ASSERT_EQ(highest_seen_txn_id, 1);
 }
 
@@ -421,13 +433,17 @@ TEST_F(TxnStatusTableITest, TestSystemClientBeginTransactionErrors) {
   ASSERT_OK(txn_sys_client_->CreateTxnStatusTable(100));
   ASSERT_OK(txn_sys_client_->OpenTxnStatusTable());
   int64_t highest_seen_txn_id = -1;
-  ASSERT_OK(txn_sys_client_->BeginTransaction(1, kUser, &highest_seen_txn_id));
+  uint32_t txn_keepalive_ms;
+  ASSERT_OK(txn_sys_client_->BeginTransaction(
+      1, kUser, &txn_keepalive_ms, &highest_seen_txn_id));
   ASSERT_EQ(1, highest_seen_txn_id);
+  ASSERT_EQ(FLAGS_txn_keepalive_interval_ms, txn_keepalive_ms);
 
   // Trying to start another transaction with a used ID should yield an error.
   {
     int64_t highest_seen_txn_id = -1;
-    auto s = txn_sys_client_->BeginTransaction(1, kUser, &highest_seen_txn_id);
+    auto s = txn_sys_client_->BeginTransaction(
+        1, kUser, nullptr /* txn_keepalive_ms */, &highest_seen_txn_id);
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_EQ(1, highest_seen_txn_id);
     ASSERT_STR_CONTAINS(s.ToString(), "not higher than the highest ID");
@@ -436,7 +452,8 @@ TEST_F(TxnStatusTableITest, TestSystemClientBeginTransactionErrors) {
   // The same should be true with a different user.
   {
     int64_t highest_seen_txn_id = -1;
-    auto s = txn_sys_client_->BeginTransaction(1, "stranger", &highest_seen_txn_id);
+    auto s = txn_sys_client_->BeginTransaction(
+        1, "stranger", nullptr /* txn_keepalive_ms */, &highest_seen_txn_id);
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_EQ(1, highest_seen_txn_id);
     ASSERT_STR_CONTAINS(s.ToString(), "not higher than the highest ID");
@@ -478,7 +495,8 @@ TEST_F(TxnStatusTableITest, SystemClientCommitAndAbortTransaction) {
   // with already used ID should yield an error.
   {
     int64_t highest_seen_txn_id = -1;
-    auto s = txn_sys_client_->BeginTransaction(1, kUser, &highest_seen_txn_id);
+    auto s = txn_sys_client_->BeginTransaction(
+        1, kUser, nullptr /* txn_keepalive_ms */, &highest_seen_txn_id);
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_EQ(1, highest_seen_txn_id);
     ASSERT_STR_CONTAINS(s.ToString(), "not higher than the highest ID");
@@ -518,6 +536,38 @@ TEST_F(TxnStatusTableITest, SystemClientCommitAndAbortTransaction) {
     ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "transaction ID 3 not owned by stranger");
   }
+}
+
+TEST_F(TxnStatusTableITest, TServerInitializesTxnSystemClient) {
+  auto* mts = cluster_->mini_tablet_server(0);
+  auto* client_initializer = mts->server()->txn_client_initializer();
+  TxnSystemClient* txn_client = nullptr;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(client_initializer->GetClient(&txn_client));
+  });
+  // We should be able to get the client, and use it to make a call.
+  ASSERT_NE(txn_client, nullptr);
+  ASSERT_OK(txn_client->CreateTxnStatusTable(100));
+  txn_client = nullptr;
+
+  // Try shutting down the master, and then restarting the tablet server to
+  // attempt to rebuild a TxnSystemClient. This should fail until the master
+  // comes back up.
+  cluster_->mini_master()->Shutdown();
+  mts->Shutdown();
+  ASSERT_OK(mts->Restart());
+  client_initializer = mts->server()->txn_client_initializer();
+  Status s = client_initializer->GetClient(&txn_client);
+  ASSERT_TRUE(s.IsServiceUnavailable()) << s.ToString();
+  ASSERT_EQ(txn_client, nullptr);
+
+  ASSERT_OK(cluster_->mini_master()->Restart());
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(client_initializer->GetClient(&txn_client));
+  });
+  // We should be able to get the client, and use it to make a call.
+  ASSERT_NE(txn_client, nullptr);
+  ASSERT_OK(txn_client->OpenTxnStatusTable());
 }
 
 TEST_F(TxnStatusTableITest, GetTransactionStatus) {
@@ -614,11 +664,7 @@ class MultiServerTxnStatusTableITest : public TxnStatusTableITest {
     opts.num_tablet_servers = 4;
     cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
     ASSERT_OK(cluster_->Start());
-    vector<string> master_addrs;
-    for (const auto& hp : cluster_->master_rpc_addrs()) {
-      master_addrs.emplace_back(hp.ToString());
-    }
-    ASSERT_OK(TxnSystemClient::Create(master_addrs, &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
 
     // Create the initial transaction status table partitions and start an
     // initial transaction.
@@ -686,8 +732,8 @@ TEST_F(MultiServerTxnStatusTableITest, TestSystemClientLeadershipChange) {
     string new_leader_uuid;
     ASSERT_OK(FindLeaderId(tablet_id, &new_leader_uuid));
     ASSERT_NE(new_leader_uuid, orig_leader_uuid);
+    ASSERT_OK(txn_sys_client_->BeginTransaction(2, kUser));
   });
-  ASSERT_OK(txn_sys_client_->BeginTransaction(2, kUser));
 }
 
 TEST_F(MultiServerTxnStatusTableITest, TestSystemClientCrashedNodes) {
@@ -700,14 +746,141 @@ TEST_F(MultiServerTxnStatusTableITest, TestSystemClientCrashedNodes) {
   ASSERT_FALSE(leader_uuid.empty());
   FLAGS_leader_failure_max_missed_heartbeat_periods = 1;
   cluster_->mini_tablet_server_by_uuid(leader_uuid)->Shutdown();
-  // We have to wait for a leader to be elected. Until that happens, the system
-  // client may try to start transactions on followers, and in doing so use up
-  // transaction IDs. Have the system client try again with a higher
-  // transaction ID until a leader is elected.
   int txn_id = 2;
+  ASSERT_OK(txn_sys_client_->BeginTransaction(++txn_id, kUser));
+}
+
+enum InjectedErrorType {
+  kFailoverTimeoutError,
+  kLeaderStatusError,
+  kLoadFromTabletError
+};
+class TxnStatusTableRetryITest : public MultiServerTxnStatusTableITest,
+                                 public ::testing::WithParamInterface<InjectedErrorType> {
+};
+
+TEST_P(TxnStatusTableRetryITest, TestRetryOnError) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  auto error_type = GetParam();
+  switch (error_type) {
+    case kFailoverTimeoutError:
+      FLAGS_txn_status_tablet_failover_inject_timeout_error = true;
+      break;
+    case kLeaderStatusError:
+      FLAGS_txn_status_tablet_inject_uninitialized_leader_status_error = true;
+      break;
+    case kLoadFromTabletError:
+      FLAGS_txn_status_tablet_inject_load_failure_error = true;
+      break;
+  }
+  // Find the leader and force it to step down. The system client should be
+  // able to find the new leader.
+  const string& tablet_id = GetTabletId();
+  ASSERT_FALSE(tablet_id.empty());
+  string orig_leader_uuid;
+  ASSERT_OK(FindLeaderId(tablet_id, &orig_leader_uuid));
+  ASSERT_FALSE(orig_leader_uuid.empty());
+  cluster_->mini_tablet_server_by_uuid(
+      orig_leader_uuid)->server()->mutable_quiescing()->store(true);
+
+  string new_leader_uuid;
+  TxnStatusEntryPB txn_status;
   ASSERT_EVENTUALLY([&] {
-    ASSERT_OK(txn_sys_client_->BeginTransaction(++txn_id, kUser));
+    ASSERT_OK(FindLeaderId(tablet_id, &new_leader_uuid));
+    ASSERT_NE(new_leader_uuid, orig_leader_uuid);
+    Status s = txn_sys_client_->GetTransactionStatus(1, kUser, &txn_status);
+    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
   });
+  orig_leader_uuid = new_leader_uuid;
+  // After disabling fault injection flag, calls should succeed given
+  // the failed ones will be retried.
+  switch (error_type) {
+    case kFailoverTimeoutError:
+      FLAGS_txn_status_tablet_failover_inject_timeout_error = false;
+      break;
+    case kLeaderStatusError:
+      FLAGS_txn_status_tablet_inject_uninitialized_leader_status_error = false;
+      break;
+    case kLoadFromTabletError:
+      FLAGS_txn_status_tablet_inject_load_failure_error = false;
+      break;
+  }
+  cluster_->mini_tablet_server_by_uuid(
+      orig_leader_uuid)->server()->mutable_quiescing()->store(true);
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(FindLeaderId(tablet_id, &new_leader_uuid));
+    ASSERT_NE(new_leader_uuid, orig_leader_uuid);
+    ASSERT_OK(txn_sys_client_->GetTransactionStatus(1, kUser, &txn_status));
+  });
+}
+
+// Test that calls to transaction status tablets will retry when:
+//   1) timeout on waiting the replica to catch up with all replicated
+//      operations in previous term.
+//   2) leader status is not initialized yet.
+INSTANTIATE_TEST_CASE_P(TestTxnStatusTableRetryOnError,
+                        TxnStatusTableRetryITest,
+                        ::testing::Values(kFailoverTimeoutError,
+                                          kLeaderStatusError,
+                                          kLoadFromTabletError));
+
+class TxnStatusTableElectionStormITest : public TxnStatusTableITest {
+ public:
+  void SetUp() override {
+    KuduTest::SetUp();
+
+    // Make leader elections more frequent to get through this test a bit more
+    // quickly.
+    FLAGS_leader_failure_max_missed_heartbeat_periods = 1;
+    FLAGS_raft_heartbeat_interval_ms = 30;
+    InternalMiniClusterOptions opts;
+    opts.num_tablet_servers = 3;
+    cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
+    ASSERT_OK(cluster_->Start());
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
+
+    // Create the initial transaction status table partitions.
+    ASSERT_OK(txn_sys_client_->CreateTxnStatusTable(100, 3));
+    ASSERT_OK(txn_sys_client_->OpenTxnStatusTable());
+
+   // Inject latency so elections become more frequent and wait a bit for our
+   // latency injection to kick in.
+   FLAGS_raft_enable_pre_election = false;
+   FLAGS_consensus_inject_latency_ms_in_notifications = 1.5 * FLAGS_raft_heartbeat_interval_ms;
+   SleepFor(MonoDelta::FromMilliseconds(FLAGS_raft_heartbeat_interval_ms * 2));
+  }
+};
+
+TEST_F(TxnStatusTableElectionStormITest, TestFrequentElections) {
+  // Ensure concurrent transaction read and write work as expected under frequent
+  // leader elections.
+  const int kNumTxnsPerThread = 5;
+  const int kNumThreads = 5;
+  vector<thread> threads;
+  for (int t = 0; t < kNumThreads; t++) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < kNumTxnsPerThread; i++) {
+        int txn_id = t * kNumTxnsPerThread + i;
+        TxnStatusEntryPB txn_status;
+        Status s = txn_sys_client_->BeginTransaction(txn_id, kUser);
+        // As we don't have guarantee of the threads' execution order, transactions to
+        // be created later can have lower txn ID than previous created ones, which is
+        // not allowed.
+        if (s.ok()) {
+          // Make sure a re-election happens before the following read.
+          SleepFor(MonoDelta::FromMilliseconds(3 * FLAGS_raft_heartbeat_interval_ms));
+
+          CHECK_OK(txn_sys_client_->GetTransactionStatus(txn_id, kUser, &txn_status));
+          CHECK(txn_status.has_user());
+          CHECK_STREQ(kUser, txn_status.user().c_str());
+          CHECK(txn_status.has_state());
+          CHECK_EQ(TxnStatePB::OPEN, txn_status.state());
+        }
+      }
+    });
+  }
+  std::for_each(threads.begin(), threads.end(), [&] (thread& t) { t.join(); });
 }
 
 } // namespace itest

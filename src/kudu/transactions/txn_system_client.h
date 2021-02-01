@@ -16,6 +16,7 @@
 // under the License.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,10 @@
 #include "kudu/util/status_callback.h"
 
 namespace kudu {
+class HostPort;
+class Timestamp;
+class ThreadPool;
+
 namespace client {
 class KuduClient;
 class KuduTable;
@@ -42,9 +47,14 @@ class TxnStatusTableITest;
 class TxnStatusTableITest_TestProtectCreateAndAlter_Test;
 } // namespace itest
 
+namespace rpc {
+class Messenger;
+} // namespace rpc
+
 namespace tserver {
 class CoordinatorOpPB;
 class CoordinatorOpResultPB;
+class ParticipantOpPB;
 } // namespace tserver
 
 namespace transactions {
@@ -55,7 +65,7 @@ class TxnStatusEntryPB;
 // calls to various servers.
 class TxnSystemClient {
  public:
-  static Status Create(const std::vector<std::string>& master_addrs,
+  static Status Create(const std::vector<HostPort>& master_addrs,
                        std::unique_ptr<TxnSystemClient>* sys_client);
 
   // Creates the transaction status table with a single range partition of the
@@ -84,9 +94,12 @@ class TxnSystemClient {
   // parameter (if not null) is set to the highest transaction identifier
   // observed by corresponding TxnStatusManager. Otherwise, the
   // 'highest_seen_txn_id' parameter is unset (e.g., in case of the requeset
-  // to TxnStatusManager timed out).
+  // to TxnStatusManager timed out). The 'keep_alive_ms' output parameter is
+  // populated with number of milliseconds for the transaction's keep-alive
+  // interval in case of success, otherwise it is not set.
   Status BeginTransaction(int64_t txn_id, const
                           std::string& user,
+                          uint32_t* txn_keepalive_ms = nullptr,
                           int64_t* highest_seen_txn_id = nullptr,
                           MonoDelta timeout = MonoDelta::FromSeconds(10));
 
@@ -115,10 +128,24 @@ class TxnSystemClient {
                               TxnStatusEntryPB* txn_status,
                               MonoDelta timeout = MonoDelta::FromSeconds(10));
 
+  // Send keep-alive heartbeat for the specified transaction as the given user.
+  Status KeepTransactionAlive(int64_t txn_id,
+                              const std::string& user,
+                              MonoDelta timeout = MonoDelta::FromSeconds(10));
+
   // Opens the transaction status table, refreshing metadata with that from the
   // masters.
   Status OpenTxnStatusTable();
 
+  // Sends an RPC to the leader of the given tablet to participate in a
+  // transaction.
+  //
+  // If this is a BEGIN_COMMIT op, 'begin_commit_timestamp' is populated on success
+  // with the timestamp used to replicate the op on the participant.
+  Status ParticipateInTransaction(const std::string& tablet_id,
+                                  const tserver::ParticipantOpPB& participant_op,
+                                  const MonoDelta& timeout,
+                                  Timestamp* begin_commit_timestamp = nullptr);
  private:
 
   friend class itest::TxnStatusTableITest;
@@ -137,6 +164,12 @@ class TxnSystemClient {
                                     const StatusCallback& cb,
                                     tserver::CoordinatorOpResultPB* result = nullptr);
 
+  void ParticipateInTransactionAsync(const std::string& tablet_id,
+                                     tserver::ParticipantOpPB participant_op,
+                                     const MonoDelta& timeout,
+                                     StatusCallback cb,
+                                     Timestamp* begin_commit_timestamp = nullptr);
+
   client::sp::shared_ptr<client::KuduTable> txn_status_table() {
     std::lock_guard<simple_spinlock> l(table_lock_);
     return txn_status_table_;
@@ -146,6 +179,44 @@ class TxnSystemClient {
 
   simple_spinlock table_lock_;
   client::sp::shared_ptr<client::KuduTable> txn_status_table_;
+};
+
+// Wrapper around a TxnSystemClient that allows callers to asynchronously
+// create a client.
+// TODO(awong): the problem at hand is similar to TxnManager initialization,
+// minus table creation. Refactor for code reuse?
+class TxnSystemClientInitializer {
+ public:
+  TxnSystemClientInitializer();
+  ~TxnSystemClientInitializer();
+
+  // Starts attempts to initialize the transaction system client.
+  Status Init(const std::shared_ptr<rpc::Messenger>& messenger,
+              std::vector<HostPort> master_addrs);
+
+  // Returns a ServiceUnavailable error if the client has not yet been
+  // initialized or if Shutdown() has been called. Otherwise, returns OK and
+  // sets 'client'. Callers should ensure that 'client' is only used while the
+  // TxnSystemClientInitializer is still in scope.
+  Status GetClient(TxnSystemClient** client) const;
+
+  // Stops the initialization, preventing success of further calls to
+  // GetClient().
+  void Shutdown();
+
+ private:
+  // Whether or not 'txn_client_' has been initialized.
+  std::atomic<bool> init_complete_;
+
+  // Whether or not the client initializer is shutting down, in which case
+  // attempts to access 'txn_client_' should fail.
+  std::atomic<bool> shutting_down_;
+
+  // Threadpool on which to schedule attempts to initialize 'txn_client_'.
+  std::unique_ptr<ThreadPool> txn_client_init_pool_;
+
+  // The TxnSystemClient, initialized asynchronously via calls to Init().
+  std::unique_ptr<TxnSystemClient> txn_client_;
 };
 
 } // namespace transactions

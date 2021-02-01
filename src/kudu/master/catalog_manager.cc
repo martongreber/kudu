@@ -60,7 +60,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <boost/optional/optional_io.hpp> // IWYU pragma: keep
-#include <boost/type_traits/decay.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/arena.h>
@@ -328,6 +327,10 @@ DEFINE_uint32(table_locations_cache_capacity_mb, 0,
               "of 0 means table locations are not be cached");
 TAG_FLAG(table_locations_cache_capacity_mb, advanced);
 
+DEFINE_bool(enable_per_range_hash_schemas, false,
+            "Whether the ability to specify different hash schemas per range is enabled");
+TAG_FLAG(enable_per_range_hash_schemas, unsafe);
+
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_int64(tsk_rotation_seconds);
 
@@ -351,7 +354,6 @@ GROUP_FLAG_VALIDATOR(auto_rebalancing_flags,
 
 using base::subtle::NoBarrier_CompareAndSwap;
 using base::subtle::NoBarrier_Load;
-using boost::make_optional;
 using boost::none;
 using boost::optional;
 using google::protobuf::Map;
@@ -1712,7 +1714,6 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
           RETURN_NOT_OK(partition_schema.MakeUpperBoundRangePartitionKeyExclusive(
                 ops[i].split_row.get()));
         }
-
         range_bounds.emplace_back(*op.split_row, *ops[i].split_row);
         break;
       }
@@ -1721,9 +1722,20 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     }
   }
 
+  PartitionSchema::RangeHashSchema range_hash_schemas;
+  if (FLAGS_enable_per_range_hash_schemas) {
+    for (int i = 0; i < req.range_hash_schemas_size(); i++) {
+      PartitionSchema::HashBucketSchemas hash_bucket_schemas;
+      RETURN_NOT_OK(PartitionSchema::ExtractHashBucketSchemasFromPB(
+          schema, req.range_hash_schemas(i).hash_schemas(), &hash_bucket_schemas));
+      range_hash_schemas.emplace_back(std::move(hash_bucket_schemas));
+    }
+  }
+
   // Create partitions based on specified partition schema and split rows.
   vector<Partition> partitions;
-  RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, range_bounds, schema, &partitions));
+  RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, range_bounds,
+                                                  range_hash_schemas, schema, &partitions));
 
   // If they didn't specify a num_replicas, set it based on the default.
   if (!req.has_num_replicas()) {
@@ -1850,7 +1862,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     }
   });
   const optional<string> dimension_label =
-      req.has_dimension_label() ? make_optional(req.dimension_label()) : none;
+      req.has_dimension_label() ? boost::make_optional(req.dimension_label()) : none;
   for (const Partition& partition : partitions) {
     PartitionPB partition_pb;
     partition.ToPB(&partition_pb);
@@ -2473,7 +2485,7 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
 
     vector<Partition> partitions;
     RETURN_NOT_OK(partition_schema.CreatePartitions(
-        {}, {{ *ops[0].split_row, *ops[1].split_row }}, schema, &partitions));
+        {}, {{ *ops[0].split_row, *ops[1].split_row }}, {}, schema, &partitions));
     switch (step.type()) {
       case AlterTableRequestPB::ADD_RANGE_PARTITION: {
         for (const Partition& partition : partitions) {
@@ -2559,7 +2571,7 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
 
           const optional<string> dimension_label =
               step.add_range_partition().has_dimension_label()
-              ? make_optional(step.add_range_partition().dimension_label())
+              ? boost::make_optional(step.add_range_partition().dimension_label())
               : none;
           PartitionPB partition_pb;
           partition.ToPB(&partition_pb);
@@ -4917,7 +4929,7 @@ void CatalogManager::HandleAssignCreatingTablet(const scoped_refptr<TabletInfo>&
   const PersistentTabletInfo& old_info = tablet->metadata().state();
 
   const optional<string> dimension_label = old_info.pb.has_dimension_label()
-      ? make_optional(old_info.pb.dimension_label())
+      ? boost::make_optional(old_info.pb.dimension_label())
       : none;
   // The "tablet creation" was already sent, but we didn't receive an answer
   // within the timeout. So the tablet will be replaced by a new one.
@@ -5239,7 +5251,7 @@ Status CatalogManager::BuildLocationsForTablet(
 
     const auto role = GetParticipantRole(peer, cstate);
     const optional<string> dimension = l_tablet.data().pb.has_dimension_label()
-        ? make_optional(l_tablet.data().pb.dimension_label())
+        ? boost::make_optional(l_tablet.data().pb.dimension_label())
         : none;
     if (ts_infos_dict) {
       const auto idx = ts_infos_dict->LookupOrAdd(peer.permanent_uuid(), fill_tsinfo_pb);

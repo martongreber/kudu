@@ -278,6 +278,7 @@
           "CORE_DUMP_DIRECTORY" : "${master_core_dump_directory}",
           "KUDU_TRUSTSTORE_LOCATION": "${ssl_client_truststore_location}",
           "KUDU_TRUSTORE_PASSWORD": "${ssl_client_truststore_password}",
+          "KUDU_KEYSTORE_TYPE": "${keystore_type}",
           "RANGER_SERVICE": "${dependency:RANGER}",
           "RANGER_AUDIT_BASE_PATH": "${ranger_base_audit_url}",
           "RANGER_KUDU_HDFS_AUDIT_DIR": "${ranger_kudu_plugin_hdfs_audit_directory}",

@@ -78,7 +78,6 @@ class TransactionsVisitor {
 // Expected usage of this class is to have a management layer that reads and
 // writes to the underlying replica only if it is leader.
 //
-// TODO(awong): ensure that only the leader TxnStatusManager can call these.
 // TODO(awong): delete transactions that are entirely aborted or committed.
 // TODO(awong): consider batching writes.
 class TxnStatusTablet {
@@ -116,6 +115,10 @@ class TxnStatusTablet {
   Status UpdateParticipant(int64_t txn_id, const std::string& tablet_id,
                            const TxnParticipantEntryPB& pb,
                            tserver::TabletServerErrorPB* ts_error);
+
+  const tablet::TabletReplica* tablet_replica() const {
+    return tablet_replica_;
+  }
 
  private:
   friend class TxnStatusManager;

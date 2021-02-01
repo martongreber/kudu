@@ -29,7 +29,6 @@
 #include <vector>
 
 #include <boost/optional/optional.hpp>
-#include <boost/type_traits/decay.hpp>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/common.h>
 
@@ -57,6 +56,7 @@
 #include "kudu/client/table_statistics-internal.h"
 #include "kudu/client/tablet-internal.h"
 #include "kudu/client/tablet_server-internal.h"
+#include "kudu/client/transaction-internal.h"
 #include "kudu/client/value.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
@@ -66,6 +66,7 @@
 #include "kudu/common/row_operations.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/txn_id.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/metadata.pb.h"
@@ -100,10 +101,9 @@
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/version_info.h"
 
-namespace kudu {
-class BlockBloomFilter;
-}  // namespace kudu
-
+using kudu::client::internal::AsyncLeaderMasterRpc;
+using kudu::client::internal::MetaCache;
+using kudu::client::sp::shared_ptr;
 using kudu::consensus::RaftPeerPB;
 using kudu::master::AlterTableRequestPB;
 using kudu::master::AlterTableResponsePB;
@@ -159,15 +159,12 @@ struct tm;
 
 namespace kudu {
 
+class BlockBloomFilter;
 class simple_spinlock;
 
 namespace client {
 
 class ResourceMetrics;
-
-using internal::AsyncLeaderMasterRpc;
-using internal::MetaCache;
-using sp::shared_ptr;
 
 const char* kVerboseEnvVar = "KUDU_CLIENT_VERBOSE";
 
@@ -402,6 +399,61 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
   return Status::OK();
 }
 
+KuduTransaction::SerializationOptions::SerializationOptions()
+    : data_(new Data) {
+}
+
+KuduTransaction::SerializationOptions::~SerializationOptions() {
+  delete data_;
+}
+
+bool KuduTransaction::SerializationOptions::keepalive() const {
+  return data_->enable_keepalive_;
+}
+
+KuduTransaction::SerializationOptions&
+KuduTransaction::SerializationOptions::enable_keepalive(bool enable) {
+  data_->enable_keepalive_ = enable;
+  return *this;
+}
+
+KuduTransaction::KuduTransaction(const sp::shared_ptr<KuduClient>& client)
+    : data_(new KuduTransaction::Data(client)) {
+}
+
+KuduTransaction::~KuduTransaction() {
+  delete data_;
+}
+
+Status KuduTransaction::CreateSession(sp::shared_ptr<KuduSession>* session) {
+  return data_->CreateSession(session);
+}
+
+Status KuduTransaction::Commit(bool wait) {
+  return data_->Commit(wait);
+}
+
+Status KuduTransaction::IsCommitComplete(
+    bool* is_complete, Status* completion_status) {
+  return data_->IsCommitComplete(is_complete, completion_status);
+}
+
+Status KuduTransaction::Rollback() {
+  return data_->Rollback();
+}
+
+Status KuduTransaction::Serialize(
+    string* serialized_txn,
+    const SerializationOptions& options) const {
+  return data_->Serialize(serialized_txn, options);
+}
+
+Status KuduTransaction::Deserialize(const sp::shared_ptr<KuduClient>& client,
+                                    const string& serialized_txn,
+                                    sp::shared_ptr<KuduTransaction>* txn) {
+  return Data::Deserialize(client, serialized_txn, txn);
+}
+
 KuduClient::KuduClient()
   : data_(new KuduClient::Data()) {
   static ObjectIdGenerator oid_generator;
@@ -529,6 +581,15 @@ shared_ptr<KuduSession> KuduClient::NewSession() {
   shared_ptr<KuduSession> ret(new KuduSession(shared_from_this()));
   ret->data_->Init(ret);
   return ret;
+}
+
+Status KuduClient::NewTransaction(sp::shared_ptr<KuduTransaction>* txn) {
+  shared_ptr<KuduTransaction> ret(new KuduTransaction(shared_from_this()));
+  const auto s = ret->data_->Begin(ret);
+  if (s.ok()) {
+    *txn = std::move(ret);
+  }
+  return s;
 }
 
 Status KuduClient::GetTablet(const string& tablet_id, KuduTablet** tablet) {
@@ -1181,8 +1242,7 @@ KuduSession::KuduSession(const shared_ptr<KuduClient>& client)
     : data_(new KuduSession::Data(client, client->data_->messenger_)) {
 }
 
-KuduSession::KuduSession(const shared_ptr<KuduClient>& client,
-                         const TxnId& txn_id)
+KuduSession::KuduSession(const shared_ptr<KuduClient>& client, const TxnId& txn_id)
     : data_(new KuduSession::Data(client, client->data_->messenger_, txn_id)) {
 }
 

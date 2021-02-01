@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <ostream>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
@@ -62,6 +63,7 @@
 #include "kudu/client/schema.h"
 #include "kudu/client/session-internal.h"
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
+#include "kudu/client/transaction-internal.h"
 #include "kudu/client/value.h"
 #include "kudu/client/write_op.h"
 #include "kudu/clock/clock.h"
@@ -73,6 +75,7 @@
 #include "kudu/common/timestamp.h"
 #include "kudu/common/txn_id.h"
 #include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/integral_types.h"
@@ -100,12 +103,17 @@
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
+#include "kudu/tablet/txn_coordinator.h"
+#include "kudu/tablet/txn_participant-test-util.h"
+#include "kudu/transactions/transactions.pb.h"
+#include "kudu/transactions/txn_status_manager.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tablet_server_options.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/util/array_view.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/barrier.h"
@@ -117,6 +125,7 @@
 #include "kudu/util/path_util.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/semaphore.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
@@ -129,6 +138,7 @@ DECLARE_bool(allow_unsafe_replication_factor);
 DECLARE_bool(catalog_manager_support_live_row_count);
 DECLARE_bool(catalog_manager_support_on_disk_size);
 DECLARE_bool(client_use_unix_domain_sockets);
+DECLARE_bool(disable_txn_system_client_init);
 DECLARE_bool(fail_dns_resolution);
 DECLARE_bool(location_mapping_by_uuid);
 DECLARE_bool(log_inject_latency);
@@ -137,6 +147,9 @@ DECLARE_bool(mock_table_metrics_for_testing);
 DECLARE_bool(rpc_listen_on_unix_domain_socket);
 DECLARE_bool(rpc_trace_negotiation);
 DECLARE_bool(scanner_inject_service_unavailable_on_continue_scan);
+DECLARE_bool(txn_manager_enabled);
+DECLARE_bool(txn_manager_lazily_initialized);
+DECLARE_int32(client_tablet_locations_by_id_ttl_ms);
 DECLARE_int32(flush_threshold_mb);
 DECLARE_int32(flush_threshold_secs);
 DECLARE_int32(heartbeat_interval_ms);
@@ -153,11 +166,15 @@ DECLARE_int32(scanner_inject_latency_on_each_batch_ms);
 DECLARE_int32(scanner_max_batch_size_bytes);
 DECLARE_int32(scanner_ttl_ms);
 DECLARE_int32(table_locations_ttl_ms);
+DECLARE_int32(txn_status_manager_inject_latency_load_from_tablet_ms);
 DECLARE_int64(live_row_count_for_testing);
 DECLARE_int64(on_disk_size_for_testing);
 DECLARE_string(location_mapping_cmd);
 DECLARE_string(superuser_acl);
 DECLARE_string(user_acl);
+DECLARE_uint32(txn_keepalive_interval_ms);
+DECLARE_uint32(txn_staleness_tracker_interval_ms);
+DECLARE_uint32(txn_manager_status_table_num_replicas);
 DEFINE_int32(test_scan_num_rows, 1000, "Number of rows to insert and scan");
 
 METRIC_DECLARE_counter(block_manager_total_bytes_read);
@@ -187,7 +204,12 @@ using kudu::rpc::MessengerBuilder;
 using kudu::security::SignedTokenPB;
 using kudu::client::sp::shared_ptr;
 using kudu::tablet::TabletReplica;
+using kudu::transactions::TxnStatusManager;
+using kudu::transactions::TxnTokenPB;
 using kudu::tserver::MiniTabletServer;
+using kudu::tserver::ParticipantOpPB;
+using kudu::tserver::ParticipantRequestPB;
+using kudu::tserver::ParticipantResponsePB;
 using std::function;
 using std::map;
 using std::pair;
@@ -224,6 +246,21 @@ class ClientTest : public KuduTest {
     FLAGS_heartbeat_interval_ms = 10;
     FLAGS_scanner_gc_check_interval_us = 50 * 1000; // 50 milliseconds.
 
+    // Enable TxnManager in Kudu master.
+    FLAGS_txn_manager_enabled = true;
+    // Basic txn-related scenarios in this test assume there is only one
+    // replica of the transaction status table.
+    FLAGS_txn_manager_status_table_num_replicas = 1;
+
+    // Speed up test scenarios which are related to txn keepalive interval.
+#if defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)
+    FLAGS_txn_keepalive_interval_ms = 1500;
+    FLAGS_txn_staleness_tracker_interval_ms = 300;
+#else
+    FLAGS_txn_keepalive_interval_ms = 250;
+    FLAGS_txn_staleness_tracker_interval_ms = 50;
+#endif
+
     SetLocationMappingCmd();
 
     // Start minicluster and wait for tablet servers to connect to master.
@@ -254,6 +291,19 @@ class ClientTest : public KuduTest {
         sync.AsStatusCallback());
     CHECK_OK(sync.Wait());
     return rt;
+  }
+
+  Status MetaCacheLookupById(
+      const string& tablet_id, scoped_refptr<internal::RemoteTablet>* remote_tablet) {
+    remote_tablet->reset();
+    scoped_refptr<internal::RemoteTablet> rt;
+    Synchronizer sync;
+    client_->data_->meta_cache_->LookupTabletById(
+        client_.get(), tablet_id, MonoTime::Max(), &rt,
+        sync.AsStatusCallback());
+    RETURN_NOT_OK(sync.Wait());
+    *remote_tablet = std::move(rt);
+    return Status::OK();
   }
 
   // Generate a set of split rows for tablets used in this test.
@@ -341,6 +391,63 @@ class ClientTest : public KuduTest {
                   RpcsQueueOverflowMetric()->value());
       }
     }
+  }
+
+  // TODO(awong): automatically begin transactions when trying to write to a
+  //              transaction for the first time.
+  void BeginTxnOnParticipants(int64_t txn_id) {
+    for (auto i = 0; i < cluster_->num_tablet_servers(); ++i) {
+      auto* tm = cluster_->mini_tablet_server(i)->server()->tablet_manager();
+      vector<scoped_refptr<TabletReplica>> replicas;
+      tm->GetTabletReplicas(&replicas);
+      for (auto& r : replicas) {
+        // Skip partitions of the transaction status manager.
+        if (r->txn_coordinator()) continue;
+        ParticipantResponsePB resp;
+        WARN_NOT_OK(CallParticipantOp(
+            r.get(), txn_id, ParticipantOpPB::BEGIN_TXN, -1, &resp),
+            "failed to start transaction on participant");;
+      }
+    }
+  }
+
+  // TODO(aserbin): consider removing this method and update the scenarios it
+  //                was used once the transaction orchestration is implemented
+  Status FinalizeCommitTransaction(int64_t txn_id) {
+    for (auto i = 0; i < cluster_->num_tablet_servers(); ++i) {
+      auto* tm = cluster_->mini_tablet_server(i)->server()->tablet_manager();
+      vector<scoped_refptr<TabletReplica>> replicas;
+      tm->GetTabletReplicas(&replicas);
+      for (auto& r : replicas) {
+        auto* c = r->txn_coordinator();
+        if (!c) {
+          continue;
+        }
+        TxnStatusManager::ScopedLeaderSharedLock l(c);
+        auto highest_txn_id = c->highest_txn_id();
+        if (txn_id > highest_txn_id) {
+          continue;
+        }
+        tserver::TabletServerErrorPB ts_error;
+        auto s = c->FinalizeCommitTransaction(txn_id, &ts_error);
+        if (s.IsNotFound()) {
+          continue;
+        }
+        return s;
+      }
+    }
+    return Status::NotFound(Substitute("transaction $0 not found", txn_id));
+  }
+
+  // TODO(aserbin): remove this method and update the scenarios it's used
+  //                once the transaction orchestration is implemented
+  Status FinalizeCommitTransaction(const shared_ptr<KuduTransaction>& txn) {
+    string txn_token;
+    RETURN_NOT_OK(txn->Serialize(&txn_token));
+    TxnTokenPB token;
+    CHECK(token.ParseFromString(txn_token));
+    CHECK(token.has_txn_id());
+    return FinalizeCommitTransaction(token.txn_id());
   }
 
   // Return the number of lookup-related RPCs which have been serviced by the master.
@@ -2133,7 +2240,6 @@ TEST_F(ClientTest, TestMinMaxRangeBounds) {
 }
 
 TEST_F(ClientTest, TestMetaCacheExpiry) {
-  google::FlagSaver saver;
   FLAGS_table_locations_ttl_ms = 25;
   auto& meta_cache = client_->data_->meta_cache_;
 
@@ -2153,9 +2259,258 @@ TEST_F(ClientTest, TestMetaCacheExpiry) {
   ASSERT_FALSE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
 
   // Force a lookup and ensure the entry is refreshed.
-  CHECK_NOTNULL(MetaCacheLookup(client_table_.get(), "").get());
+  ASSERT_NE(nullptr, MetaCacheLookup(client_table_.get(), ""));
+  ASSERT_TRUE(entry.stale());
   ASSERT_TRUE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
   ASSERT_FALSE(entry.stale());
+}
+
+// This test scenario verifies that reset of the metacache is safe while working
+// with the client. The scenario calls MetaCache::ClearCache() in a rather
+// synthetic way, but the natural control flow does something similar to that
+// when alterting a table by adding a new range partition (see
+// KuduTableAlterer::Alter() for details).
+TEST_F(ClientTest, ClearCacheAndConcurrentWorkload) {
+  CountDownLatch latch(1);
+  thread cache_cleaner([&]() {
+    const auto sleep_interval = MonoDelta::FromMilliseconds(3);
+    while (!latch.WaitFor(sleep_interval)) {
+      client_->data_->meta_cache_->ClearCache();
+    }
+  });
+  auto thread_joiner = MakeScopedCleanup([&] {
+    latch.CountDown();
+    cache_cleaner.join();
+  });
+
+  constexpr const int kLowIdx = 0;
+  constexpr const int kHighIdx = 1000;
+  const auto runUntil = MonoTime::Now() + MonoDelta::FromSeconds(1);
+  while (MonoTime::Now() < runUntil) {
+    NO_FATALS(InsertTestRows(client_table_.get(), kHighIdx, kLowIdx));
+    NO_FATALS(UpdateTestRows(client_table_.get(), kLowIdx, kHighIdx));
+    NO_FATALS(DeleteTestRows(client_table_.get(), kLowIdx, kHighIdx));
+  }
+}
+
+TEST_F(ClientTest, TestBasicIdBasedLookup) {
+  auto tablet_ids = cluster_->mini_tablet_server(0)->ListTablets();
+  ASSERT_FALSE(tablet_ids.empty());
+  scoped_refptr<internal::RemoteTablet> rt;
+  for (const auto& tablet_id : tablet_ids) {
+    ASSERT_OK(MetaCacheLookupById(tablet_id, &rt));
+    ASSERT_TRUE(rt != nullptr);
+    ASSERT_EQ(tablet_id, rt->tablet_id());
+  }
+  const auto& kDummyId = "dummy-tablet-id";
+  Status s = MetaCacheLookupById(kDummyId, &rt);
+  ASSERT_TRUE(s.IsNotFound());
+  ASSERT_EQ(nullptr, rt);
+
+  auto& meta_cache = client_->data_->meta_cache_;
+  internal::MetaCacheEntry entry;
+  ASSERT_FALSE(meta_cache->LookupEntryByIdFastPath(kDummyId, &entry));
+}
+
+TEST_F(ClientTest, TestMetaCacheExpiryById) {
+  FLAGS_client_tablet_locations_by_id_ttl_ms = 25;
+  auto tablet_ids = cluster_->mini_tablet_server(0)->ListTablets();
+  ASSERT_FALSE(tablet_ids.empty());
+  const auto& tablet_id = tablet_ids[0];
+
+  auto& meta_cache = client_->data_->meta_cache_;
+  meta_cache->ClearCache();
+  {
+    internal::MetaCacheEntry entry;
+    ASSERT_FALSE(meta_cache->LookupEntryByIdFastPath(tablet_id, &entry));
+    ASSERT_FALSE(entry.Initialized());
+  }
+  {
+    scoped_refptr<internal::RemoteTablet> rt;
+    ASSERT_OK(MetaCacheLookupById(tablet_id, &rt));
+    ASSERT_NE(nullptr, rt);
+    internal::MetaCacheEntry entry;
+    ASSERT_TRUE(meta_cache->LookupEntryByIdFastPath(tablet_id, &entry));
+    ASSERT_TRUE(entry.Initialized());
+    ASSERT_FALSE(entry.stale());
+
+    // After some time, the entry should become stale.
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_client_tablet_locations_by_id_ttl_ms));
+    ASSERT_TRUE(entry.stale());
+  }
+  {
+    internal::MetaCacheEntry entry;
+    ASSERT_FALSE(meta_cache->LookupEntryByIdFastPath(tablet_id, &entry));
+    ASSERT_FALSE(entry.Initialized());
+
+    // Force a lookup and ensure the entry is refreshed only once we refresh the
+    // entry.
+    scoped_refptr<internal::RemoteTablet> rt;
+    ASSERT_OK(MetaCacheLookupById(tablet_id, &rt));
+    ASSERT_NE(nullptr, rt);
+    ASSERT_TRUE(meta_cache->LookupEntryByIdFastPath(tablet_id, &entry));
+    ASSERT_FALSE(entry.stale());
+  }
+}
+
+TEST_F(ClientTest, TestMetaCacheWithKeysAndIds) {
+  auto& meta_cache = client_->data_->meta_cache_;
+  auto tablet_ids = cluster_->mini_tablet_server(0)->ListTablets();
+  ASSERT_FALSE(tablet_ids.empty());
+  const auto& first_tablet_id = tablet_ids[0];
+
+  meta_cache->ClearCache();
+  {
+    internal::MetaCacheEntry entry;
+    ASSERT_FALSE(meta_cache->LookupEntryByIdFastPath(first_tablet_id, &entry));
+    ASSERT_FALSE(entry.Initialized());
+    ASSERT_FALSE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
+    ASSERT_FALSE(entry.Initialized());
+
+    ASSERT_NE(nullptr, MetaCacheLookup(client_table_.get(), ""));
+    ASSERT_TRUE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
+    ASSERT_FALSE(entry.stale());
+  }
+  // Just because we have a cache entry for key-based lookup doesn't mean we
+  // have an entry for id-based lookup.
+  for (const auto& tid : tablet_ids) {
+    {
+      internal::MetaCacheEntry entry;
+      ASSERT_FALSE(meta_cache->LookupEntryByIdFastPath(tid, &entry));
+      ASSERT_FALSE(entry.Initialized());
+
+      // We should be able to force an id-based lookup even if the tablets are
+      // already in the meta cache.
+      scoped_refptr<internal::RemoteTablet> rt;
+      ASSERT_OK(MetaCacheLookupById(tid, &rt));
+      ASSERT_NE(nullptr, rt);
+    }
+    {
+      internal::MetaCacheEntry entry;
+      ASSERT_TRUE(meta_cache->LookupEntryByIdFastPath(tid, &entry));
+      ASSERT_FALSE(entry.stale());
+    }
+  }
+  // Even if we looked up new locations, the key-based cached entry should
+  // still be available.
+  {
+    internal::MetaCacheEntry entry;
+    ASSERT_TRUE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
+    ASSERT_FALSE(entry.stale());
+  }
+  // Let's do that again but with an id-based lookup first.
+  meta_cache->ClearCache();
+  {
+    internal::MetaCacheEntry entry;
+    ASSERT_FALSE(meta_cache->LookupEntryByIdFastPath(first_tablet_id, &entry));
+    ASSERT_FALSE(entry.Initialized());
+    ASSERT_FALSE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
+    ASSERT_FALSE(entry.Initialized());
+  }
+  // Once we do the lookup by ID, we should be able to fast-path the id-based
+  // lookup but not the key-based lookup.
+  {
+    internal::MetaCacheEntry entry;
+    scoped_refptr<internal::RemoteTablet> rt;
+    ASSERT_OK(MetaCacheLookupById(first_tablet_id, &rt));
+    ASSERT_NE(nullptr, rt);
+    ASSERT_TRUE(meta_cache->LookupEntryByIdFastPath(first_tablet_id, &entry));
+    ASSERT_FALSE(entry.stale());
+    ASSERT_FALSE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
+  }
+  // And once we do the key-based lookups, we should be able to see them both
+  // cached.
+  {
+    internal::MetaCacheEntry entry;
+    ASSERT_NE(nullptr, MetaCacheLookup(client_table_.get(), ""));
+    ASSERT_TRUE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
+    ASSERT_FALSE(entry.stale());
+  }
+  {
+    internal::MetaCacheEntry entry;
+    ASSERT_TRUE(meta_cache->LookupEntryByIdFastPath(first_tablet_id, &entry));
+    ASSERT_FALSE(entry.stale());
+  }
+}
+
+TEST_F(ClientTest, TestMetaCacheExpiryWithKeysAndIds) {
+  auto& meta_cache = client_->data_->meta_cache_;
+  meta_cache->ClearCache();
+  auto tablet_ids = cluster_->mini_tablet_server(0)->ListTablets();
+  ASSERT_FALSE(tablet_ids.empty());
+  const auto& first_tablet_id = tablet_ids[0];
+
+  FLAGS_table_locations_ttl_ms = 10000;
+  FLAGS_client_tablet_locations_by_id_ttl_ms = 25;
+  internal::MetaCacheEntry entry;
+  ASSERT_FALSE(meta_cache->LookupEntryByIdFastPath(first_tablet_id, &entry));
+  ASSERT_FALSE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
+
+  // Perform both id-based and key-based lookups.
+  ASSERT_NE(nullptr, MetaCacheLookup(client_table_.get(), ""));
+  scoped_refptr<internal::RemoteTablet> rt;
+  ASSERT_OK(MetaCacheLookupById(first_tablet_id, &rt));
+  ASSERT_NE(nullptr, rt);
+
+  // Wait for our id-based entries to expire. This shouldn't affect our
+  // key-based entries.
+  SleepFor(MonoDelta::FromMilliseconds(FLAGS_client_tablet_locations_by_id_ttl_ms));
+  ASSERT_FALSE(meta_cache->LookupEntryByIdFastPath(first_tablet_id, &entry));
+  ASSERT_TRUE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
+  ASSERT_FALSE(entry.stale());
+
+  FLAGS_client_tablet_locations_by_id_ttl_ms = 10000;
+  FLAGS_table_locations_ttl_ms = 25;
+  meta_cache->ClearCache();
+  ASSERT_NE(nullptr, MetaCacheLookup(client_table_.get(), ""));
+  ASSERT_OK(MetaCacheLookupById(first_tablet_id, &rt));
+  ASSERT_NE(nullptr, rt);
+
+  // Wait for our key-based entries to expire. This shouldn't affect our
+  // id-based entries.
+  SleepFor(MonoDelta::FromMilliseconds(FLAGS_table_locations_ttl_ms));
+  ASSERT_FALSE(meta_cache->LookupEntryByKeyFastPath(client_table_.get(), "", &entry));
+  ASSERT_TRUE(meta_cache->LookupEntryByIdFastPath(first_tablet_id, &entry));
+  ASSERT_FALSE(entry.stale());
+}
+
+// Test that if our cache entry indicates there is no leader, we will perform a
+// lookup and refresh our cache entry.
+TEST_F(ClientTest, TestMetaCacheLookupNoLeaders) {
+  auto& meta_cache = client_->data_->meta_cache_;
+  auto tablet_ids = cluster_->mini_tablet_server(0)->ListTablets();
+  ASSERT_FALSE(tablet_ids.empty());
+  const auto& tablet_id = tablet_ids[0];
+
+  // Populate the cache.
+  scoped_refptr<internal::RemoteTablet> rt;
+  ASSERT_OK(MetaCacheLookupById(tablet_id, &rt));
+  ASSERT_NE(nullptr, rt);
+
+  // Mark the cache entry's replicas as followers.
+  internal::MetaCacheEntry entry;
+  ASSERT_TRUE(meta_cache->LookupEntryByIdFastPath(tablet_id, &entry));
+  ASSERT_FALSE(entry.stale());
+  vector<internal::RemoteReplica> replicas;
+  auto remote_tablet = entry.tablet();
+  remote_tablet->GetRemoteReplicas(&replicas);
+  for (auto& r : replicas) {
+    remote_tablet->MarkTServerAsFollower(r.ts);
+  }
+  const auto has_leader = [&] {
+    remote_tablet->GetRemoteReplicas(&replicas);
+    for (auto& r : replicas) {
+      if (r.role == consensus::RaftPeerPB::LEADER) {
+        return true;
+      }
+    }
+    return false;
+  };
+  ASSERT_FALSE(has_leader());
+  // This should force a lookup RPC, rather than leaving our cache entries
+  // leaderless.
+  ASSERT_OK(MetaCacheLookupById(tablet_id, &rt));
+  ASSERT_TRUE(has_leader());
 }
 
 TEST_F(ClientTest, TestGetTabletServerBlacklist) {
@@ -2792,6 +3147,50 @@ TEST_F(ClientTest, TestWriteTimeout) {
                        R"(Failed to write batch of 1 ops to tablet.*after 1 attempt.*)"
                        R"(Write RPC to 127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:.*timed out)");
   }
+}
+
+// Test that Write RPCs get properly retried through the duration of a restart.
+// This tests the narrow windows during startup and shutdown that RPC services
+// are unregistered, checking that any resuling  "missing service" errors don't
+// get propogated to end users.
+TEST_F(ClientTest, TestWriteWhileRestarting) {
+  shared_ptr<KuduSession> session = client_->NewSession();
+  ASSERT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
+  Status writer_error;
+  int row_id = 1;
+
+  // Writes a row and checks for errors.
+  const auto& write_and_check_error = [&] {
+    RETURN_NOT_OK(ApplyInsertToSession(session.get(), client_table_, row_id++, 1, "row"));
+    RETURN_NOT_OK(session->Flush());
+    // If we successfully flush, check for errors.
+    vector<KuduError*> errors;
+    bool overflow;
+    session->GetPendingErrors(&errors, &overflow);
+    CHECK(!overflow);
+    if (PREDICT_FALSE(!errors.empty())) {
+      return errors[0]->status();
+    }
+    return Status::OK();
+  };
+
+  // Until we finish restarting, hit the tablet server with write requests.
+  CountDownLatch stop(1);
+  thread t([&] {
+    while (writer_error.ok() && stop.count() == 1) {
+      writer_error = write_and_check_error();
+    }
+  });
+  auto thread_joiner = MakeScopedCleanup([&] { t.join(); });
+  auto* ts = cluster_->mini_tablet_server(0);
+  ts->Shutdown();
+  ASSERT_OK(ts->Restart());
+  stop.CountDown();
+  thread_joiner.cancel();
+  t.join();
+
+  // The writer thread should have hit no issues.
+  ASSERT_OK(writer_error);
 }
 
 TEST_F(ClientTest, TestFailedDnsResolution) {
@@ -6585,12 +6984,15 @@ TEST_F(ClientTest, TxnIdOfTransactionalSession) {
   // Check how relevant member fields are populated in case of
   // transactional session.
   {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
     const TxnId kTxnId(0);
     KuduSession s(client_, kTxnId);
 
     const auto& session_data_txn_id = s.data_->txn_id_;
     ASSERT_TRUE(session_data_txn_id.IsValid());
-    ASSERT_EQ(kTxnId.value(), session_data_txn_id.value());
+    const auto& txnId = txn->data_->txn_id_;
+    ASSERT_EQ(txnId.value(), session_data_txn_id.value());
 
     NO_FATALS(apply_single_insert(&s));
 
@@ -6598,7 +7000,7 @@ TEST_F(ClientTest, TxnIdOfTransactionalSession) {
     ASSERT_NE(nullptr, s.data_->batcher_.get());
     const auto& batcher_txn_id = s.data_->batcher_->txn_id();
     ASSERT_TRUE(batcher_txn_id.IsValid());
-    ASSERT_EQ(kTxnId.value(), batcher_txn_id.value());
+    ASSERT_EQ(txnId.value(), batcher_txn_id.value());
   }
 }
 
@@ -6693,6 +7095,609 @@ TEST_F(ClientTest, TestClientLocationNoLocationMappingCmd) {
   ASSERT_TRUE(client_->location().empty());
 }
 
+// Check basic operations of the transaction-related API.
+// TODO(aserbin): add more scenarios and update existing ones to remove explicit
+//                FinalizeCommitTransaction() call when transaction
+//                orchestration is ready (i.e. FinalizeCommitTransaction() is
+//                called for all registered participants by the backend itself).
+TEST_F(ClientTest, TxnBasicOperations) {
+  // KuduClient::NewTransaction() populates the output parameter on success.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    ASSERT_NE(nullptr, txn.get());
+
+    shared_ptr<KuduSession> session;
+    ASSERT_OK(txn->CreateSession(&session));
+    ASSERT_NE(nullptr, session.get());
+    ASSERT_EQ(0, session->CountPendingErrors());
+    ASSERT_OK(session->Close());
+  }
+
+  // Multiple Rollback() calls are OK.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    ASSERT_OK(txn->Rollback());
+    ASSERT_OK(txn->Rollback());
+  }
+
+  // It's possible to rollback a transaction that hasn't yet finalized
+  // its commit phase.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    ASSERT_OK(txn->Commit(false /* wait */));
+    ASSERT_OK(txn->Rollback());
+  }
+
+  // It's impossible to rollback a transaction that has finalized
+  // its commit phase.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    ASSERT_OK(txn->Commit(false /* wait */));
+    ASSERT_OK(FinalizeCommitTransaction(txn));
+    auto cs = Status::Incomplete("other than Status::OK() initial status");
+    bool is_complete = false;
+    ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
+    ASSERT_OK(cs);
+    ASSERT_TRUE(is_complete);
+    auto s = txn->Rollback();
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+  }
+
+  // It's impossible to commit a transaction that's being rolled back.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    ASSERT_OK(txn->Rollback());
+    auto s = txn->Commit(false /* wait */);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "is not open: state: ABORTED");
+  }
+
+  // TODO(aserbin): uncomment this when other parts of transaction lifecycle
+  //                are properly implemented
+#if 0
+  // Insert rows in a transactional session, then rollback the transaction
+  // and make sure the rows are gone.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    shared_ptr<KuduSession> session;
+    ASSERT_OK(txn->CreateSession(&session));
+    NO_FATALS(InsertTestRows(client_table_.get(), session.get(), 10));
+    ASSERT_OK(txn->Rollback());
+    ASSERT_EQ(0, CountRowsFromClient(client_table_.get()));
+  }
+
+  // Insert rows in a transactional session, then commit the transaction
+  // and make sure the expected rows are there.
+  {
+    constexpr auto kRowsNum = 123;
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    shared_ptr<KuduSession> session;
+    ASSERT_OK(txn->CreateSession(&session));
+    NO_FATALS(InsertTestRows(client_table_.get(), session.get(), kRowsNum));
+    ASSERT_OK(txn->Commit());
+    ASSERT_EQ(kRowsNum, CountRowsFromClient(
+        client_table_.get(), KuduScanner::READ_YOUR_WRITES, kNoBound, kNoBound));
+    ASSERT_EQ(0, session->CountPendingErrors());
+  }
+#endif
+}
+
+// Verify the basic functionality of the KuduTransaction::Commit() and
+// KuduTransaction::IsCommitComplete() methods.
+TEST_F(ClientTest, TxnCommit) {
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    bool is_complete = true;
+    Status cs;
+    ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
+    ASSERT_FALSE(is_complete);
+    ASSERT_TRUE(cs.IsIllegalState()) << cs.ToString();
+    ASSERT_STR_CONTAINS(cs.ToString(), "transaction is still open");
+
+    ASSERT_OK(txn->Rollback());
+    ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
+    ASSERT_TRUE(is_complete);
+    ASSERT_TRUE(cs.IsAborted()) << cs.ToString();
+    ASSERT_STR_CONTAINS(cs.ToString(), "transaction has been aborted");
+  }
+
+  {
+    string txn_token;
+    {
+      shared_ptr<KuduTransaction> txn;
+      ASSERT_OK(client_->NewTransaction(&txn));
+      ASSERT_OK(txn->Commit(false /* wait */));
+      // TODO(aserbin): when txn lifecycle is properly implemented, inject a
+      //                delay into the txn finalizing code to make sure
+      //                the transaction stays in the COMMIT_IN_PROGRESS state
+      //                for a while
+      bool is_complete = true;
+      Status cs;
+      ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
+      ASSERT_FALSE(is_complete);
+      ASSERT_TRUE(cs.IsIncomplete()) << cs.ToString();
+      ASSERT_STR_CONTAINS(cs.ToString(), "commit is still in progress");
+      ASSERT_OK(txn->Serialize(&txn_token));
+    }
+
+    // Make sure the transaction isn't aborted once its KuduTransaction handle
+    // goes out of scope.
+    shared_ptr<KuduTransaction> serdes_txn;
+    ASSERT_OK(KuduTransaction::Deserialize(client_, txn_token, &serdes_txn));
+    bool is_complete = true;
+    Status cs;
+    ASSERT_OK(serdes_txn->IsCommitComplete(&is_complete, &cs));
+    ASSERT_FALSE(is_complete);
+    ASSERT_TRUE(cs.IsIncomplete()) << cs.ToString();
+    ASSERT_STR_CONTAINS(cs.ToString(), "commit is still in progress");
+  }
+
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    ASSERT_OK(txn->Commit(false /* wait */));
+    bool is_complete = true;
+    Status cs;
+    ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
+    ASSERT_FALSE(is_complete);
+    ASSERT_TRUE(cs.IsIncomplete()) << cs.ToString();
+    ASSERT_OK(FinalizeCommitTransaction(txn));
+    {
+      bool is_complete = false;
+      auto cs = Status::Incomplete("other than Status::OK() initial status");
+      ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
+      ASSERT_TRUE(is_complete);
+      ASSERT_OK(cs);
+    }
+  }
+
+  // TODO(aserbin): uncomment this when txn lifecycle is properly implemented
+#if 0
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    ASSERT_OK(txn->Commit(false /* wait */));
+    ASSERT_EVENTUALLY([&] {
+      bool is_complete = false;
+      Status cs;
+      ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
+      ASSERT_TRUE(is_complete);
+      ASSERT_OK(cs);
+    });
+  }
+
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    ASSERT_OK(txn->Commit());
+    bool is_complete = false;
+    Status cs = Status::Incomplete("other than Status::OK() initial status");
+    ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
+    ASSERT_TRUE(is_complete);
+    ASSERT_OK(cs);
+  }
+#endif
+}
+
+// This test verifies the behavior of KuduTransaction instance when the bound
+// KuduClient instance gets out of scope.
+TEST_F(ClientTest, TxnHandleLifecycle) {
+  shared_ptr<KuduTransaction> txn;
+  {
+    const auto master_addr = cluster_->mini_master()->bound_rpc_addr().ToString();
+    KuduClientBuilder b;
+    b.add_master_server_addr(master_addr);
+    shared_ptr<KuduClient> c;
+    ASSERT_OK(b.Build(&c));
+    ASSERT_OK(c->NewTransaction(&txn));
+  }
+  auto s = txn->Rollback();
+  ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "associated KuduClient is gone");
+}
+
+TEST_F(ClientTest, TxnCorruptedToken) {
+  vector<pair<string, string>> token_test_cases;
+  token_test_cases.emplace_back("an empty string", "");
+  {
+    TxnTokenPB token;
+    string buf;
+    ASSERT_TRUE(token.SerializeToString(&buf));
+    token_test_cases.emplace_back("empty token", std::move(buf));
+  }
+  {
+    TxnTokenPB token;
+    token.set_txn_id(0);
+    string buf;
+    ASSERT_TRUE(token.SerializeToString(&buf));
+    token_test_cases.emplace_back("missing keepalive_millis field",
+                                  std::move(buf));
+  }
+  {
+    TxnTokenPB token;
+    token.set_keepalive_millis(1000);
+    string buf;
+    ASSERT_TRUE(token.SerializeToString(&buf));
+    token_test_cases.emplace_back("missing txn_id field", std::move(buf));
+  }
+
+  for (const auto& description_and_token : token_test_cases) {
+    SCOPED_TRACE(description_and_token.first);
+    const auto& token = description_and_token.second;
+    shared_ptr<KuduTransaction> serdes_txn;
+    auto s = KuduTransaction::Deserialize(client_, token, &serdes_txn);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  }
+}
+
+// Test scenario to verify serialization/deserialization of transaction tokens.
+TEST_F(ClientTest, TxnToken) {
+  shared_ptr<KuduTransaction> txn;
+  ASSERT_OK(client_->NewTransaction(&txn));
+
+  const TxnId txn_id = txn->data_->txn_id_;
+  ASSERT_TRUE(txn_id.IsValid());
+  const uint32_t txn_keepalive_ms = txn->data_->txn_keep_alive_ms_;
+  ASSERT_GT(txn_keepalive_ms, 0);
+
+  string txn_token;
+  ASSERT_OK(txn->Serialize(&txn_token));
+
+  // Serializing the same transaction again produces the same result.
+  {
+    string token;
+    ASSERT_OK(txn->Serialize(&token));
+    ASSERT_EQ(txn_token, token);
+  }
+
+  // Check the token for consistency.
+  {
+    TxnTokenPB token;
+    ASSERT_TRUE(token.ParseFromString(txn_token));
+    ASSERT_TRUE(token.has_txn_id());
+    ASSERT_EQ(txn_id.value(), token.txn_id());
+    ASSERT_TRUE(token.has_keepalive_millis());
+    ASSERT_EQ(txn_keepalive_ms, token.keepalive_millis());
+  }
+
+  shared_ptr<KuduTransaction> serdes_txn;
+  ASSERT_OK(KuduTransaction::Deserialize(client_, txn_token, &serdes_txn));
+  ASSERT_NE(nullptr, serdes_txn.get());
+  ASSERT_EQ(txn_id, serdes_txn->data_->txn_id_);
+  ASSERT_EQ(txn_keepalive_ms, serdes_txn->data_->txn_keep_alive_ms_);
+
+  // Make sure the KuduTransaction object deserialized from a token is fully
+  // functional.
+  string serdes_txn_token;
+  ASSERT_OK(serdes_txn->Serialize(&serdes_txn_token));
+  ASSERT_EQ(txn_token, serdes_txn_token);
+
+  // TODO(awong): remove once we register participants automatically before
+  // inserting.
+  BeginTxnOnParticipants(txn_id);
+  {
+    static constexpr auto kNumRows = 10;
+    shared_ptr<KuduSession> session;
+    ASSERT_OK(serdes_txn->CreateSession(&session));
+    NO_FATALS(InsertTestRows(client_table_.get(), session.get(), kNumRows));
+    ASSERT_OK(serdes_txn->Commit(false /* wait */));
+
+    // The state of a transaction isn't stored in the token, so initiating
+    // commit of the transaction doesn't change the result of the serialization.
+    string token;
+    ASSERT_OK(serdes_txn->Serialize(&token));
+    ASSERT_EQ(serdes_txn_token, token);
+  }
+
+  // A new transaction should produce in a new, different token.
+  shared_ptr<KuduTransaction> other_txn;
+  ASSERT_OK(client_->NewTransaction(&other_txn));
+  string other_txn_token;
+  ASSERT_OK(other_txn->Serialize(&other_txn_token));
+  ASSERT_NE(txn_token, other_txn_token);
+
+  // The state of a transaction isn't stored in the token, so aborting
+  // the doesn't change the result of the serialization.
+  string token;
+  ASSERT_OK(other_txn->Rollback());
+  ASSERT_OK(other_txn->Serialize(&token));
+  ASSERT_EQ(other_txn_token, token);
+}
+
+// Begin a transaction under one user, and then try to commit/rollback the
+// transaction under different user. The latter should result in
+// Status::NotAuthorized() status.
+TEST_F(ClientTest, AttemptToControlTxnByOtherUser) {
+  static constexpr const char* const kOtherTxnUser = "other-txn-user";
+  const KuduTransaction::SerializationOptions kSerOptions;
+
+  shared_ptr<KuduTransaction> txn;
+  ASSERT_OK(client_->NewTransaction(&txn));
+  string txn_token;
+  ASSERT_OK(txn->Serialize(&txn_token));
+
+  // Transaction identifier is surfacing here only to build the reference error
+  // message for Status::NotAuthorized() returned by attempts to perform
+  // commit/rollback operations below.
+  TxnId txn_id;
+  {
+    TxnTokenPB token;
+    ASSERT_TRUE(token.ParseFromString(txn_token));
+    ASSERT_TRUE(token.has_txn_id());
+    txn_id = token.txn_id();
+  }
+  ASSERT_TRUE(txn_id.IsValid());
+  const auto ref_msg = Substitute(
+      "transaction ID $0 not owned by $1", txn_id.value(), kOtherTxnUser);
+
+  KuduClientBuilder client_builder;
+  string authn_creds;
+  AuthenticationCredentialsPB pb;
+  pb.set_real_user(kOtherTxnUser);
+  ASSERT_TRUE(pb.SerializeToString(&authn_creds));
+  client_builder.import_authentication_credentials(authn_creds);
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(&client_builder, &client));
+  shared_ptr<KuduTransaction> serdes_txn;
+  ASSERT_OK(KuduTransaction::Deserialize(client, txn_token, &serdes_txn));
+  const vector<pair<string, Status>> txn_ctl_results = {
+    { "rollback", serdes_txn->Rollback() },
+    { "commit", serdes_txn->Commit(false /* wait */) },
+  };
+  for (const auto& op_and_status : txn_ctl_results) {
+    SCOPED_TRACE(op_and_status.first);
+    const auto& s = op_and_status.second;
+    ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), ref_msg);
+  }
+}
+
+TEST_F(ClientTest, NoTxnManager) {
+  shared_ptr<KuduTransaction> txn;
+  ASSERT_OK(client_->NewTransaction(&txn));
+
+  // Shutdown all masters: a TxnManager is a part of master, so after shutting
+  // down all masters in the cluster there will be no single TxnManager running.
+  cluster_->ShutdownNodes(cluster::ClusterNodes::MASTERS_ONLY);
+
+  {
+    shared_ptr<KuduTransaction> txn;
+    auto s = client_->NewTransaction(&txn);
+    ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "Client connection negotiation failed");
+  }
+
+  const vector<pair<string, Status>> txn_ctl_results = {
+    { "rollback", txn->Rollback() },
+    { "commit", txn->Commit(false /* wait */) },
+  };
+  for (const auto& op_and_status : txn_ctl_results) {
+    SCOPED_TRACE(op_and_status.first);
+    const auto& s = op_and_status.second;
+    ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "Client connection negotiation failed");
+  }
+}
+
+class ClientTxnManagerProxyTest : public ClientTest {
+ public:
+  void SetUp() override {
+    // To avoid extra latency in addition to already injected ones, scenarios
+    // based on setup can assume assume the initial txn status tablet is already
+    // created.
+    FLAGS_txn_manager_lazily_initialized = false;
+
+    // Inject latency into the process of loading txn status data from the
+    // backing tablet, so TxnStatusManager would respond with
+    // ServiceUnavailable() for some time right after starting up.
+    FLAGS_txn_status_manager_inject_latency_load_from_tablet_ms = 3000;
+
+    ClientTest::SetUp();
+    ASSERT_OK(cluster_->mini_master()->master()->WaitForTxnManagerInit());
+  }
+};
+
+// This is a scenario to verify the retry logic in the client: if receiving
+// ServiceNotAvailable() error status, it should retry its RPCs to TxnManager
+// a bit later.
+TEST_F(ClientTxnManagerProxyTest, RetryOnServiceUnavailable) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  shared_ptr<KuduTransaction> txn;
+  ASSERT_OK(client_->NewTransaction(&txn));
+}
+
+TEST_F(ClientTest, TxnKeepAlive) {
+  // Begin a transaction and wait for longer than the keepalive interval
+  // (with some margin). If there were no txn keepalive messages sent,
+  // the transaction would be automatically aborted. Since the client
+  // sends keepalive heartbeats under the hood, it's still possible to commit
+  // the transaction after some period of inactivity.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+
+    SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_txn_keepalive_interval_ms));
+
+    ASSERT_OK(txn->Commit(false /* wait */));
+    ASSERT_OK(FinalizeCommitTransaction(txn));
+  }
+
+  // Begin a transaction and move its KuduTransaction object out of the
+  // scope. After txn keepalive interval (with some margin) the system should
+  // automatically abort the transaction.
+  {
+    string txn_token;
+    {
+      shared_ptr<KuduTransaction> txn;
+      ASSERT_OK(client_->NewTransaction(&txn));
+      ASSERT_OK(txn->Serialize(&txn_token));
+    }
+
+    SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_txn_keepalive_interval_ms));
+
+    // The transaction should be automatically aborted since no keepalive
+    // requests were sent once the original KuduTransaction object went out
+    // of the scope.
+    shared_ptr<KuduTransaction> serdes_txn;
+    ASSERT_OK(KuduTransaction::Deserialize(client_, txn_token, &serdes_txn));
+    auto s = serdes_txn->Commit(false /* wait */);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORTED");
+  }
+
+  // Begin a new transaction and move the KuduTransaction object out of the
+  // scope. If the transaction handle is deserialized from a txn token that
+  // hadn't keepalive enabled when serialized, the transaction should be
+  // automatically aborted after txn keepalive timeout.
+  {
+    string txn_token;
+    {
+      shared_ptr<KuduTransaction> txn;
+      ASSERT_OK(client_->NewTransaction(&txn));
+      ASSERT_OK(txn->Serialize(&txn_token));
+    }
+
+    shared_ptr<KuduTransaction> serdes_txn;
+    ASSERT_OK(KuduTransaction::Deserialize(client_, txn_token, &serdes_txn));
+    ASSERT_NE(nullptr, serdes_txn.get());
+
+    SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_txn_keepalive_interval_ms));
+
+    auto s = serdes_txn->Commit(false /* wait */);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORTED");
+  }
+
+  // Begin a new transaction and move the KuduTransaction object out of the
+  // scope. If the transaction handle is deserialized from a txn token that
+  // had keepalive enabled when serialized, the transaction should stay alive
+  // even if the original KuduTransaction object went out of the scope.
+  // It's assumed that no longer than the keepalive timeout interval has passed
+  // between the original transaction handle got out of scope and the new
+  // one has been created from the token.
+  {
+    string txn_token;
+    {
+      shared_ptr<KuduTransaction> txn;
+      ASSERT_OK(client_->NewTransaction(&txn));
+      KuduTransaction::SerializationOptions options;
+      options.enable_keepalive(true);
+      ASSERT_OK(txn->Serialize(&txn_token, options));
+    }
+
+    shared_ptr<KuduTransaction> serdes_txn;
+    ASSERT_OK(KuduTransaction::Deserialize(client_, txn_token, &serdes_txn));
+
+    SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_txn_keepalive_interval_ms));
+
+    ASSERT_OK(serdes_txn->Commit(false /* wait */));
+    ASSERT_OK(FinalizeCommitTransaction(serdes_txn));
+  }
+}
+
+// A scenario to explicitly show that long-running transactions are not aborted
+// if Kudu masters are not available for periods of time shorter than the txn
+// keepalive interval.
+TEST_F(ClientTest, TxnKeepAliveAndUnavailableTxnManagerShortTime) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+#if defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)
+  // ASAN and TSAN use longer intervals to avoid flakiness: it takes some
+  // time to restart masters, and that adds up to the unavailability interval.
+  constexpr const auto kUnavailabilityIntervalMs = 5000;
+#else
+  constexpr const auto kUnavailabilityIntervalMs = 1000;
+#endif
+
+  // To avoid flakiness, set the txn keepalive interval longer than it is in
+  // other scenarios (NOTE: it's still much shorter than it's default value
+  // to be used in real life).
+  //
+  // The cluster is restarted to avoid TSAN warnings on the access to the
+  // flag values by the stale txn monitoring thread and the assignments below.
+  cluster_->Shutdown();
+  FLAGS_txn_keepalive_interval_ms = 3 * kUnavailabilityIntervalMs;
+  FLAGS_txn_staleness_tracker_interval_ms = kUnavailabilityIntervalMs / 8;
+  ASSERT_OK(cluster_->Start());
+
+  shared_ptr<KuduTransaction> txn;
+  ASSERT_OK(client_->NewTransaction(&txn));
+
+  // Shutdown masters -- they host TxnManager instances which proxy txn-related
+  // RPC calls from clients to corresponding TxnStatusManager.
+  cluster_->ShutdownNodes(cluster::ClusterNodes::MASTERS_ONLY);
+
+  // An attempt to commit a transaction should fail right away (i.e. no retries)
+  // due to unreachable masters.
+  {
+    auto s = txn->Commit(false /* wait */);
+    ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "connection negotiation failed");
+    ASSERT_STR_CONTAINS(s.ToString(), "Connection refused");
+  }
+
+  // Wait for some time, but not too long to allow the system to get txn
+  // keepalive heartbeat before the timeout.
+  SleepFor(MonoDelta::FromMilliseconds(kUnavailabilityIntervalMs));
+
+  // Start masters back.
+  for (auto idx = 0; idx < cluster_->num_masters(); ++idx) {
+    ASSERT_OK(cluster_->mini_master(idx)->Restart());
+  }
+
+  // Now, when masters are back and running, the client should be able
+  // to commit the transaction. It should not be automatically aborted.
+  ASSERT_OK(txn->Commit(false /* wait */));
+  ASSERT_OK(FinalizeCommitTransaction(txn));
+}
+
+// A scenario to explicitly show that long-running transactions are
+// aborted if Kudu masters are not available for time period longer than
+// the txn keepalive interval.
+TEST_F(ClientTest, TxnKeepAliveAndUnavailableTxnManagerLongTime) {
+  shared_ptr<KuduTransaction> txn;
+  ASSERT_OK(client_->NewTransaction(&txn));
+
+  // Shutdown masters -- they host TxnManager instances which proxy txn-related
+  // RPC calls from clients to corresponding TxnStatusManager.
+  cluster_->ShutdownNodes(cluster::ClusterNodes::MASTERS_ONLY);
+
+  // Wait for some time to allow the system to detect stale transactions.
+  SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_txn_keepalive_interval_ms));
+
+  // An attempt to commit a transaction should fail due to unreachable masters.
+  {
+    auto s = txn->Commit(false /* wait */);
+    ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "connection negotiation failed");
+    ASSERT_STR_CONTAINS(s.ToString(), "Connection refused");
+  }
+
+  // Start masters back.
+  for (auto idx = 0; idx < cluster_->num_masters(); ++idx) {
+    ASSERT_OK(cluster_->mini_master(idx)->Restart());
+  }
+
+  // Now, when masters are back and running, the client should get the
+  // Status::IllegalState() status back when trying to commit the transaction
+  // which has been automatically aborted by the system due to not receiving
+  // any txn keepalive messages for longer than prescribed by the
+  // --txn_keepalive_interval_ms flag.
+  {
+    auto s = txn->Commit(false /* wait */);
+    ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORTED");
+  }
+}
+
 // Client test that assigns locations to clients and tablet servers.
 // For now, assigns a uniform location to all clients and tablet servers.
 class ClientWithLocationTest : public ClientTest {
@@ -6704,6 +7709,10 @@ class ClientWithLocationTest : public ClientTest {
     FLAGS_location_mapping_cmd = strings::Substitute("$0 $1",
                                                      location_cmd_path, location);
     FLAGS_location_mapping_by_uuid = true;
+
+    // Some of these tests assume no client activity, so disable the
+    // transaction system client.
+    FLAGS_disable_txn_system_client_init = true;
   }
 };
 
@@ -6801,7 +7810,8 @@ TEST_F(ClientTest, TestProjectionPredicatesFuzz) {
   Random rng(SeedRandom());
   vector<string> projected_col_names =
       SelectRandomSubset<vector<string>, string, Random>(all_col_names, 0, &rng);
-  std::random_shuffle(projected_col_names.begin(), projected_col_names.end());
+  std::mt19937 gen(SeedRandom());
+  std::shuffle(projected_col_names.begin(), projected_col_names.end(), gen);
   ASSERT_OK(scanner->SetProjectedColumnNames(projected_col_names));
 
   // Insert some rows with randomized keys, flushing the tablet periodically.

@@ -77,7 +77,7 @@ if [[ -f "/usr/bin/yum" ]]; then
   # to install the ninja-build package.
   if [[ "$OS_MAJOR_VERSION" -gt "7" ]]; then
     yum install -y 'dnf-command(config-manager)'
-    yum config-manager --set-enabled PowerTools
+    yum config-manager --set-enabled powertools
   fi
 
   # Install libraries often used for Kudu development and build performance.
@@ -97,13 +97,11 @@ if [[ -f "/usr/bin/yum" ]]; then
   #  ruby-devel \
   #  zlib-devel
 
-  # To build on a version older than 7.0, the Red Hat Developer Toolset
-  # must be installed (in order to have access to a C++11 capable compiler).
-  if [[ "$OS_MAJOR_VERSION" -lt "7" ]]; then
-    DTLS_REPO_URL=https://copr.fedorainfracloud.org/coprs/rhscl/devtoolset-3/repo/epel-6/rhscl-devtoolset-3-epel-6.repo
-    yum install -y scl-utils yum-utils
-    yum-config-manager --add-repo=${DTLS_REPO_URL}
-    yum install -y devtoolset-3-toolchain
+  # To build on a version older than 8.0, the Red Hat Developer Toolset
+  # must be installed (in order to have access to a C++17 capable compiler).
+  if [[ "$OS_MAJOR_VERSION" -lt "8" ]]; then
+    yum install -y centos-release-scl-rh
+    yum install -y devtoolset-8
   fi
 
   # Reduce the image size by cleaning up after the install.
@@ -181,6 +179,60 @@ elif [[ -f "/usr/bin/apt-get" ]]; then
   rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
   unset DEBIAN_FRONTEND
+  # OpenSUSE/SLES
+elif [[ -f "/usr/bin/zypper" ]]; then
+  # Update the repo.
+  zypper update -y
+
+  zypper install -y \
+    autoconf \
+    automake \
+    chrony \
+    chrpath \
+    cyrus-sasl-devel \
+    cyrus-sasl-gssapi \
+    cyrus-sasl-plain \
+    curl \
+    flex \
+    gcc \
+    gcc-c++ \
+    gdb \
+    git \
+    gzip \
+    hostname \
+    krb5-devel \
+    krb5-server \
+    libtool \
+    lsb-release \
+    lsof \
+    make \
+    openssl-devel \
+    patch \
+    pkg-config \
+    python \
+    rsync \
+    sudo \
+    unzip \
+    vim \
+    which \
+    wget
+
+  # Install extra impala packages for the impala images. They are nominal in size.
+  # TODO(ghenke): tzdata equivalent package. This is not an issue given we currently
+  # only build the Impala images with in CentOS 7.
+  zypper install -y \
+    libffi-devel \
+    liblzo2-2
+
+  # Install libraries often used for Kudu development and build performance.
+  zypper install -y \
+    ccache \
+    cmake \
+    ninja
+
+  # Reduce the image size by cleaning up after the install.
+  zypper clean --all
+  rm -rf /var/lib/zypp/* /tmp/* /var/tmp/*
 else
   echo "Unsupported OS"
   exit 1

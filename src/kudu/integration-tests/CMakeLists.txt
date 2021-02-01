@@ -36,6 +36,7 @@ set(INTEGRATION_TESTS_SRCS
 
 add_library(itest_util ${INTEGRATION_TESTS_SRCS})
 target_link_libraries(itest_util
+  tablet_test_util
   tserver_proto
   tserver_test_util
   master_proto
@@ -133,6 +134,7 @@ ADD_KUDU_TEST(tombstoned_voting-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(token_signer-itest)
 ADD_KUDU_TEST(txn_participant-itest)
 ADD_KUDU_TEST(txn_status_table-itest)
+ADD_KUDU_TEST(txn_status_manager-itest)
 ADD_KUDU_TEST(location_assignment-itest
   DATA_FILES ../scripts/assign-location.py)
 ADD_KUDU_TEST(ts_authz-itest NUM_SHARDS 2)

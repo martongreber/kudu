@@ -58,6 +58,7 @@
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet.pb.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/env.h"
@@ -86,6 +87,7 @@ using kudu::rpc::RpcController;
 using kudu::server::ServerStatusPB;
 using kudu::tserver::ListTabletsRequestPB;
 using kudu::tserver::ListTabletsResponsePB;
+using kudu::tserver::TabletServerAdminServiceProxy;
 using kudu::tserver::TabletServerServiceProxy;
 using std::copy;
 using std::pair;
@@ -720,9 +722,11 @@ void ExternalMiniCluster::AssertNoCrashes() {
   ASSERT_EQ(0, num_crashes) << "At least one process crashed";
 }
 
-Status ExternalMiniCluster::WaitForTabletsRunning(ExternalTabletServer* ts,
-                                                  int min_tablet_count,
-                                                  const MonoDelta& timeout) {
+Status ExternalMiniCluster::WaitForTabletsRunning(
+    ExternalTabletServer* ts,
+    int min_tablet_count,
+    const MonoDelta& timeout,
+    vector<TabletIdAndTableName>* tablets_info) {
   TabletServerServiceProxy proxy(messenger_, ts->bound_rpc_addr(), ts->bound_rpc_addr().host());
   ListTabletsRequestPB req;
   ListTabletsResponsePB resp;
@@ -747,6 +751,17 @@ Status ExternalMiniCluster::WaitForTabletsRunning(ExternalTabletServer* ts,
     // 1. All the tablets are running, and
     // 2. We've observed as many tablets as we had expected or more.
     if (all_running && resp.status_and_schema_size() >= min_tablet_count) {
+      if (tablets_info) {
+        tablets_info->clear();
+        const auto num_elems = resp.status_and_schema_size();
+        tablets_info->reserve(num_elems);
+        for (auto i = 0; i < num_elems; ++i) {
+          const auto& elem = resp.status_and_schema(i);
+          tablets_info->emplace_back(
+              TabletIdAndTableName{elem.tablet_status().tablet_id(),
+                                   elem.tablet_status().table_name()});
+        }
+      }
       return Status::OK();
     }
 
@@ -877,6 +892,13 @@ std::shared_ptr<TabletServerServiceProxy> ExternalMiniCluster::tserver_proxy(int
   CHECK_LT(idx, tablet_servers_.size());
   const auto& addr = CHECK_NOTNULL(tablet_server(idx))->bound_rpc_addr();
   return std::make_shared<TabletServerServiceProxy>(messenger_, addr, addr.host());
+}
+
+std::shared_ptr<TabletServerAdminServiceProxy> ExternalMiniCluster::tserver_admin_proxy(
+    int idx) const {
+  CHECK_LT(idx, tablet_servers_.size());
+  const auto& addr = CHECK_NOTNULL(tablet_server(idx))->bound_rpc_addr();
+  return std::make_shared<TabletServerAdminServiceProxy>(messenger_, addr, addr.host());
 }
 
 Status ExternalMiniCluster::CreateClient(client::KuduClientBuilder* builder,

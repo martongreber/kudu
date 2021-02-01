@@ -88,10 +88,19 @@ DEFINE_double(sys_catalog_fail_during_write, 0.0,
               "Fraction of the time when system table writes will fail");
 TAG_FLAG(sys_catalog_fail_during_write, hidden);
 
+// Following flags related to dynamic multi-master are hidden till the feature is ready to
+// be advertised.
 DEFINE_string(master_address_add_new_master, "",
               "Address of master to add as a NON_VOTER on creating a distributed master config.");
 TAG_FLAG(master_address_add_new_master, unsafe);
 TAG_FLAG(master_address_add_new_master, hidden);
+
+DEFINE_bool(master_consensus_allow_status_msg_for_failed_peer, false,
+            "Allows status-only Raft messages to be sent to a master peer in FAILED_UNRECOVERABLE "
+            "state.");
+TAG_FLAG(master_consensus_allow_status_msg_for_failed_peer, advanced);
+TAG_FLAG(master_consensus_allow_status_msg_for_failed_peer, hidden);
+TAG_FLAG(master_consensus_allow_status_msg_for_failed_peer, runtime);
 
 DECLARE_bool(master_support_change_config);
 DECLARE_int64(rpc_max_message_size);
@@ -313,7 +322,7 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
 
   vector<KuduPartialRow> split_rows;
   vector<Partition> partitions;
-  RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, {}, schema, &partitions));
+  RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, {}, {}, schema, &partitions));
   DCHECK_EQ(1, partitions.size());
 
   RETURN_NOT_OK(tablet::TabletMetadata::CreateNew(fs_manager,
@@ -462,13 +471,17 @@ Status SysCatalogTable::SetupTablet(
       cmeta_manager_,
       local_peer_pb_,
       master_->tablet_apply_pool(),
+      /*reload_txn_status_tablet_pool*/nullptr,
       /*txn_coordinator_factory*/ nullptr,
       [this, tablet_id](const string& reason) {
         this->SysCatalogStateChanged(tablet_id, reason);
       }));
-  RETURN_NOT_OK_SHUTDOWN(tablet_replica_->Init({ /*quiescing*/nullptr,
-                                                 master_->num_raft_leaders(),
-                                                 master_->raft_pool() }),
+
+  consensus::ServerContext server_ctx{/*quiescing*/nullptr,
+                                      master_->num_raft_leaders(),
+                                      master_->raft_pool(),
+                                      &FLAGS_master_consensus_allow_status_msg_for_failed_peer};
+  RETURN_NOT_OK_SHUTDOWN(tablet_replica_->Init(std::move(server_ctx)),
                          "failed to initialize system catalog replica");
 
   shared_ptr<Tablet> tablet;

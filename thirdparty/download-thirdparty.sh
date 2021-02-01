@@ -199,14 +199,21 @@ fetch_and_patch \
  $GPERFTOOLS_SOURCE \
  $GPERFTOOLS_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/gperftools-Replace-namespace-base-with-namespace-tcmalloc.patch" \
- "patch -p1 < $TP_DIR/patches/gperftools-unbreak-memz.patch" \
  "autoreconf -fvi"
 
+# NOTE: creating an empty 'third_party/googletest/m4' subdir is a recipe from
+# the $PROTOBUF_SOURCE/autogen.sh file:
+#
+#   The absence of a m4 directory in googletest causes autoreconf to fail when
+#   building under the CentOS docker image. It's a warning in regular build on
+#   Ubuntu/gLinux as well.
+#
 PROTOBUF_PATCHLEVEL=0
 fetch_and_patch \
- protobuf-${PROTOBUF_VERSION}.tar.gz \
+ protobuf-cpp-${PROTOBUF_VERSION}.tar.gz \
  $PROTOBUF_SOURCE \
  $PROTOBUF_PATCHLEVEL \
+ "mkdir -p third_party/googletest/m4" \
  "autoreconf -fvi"
 
 # Returns 0 if cmake should be patched to work around this bug [1].
@@ -255,11 +262,12 @@ fetch_and_patch \
  $ZLIB_SOURCE \
  $ZLIB_PATCHLEVEL
 
-LIBEV_PATCHLEVEL=0
+LIBEV_PATCHLEVEL=1
 fetch_and_patch \
  libev-${LIBEV_VERSION}.tar.gz \
  $LIBEV_SOURCE \
- $LIBEV_PATCHLEVEL
+ $LIBEV_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/libev-c17.patch"
 
 RAPIDJSON_PATCHLEVEL=1
 fetch_and_patch \
@@ -474,7 +482,6 @@ fetch_and_patch \
  $RANGER_NAME.tar.gz \
  $RANGER_SOURCE \
  $RANGER_PATCHLEVEL \
- "patch -p1 < $TP_DIR/patches/ranger-python3.patch" \
  "patch -p0 < $TP_DIR/patches/ranger-fixscripts.patch"
 
 echo "---------------"

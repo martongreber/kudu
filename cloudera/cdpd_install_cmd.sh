@@ -75,6 +75,10 @@ export CCACHE_NOHASHDIR=1
 ccache -z || true
 ccache -p || true
 
+# TODO(RELENG-12258): Remove workaround once devtoolset-8 is availiable in the base image.
+# Install devtoolset-8 which is required to build Kudu on Centos 7
+sudo yum install -y centos-release-scl-rh && sudo yum install -y devtoolset-8
+
 # Build thirdparty.
 build-support/enable_devtoolset.sh thirdparty/build-if-necessary.sh
 

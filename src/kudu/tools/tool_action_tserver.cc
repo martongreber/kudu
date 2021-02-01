@@ -23,7 +23,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/algorithm/string/predicate.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -37,6 +36,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
@@ -47,6 +47,7 @@
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/util/init.h"
 #include "kudu/util/status.h"
+#include "kudu/util/string_case.h"
 
 DEFINE_bool(allow_missing_tserver, false, "If true, performs the action on the "
     "tserver even if it has not been registered with the master and has no "
@@ -81,10 +82,6 @@ using tserver::TabletServerAdminServiceProxy;
 namespace tools {
 namespace {
 
-const char* const kTServerAddressArg = "tserver_address";
-const char* const kTServerAddressDesc = "Address of a Kudu Tablet Server of "
-    "form 'hostname:port'. Port may be omitted if the Tablet Server is bound "
-    "to the default port.";
 const char* const kTServerIdArg = "tserver_uuid";
 const char* const kTServerIdDesc = "UUID of a Kudu Tablet Server";
 const char* const kFlagArg = "flag";
@@ -132,7 +129,7 @@ Status ListTServers(const RunnerContext& context) {
   const vector<string> cols = strings::Split(FLAGS_columns, ",", strings::SkipEmpty());
   ListTabletServersRequestPB req;
   for (const auto& col : cols) {
-    if (boost::iequals(col, "state")) {
+    if (iequals(col, "state")) {
       req.set_include_states(true);
     }
   }
@@ -154,44 +151,44 @@ Status ListTServers(const RunnerContext& context) {
 
   for (const auto& column : cols) {
     vector<string> values;
-    if (boost::iequals(column, "uuid")) {
+    if (iequals(column, "uuid")) {
       for (const auto& server : servers) {
         values.emplace_back(server.instance_id().permanent_uuid());
       }
-    } else if (boost::iequals(column, "seqno")) {
+    } else if (iequals(column, "seqno")) {
       for (const auto& server : servers) {
         values.emplace_back(std::to_string(server.instance_id().instance_seqno()));
       }
-    } else if (boost::iequals(column, "rpc-addresses") ||
-               boost::iequals(column, "rpc_addresses")) {
+    } else if (iequals(column, "rpc-addresses") ||
+               iequals(column, "rpc_addresses")) {
       for (const auto& server : servers) {
         values.emplace_back(JoinMapped(server.registration().rpc_addresses(),
                                        hostport_to_string, ","));
       }
-    } else if (boost::iequals(column, "http-addresses") ||
-               boost::iequals(column, "http_addresses")) {
+    } else if (iequals(column, "http-addresses") ||
+               iequals(column, "http_addresses")) {
       for (const auto& server : servers) {
         values.emplace_back(JoinMapped(server.registration().http_addresses(),
                                        hostport_to_string, ","));
       }
-    } else if (boost::iequals(column, "version")) {
+    } else if (iequals(column, "version")) {
       for (const auto& server : servers) {
         values.emplace_back(server.registration().software_version());
       }
-    } else if (boost::iequals(column, "heartbeat")) {
+    } else if (iequals(column, "heartbeat")) {
       for (const auto& server : servers) {
         values.emplace_back(Substitute("$0ms", server.millis_since_heartbeat()));
       }
-    } else if (boost::iequals(column, "location")) {
+    } else if (iequals(column, "location")) {
       for (const auto& server : servers) {
         string loc = server.location();
         values.emplace_back(loc.empty() ? "<none>" : std::move(loc));
       }
-    } else if (boost::iequals(column, "start_time")) {
+    } else if (iequals(column, "start_time")) {
       for (const auto& server : servers) {
         values.emplace_back(StartTimeToString(server.registration()));
       }
-    } else if (boost::iequals(column, "state")) {
+    } else if (iequals(column, "state")) {
       for (const auto& server : servers) {
         values.emplace_back(TServerStatePB_Name(server.state()));
       }
@@ -303,18 +300,15 @@ Status QuiescingStatus(const RunnerContext& context) {
 
 unique_ptr<Mode> BuildTServerMode() {
   unique_ptr<Action> dump_memtrackers =
-      ActionBuilder("dump_memtrackers", &TserverDumpMemTrackers)
+      TServerActionBuilder("dump_memtrackers", &TserverDumpMemTrackers)
       .Description("Dump the memtrackers from a Kudu Tablet Server")
-      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
       .AddOptionalParameter("format")
       .AddOptionalParameter("memtracker_output")
-      .AddOptionalParameter("timeout_ms")
       .Build();
 
   unique_ptr<Action> get_flags =
-      ActionBuilder("get_flags", &TServerGetFlags)
+      TServerActionBuilder("get_flags", &TServerGetFlags)
       .Description("Get the gflags for a Kudu Tablet Server")
-      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
       .AddOptionalParameter("all_flags")
       .AddOptionalParameter("flags")
       .AddOptionalParameter("flag_tags")
@@ -323,7 +317,7 @@ unique_ptr<Mode> BuildTServerMode() {
   unique_ptr<Action> run =
       ActionBuilder("run", &TServerRun)
       .ProgramName("kudu-tserver")
-      .Description("Runs a Kudu Tablet Server")
+      .Description("Run a Kudu Tablet Server")
       .ExtraDescription("Note: The tablet server is started in this process and "
                         "runs until interrupted.\n\n"
                         "The most common configuration flags are described below. "
@@ -344,58 +338,50 @@ unique_ptr<Mode> BuildTServerMode() {
       .Build();
 
   unique_ptr<Action> set_flag =
-      ActionBuilder("set_flag", &TServerSetFlag)
+      TServerActionBuilder("set_flag", &TServerSetFlag)
       .Description("Change a gflag value on a Kudu Tablet Server")
-      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
       .AddRequiredParameter({ kFlagArg, "Name of the gflag" })
       .AddRequiredParameter({ kValueArg, "New value for the gflag" })
       .AddOptionalParameter("force")
       .Build();
 
   unique_ptr<Action> status =
-      ActionBuilder("status", &TServerStatus)
+      TServerActionBuilder("status", &TServerStatus)
       .Description("Get the status of a Kudu Tablet Server")
-      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
       .Build();
 
   unique_ptr<Action> timestamp =
-      ActionBuilder("timestamp", &TServerTimestamp)
+      TServerActionBuilder("timestamp", &TServerTimestamp)
       .Description("Get the current timestamp of a Kudu Tablet Server")
-      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
       .Build();
 
   unique_ptr<Action> list_tservers =
-      ActionBuilder("list", &ListTServers)
+      ClusterActionBuilder("list", &ListTServers)
       .Description("List tablet servers in a Kudu cluster")
-      .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
       .AddOptionalParameter("columns", string("uuid,rpc-addresses"),
                             string("Comma-separated list of tserver info fields to "
                                    "include in output.\nPossible values: uuid, "
                                    "rpc-addresses, http-addresses, version, seqno, "
                                    "heartbeat, start_time, state"))
       .AddOptionalParameter("format")
-      .AddOptionalParameter("timeout_ms")
       .Build();
 
   unique_ptr<Action> quiescing_status =
-      ActionBuilder("status", &QuiescingStatus)
+      TServerActionBuilder("status", &QuiescingStatus)
       .Description("Output information about the quiescing state of a Tablet "
                    "Server.")
-      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
       .Build();
   unique_ptr<Action> start_quiescing =
-      ActionBuilder("start", &StartQuiescingTServer)
+      TServerActionBuilder("start", &StartQuiescingTServer)
       .Description("Start quiescing the given Tablet Server. While a Tablet "
                    "Server is quiescing, Tablet replicas on it will no longer "
                    "attempt to become leader, and new scan requests will be "
                    "retried at other servers.")
-      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
       .AddOptionalParameter("error_if_not_fully_quiesced")
       .Build();
   unique_ptr<Action> stop_quiescing =
-      ActionBuilder("stop", &StopQuiescingTServer)
+      TServerActionBuilder("stop", &StopQuiescingTServer)
       .Description("Stop quiescing a Tablet Server.")
-      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
       .Build();
   unique_ptr<Mode> quiesce = ModeBuilder("quiesce")
       .Description("Operate on the quiescing state of a Kudu Tablet Server.")
@@ -405,11 +391,10 @@ unique_ptr<Mode> BuildTServerMode() {
       .Build();
 
   unique_ptr<Action> enter_maintenance =
-      ActionBuilder("enter_maintenance", &EnterMaintenance)
+      ClusterActionBuilder("enter_maintenance", &EnterMaintenance)
       .Description("Begin maintenance on the Tablet Server. While under "
                    "maintenance, downtime of the Tablet Server will not lead "
                    "to the immediate re-replication of its tablet replicas.")
-      .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
       .AddRequiredParameter({ kTServerIdArg, kTServerIdDesc })
       .AddOptionalParameter("allow_missing_tserver")
       .Build();
@@ -417,9 +402,8 @@ unique_ptr<Mode> BuildTServerMode() {
   // because if the tserver is missing, the non-existent tserver's state is
   // already NONE and so exit_maintenance is a no-op.
   unique_ptr<Action> exit_maintenance =
-      ActionBuilder("exit_maintenance", &ExitMaintenance)
+      ClusterActionBuilder("exit_maintenance", &ExitMaintenance)
       .Description("End maintenance of the Tablet Server.")
-      .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
       .AddRequiredParameter({ kTServerIdArg, kTServerIdDesc })
       .Build();
   unique_ptr<Mode> state = ModeBuilder("state")

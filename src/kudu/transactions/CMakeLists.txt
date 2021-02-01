@@ -31,6 +31,7 @@ ADD_EXPORTABLE_LIBRARY(transactions_proto
 
 set(TRANSACTIONS_SRCS
   coordinator_rpc.cc
+  participant_rpc.cc
   txn_status_entry.cc
   txn_status_manager.cc
   txn_status_tablet.cc
@@ -40,6 +41,7 @@ add_library(transactions ${TRANSACTIONS_SRCS})
 target_link_libraries(transactions
   kudu_client
   kudu_common
+  server_process
   tablet
   transactions_proto
   ${KUDU_BASE_LIBS}

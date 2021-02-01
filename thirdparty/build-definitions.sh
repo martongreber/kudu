@@ -276,6 +276,20 @@ build_llvm() {
         TOOLS_ARGS="$TOOLS_ARGS -DGCC_INSTALL_PREFIX=$GCC_INSTALL_PREFIX"
       fi
 
+      if [ -n "$OS_OSX" ]; then
+        # Xcode 12.2 fails to build the sanitizers and they are not needed.
+        # We disable them as a workaround to the build issues.
+        # Disable the sanitizers and xray to prevent sanitizer_common compilation.
+        # See https://github.com/llvm-mirror/compiler-rt/blob/749af53928a31afa3111f27cc41fd15849d86667/lib/CMakeLists.txt#L11-L14
+        TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_BUILD_SANITIZERS=OFF"
+        TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_BUILD_XRAY=OFF"
+
+        # Disable Apple platforms the we do not support.
+        TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_ENABLE_IOS=OFF"
+        TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_ENABLE_WATCHOS=OFF"
+        TOOLS_ARGS="$TOOLS_ARGS -DCOMPILER_RT_ENABLE_TVOS=OFF"
+      fi
+
       # Depend on zlib from the thirdparty tree. It's an optional dependency for
       # LLVM, but a required [1] one for IWYU. When TSAN is enabled these flags
       # are already set by build-thirdparty.sh in order to support the
@@ -328,7 +342,6 @@ build_llvm() {
     -DLLVM_INCLUDE_UTILS=OFF \
     -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
     -DLLVM_ENABLE_RTTI=ON \
-    -DCMAKE_OSX_ARCHITECTURES="x86_64" \
     -DCMAKE_CXX_FLAGS="$CLANG_CXXFLAGS" \
     -DCMAKE_EXE_LINKER_FLAGS="$CLANG_LDFLAGS" \
     -DCMAKE_MODULE_LINKER_FLAGS="$CLANG_LDFLAGS" \
@@ -650,7 +663,7 @@ build_mustache() {
   mkdir -p $MUSTACHE_BDIR
   pushd $MUSTACHE_BDIR
   # We add $PREFIX/include for boost and $PREFIX_COMMON/include for rapidjson.
-  ${CXX:-g++} -std=c++11 $EXTRA_CXXFLAGS -I$PREFIX/include -I$PREFIX_COMMON/include -O3 -DNDEBUG -fPIC -c "$MUSTACHE_SOURCE/mustache.cc"
+  ${CXX:-g++} -std=c++17 $EXTRA_CXXFLAGS -I$PREFIX/include -I$PREFIX_COMMON/include -O3 -DNDEBUG -fPIC -c "$MUSTACHE_SOURCE/mustache.cc"
   ar rs libmustache.a mustache.o
   cp libmustache.a $PREFIX/lib/
   cp $MUSTACHE_SOURCE/mustache.h $PREFIX/include/
@@ -670,6 +683,12 @@ build_curl() {
   KRB5CONFIG_LOCATION=$(which krb5-config 2>/dev/null || :)
   if [ -n "$KRB5CONFIG_LOCATION" -a "$KRB5CONFIG_LOCATION" != "/usr/bin/krb5-config" ]; then
     export KRB5CONFIG=$KRB5CONFIG_LOCATION
+  fi
+  # In the case the special SLES location is not on the PATH but exists and we haven't
+  # found another viable KRB5CONFIG_LOCATION, use the special SLES location.
+  SLES_KRB5CONFIG_LOCATION="/usr/lib/mit/bin/krb5-config"
+  if [ -z "$KRB5CONFIG_LOCATION" -a -f "$SLES_KRB5CONFIG_LOCATION" ]; then
+    export KRB5CONFIG=$SLES_KRB5CONFIG_LOCATION
   fi
 
   # In the scope of using libcurl in Kudu tests and other simple scenarios,
@@ -819,16 +838,18 @@ build_boost() {
 
   # If CC and CXX are set, set the compiler in user-config.jam.
   if [ -n "$CC" -a -n "$CXX" ]; then
-    # Determine the name of the compiler referenced in $CC. This assumes
-    # the compiler prints its name in the first line of the output. The pattern
+    # Determine the name of the compiler referenced in $CC. The pattern
     # matching works for various flavors of GCC and LLVM clang. As the last
-    # resort, output the first word of the first line. The '$CC --version'
-    # approach appears to work even if the compiler is called through ccache.
-    local COMPILER=$($CC --version | \
-      awk '/(Apple )?(clang|LLVM) version [[:digit:]]+\.[[:digit:]]+/ {
-             print "clang"; exit }
-           /\(GCC\) [[:digit:]]+\.[[:digit:]]+/{ print "gcc"; exit }
-           { print $1; exit }')
+    # resort, output the first word of the line containing version information.
+    # The '$CC -v 2>&1' approach appears to work even if the compiler is
+    # called through ccache, and the version line keeps the same format on
+    # different OS and flavors, whereas '$CC --version' is plagued by many
+    # variations depending on the OS flavor and versioning/packaging nuances.
+    local COMPILER=$($CC -v 2>&1 | grep -E ' version [[:digit:]]' | awk '
+        /^(Apple )?(clang|LLVM) version [[:digit:]]+\.[[:digit:]]+/ { print "clang"; exit }
+        /^gcc version [[:digit:]]+\.[[:digit:]]+/ { print "gcc"; exit }
+        { print $1; exit }
+    ')
 
     # If the compiler binary used was 'cc' and not 'gcc', it will also report
     # itself as 'cc'. Coerce it to gcc.
@@ -845,7 +866,12 @@ build_boost() {
   fi
 
   # Build the date_time boost lib.
-  ./bootstrap.sh --prefix=$PREFIX threading=multi --with-libraries=date_time
+  if [ -z "$TOOLSET" ]; then
+    ./bootstrap.sh --prefix=$PREFIX threading=multi --with-libraries=date_time
+  else
+    ./bootstrap.sh --prefix=$PREFIX threading=multi --with-libraries=date_time \
+        --with-toolset=$COMPILER
+  fi
   ./b2 clean $TOOLSET --build-dir="$BOOST_BDIR"
   ./b2 install variant=release link=static,shared --build-dir="$BOOST_BDIR" $TOOLSET -q -d0 \
     --debug-configuration \

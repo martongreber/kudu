@@ -58,6 +58,8 @@ set(CLIENT_SRCS
   table_creator-internal.cc
   tablet-internal.cc
   tablet_server-internal.cc
+  transaction-internal.cc
+  txn_manager_proxy_rpc.cc
   value.cc
   write_op.cc
 )
@@ -70,7 +72,8 @@ set(CLIENT_LIBS
   kudu_util
   master_proto
   tserver_proto
-  tserver_service_proto)
+  tserver_service_proto
+  txn_manager_proto)
 
 # Make sure we exclude tcmalloc from the exported library; we want the library
 # code to use the linking application's malloc implementation.
@@ -181,6 +184,7 @@ install(FILES
   client.h
   columnar_scan_batch.h
   hash.h
+  resource_metrics.h
   row_result.h
   scan_batch.h
   scan_predicate.h
@@ -189,7 +193,6 @@ install(FILES
   stubs.h
   value.h
   write_op.h
-  resource_metrics.h
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/kudu/client)
 
 # Headers: common

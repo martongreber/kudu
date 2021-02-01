@@ -50,17 +50,17 @@ GMOCK_VERSION=1.8.0
 GMOCK_NAME=googletest-release-$GMOCK_VERSION
 GMOCK_SOURCE=$TP_SOURCE_DIR/$GMOCK_NAME
 
-GPERFTOOLS_VERSION=2.6.90
+GPERFTOOLS_VERSION=2.8.1
 GPERFTOOLS_NAME=gperftools-$GPERFTOOLS_VERSION
 GPERFTOOLS_SOURCE=$TP_SOURCE_DIR/$GPERFTOOLS_NAME
 
-PROTOBUF_VERSION=3.12.3
+PROTOBUF_VERSION=3.14.0
 PROTOBUF_NAME=protobuf-$PROTOBUF_VERSION
 PROTOBUF_SOURCE=$TP_SOURCE_DIR/$PROTOBUF_NAME
 
 # Note: CMake gets patched on SLES12SP0. When changing the CMake version, please check if
 # cmake-issue-15873-dont-use-select.patch needs to be updated.
-CMAKE_VERSION=3.16.4
+CMAKE_VERSION=3.19.1
 CMAKE_NAME=cmake-$CMAKE_VERSION
 CMAKE_SOURCE=$TP_SOURCE_DIR/$CMAKE_NAME
 
@@ -203,7 +203,8 @@ BISON_SOURCE=$TP_SOURCE_DIR/$BISON_NAME
 
 # Note: The Hive release binary tarball is stripped of unnecessary jars before
 # being uploaded. See thirdparty/package-hive.sh for details.
-HIVE_VERSION=3.1.1
+# ./thirdparty/package-hive.sh -d -r -v 3.1.2 apache-hive-3.1.2-bin
+HIVE_VERSION=3.1.2
 HIVE_NAME=hive-$HIVE_VERSION
 HIVE_SOURCE=$TP_SOURCE_DIR/$HIVE_NAME
 
@@ -325,7 +326,7 @@ POSTGRES_JDBC_SOURCE=$TP_SOURCE_DIR/$POSTGRES_JDBC_NAME
 # run the following commands:
 # mvn versions:set -DnewVersion=$(git rev-parse HEAD)
 # mvn versions:update-child-modules
-# mvn package
-RANGER_VERSION=f37f5407eee8d2627a4306a25938b151f8e2ba31
+# mvn package -DskipTests
+RANGER_VERSION=2.1.0
 RANGER_NAME=ranger-$RANGER_VERSION-admin
 RANGER_SOURCE=$TP_SOURCE_DIR/$RANGER_NAME

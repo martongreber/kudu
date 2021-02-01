@@ -200,7 +200,9 @@ Status Master::Init() {
   }
 
   maintenance_manager_.reset(new MaintenanceManager(
-      MaintenanceManager::kDefaultOptions, fs_manager_->uuid()));
+      MaintenanceManager::kDefaultOptions,
+      fs_manager_->uuid(),
+      metric_entity()));
 
   // The certificate authority object is initialized upon loading
   // CA private key and certificate from the system table when the server
@@ -336,7 +338,6 @@ Status Master::InitTxnManager() {
 }
 
 Status Master::WaitForTxnManagerInit(const MonoDelta& timeout) const {
-  CHECK_EQ(state_, kRunning);
   if (timeout.Initialized()) {
     const Status* s = txn_manager_init_status_.WaitFor(timeout);
     if (!s) {
@@ -389,7 +390,7 @@ Status Master::InitMasterRegistration() {
     reg.set_https_enabled(web_server()->IsSecure());
   }
   reg.set_software_version(VersionInfo::GetVersionInfo());
-  reg.set_start_time(start_time_);
+  reg.set_start_time(start_walltime_);
 
   registration_.Swap(&reg);
   registration_initialized_.store(true);

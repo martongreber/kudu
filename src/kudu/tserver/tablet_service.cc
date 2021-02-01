@@ -30,9 +30,9 @@
 #include <vector>
 
 #include <boost/optional/optional.hpp>
-#include <boost/type_traits/decay.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <google/protobuf/stubs/port.h>
 
 #include "kudu/clock/clock.h"
 #include "kudu/common/column_predicate.h"
@@ -79,6 +79,7 @@
 #include "kudu/tablet/mvcc.h"
 #include "kudu/tablet/ops/alter_schema_op.h"
 #include "kudu/tablet/ops/op.h"
+#include "kudu/tablet/ops/participant_op.h"
 #include "kudu/tablet/ops/write_op.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet.h"
@@ -87,6 +88,7 @@
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/txn_coordinator.h"
 #include "kudu/transactions/transactions.pb.h"
+#include "kudu/transactions/txn_status_manager.h"
 #include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_replica_lookup.h"
 #include "kudu/tserver/tablet_server.h"
@@ -173,6 +175,7 @@ TAG_FLAG(tserver_inject_invalid_authz_token_ratio, hidden);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_int32(memory_limit_warn_threshold_percentage);
 DECLARE_int32(tablet_history_max_age_sec);
+DECLARE_uint32(txn_keepalive_interval_ms);
 
 METRIC_DEFINE_counter(
     server,
@@ -217,6 +220,7 @@ using kudu::security::TokenPB;
 using kudu::server::ServerBase;
 using kudu::tablet::AlterSchemaOpState;
 using kudu::tablet::MvccSnapshot;
+using kudu::tablet::ParticipantOpState;
 using kudu::tablet::TABLET_DATA_COPYING;
 using kudu::tablet::TABLET_DATA_DELETED;
 using kudu::tablet::TABLET_DATA_TOMBSTONED;
@@ -1198,6 +1202,7 @@ Status ValidateCoordinatorOpFields(const CoordinatorOpPB& op) {
     case CoordinatorOpPB::BEGIN_COMMIT_TXN:
     case CoordinatorOpPB::ABORT_TXN:
     case CoordinatorOpPB::GET_TXN_STATUS:
+    case CoordinatorOpPB::KEEP_TXN_ALIVE:
       if (!op.has_txn_id()) {
         return Status::InvalidArgument(Substitute("Missing txn id: $0",
                                                   SecureShortDebugString(op)));
@@ -1252,25 +1257,35 @@ void TabletServiceAdminImpl::CoordinateTransaction(const CoordinateTransactionRe
   const auto& user = op.user();
   const auto& txn_id = op.txn_id();
   int64_t highest_seen_txn_id = -1;
-  switch (op.type()) {
-    case CoordinatorOpPB::BEGIN_TXN:
-      s = txn_coordinator->BeginTransaction(
-          txn_id, user, &highest_seen_txn_id, &ts_error);
-      break;
-    case CoordinatorOpPB::REGISTER_PARTICIPANT:
-      s = txn_coordinator->RegisterParticipant(txn_id, op.txn_participant_id(), user, &ts_error);
-      break;
-    case CoordinatorOpPB::BEGIN_COMMIT_TXN:
-      s = txn_coordinator->BeginCommitTransaction(txn_id, user, &ts_error);
-      break;
-    case CoordinatorOpPB::ABORT_TXN:
-      s = txn_coordinator->AbortTransaction(txn_id, user, &ts_error);
-      break;
-    case CoordinatorOpPB::GET_TXN_STATUS:
-      s = txn_coordinator->GetTransactionStatus(txn_id, user, &txn_status);
-      break;
-    default:
-      s = Status::InvalidArgument(Substitute("Unknown op type: $0", op.type()));
+  {
+    transactions::TxnStatusManager::ScopedLeaderSharedLock l(txn_coordinator);
+    if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, context)) {
+      return;
+    }
+    switch (op.type()) {
+      case CoordinatorOpPB::BEGIN_TXN:
+        s = txn_coordinator->BeginTransaction(
+            txn_id, user, &highest_seen_txn_id, &ts_error);
+        break;
+      case CoordinatorOpPB::REGISTER_PARTICIPANT:
+        s = txn_coordinator->RegisterParticipant(txn_id, op.txn_participant_id(), user, &ts_error);
+        break;
+      case CoordinatorOpPB::BEGIN_COMMIT_TXN:
+        s = txn_coordinator->BeginCommitTransaction(txn_id, user, &ts_error);
+        break;
+      case CoordinatorOpPB::ABORT_TXN:
+        s = txn_coordinator->AbortTransaction(txn_id, user, &ts_error);
+        break;
+      case CoordinatorOpPB::GET_TXN_STATUS:
+        s = txn_coordinator->GetTransactionStatus(
+            txn_id, user, &txn_status, &ts_error);
+        break;
+      case CoordinatorOpPB::KEEP_TXN_ALIVE:
+        s = txn_coordinator->KeepTransactionAlive(txn_id, user, &ts_error);
+        break;
+      default:
+        s = Status::InvalidArgument(Substitute("Unknown op type: $0", op.type()));
+   }
   }
   if (ts_error.has_status() && ts_error.status().code() != AppStatusPB::OK) {
     *resp->mutable_error() = std::move(ts_error);
@@ -1283,12 +1298,45 @@ void TabletServiceAdminImpl::CoordinateTransaction(const CoordinateTransactionRe
   } else if (op.type() == CoordinatorOpPB::GET_TXN_STATUS) {
     // Populate corresponding field in the response.
     *(resp->mutable_op_result()->mutable_txn_status()) = std::move(txn_status);
+  } else if (op.type() == CoordinatorOpPB::BEGIN_TXN) {
+    resp->mutable_op_result()->set_keepalive_millis(
+        FLAGS_txn_keepalive_interval_ms);
   }
   if (op.type() == CoordinatorOpPB::BEGIN_TXN && !s.IsServiceUnavailable()) {
     DCHECK_GE(highest_seen_txn_id, 0);
     resp->mutable_op_result()->set_highest_seen_txn_id(highest_seen_txn_id);
   }
   context->RespondSuccess();
+}
+
+void TabletServiceAdminImpl::ParticipateInTransaction(const ParticipantRequestPB* req,
+                                                      ParticipantResponsePB* resp,
+                                                      rpc::RpcContext* context) {
+  scoped_refptr<TabletReplica> replica;
+  if (!LookupRunningTabletReplicaOrRespond(server_->tablet_manager(), req->tablet_id(), resp,
+                                           context, &replica)) {
+    return;
+  }
+  shared_ptr<Tablet> tablet;
+  TabletServerErrorPB::Code error_code;
+  Status s = GetTabletRef(replica, &tablet, &error_code);
+  if (PREDICT_FALSE(!s.ok())) {
+    SetupErrorAndRespond(resp->mutable_error(), s, error_code, context);
+    return;
+  }
+  // TODO(awong): consider memory-based throttling?
+  // TODO(awong): we should also persist the transaction's owner, and prevent
+  // other users from mutating it.
+  unique_ptr<ParticipantOpState> op_state(
+      new ParticipantOpState(replica.get(), tablet->txn_participant(), req, resp));
+  op_state->set_completion_callback(unique_ptr<OpCompletionCallback>(
+      new RpcOpCompletionCallback<ParticipantResponsePB>(context, resp)));
+  s = replica->SubmitTxnParticipantOp(std::move(op_state));
+  if (PREDICT_FALSE(!s.ok())) {
+    SetupErrorAndRespond(resp->mutable_error(), s,
+                         TabletServerErrorPB::UNKNOWN_ERROR,
+                         context);
+  }
 }
 
 bool TabletServiceAdminImpl::SupportsFeature(uint32_t feature) const {
@@ -2657,9 +2705,9 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   }
 
   VLOG(3) << "Before optimizing scan spec: " << spec.ToString(tablet_schema);
-  spec.PruneHashForInlistIfPossible(tablet_schema,
-                                    replica->tablet_metadata()->partition(),
-                                    replica->tablet_metadata()->partition_schema());
+  spec.PruneInlistValuesIfPossible(tablet_schema,
+                                   replica->tablet_metadata()->partition(),
+                                   replica->tablet_metadata()->partition_schema());
   spec.OptimizeScan(tablet_schema, scanner->arena(), true);
   VLOG(3) << "After optimizing scan spec: " << spec.ToString(tablet_schema);
 
@@ -3131,10 +3179,11 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   s = time_manager->WaitUntilSafe(tmp_snap_timestamp, final_deadline);
 
   tablet::MvccSnapshot snap;
+  auto* mvcc_manager = tablet->mvcc_manager();
   if (PREDICT_TRUE(s.ok())) {
     // Wait for the in-flights in the snapshot to be finished.
     TRACE("Waiting for operations to commit");
-    s = tablet->mvcc_manager()->WaitForSnapshotWithAllApplied(
+    s = mvcc_manager->WaitForSnapshotWithAllApplied(
           tmp_snap_timestamp, &snap, client_deadline);
   }
 

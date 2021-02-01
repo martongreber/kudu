@@ -25,12 +25,19 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/util/monotime.h"
 
 using std::string;
 using std::vector;
 
 namespace kudu {
 namespace transactions {
+
+TransactionEntry::TransactionEntry(int64_t txn_id, std::string user)
+    : txn_id_(txn_id),
+      user_(std::move(user)),
+      last_heartbeat_time_(MonoTime::Now()) {
+}
 
 scoped_refptr<ParticipantEntry> TransactionEntry::GetOrCreateParticipant(
     const string& tablet_id) {
@@ -52,6 +59,11 @@ vector<string> TransactionEntry::GetParticipantIds() const {
   vector<string> ret;
   AppendKeysFromMap(participants_, &ret);
   return ret;
+}
+
+TxnStatePB TransactionEntry::state() const {
+  CowLock<PersistentTransactionEntry> l(&metadata_, LockMode::READ);
+  return l.data().pb.state();
 }
 
 } // namespace transactions

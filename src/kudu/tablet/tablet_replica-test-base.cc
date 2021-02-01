@@ -95,6 +95,9 @@ Status TabletReplicaTestBase::ExecuteWrite(TabletReplica* replica, const WriteRe
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
   }
+  if (resp.per_row_errors_size() > 0) {
+    return StatusFromPB(resp.per_row_errors(0).error());
+  }
   return Status::OK();
 }
 
@@ -141,6 +144,7 @@ Status TabletReplicaTestBase::SetUpReplica(bool new_replica) {
                       cmeta_manager_,
                       *config_peer,
                       apply_pool_.get(),
+                      /*reload_txn_status_tablet_pool*/nullptr,
                       /*txn_coordinator_factory*/nullptr,
                       [tablet_id] (const string& reason) {
                         LOG(INFO) << Substitute(

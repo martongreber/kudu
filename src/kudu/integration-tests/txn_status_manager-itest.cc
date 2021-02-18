@@ -111,6 +111,11 @@ class TxnStatusManagerITest : public ExternalMiniClusterITestBase {
         "--raft_heartbeat_interval_ms=$0", kRaftHbIntervalMs));
     cluster_opts_.extra_tserver_flags.emplace_back(
         "--leader_failure_max_missed_heartbeat_periods=1.25");
+
+    // Some of these tests rely on checking state assuming no background tasks.
+    // For simplicity, disable the background commits.
+    cluster_opts_.extra_tserver_flags.emplace_back(
+        "--txn_schedule_background_tasks=false");
   }
 
   void SetUp() override {
@@ -261,7 +266,7 @@ TEST_F(TxnStatusManagerITest, StaleTransactionsCleanup) {
     // and abort it. An extra margin here is to avoid flakiness due to
     // scheduling anomalies.
     SleepFor(MonoDelta::FromMilliseconds(3 * keepalive_interval_ms));
-    NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORTED));
+    NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORT_IN_PROGRESS));
   }
 
   // Check that the transaction staleness is detected and the stale transaction
@@ -316,7 +321,7 @@ TEST_F(TxnStatusManagerITest, ToggleStaleTxnTrackerInRuntime) {
   // Check that the transaction staleness is detected and the stale transaction
   // is aborted once stale transaction tracking is re-enabled.
   SleepFor(MonoDelta::FromMilliseconds(3 * keepalive_interval_ms));
-  NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORTED));
+  NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORT_IN_PROGRESS));
 }
 
 // Verify the functionality of the stale transaction tracker in TxnStatusManager
@@ -324,7 +329,7 @@ TEST_F(TxnStatusManagerITest, ToggleStaleTxnTrackerInRuntime) {
 // sure that a transaction isn't aborted if keepalive requests are sent as
 // required even in case of Raft leader re-elections and restarts
 // of the TxnStatusManager instances.
-TEST_F(TxnStatusManagerITest, DISABLED_TxnKeepAliveMultiTxnStatusManagerInstances) {
+TEST_F(TxnStatusManagerITest, TxnKeepAliveMultiTxnStatusManagerInstances) {
   SKIP_IF_SLOW_NOT_ALLOWED();
 
   int64_t txn_id;
@@ -338,8 +343,8 @@ TEST_F(TxnStatusManagerITest, DISABLED_TxnKeepAliveMultiTxnStatusManagerInstance
   CountDownLatch latch(1);
   Status keep_txn_alive_status;
   thread txn_keepalive_sender([&] {
-    const auto period = MonoDelta::FromMilliseconds(keepalive_interval_ms / 2);
-    const auto timeout = MonoDelta::FromMilliseconds(keepalive_interval_ms / 4);
+    const auto period = MonoDelta::FromMilliseconds(keepalive_interval_ms / 5);
+    const auto timeout = MonoDelta::FromMilliseconds(keepalive_interval_ms / 10);
     // Keepalive thread uses its own messenger and proxy.
     std::shared_ptr<rpc::Messenger> m;
     rpc::MessengerBuilder b("txn-keepalive");
@@ -445,7 +450,7 @@ TEST_F(TxnStatusManagerITest, DISABLED_TxnKeepAliveMultiTxnStatusManagerInstance
   // should be automatically aborted by TxnStatusManager running with the
   // leader replica of the txn status tablet.
   ASSERT_EVENTUALLY([&]{
-    NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORTED));
+    NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORT_IN_PROGRESS));
   });
 
   NO_FATALS(cluster_->AssertNoCrashes());

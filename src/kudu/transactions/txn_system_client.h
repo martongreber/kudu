@@ -45,6 +45,7 @@ class KuduTable;
 namespace itest {
 class TxnStatusTableITest;
 class TxnStatusTableITest_TestProtectCreateAndAlter_Test;
+class TxnStatusTableITest_CheckOpenTxnStatusTable_Test;
 } // namespace itest
 
 namespace rpc {
@@ -137,6 +138,11 @@ class TxnSystemClient {
   // masters.
   Status OpenTxnStatusTable();
 
+  // Check if the transaction status table is already open, returning
+  // Status::OK() if so. Otherwise, open the transaction status table. In the
+  // latter case, the result status of opening the table is returned.
+  Status CheckOpenTxnStatusTable();
+
   // Sends an RPC to the leader of the given tablet to participate in a
   // transaction.
   //
@@ -146,10 +152,16 @@ class TxnSystemClient {
                                   const tserver::ParticipantOpPB& participant_op,
                                   const MonoDelta& timeout,
                                   Timestamp* begin_commit_timestamp = nullptr);
+  void ParticipateInTransactionAsync(const std::string& tablet_id,
+                                     tserver::ParticipantOpPB participant_op,
+                                     const MonoDelta& timeout,
+                                     StatusCallback cb,
+                                     Timestamp* begin_commit_timestamp = nullptr);
  private:
 
   friend class itest::TxnStatusTableITest;
   FRIEND_TEST(itest::TxnStatusTableITest, TestProtectCreateAndAlter);
+  FRIEND_TEST(itest::TxnStatusTableITest, CheckOpenTxnStatusTable);
 
   explicit TxnSystemClient(client::sp::shared_ptr<client::KuduClient> client)
       : client_(std::move(client)) {}
@@ -163,12 +175,6 @@ class TxnSystemClient {
                                     const MonoDelta& timeout,
                                     const StatusCallback& cb,
                                     tserver::CoordinatorOpResultPB* result = nullptr);
-
-  void ParticipateInTransactionAsync(const std::string& tablet_id,
-                                     tserver::ParticipantOpPB participant_op,
-                                     const MonoDelta& timeout,
-                                     StatusCallback cb,
-                                     Timestamp* begin_commit_timestamp = nullptr);
 
   client::sp::shared_ptr<client::KuduTable> txn_status_table() {
     std::lock_guard<simple_spinlock> l(table_lock_);
@@ -199,6 +205,11 @@ class TxnSystemClientInitializer {
   // sets 'client'. Callers should ensure that 'client' is only used while the
   // TxnSystemClientInitializer is still in scope.
   Status GetClient(TxnSystemClient** client) const;
+
+  // Like the above, but retries periodically for the client to be initialized
+  // for up to 'timeout', returning a TimedOut error if unable to. Returns a
+  // ServiceUnavailable error if the initializer has been being shut down.
+  Status WaitForClient(const MonoDelta& timeout, TxnSystemClient** client) const;
 
   // Stops the initialization, preventing success of further calls to
   // GetClient().

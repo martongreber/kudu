@@ -99,6 +99,10 @@ DEFINE_int32(num_txn_status_tablets_to_reload_simultaneously, 0,
              "sense to manually tune this.");
 TAG_FLAG(num_txn_status_tablets_to_reload_simultaneously, advanced);
 
+DEFINE_int32(txn_commit_pool_num_threads, 10,
+             "Number of threads available for transaction commit tasks.");
+TAG_FLAG(txn_commit_pool_num_threads, advanced);
+
 DEFINE_int32(tablet_start_warn_threshold_ms, 500,
              "If a tablet takes more than this number of millis to start, issue "
              "a warning with a trace.");
@@ -370,6 +374,10 @@ Status TSTabletManager::Init() {
                 .set_max_queue_size(0)
                 .set_max_threads(FLAGS_num_tablets_to_copy_simultaneously)
                 .Build(&tablet_copy_pool_));
+
+  RETURN_NOT_OK(ThreadPoolBuilder("txn-commit")
+                .set_max_threads(FLAGS_txn_commit_pool_num_threads)
+                .Build(&txn_commit_pool_));
 
   // Start the threadpools we'll use to open and delete tablets.
   // This has to be done in Init() instead of the constructor, since the
@@ -870,10 +878,8 @@ Status TSTabletManager::CreateAndRegisterTabletReplica(
     scoped_refptr<TabletMetadata> meta,
     RegisterTabletReplicaMode mode,
     scoped_refptr<TabletReplica>* replica_out) {
-  // TODO(awong): this factory will at some point contain some tserver-wide
-  // state like a system client that can make calls to leader tablets. For now,
-  // just use a simple local factory.
-  TxnStatusManagerFactory tsm_factory;
+  TxnStatusManagerFactory tsm_factory(server_->txn_client_initializer(),
+                                      txn_commit_pool_.get());
   const auto& tablet_id = meta->tablet_id();
   scoped_refptr<TabletReplica> replica(
       new TabletReplica(std::move(meta),
@@ -1287,6 +1293,10 @@ void TSTabletManager::Shutdown() {
   // properly executed to unblock the shutdown process of replicas.
   reload_txn_status_tablet_pool_->Shutdown();
 
+  // Now that our TxnStatusManagers have shut down, clean up the threadpool
+  // used for commit tasks.
+  txn_commit_pool_->Shutdown();
+
   {
     std::lock_guard<RWMutex> l(lock_);
     // We don't expect anyone else to be modifying the map after we start the
@@ -1458,7 +1468,9 @@ void TSTabletManager::TxnStalenessTrackerTask() {
       if (!l.first_failed_status().ok()) {
         VLOG(1) << "Skipping transaction staleness track task: "
                 << l.first_failed_status().ToString();
-        continue;
+        // Since it is very likely the leader lock check will fail for the rest
+        // replicas, we can end this round of checking earlier.
+        break;
       }
       coordinator->AbortStaleTransactions();
     }

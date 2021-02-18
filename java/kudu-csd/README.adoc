@@ -66,9 +66,12 @@ changes in Kudu 6.2.0. To perform the fork, take the following steps:
   `generate_mdl.py` script to generate the MDL and save it as a file in
   `kudu-csd-{major.minor}/src/descriptor`. The script expects the binaries to
   be located in the standard `build/latest` symlink, which means they should
-  be found in `../../build/latest/bin` relative to `generate_mdl.py`. In this
-  example, the MDL must be generated with 6.1 binaries in `build/latest/bin`
-  and the proper command to run in the `kudu-csd-6.1` directory is
+  be found in `../../build/latest/bin` relative to `generate_mdl.py`. It also
+  expects that the "cdhVersion" field has already been set in the above step.
+  Verify that by ensuring the "min" and "max" values in the
+  "compatibility"."cdhVersion" field matches the SDL. In this example, the MDL
+  must be generated with 6.1 binaries in `build/latest/bin` and the proper
+  command to run in the `kudu-csd-6.1` directory is
 +
 [source,bash]
 ----

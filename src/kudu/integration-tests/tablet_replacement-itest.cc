@@ -22,7 +22,6 @@
 #include <ostream>
 #include <set>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -137,10 +136,7 @@ void TabletReplacementITest::GetTsMapForReplicas(
 
 void TabletReplacementITest::TestDontEvictIfRemainingConfigIsUnstable(
     InstabilityType type, bool is_3_4_3_mode) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   // The configuration is tuned to minimize chances of reporting on failed
   // tablet replicas one-by-one. That's because by the scenario 2 replicas out
@@ -320,7 +316,7 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneEvictedReplica) {
     // The rest of this test has multi-second waits, so we do it in slow test mode.
     LOG(WARNING) << "not verifying that a newly-added replica won't be tombstoned; "
                     "run with KUDU_ALLOW_SLOW_TESTS=1 to verify";
-    return;
+    GTEST_SKIP();
   }
 
   // Shut down a majority of followers (3 servers) and then try to add the
@@ -486,10 +482,7 @@ class EvictAndReplaceDeadFollowerITest :
 
 // Test that unreachable followers are evicted and replaced.
 TEST_P(EvictAndReplaceDeadFollowerITest, UnreachableFollower) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const bool is_3_4_3_mode = GetParam();
   MonoDelta kTimeout = MonoDelta::FromSeconds(30);
@@ -554,9 +547,9 @@ TEST_P(EvictAndReplaceDeadFollowerITest, UnreachableFollower) {
   ASSERT_OK(cluster_->tablet_server_by_uuid(kFollowerId)->Restart());
 }
 
-INSTANTIATE_TEST_CASE_P(,
-                        EvictAndReplaceDeadFollowerITest,
-                        ::testing::Bool());
+INSTANTIATE_TEST_SUITE_P(,
+                         EvictAndReplaceDeadFollowerITest,
+                         ::testing::Bool());
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -575,9 +568,9 @@ TEST_P(DontEvictIfRemainingConfigIsUnstableITest, NodesStopped) {
   TestDontEvictIfRemainingConfigIsUnstable(NODE_STOPPED, GetParam());
 }
 
-INSTANTIATE_TEST_CASE_P(,
-                        DontEvictIfRemainingConfigIsUnstableITest,
-                        ::testing::Bool());
+INSTANTIATE_TEST_SUITE_P(,
+                         DontEvictIfRemainingConfigIsUnstableITest,
+                         ::testing::Bool());
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -591,10 +584,7 @@ INSTANTIATE_TEST_CASE_P(,
 // copied tablet should detect that these config change
 // operations have already been applied and skip them.
 TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const MonoDelta timeout = MonoDelta::FromSeconds(30);
   vector<string> ts_flags;

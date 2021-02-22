@@ -41,7 +41,6 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
-#include <gmock/gmock-generated-matchers.h>
 #include <gmock/gmock-matchers.h>
 #include <google/protobuf/util/message_differencer.h>
 #include <gtest/gtest.h>
@@ -1404,8 +1403,8 @@ TEST_P(ScanMultiTabletParamTest, Test) {
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, kTabletsNum * kRowsPerTablet,
                                    kNoBound));
 }
-INSTANTIATE_TEST_CASE_P(Params, ScanMultiTabletParamTest,
-                        testing::ValuesIn(read_modes));
+INSTANTIATE_TEST_SUITE_P(Params, ScanMultiTabletParamTest,
+                         testing::ValuesIn(read_modes));
 
 TEST_F(ClientTest, TestScanEmptyTable) {
   KuduScanner scanner(client_table_.get());
@@ -3862,10 +3861,7 @@ class FlushModeOpRatesTest : public ClientTest,
 // in AUTO_FLUSH and AUTO_FLUSH_BACKGROUND mode; all the operations have
 // the same pre-defined size.
 TEST_P(FlushModeOpRatesTest, RunComparison) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const size_t kBufferSizeBytes = 1024;
   const size_t kRowNum = 256;
@@ -3906,9 +3902,8 @@ TEST_P(FlushModeOpRatesTest, RunComparison) {
   EXPECT_GT(t_afs_wall, t_afb_wall);
 }
 
-INSTANTIATE_TEST_CASE_P(,
-                        FlushModeOpRatesTest,
-                        ::testing::Values(RowSize::CONSTANT, RowSize::RANDOM));
+INSTANTIATE_TEST_SUITE_P(, FlushModeOpRatesTest,
+                         ::testing::Values(RowSize::CONSTANT, RowSize::RANDOM));
 
 // A test to verify that it's safe to perform synchronous and/or asynchronous
 // flush while having the auto-flusher thread running in the background.
@@ -5248,10 +5243,7 @@ shared_ptr<KuduSession> LoadedSession(const shared_ptr<KuduClient>& client,
 // half update rows in descending order.
 // This ensures that we don't hit a deadlock in such a situation.
 TEST_F(ClientTest, TestDeadlockSimulation) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "TestDeadlockSimulation disabled since slow.";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   // Make reverse client who will make batches that update rows
   // in reverse order. Separate client used so rpc calls come in at same time.
@@ -5665,8 +5657,8 @@ TEST_P(LatestObservedTimestampParamTest, Test) {
     latest_ts = ts;
   }
 }
-INSTANTIATE_TEST_CASE_P(Params, LatestObservedTimestampParamTest,
-                        testing::ValuesIn(read_modes));
+INSTANTIATE_TEST_SUITE_P(Params, LatestObservedTimestampParamTest,
+                         testing::ValuesIn(read_modes));
 
 // Insert bunch of rows, delete a row, and then insert the row back.
 // Run scans several scan and check the results are consistent with the
@@ -6041,9 +6033,9 @@ TEST_P(IntEncodingNullPredicatesTest, TestIntEncodings) {
   }
 }
 
-INSTANTIATE_TEST_CASE_P(IntColEncodings,
-                        IntEncodingNullPredicatesTest,
-                        ::testing::Values(kPlain, kBitShuffle, kRunLength));
+INSTANTIATE_TEST_SUITE_P(IntColEncodings,
+                         IntEncodingNullPredicatesTest,
+                         ::testing::Values(kPlain, kBitShuffle, kRunLength));
 
 
 enum BinaryEncoding {
@@ -6138,9 +6130,9 @@ TEST_P(BinaryEncodingNullPredicatesTest, TestBinaryEncodings) {
   }
 }
 
-INSTANTIATE_TEST_CASE_P(BinaryColEncodings,
-                        BinaryEncodingNullPredicatesTest,
-                        ::testing::Values(kPlainBin, kPrefix, kDictionary));
+INSTANTIATE_TEST_SUITE_P(BinaryColEncodings,
+                         BinaryEncodingNullPredicatesTest,
+                         ::testing::Values(kPlainBin, kPrefix, kDictionary));
 
 TEST_F(ClientTest, TestClonePredicates) {
   NO_FATALS(InsertTestRows(client_table_.get(), 2, 0));
@@ -6617,7 +6609,7 @@ static const ServiceUnavailableRetryParams service_unavailable_retry_cases[] = {
   },
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     , ServiceUnavailableRetryClientTest,
     ::testing::ValuesIn(service_unavailable_retry_cases));
 

@@ -437,7 +437,7 @@ typedef ::testing::Types<FileBlockManager, LogBlockManager> BlockManagers;
 #else
 typedef ::testing::Types<FileBlockManager> BlockManagers;
 #endif
-TYPED_TEST_CASE(BlockManagerTest, BlockManagers);
+TYPED_TEST_SUITE(BlockManagerTest, BlockManagers);
 
 // Test to make sure that we don't break the file block manager, which depends
 // on a static set of directories to function properly. Internally, the
@@ -599,10 +599,7 @@ TYPED_TEST(BlockManagerTest, CloseTwiceTest) {
 TYPED_TEST(BlockManagerTest, CloseManyBlocksTest) {
   const int kNumBlocks = 1000;
 
-  if (!AllowSlowTests()) {
-    LOG(INFO) << "Not running in slow-tests mode";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   Random rand(SeedRandom());
   unique_ptr<BlockCreationTransaction> creation_transaction =

@@ -167,11 +167,7 @@ class TabletCopyITest : public ExternalMiniClusterITestBase {
 // A leader can "go rogue" due to a VM pause, CTRL-z, partition, etc.
 TEST_F(TabletCopyITest, TestRejectRogueLeader) {
   // This test pauses for at least 10 seconds. Only run in slow-test mode.
-  if (!AllowSlowTests()) {
-    LOG(INFO) << "Skipping test in fast-test mode.";
-    return;
-  }
-
+  SKIP_IF_SLOW_NOT_ALLOWED();
   vector<string> ts_flags, master_flags;
   ts_flags.emplace_back("--enable_leader_failure_detection=false");
   master_flags.emplace_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
@@ -620,10 +616,7 @@ TEST_F(TabletCopyITest, TestTabletCopyFollowerWithHigherTerm) {
 // multiple tablets between the same tablet copy client host and source host
 // could corrupt each other.
 TEST_F(TabletCopyITest, TestConcurrentTabletCopys) {
-  if (!AllowSlowTests()) {
-    LOG(INFO) << "Skipping test in fast-test mode.";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   vector<string> ts_flags, master_flags;
   ts_flags.emplace_back("--enable_leader_failure_detection=false");
@@ -730,10 +723,7 @@ TEST_F(TabletCopyITest, TestConcurrentTabletCopys) {
 // KUDU-1047.
 TEST_F(TabletCopyITest, TestDeleteLeaderDuringTabletCopyStressTest) {
   // This test takes a while due to failure detection.
-  if (!AllowSlowTests()) {
-    LOG(INFO) << "Skipping test in fast-test mode.";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const MonoDelta timeout = MonoDelta::FromSeconds(60);
   NO_FATALS(StartCluster(vector<string>(), vector<string>(), 5));
@@ -1230,8 +1220,8 @@ const char* kTabletCopyFailureITestFlags[] = {
   "--tablet_copy_early_session_timeout_prob=1.0",
   "--tablet_copy_fault_crash_on_fetch_all=1.0"
 };
-INSTANTIATE_TEST_CASE_P(FailureCause, TabletCopyFailureITest,
-                        ::testing::ValuesIn(kTabletCopyFailureITestFlags));
+INSTANTIATE_TEST_SUITE_P(FailureCause, TabletCopyFailureITest,
+                         ::testing::ValuesIn(kTabletCopyFailureITestFlags));
 
 // Test that a failed tablet copy of a brand-new replica results in still being
 // able to vote while tombstoned.
@@ -1426,8 +1416,8 @@ class BadTabletCopyITest : public TabletCopyITest,
 const char* kFlagFaultOnFetch = "fault_crash_on_handle_tc_fetch_data";
 const char* kFlagEarlyTimeout = "tablet_copy_early_session_timeout_prob";
 const char* kBadTabletCopyITestFlags[] = { kFlagFaultOnFetch, kFlagEarlyTimeout };
-INSTANTIATE_TEST_CASE_P(FaultFlags, BadTabletCopyITest,
-                        ::testing::ValuesIn(kBadTabletCopyITestFlags));
+INSTANTIATE_TEST_SUITE_P(FaultFlags, BadTabletCopyITest,
+                         ::testing::ValuesIn(kBadTabletCopyITestFlags));
 
 void BadTabletCopyITest::LoadTable(TestWorkload* workload, int min_rows, int min_blocks) {
   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
@@ -1472,11 +1462,7 @@ void BadTabletCopyITest::LoadTable(TestWorkload* workload, int min_rows, int min
 
 // Ensure that a tablet copy failure results in no orphaned blocks and no data loss.
 TEST_P(BadTabletCopyITest, TestBadCopy) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "Not running " << CURRENT_TEST_NAME() << " because it is a slow test.";
-    return;
-  }
-
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // Load 2 tablets with 3 replicas each across 3 tablet servers s.t. we end up
   // with a replication distribution like: ([A], [A,B], [A,B], [B]).
   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);

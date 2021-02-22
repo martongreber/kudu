@@ -20,10 +20,12 @@
 #include <openssl/crypto.h>
 
 #include <cstring>
+#include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/strings/strip.h"
@@ -97,7 +99,8 @@ class CryptoTest : public KuduTest {
 TEST_F(CryptoTest, RsaPrivateKeyInputOutputPEM) {
   // TODO(KUDU-3207): Skip when run in FIPS mode due to different private key format.
   if (FIPS_mode()) {
-    return;
+    LOG(WARNING) << "Skipping test in FIPS mode. See KUDU-3207.";
+    GTEST_SKIP();
   }
   PrivateKey key;
   ASSERT_OK(key.FromFile(private_key_file_, DataFormat::PEM));
@@ -192,7 +195,7 @@ TEST_P(CryptoKeySerDesTest, ToAndFromString) {
   NO_FATALS(CheckToAndFromString(public_key, format));
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     DataFormats, CryptoKeySerDesTest,
     ::testing::Values(DataFormat::DER, DataFormat::PEM));
 

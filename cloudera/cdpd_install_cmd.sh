@@ -78,6 +78,8 @@ ccache -p || true
 # TODO(RELENG-12258): Remove workaround once devtoolset-8 is availiable in the base image.
 # Install devtoolset-8 which is required to build Kudu on Centos 7
 sudo yum install -y centos-release-scl-rh && sudo yum install -y devtoolset-8
+# Install chrpath which is required to build the kudu-binary Jar
+sudo yum install -y chrpath
 
 # Build thirdparty.
 build-support/enable_devtoolset.sh thirdparty/build-if-necessary.sh
@@ -90,10 +92,19 @@ done
 
 # Build the java modules.
 pushd java
+# Note: We use install instead of publish because the CDP build publishes
+# the Jars that are installed to the local maven repo at the end of the build.
 ./gradlew install -PskipSigning=true
 # Build again with Spark 2
 ./gradlew install -PskipSigning=true -Pspark2
 popd
+
+# Build the `kudu-binary` jar.
+# Note: We do not build and publish the OSX compatible jar like is done in upstream Kudu.
+build-support/mini-cluster/build_mini_cluster_binaries.sh
+# Note: We use install instead of publish because the CDP build publishes
+# the Jars that are installed to the local maven repo at the end of the build.
+build-support/mini-cluster/publish_mini_cluster_binaries.sh --action install
 
 # Copy the published artifacts to a versioned staging directory.
 mkdir -p ../kudu-${VERSION}/java

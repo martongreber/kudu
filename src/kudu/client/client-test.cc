@@ -104,7 +104,6 @@
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/txn_coordinator.h"
-#include "kudu/tablet/txn_participant-test-util.h"
 #include "kudu/transactions/transactions.pb.h"
 #include "kudu/transactions/txn_status_manager.h"
 #include "kudu/tserver/mini_tablet_server.h"
@@ -113,7 +112,6 @@
 #include "kudu/tserver/tablet_server_options.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver.pb.h"
-#include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/util/array_view.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/barrier.h"
@@ -174,6 +172,7 @@ DECLARE_int64(on_disk_size_for_testing);
 DECLARE_string(location_mapping_cmd);
 DECLARE_string(superuser_acl);
 DECLARE_string(user_acl);
+DECLARE_uint32(dns_resolver_cache_capacity_mb);
 DECLARE_uint32(txn_keepalive_interval_ms);
 DECLARE_uint32(txn_staleness_tracker_interval_ms);
 DECLARE_uint32(txn_manager_status_table_num_replicas);
@@ -209,9 +208,6 @@ using kudu::tablet::TabletReplica;
 using kudu::transactions::TxnStatusManager;
 using kudu::transactions::TxnTokenPB;
 using kudu::tserver::MiniTabletServer;
-using kudu::tserver::ParticipantOpPB;
-using kudu::tserver::ParticipantRequestPB;
-using kudu::tserver::ParticipantResponsePB;
 using std::function;
 using std::map;
 using std::pair;
@@ -390,24 +386,6 @@ class ClientTest : public KuduTest {
     }
   }
 
-  // TODO(awong): automatically begin transactions when trying to write to a
-  //              transaction for the first time.
-  void BeginTxnOnParticipants(int64_t txn_id) {
-    for (auto i = 0; i < cluster_->num_tablet_servers(); ++i) {
-      auto* tm = cluster_->mini_tablet_server(i)->server()->tablet_manager();
-      vector<scoped_refptr<TabletReplica>> replicas;
-      tm->GetTabletReplicas(&replicas);
-      for (auto& r : replicas) {
-        // Skip partitions of the transaction status manager.
-        if (r->txn_coordinator()) continue;
-        ParticipantResponsePB resp;
-        WARN_NOT_OK(CallParticipantOp(
-            r.get(), txn_id, ParticipantOpPB::BEGIN_TXN, -1, &resp),
-            "failed to start transaction on participant");;
-      }
-    }
-  }
-
   // TODO(aserbin): consider removing this method and update the scenarios it
   //                was used once the transaction orchestration is implemented
   Status FinalizeCommitTransaction(int64_t txn_id) {
@@ -463,7 +441,7 @@ class ClientTest : public KuduTest {
   // Inserts given number of tests rows into the specified table
   // in the context of the session.
   static void InsertTestRows(KuduTable* table, KuduSession* session,
-                      int num_rows, int first_row = 0) {
+                             int num_rows, int first_row = 0) {
     for (int i = first_row; i < num_rows + first_row; ++i) {
       unique_ptr<KuduInsert> insert(BuildTestInsert(table, i));
       ASSERT_OK(session->Apply(insert.release()));
@@ -3188,42 +3166,56 @@ TEST_F(ClientTest, TestWriteWhileRestarting) {
 }
 
 TEST_F(ClientTest, TestFailedDnsResolution) {
-  shared_ptr<KuduSession> session = client_->NewSession();
+  // Create a dedicated instance of a client which doesn't cache DNS resolution
+  // results. This is to avoid using the DNS resolver cache if the hostname/IP
+  // address of tablet server is the same as master's address. The latter is
+  // the case when using other than UNIQUE_LOOPBACK binding mode for the
+  // server components of the test mini-cluster.
+  FLAGS_dns_resolver_cache_capacity_mb = 0;
+  shared_ptr<KuduClient> c;
+  ASSERT_OK(KuduClientBuilder()
+      .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr().ToString())
+      .Build(&c));
+  shared_ptr<KuduTable> t;
+  ASSERT_OK(c->OpenTable(kTableName, &t));
+
+  shared_ptr<KuduSession> session = c->NewSession();
   ASSERT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
-  const string kMasterError = "timed out after deadline expired: GetTableLocations RPC";
 
-  // First time disable dns resolution.
-  // Set the timeout to be short since we know it can't succeed, but not to the point where we
-  // can timeout before getting the dns error.
-  {
-    for (int i = 0;;i++) {
-      google::FlagSaver saver;
-      FLAGS_fail_dns_resolution = true;
-      session->SetTimeoutMillis(500);
-      ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "row"));
-      Status s = session->Flush();
-      ASSERT_TRUE(s.IsIOError()) << "unexpected status: " << s.ToString();
-      unique_ptr<KuduError> error = GetSingleErrorFromSession(session.get());
-      ASSERT_TRUE(error->status().IsTimedOut()) << error->status().ToString();
+  // First, make DNS resolution time out.
+  // Set the timeout to be short since we know it can't succeed, but not to the
+  // point where we can timeout before getting the DNS error.
+  FLAGS_fail_dns_resolution = true;
+  session->SetTimeoutMillis(1000);
 
-      // Due to KUDU-1466 there is a narrow window in which the error reported might be that the
-      // GetTableLocations RPC to the master timed out instead of the expected dns resolution error.
-      // In that case just loop again.
-
-      if (error->status().ToString().find(kMasterError) != std::string::npos) {
-        ASSERT_LE(i, 10) << "Didn't get a dns resolution error after 10 tries.";
-        continue;
-      }
-
-      ASSERT_STR_CONTAINS(error->status().ToString(),
-                          "Network error: Failed to resolve address for TS");
-      break;
+  // Due to KUDU-1466, there is a narrow window in which the error reported
+  // might be that the GetTableLocations RPC to the master timed out instead of
+  // the expected DNS resolution error while trying to send Write RPC to
+  // tablet server.
+  for (auto i = 0;; ++i) {
+    constexpr const char* const kMasterErrors[] = {
+      "timed out after deadline expired: GetTableLocations RPC",
+      "LookupRpc timed out after deadline expired",
+    };
+    ASSERT_OK(ApplyInsertToSession(session.get(), t, 1, 1, "row"));
+    auto s = session->Flush();
+    ASSERT_TRUE(s.IsIOError()) << s.ToString();
+    unique_ptr<KuduError> error = GetSingleErrorFromSession(session.get());
+    ASSERT_TRUE(error->status().IsTimedOut()) << error->status().ToString();
+    const auto row_status_str = error->status().ToString();
+    if (row_status_str.find(kMasterErrors[0]) != std::string::npos ||
+        row_status_str.find(kMasterErrors[1]) != std::string::npos) {
+      ASSERT_LE(i, 10) << "could not get DNS resolution error after 10 tries";
+      continue;
     }
+    ASSERT_STR_CONTAINS(row_status_str,
+                        "Network error: Failed to resolve address for TS");
+    break;
   }
 
-  // Now re-enable dns resolution, the write should succeed.
+  // Now, re-enable the DNS resolution: the write should succeed.
   FLAGS_fail_dns_resolution = false;
-  ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "row"));
+  ASSERT_OK(ApplyInsertToSession(session.get(), t, 1, 1, "row"));
   ASSERT_OK(session->Flush());
 }
 
@@ -7138,9 +7130,6 @@ TEST_F(ClientTest, TxnBasicOperations) {
     ASSERT_STR_CONTAINS(s.ToString(), "is not open: state: ABORT");
   }
 
-  // TODO(aserbin): uncomment this when other parts of transaction lifecycle
-  //                are properly implemented
-#if 0
   // Insert rows in a transactional session, then rollback the transaction
   // and make sure the rows are gone.
   {
@@ -7167,7 +7156,6 @@ TEST_F(ClientTest, TxnBasicOperations) {
         client_table_.get(), KuduScanner::READ_YOUR_WRITES));
     ASSERT_EQ(0, session->CountPendingErrors());
   }
-#endif
 }
 
 // Verify the basic functionality of the KuduTransaction::Commit() and
@@ -7339,9 +7327,6 @@ TEST_F(ClientTest, TxnToken) {
   ASSERT_OK(serdes_txn->Serialize(&serdes_txn_token));
   ASSERT_EQ(txn_token, serdes_txn_token);
 
-  // TODO(awong): remove once we register participants automatically before
-  // inserting.
-  BeginTxnOnParticipants(txn_id);
   {
     static constexpr auto kNumRows = 10;
     shared_ptr<KuduSession> session;

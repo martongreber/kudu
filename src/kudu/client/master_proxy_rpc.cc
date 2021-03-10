@@ -46,6 +46,8 @@ using strings::Substitute;
 
 namespace kudu {
 
+using master::AddMasterRequestPB;
+using master::AddMasterResponsePB;
 using master::AlterTableRequestPB;
 using master::AlterTableResponsePB;
 using master::ChangeTServerStateRequestPB;
@@ -74,6 +76,8 @@ using master::ListTabletServersRequestPB;
 using master::ListTabletServersResponsePB;
 using master::MasterServiceProxy;
 using master::MasterErrorPB;
+using master::RemoveMasterRequestPB;
+using master::RemoveMasterResponsePB;
 using master::ReplaceTabletRequestPB;
 using master::ReplaceTabletResponsePB;
 using rpc::BackoffType;
@@ -259,7 +263,7 @@ bool AsyncLeaderMasterRpc<ReqClass, RespClass>::RetryOrReconnectIfNecessary(
       return true;
     }
     if (err->unsupported_feature_flags_size() > 0) {
-      s = Status::NotSupported(Substitute("Cluster is does not support $0",
+      s = Status::NotSupported(Substitute("Cluster does not support $0",
                                           rpc_name_));
     }
   }
@@ -283,19 +287,21 @@ bool AsyncLeaderMasterRpc<ReqClass, RespClass>::RetryOrReconnectIfNecessary(
   return false;
 }
 
+template class AsyncLeaderMasterRpc<AddMasterRequestPB, AddMasterResponsePB>;
+template class AsyncLeaderMasterRpc<AlterTableRequestPB, AlterTableResponsePB>;
 template class AsyncLeaderMasterRpc<ChangeTServerStateRequestPB, ChangeTServerStateResponsePB>;
 template class AsyncLeaderMasterRpc<CreateTableRequestPB, CreateTableResponsePB>;
-template class AsyncLeaderMasterRpc<IsCreateTableDoneRequestPB, IsCreateTableDoneResponsePB>;
 template class AsyncLeaderMasterRpc<DeleteTableRequestPB, DeleteTableResponsePB>;
-template class AsyncLeaderMasterRpc<AlterTableRequestPB, AlterTableResponsePB>;
-template class AsyncLeaderMasterRpc<IsAlterTableDoneRequestPB, IsAlterTableDoneResponsePB>;
-template class AsyncLeaderMasterRpc<GetTableSchemaRequestPB, GetTableSchemaResponsePB>;
 template class AsyncLeaderMasterRpc<GetTableLocationsRequestPB, GetTableLocationsResponsePB>;
-template class AsyncLeaderMasterRpc<GetTabletLocationsRequestPB, GetTabletLocationsResponsePB>;
+template class AsyncLeaderMasterRpc<GetTableSchemaRequestPB, GetTableSchemaResponsePB>;
 template class AsyncLeaderMasterRpc<GetTableStatisticsRequestPB, GetTableStatisticsResponsePB>;
+template class AsyncLeaderMasterRpc<GetTabletLocationsRequestPB, GetTabletLocationsResponsePB>;
+template class AsyncLeaderMasterRpc<IsAlterTableDoneRequestPB, IsAlterTableDoneResponsePB>;
+template class AsyncLeaderMasterRpc<IsCreateTableDoneRequestPB, IsCreateTableDoneResponsePB>;
+template class AsyncLeaderMasterRpc<ListMastersRequestPB, ListMastersResponsePB>;
 template class AsyncLeaderMasterRpc<ListTablesRequestPB, ListTablesResponsePB>;
 template class AsyncLeaderMasterRpc<ListTabletServersRequestPB, ListTabletServersResponsePB>;
-template class AsyncLeaderMasterRpc<ListMastersRequestPB, ListMastersResponsePB>;
+template class AsyncLeaderMasterRpc<RemoveMasterRequestPB, RemoveMasterResponsePB>;
 template class AsyncLeaderMasterRpc<ReplaceTabletRequestPB, ReplaceTabletResponsePB>;
 
 } // namespace internal

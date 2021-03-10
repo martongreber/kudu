@@ -202,7 +202,7 @@ if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
   set +x
   if [ -n "${KUDU_TRUSTSTORE_LOCATION}" ] && [ -n "${KUDU_TRUSTORE_PASSWORD}" ]; then
     perl -pi -e "s#\{\{RANGER_PLUGIN_TRUSTSTORE}}#${KUDU_TRUSTSTORE_LOCATION}#g" "${CONF_DIR}"/ranger-kudu-policymgr-ssl.xml
-    if [[ "${RANGER_KEYSTORE_TYPE}" -eq "bcfks" ]]
+    if [[ "${RANGER_KEYSTORE_TYPE}" = "bcfks" ]]
     then
       STORETYPE="bcfks"
     else

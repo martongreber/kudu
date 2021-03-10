@@ -683,8 +683,8 @@ class ToolTestKerberosParameterized : public ToolTest, public ::testing::WithPar
     return GetParam();
   }
 };
-INSTANTIATE_TEST_CASE_P(ToolTestKerberosParameterized, ToolTestKerberosParameterized,
-                        ::testing::Values(false, true));
+INSTANTIATE_TEST_SUITE_P(ToolTestKerberosParameterized, ToolTestKerberosParameterized,
+                         ::testing::Values(false, true));
 
 enum RunCopyTableCheckArgsType {
   kTestCopyTableDstTableExist,
@@ -919,14 +919,14 @@ const char ToolTestCopyTableParameterized::kComplexSchemaColumns[]
     = "key_hash0,key_hash1,key_hash2,key_range,int8_val,int16_val,int32_val,int64_val,"
       "timestamp_val,string_val,bool_val,float_val,double_val,binary_val,decimal_val";
 
-INSTANTIATE_TEST_CASE_P(CopyTableParameterized,
-                        ToolTestCopyTableParameterized,
-                        ::testing::Values(kTestCopyTableDstTableExist,
-                                          kTestCopyTableDstTableNotExist,
-                                          kTestCopyTableUpsert,
-                                          kTestCopyTableSchemaOnly,
-                                          kTestCopyTableComplexSchema,
-                                          kTestCopyTablePredicates));
+INSTANTIATE_TEST_SUITE_P(CopyTableParameterized,
+                         ToolTestCopyTableParameterized,
+                         ::testing::Values(kTestCopyTableDstTableExist,
+                                           kTestCopyTableDstTableNotExist,
+                                           kTestCopyTableUpsert,
+                                           kTestCopyTableSchemaOnly,
+                                           kTestCopyTableComplexSchema,
+                                           kTestCopyTablePredicates));
 
 void ToolTest::StartExternalMiniCluster(ExternalMiniClusterOptions opts) {
   cluster_.reset(new ExternalMiniCluster(std::move(opts)));
@@ -1107,6 +1107,8 @@ TEST_F(ToolTest, TestModeHelp) {
         "status.*Get the status",
         "timestamp.*Get the current timestamp",
         "list.*List masters in a Kudu cluster",
+        "add.*Add a master to the Raft configuration",
+        "remove.*Remove a master from the Raft configuration"
     };
     NO_FATALS(RunTestHelp(kCmd, kMasterModeRegexes));
     NO_FATALS(RunTestHelpRpcFlags(kCmd,
@@ -1125,6 +1127,12 @@ TEST_F(ToolTest, TestModeHelp) {
     };
     NO_FATALS(RunTestHelp(kSubCmd, kMasterAuthzCacheModeRegexes));
     NO_FATALS(RunTestHelpRpcFlags(kSubCmd, {"refresh"}));
+  }
+  {
+    NO_FATALS(RunTestHelp("master add --help",
+                          {"-wait_secs \\(Timeout in seconds to wait for the newly added master"}));
+    NO_FATALS(RunTestHelp("master remove --help",
+                          {"-master_uuid \\(Permanent UUID of the master"}));
   }
   {
     const vector<string> kPbcModeRegexes = {
@@ -1314,6 +1322,10 @@ TEST_F(ToolTest, TestActionHelp) {
 
 TEST_F(ToolTest, TestActionMissingRequiredArg) {
   NO_FATALS(RunActionMissingRequiredArg("master list", "master_addresses"));
+  NO_FATALS(RunActionMissingRequiredArg("master add", "master_addresses"));
+  NO_FATALS(RunActionMissingRequiredArg("master add master.example.com", "master_address"));
+  NO_FATALS(RunActionMissingRequiredArg("master remove", "master_addresses"));
+  NO_FATALS(RunActionMissingRequiredArg("master remove master.example.com", "master_address"));
   NO_FATALS(RunActionMissingRequiredArg("cluster ksck --master_addresses=master.example.com",
                                         "master_addresses"));
   NO_FATALS(RunActionMissingRequiredArg("local_replica cmeta rewrite_raft_config fake_id",
@@ -4909,11 +4921,11 @@ class ControlShellToolTest :
   unique_ptr<SubprocessProtocol> proto_;
 };
 
-INSTANTIATE_TEST_CASE_P(SerializationModes, ControlShellToolTest,
-                        ::testing::Combine(::testing::Values(
-                            SubprocessProtocol::SerializationMode::PB,
-                            SubprocessProtocol::SerializationMode::JSON),
-                                           ::testing::Bool()));
+INSTANTIATE_TEST_SUITE_P(SerializationModes, ControlShellToolTest,
+                         ::testing::Combine(::testing::Values(
+                             SubprocessProtocol::SerializationMode::PB,
+                             SubprocessProtocol::SerializationMode::JSON),
+                                            ::testing::Bool()));
 
 TEST_P(ControlShellToolTest, TestControlShell) {
   const int kNumMasters = 1;
@@ -5903,7 +5915,7 @@ class Is343ReplicaUtilTest :
     public ToolTest,
     public ::testing::WithParamInterface<bool> {
 };
-INSTANTIATE_TEST_CASE_P(, Is343ReplicaUtilTest, ::testing::Bool());
+INSTANTIATE_TEST_SUITE_P(, Is343ReplicaUtilTest, ::testing::Bool());
 TEST_P(Is343ReplicaUtilTest, Is343Cluster) {
   constexpr auto kReplicationFactor = 3;
   const auto is_343_scheme = GetParam();

@@ -23,6 +23,7 @@
 #include <ostream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -695,10 +696,7 @@ TEST_F(RaftConsensusNonVoterITest, AddThenRemoveNonVoterReplica) {
 //  * does not start leader elections
 //  * returns an error on RunLeaderElection() RPC call
 TEST_F(RaftConsensusNonVoterITest, NonVoterReplicasDoNotVote) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const MonoDelta kTimeout = MonoDelta::FromSeconds(60);
   const int kOriginalReplicasNum = 2;
@@ -830,10 +828,7 @@ TEST_F(RaftConsensusNonVoterITest, NonVoterReplicasDoNotVote) {
 // Promote and demote a replica under active workload.
 // Promote a replica and remove it, making sure it gets tombstoned.
 TEST_F(RaftConsensusNonVoterITest, PromoteAndDemote) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const MonoDelta kTimeout = MonoDelta::FromSeconds(120);
   const int kInitialReplicasNum = 3;
@@ -1019,10 +1014,7 @@ TEST_F(RaftConsensusNonVoterITest, PromoteAndDemote) {
 //    its failure detection mechanism works as expected.
 //
 TEST_F(RaftConsensusNonVoterITest, PromotedReplicaCanVote) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const MonoDelta kTimeout = MonoDelta::FromSeconds(60);
   const int kInitialReplicasNum = 3;
@@ -1164,10 +1156,7 @@ TEST_F(RaftConsensusNonVoterITest, PromotedReplicaCanVote) {
 // Add an extra non-voter replica to the tablet and make sure it's evicted
 // by the catalog manager once catalog manager sees its state updated.
 TEST_F(RaftConsensusNonVoterITest, CatalogManagerEvictsExcessNonVoter) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const int kReplicaUnavailableSec = 5;
   const MonoDelta kTimeout = MonoDelta::FromSeconds(60);
@@ -1261,10 +1250,7 @@ TEST_F(RaftConsensusNonVoterITest, CatalogManagerEvictsExcessNonVoter) {
 //
 // TODO(aserbin): and make it run for 5 tablet servers.
 TEST_F(RaftConsensusNonVoterITest, CatalogManagerAddsNonVoter) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const int kReplicaUnavailableSec = 10;
   const MonoDelta kTimeout = MonoDelta::FromSeconds(6 * kReplicaUnavailableSec);
@@ -1322,10 +1308,7 @@ TEST_F(RaftConsensusNonVoterITest, CatalogManagerAddsNonVoter) {
 // original voter replicas from the tablet server should stay, but the newly
 // added non-voter replicas should be evicted.
 TEST_F(RaftConsensusNonVoterITest, TabletServerIsGoneAndBack) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const auto kReplicasNum = 3;
   const auto kReplicaUnavailableSec = 5;
@@ -1429,10 +1412,7 @@ TEST_F(RaftConsensusNonVoterITest, TabletServerIsGoneAndBack) {
 // replace the failed voter replica, so eventually the tablet has appropriate
 // number of functional replicas to guarantee the tablet's replication factor.
 TEST_F(RaftConsensusNonVoterITest, FailedTabletCopy) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const auto kReplicasNum = 3;
   const auto kConsensusRpcTimeout = MonoDelta::FromSeconds(5);
@@ -1612,10 +1592,7 @@ TEST_F(RaftConsensusNonVoterITest, FailedTabletCopy) {
 // After that, all tablet servers except for the former leader replica's server
 // are started again.
 TEST_F(RaftConsensusNonVoterITest, RestartClusterWithNonVoter) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const auto kReplicasNum = 3;
   const auto kConsensusRpcTimeout = MonoDelta::FromSeconds(5);
@@ -1770,10 +1747,7 @@ TEST_F(RaftConsensusNonVoterITest, RestartClusterWithNonVoter) {
 // Raft cluster, adding a new non-voter replica, when a majority of voters
 // is not online. Make sure the configuration change is not committed.
 TEST_F(RaftConsensusNonVoterITest, NonVoterReplicasInConsensusQueue) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const MonoDelta kTimeout = MonoDelta::FromSeconds(60);
   const int kOriginalReplicasNum = 3;
@@ -1880,9 +1854,9 @@ class IncompatibleReplicaReplacementSchemesITest :
     public RaftConsensusNonVoterITest,
     public ::testing::WithParamInterface<std::tuple<bool, bool>> {
 };
-INSTANTIATE_TEST_CASE_P(, IncompatibleReplicaReplacementSchemesITest,
-                        ::testing::Combine(::testing::Bool(),
-                                           ::testing::Bool()));
+INSTANTIATE_TEST_SUITE_P(, IncompatibleReplicaReplacementSchemesITest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Bool()));
 TEST_P(IncompatibleReplicaReplacementSchemesITest, MasterAndTserverMisconfig) {
   FLAGS_num_tablet_servers = 1;
   FLAGS_num_replicas = 1;
@@ -1968,7 +1942,7 @@ class ReplicaBehindWalGcThresholdITest :
     public ::testing::WithParamInterface<
         std::tuple<RaftConsensusITestBase::BehindWalGcBehavior, bool>> {
 };
-INSTANTIATE_TEST_CASE_P(,
+INSTANTIATE_TEST_SUITE_P(,
     ReplicaBehindWalGcThresholdITest,
     ::testing::Combine(
         ::testing::Values(RaftConsensusITestBase::BehindWalGcBehavior::STOP_CONTINUE,
@@ -1976,10 +1950,7 @@ INSTANTIATE_TEST_CASE_P(,
                           RaftConsensusITestBase::BehindWalGcBehavior::SHUTDOWN),
         ::testing::Bool()));
 TEST_P(ReplicaBehindWalGcThresholdITest, ReplicaReplacement) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const auto kReplicasNum = 3;
   const auto kTimeoutSec = 60;

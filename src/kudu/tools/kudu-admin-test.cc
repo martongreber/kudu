@@ -27,6 +27,7 @@
 #include <ostream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -460,12 +461,12 @@ TEST_P(MoveTabletParamTest, Test) {
   }
 }
 
-INSTANTIATE_TEST_CASE_P(EnableKudu1097AndDownTS, MoveTabletParamTest,
-                        ::testing::Combine(::testing::Values(Kudu1097::Disable,
+INSTANTIATE_TEST_SUITE_P(EnableKudu1097AndDownTS, MoveTabletParamTest,
+                         ::testing::Combine(::testing::Values(Kudu1097::Disable,
                                                              Kudu1097::Enable),
-                                           ::testing::Values(DownTS::None,
-                                                             DownTS::TabletPeer,
-                                                             DownTS::UninvolvedTS)));
+                                            ::testing::Values(DownTS::None,
+                                                              DownTS::TabletPeer,
+                                                              DownTS::UninvolvedTS)));
 
 Status RunUnsafeChangeConfig(const string& tablet_id,
                              const string& dst_host,
@@ -1474,10 +1475,7 @@ TEST_F(AdminCliTest, TestLeaderTransferToNonVoter) {
 // abrupt stepdowns are happening, as long as the writes have long enough
 // timeouts to ride over the unstable leadership.
 TEST_F(AdminCliTest, TestSimultaneousLeaderTransferAndAbruptStepdown) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const MonoDelta kTimeout = MonoDelta::FromSeconds(10);
   FLAGS_num_tablet_servers = 3;
@@ -1539,9 +1537,9 @@ class TestLeaderStepDown :
     public AdminCliTest,
     public ::testing::WithParamInterface<LeaderStepDownMode> {
 };
-INSTANTIATE_TEST_CASE_P(, TestLeaderStepDown,
-                        ::testing::Values(LeaderStepDownMode::ABRUPT,
-                                          LeaderStepDownMode::GRACEFUL));
+INSTANTIATE_TEST_SUITE_P(, TestLeaderStepDown,
+                         ::testing::Values(LeaderStepDownMode::ABRUPT,
+                                           LeaderStepDownMode::GRACEFUL));
 TEST_P(TestLeaderStepDown, TestLeaderStepDownWhenNotPresent) {
   FLAGS_num_tablet_servers = 3;
   FLAGS_num_replicas = 3;

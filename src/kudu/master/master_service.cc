@@ -262,10 +262,20 @@ void MasterServiceImpl::AddMaster(const AddMasterRequestPB* req,
     return;
   }
 
-  Status s = server_->AddMaster(HostPortFromPB(req->rpc_addr()), rpc);
+  HostPort hp = HostPortFromPB(req->rpc_addr());
+  Status s = server_->AddMaster(hp, rpc);
   if (!s.ok()) {
-    LOG(ERROR) << Substitute("Failed adding master $0:$1. $2", req->rpc_addr().host(),
-                             req->rpc_addr().port(), s.ToString());
+    // Special handling for master already present error for retry scenarios.
+    // Responding back using RespondFailure() will clobber the error code
+    // and hence responding with success and setting the error code.
+    if (s.IsAlreadyPresent()) {
+      LOG(WARNING) << Substitute("Master $0 already present", hp.ToString());
+      StatusToPB(s, resp->mutable_error()->mutable_status());
+      resp->mutable_error()->set_code(MasterErrorPB::MASTER_ALREADY_PRESENT);
+      rpc->RespondSuccess();
+      return;
+    }
+    LOG(ERROR) << Substitute("Failed adding master $0. $1", hp.ToString(), s.ToString());
     rpc->RespondFailure(s);
     return;
   }
@@ -832,8 +842,8 @@ void MasterServiceImpl::RefreshAuthzCache(
 
 bool MasterServiceImpl::SupportsFeature(uint32_t feature) const {
   switch (feature) {
-    case MasterFeatures::RANGE_PARTITION_BOUNDS:    FALLTHROUGH_INTENDED;
-    case MasterFeatures::ADD_DROP_RANGE_PARTITIONS: FALLTHROUGH_INTENDED;
+    case MasterFeatures::RANGE_PARTITION_BOUNDS:    [[fallthrough]];
+    case MasterFeatures::ADD_DROP_RANGE_PARTITIONS: [[fallthrough]];
     case MasterFeatures::REPLICA_MANAGEMENT:
       return true;
     case MasterFeatures::GENERATE_AUTHZ_TOKEN:

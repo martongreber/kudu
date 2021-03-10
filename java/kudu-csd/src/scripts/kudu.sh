@@ -185,7 +185,7 @@ if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
   if [ "$CMD" = "master" ]; then
     KUDU_ARGS="$KUDU_ARGS \
                --ranger_config_path=$CONF_DIR \
-               --trusted_user_acl=impala,hive,kudu \
+               --trusted_user_acl=impala,hive,kudu,rangeradmin \
                --ranger_java_path=$JAVA_HOME/bin/java \
                --ranger_jar_path=$KUDU_HOME/kudu-subprocess.jar"
   elif [ "$CMD" = "tserver" ]; then
@@ -202,7 +202,12 @@ if [[ -n "${RANGER_SERVICE}" && "${RANGER_SERVICE}" != "none" ]]; then
   set +x
   if [ -n "${KUDU_TRUSTSTORE_LOCATION}" ] && [ -n "${KUDU_TRUSTORE_PASSWORD}" ]; then
     perl -pi -e "s#\{\{RANGER_PLUGIN_TRUSTSTORE}}#${KUDU_TRUSTSTORE_LOCATION}#g" "${CONF_DIR}"/ranger-kudu-policymgr-ssl.xml
-    STORETYPE="${KUDU_KEYSTORE_TYPE:-jceks}"
+    if [[ "${RANGER_KEYSTORE_TYPE}" = "bcfks" ]]
+    then
+      STORETYPE="bcfks"
+    else
+      STORETYPE="jceks"
+    fi
     RANGER_PLUGIN_TRUSTSTORE_CRED_FILE="${STORETYPE}://file${CONF_DIR}/rangerpluginssl.${STORETYPE}"
 
     # Use jars from Ranger admin package to generate the trsustore credential file.

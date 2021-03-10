@@ -35,6 +35,7 @@
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/location_cache.h"
@@ -467,16 +468,25 @@ Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
   return Status::OK();
 }
 
-Status Master::GetMasterHostPorts(vector<HostPort>* hostports) const {
+Status Master::GetMasterHostPorts(vector<HostPort>* hostports, MasterType type) const {
   auto consensus = catalog_manager_->master_consensus();
   if (!consensus) {
     return Status::IllegalState("consensus not running");
   }
 
+  auto get_raft_member_type = [] (MasterType type) constexpr {
+    switch (type) {
+      case MasterType::VOTER_ONLY:
+        return RaftPeerPB::VOTER;
+      default:
+        LOG(FATAL) << "No matching Raft member type for master type: " << type;
+    }
+  };
+
   hostports->clear();
   consensus::RaftConfigPB config = consensus->CommittedConfig();
   for (const auto& peer : *config.mutable_peers()) {
-    if (peer.member_type() == consensus::RaftPeerPB::VOTER) {
+    if (type == MasterType::ALL || get_raft_member_type(type) == peer.member_type()) {
       // In non-distributed master configurations, we may not store our own
       // last known address in the Raft config. So, we'll fill it in from
       // the server Registration instead.
@@ -496,8 +506,8 @@ Status Master::GetMasterHostPorts(vector<HostPort>* hostports) const {
 Status Master::AddMaster(const HostPort& hp, rpc::RpcContext* rpc) {
   // Ensure requested master to be added is not already part of list of masters.
   vector<HostPort> masters;
-  // Here the check is made against committed config with voters only.
-  RETURN_NOT_OK(GetMasterHostPorts(&masters));
+  // Here the check is made against committed config with all member types.
+  RETURN_NOT_OK(GetMasterHostPorts(&masters, MasterType::ALL));
   if (std::find(masters.begin(), masters.end(), hp) != masters.end()) {
     return Status::AlreadyPresent("Master already present");
   }
@@ -511,6 +521,88 @@ Status Master::AddMaster(const HostPort& hp, rpc::RpcContext* rpc) {
   // If it's in progress, on initiating config change Raft will return error.
   return catalog_manager()->InitiateMasterChangeConfig(CatalogManager::kAddMaster, hp, peer_uuid,
                                                        rpc);
+}
+
+Status Master::RemoveMaster(const HostPort& hp, const string& uuid, rpc::RpcContext* rpc) {
+  // Ensure requested master to be removed is part of list of masters.
+  auto consensus = catalog_manager_->master_consensus();
+  if (!consensus) {
+    return Status::IllegalState("consensus not running");
+  }
+  consensus::RaftConfigPB config = consensus->CommittedConfig();
+
+  // We can't allow removing a master from a single master configuration. Following
+  // check ensures a more appropriate error message is returned in case the removal
+  // was targeted for a different cluster.
+  if (config.peers_size() == 1) {
+    bool hp_found;
+    if (!config.peers(0).has_last_known_addr()) {
+      // In non-distributed master configurations, we may not store our own
+      // last known address in the Raft config.
+      DCHECK(registration_initialized_.load());
+      DCHECK_GT(registration_.rpc_addresses_size(), 0);
+      const auto& addresses = registration_.rpc_addresses();
+      hp_found = std::find_if(addresses.begin(), addresses.end(),
+                              [&hp](const auto &hp_pb) {
+                                return HostPortFromPB(hp_pb) == hp;
+                              }) != addresses.end();
+    } else {
+      hp_found = HostPortFromPB(config.peers(0).last_known_addr()) == hp;
+    }
+    if (hp_found) {
+      return Status::InvalidArgument(Substitute("Can't remove master $0 in a single master "
+                                                "configuration", hp.ToString()));
+    }
+    return Status::NotFound(Substitute("Master $0 not found", hp.ToString()));
+  }
+
+  // UUIDs of masters matching the supplied HostPort 'hp' to remove.
+  vector<string> matching_masters;
+  for (const auto& peer : config.peers()) {
+    if (peer.has_last_known_addr() && HostPortFromPB(peer.last_known_addr()) == hp) {
+      matching_masters.push_back(peer.permanent_uuid());
+    }
+  }
+
+  string matching_uuid;
+  if (PREDICT_TRUE(matching_masters.size() == 1)) {
+    if (!uuid.empty() && uuid != matching_masters[0]) {
+      return Status::InvalidArgument(Substitute("Mismatch in UUID of the master $0 to be removed. "
+                                                "Expected: $1, supplied: $2.", hp.ToString(),
+                                                matching_masters[0], uuid));
+    }
+    matching_uuid = matching_masters[0];
+  } else if (matching_masters.empty()) {
+    return Status::NotFound(Substitute("Master $0 not found", hp.ToString()));
+  } else {
+    // We found multiple masters with matching HostPorts. Use the optional uuid to
+    // disambiguate, if possible.
+    DCHECK_GE(matching_masters.size(), 2);
+    if (!uuid.empty()) {
+      int matching_uuids_count = std::count(matching_masters.begin(), matching_masters.end(), uuid);
+      if (matching_uuids_count == 1) {
+        matching_uuid = uuid;
+      } else {
+        LOG(FATAL) << Substitute("Found multiple masters with same RPC address $0 and UUID $1",
+                                 hp.ToString(), uuid);
+      }
+    } else {
+      // Uuid not supplied and we found multiple matching HostPorts.
+      return Status::InvalidArgument(Substitute("Found multiple masters with same RPC address $0 "
+                                                "and following UUIDs $1. Supply UUID to "
+                                                "disambiguate.", hp.ToString(),
+                                                JoinStrings(matching_masters, ",")));
+    }
+  }
+
+  if (matching_uuid == fs_manager_->uuid()) {
+    return Status::InvalidArgument(Substitute("Can't remove the leader master $0", hp.ToString()));
+  }
+
+  // No early validation for whether a config change is in progress.
+  // If it's in progress, on initiating config change Raft will return error.
+  return catalog_manager()->InitiateMasterChangeConfig(CatalogManager::kRemoveMaster, hp,
+                                                       matching_uuid, rpc);
 }
 
 } // namespace master

@@ -157,6 +157,29 @@ Status TxnSystemClient::OpenTxnStatusTable() {
   return Status::OK();
 }
 
+Status TxnSystemClient::CheckOpenTxnStatusTable() {
+  {
+    std::lock_guard<simple_spinlock> l(table_lock_);
+    if (txn_status_table_) {
+      return Status::OK();
+    }
+  }
+
+  // TODO(aserbin): enqueue concurrent calls to the OpenTable() above, if any
+  client::sp::shared_ptr<KuduTable> table;
+  RETURN_NOT_OK(client_->OpenTable(TxnStatusTablet::kTxnStatusTableName, &table));
+
+  {
+    std::lock_guard<simple_spinlock> l(table_lock_);
+    // Extra check to handle concurrent callers.
+    if (!txn_status_table_) {
+      txn_status_table_ = std::move(table);
+    }
+  }
+
+  return Status::OK();
+}
+
 Status TxnSystemClient::BeginTransaction(int64_t txn_id,
                                          const string& user,
                                          uint32_t* txn_keepalive_ms,
@@ -441,6 +464,25 @@ Status TxnSystemClientInitializer::GetClient(TxnSystemClient** client) const {
     return Status::OK();
   }
   return Status::ServiceUnavailable("could not get TxnSystemClient, still initializing");
+}
+
+Status TxnSystemClientInitializer::WaitForClient(const MonoDelta& timeout,
+                                                 TxnSystemClient** client) const {
+  const auto deadline = MonoTime::Now() + timeout;
+  Status s;
+  do {
+    if (shutting_down_) {
+      return Status::ServiceUnavailable("could not get TxnSystemClient, shutting down");
+    }
+    s = GetClient(client);
+    if (PREDICT_TRUE(s.ok())) {
+      DCHECK(*client);
+      return Status::OK();
+    }
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  } while (MonoTime::Now() < deadline);
+  return Status::TimedOut(Substitute("Unable to get client in $0: $1",
+                                     timeout.ToString(), s.ToString()));
 }
 
 void TxnSystemClientInitializer::Shutdown() {

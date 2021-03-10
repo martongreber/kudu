@@ -62,8 +62,7 @@
 #ifndef UTIL_GTL_MAP_UTIL_H_
 #define UTIL_GTL_MAP_UTIL_H_
 
-#include <stddef.h>
-
+#include <cstddef>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -440,10 +439,28 @@ typename Collection::mapped_type& InsertKeyOrDie(
 //
 // Emplace*()
 //
+
+// Dancing with std::enable_if() is necessary to make these two functions
+// below work for both dictionary-like and set-like containers as well.
+// The idea is that for dictionary-like containers Collection::value_type
+// is always pair<const key_type, mapped_type>, so it cannot be the same
+// as key type.
 template <class Collection, class... Args>
-bool EmplaceIfNotPresent(Collection* const collection,
-                         Args&&... args) {
+typename std::enable_if<
+    std::is_same<typename Collection::key_type,
+                 typename Collection::value_type>::value,
+    bool>::type
+EmplaceIfNotPresent(Collection* const collection, Args&&... args) {
   return collection->emplace(std::forward<Args>(args)...).second;
+}
+
+template <class Collection, class... Args>
+typename std::enable_if<
+    !std::is_same<typename Collection::key_type,
+                  typename Collection::value_type>::value,
+    bool>::type
+EmplaceIfNotPresent(Collection* const collection, Args&&... args) {
+  return collection->try_emplace(std::forward<Args>(args)...).second;
 }
 
 // Emplaces the given key-value pair into the collection. Returns true if the
@@ -453,21 +470,35 @@ template <class Collection>
 bool EmplaceOrUpdate(Collection* const collection,
                      const typename Collection::key_type& key,
                      typename Collection::mapped_type&& value) {
-  typedef typename Collection::mapped_type mapped_type;
-  auto it = collection->find(key);
-  if (it == collection->end()) {
-    collection->emplace(key, std::forward<mapped_type>(value));
-    return true;
-  }
-  it->second = std::forward<mapped_type>(value);
-  return false;
+  return collection->insert_or_assign(
+      key, std::forward<typename Collection::mapped_type>(value)).second;
+}
+
+// Given the key and parameters to construct the mapped object in-place,
+// EmplaceOrDie() returns reference to the mapped object for dictionary-like
+// containers or constant reference to the element itself for set-like ones.
+// See the comment for EmplaceIfNotPresent() for details behind the template
+// meta-programming details.
+template <class Collection, class... Args>
+typename std::enable_if<
+    std::is_same<typename Collection::key_type,
+                 typename Collection::value_type>::value,
+    const typename Collection::value_type&>::type
+EmplaceOrDie(Collection* const collection, Args&&... args) {
+  auto res = collection->emplace(std::forward<Args>(args)...);
+  CHECK(res.second) << "duplicate value";
+  return *res.first;
 }
 
 template <class Collection, class... Args>
-void EmplaceOrDie(Collection* const collection,
-                  Args&&... args) {
-  CHECK(EmplaceIfNotPresent(collection, std::forward<Args>(args)...))
-      << "duplicate value";
+typename std::enable_if<
+    !std::is_same<typename Collection::key_type,
+                  typename Collection::value_type>::value,
+    typename Collection::mapped_type&>::type
+EmplaceOrDie(Collection* const collection, Args&&... args) {
+  auto res = collection->emplace(std::forward<Args>(args)...);
+  CHECK(res.second) << "duplicate value";
+  return res.first->second;
 }
 
 //
@@ -495,18 +526,18 @@ LookupOrInsert(Collection* const collection,
 }
 
 // It's similar to LookupOrInsert() but uses the emplace and r-value mechanics
-// to achieve the desired results. The constructor of the new element is called
-// with exactly the same arguments as supplied to emplace, forwarded via
-// std::forward<Args>(args). The element may be constructed even if there
-// already is an element with the same key in the container, in which case the
-// newly constructed element will be destroyed immediately.
+// to achieve the desired results, constructing the element in-place in the
+// container. The constructor of the new element is called with exactly the same
+// arguments as supplied to emplace, forwarded via std::forward<Args>(args).
+// The element is constructed only if there was no element with the specified
+// key in the container.
 // For details, see
-//   https://en.cppreference.com/w/cpp/container/map/emplace
-//   https://en.cppreference.com/w/cpp/container/unordered_map/emplace
+//   https://en.cppreference.com/w/cpp/container/map/try_emplace
+//   https://en.cppreference.com/w/cpp/container/unordered_map/try_emplace
 template <class Collection, class... Args>
 typename Collection::mapped_type&
 LookupOrEmplace(Collection* const collection, Args&&... args) {
-  return collection->emplace(std::forward<Args>(args)...).first->second;
+  return collection->try_emplace(std::forward<Args>(args)...).first->second;
 }
 
 // Counts the number of equivalent elements in the given "sequence", and stores

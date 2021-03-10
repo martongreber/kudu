@@ -31,7 +31,6 @@
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 
-#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/common/common.pb.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
@@ -479,6 +478,11 @@ class ExternalMiniCluster : public MiniCluster {
   // Adds a master to the ExternalMiniCluster when the new master has been added
   // dynamically after bringing up the ExternalMiniCluster.
   Status AddMaster(const scoped_refptr<ExternalMaster>& master);
+
+  // Removes any bookkeeping of the master specified by 'hp' from the ExternalMiniCluster
+  // after already having run through a successful master Raft change config to remove it.
+  // This helps keep the state of the actual cluster in sync with the state in ExternalMiniCluster.
+  Status RemoveMaster(const HostPort& hp);
 
  private:
   Status StartMasters();

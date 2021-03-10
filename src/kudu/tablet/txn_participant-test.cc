@@ -256,7 +256,7 @@ TEST_F(TxnParticipantTest, TestTransactionNotFound) {
       ASSERT_TRUE(resp.has_error());
       ASSERT_TRUE(resp.error().has_status());
       ASSERT_EQ(TabletServerErrorPB::UNKNOWN_ERROR, resp.error().code());
-      ASSERT_EQ(AppStatusPB::NOT_FOUND, resp.error().status().code());
+      ASSERT_EQ(AppStatusPB::ILLEGAL_STATE, resp.error().status().code());
       ASSERT_FALSE(resp.has_timestamp());
     }
   };
@@ -269,7 +269,8 @@ TEST_F(TxnParticipantTest, TestTransactionNotFound) {
 }
 
 TEST_F(TxnParticipantTest, TestIllegalTransitions) {
-  const auto check_valid_op = [&] (const ParticipantOpPB::ParticipantOpType& type, int64_t txn_id) {
+  const auto check_valid_op = [&] (const ParticipantOpPB::ParticipantOpType& type,
+                                   int64_t txn_id) {
     ParticipantResponsePB resp;
     ASSERT_OK(CallParticipantOp(
         tablet_replica_.get(), txn_id, type, kDummyCommitTimestamp, &resp));
@@ -278,7 +279,7 @@ TEST_F(TxnParticipantTest, TestIllegalTransitions) {
     ASSERT_TRUE(resp.has_timestamp());
   };
   const auto check_bad_ops = [&] (const vector<ParticipantOpPB::ParticipantOpType>& ops,
-                                       int64_t txn_id) {
+                                  int64_t txn_id) {
     for (const auto& type : ops) {
       ParticipantResponsePB resp;
       ASSERT_OK(CallParticipantOp(
@@ -291,6 +292,24 @@ TEST_F(TxnParticipantTest, TestIllegalTransitions) {
       ASSERT_FALSE(resp.has_timestamp());
     }
   };
+  const auto check_already_applied = [&] (const vector<ParticipantOpPB::ParticipantOpType>& ops,
+                                          int64_t txn_id, bool expect_timestamp) {
+    for (const auto& type : ops) {
+      ParticipantResponsePB resp;
+      ASSERT_OK(CallParticipantOp(
+          tablet_replica_.get(), txn_id, type, kDummyCommitTimestamp, &resp));
+      SCOPED_TRACE(SecureShortDebugString(resp));
+      ASSERT_TRUE(resp.has_error());
+      ASSERT_TRUE(resp.error().has_status());
+      ASSERT_EQ(AppStatusPB::ILLEGAL_STATE, resp.error().status().code());
+      ASSERT_EQ(TabletServerErrorPB::TXN_OP_ALREADY_APPLIED, resp.error().code());
+      if (expect_timestamp) {
+        ASSERT_TRUE(resp.has_timestamp());
+      } else {
+        ASSERT_FALSE(resp.has_timestamp());
+      }
+    }
+  };
   // Once we've begun the transaction, we can't finalize without beginning to
   // commit.
   NO_FATALS(check_valid_op(ParticipantOpPB::BEGIN_TXN, kTxnId));
@@ -301,6 +320,7 @@ TEST_F(TxnParticipantTest, TestIllegalTransitions) {
 
   // Once we begin committing, we can't start the transaction again.
   NO_FATALS(check_valid_op(ParticipantOpPB::BEGIN_COMMIT, kTxnId));
+  NO_FATALS(check_already_applied({ ParticipantOpPB::BEGIN_COMMIT }, kTxnId, true));
   NO_FATALS(check_bad_ops({ ParticipantOpPB::BEGIN_TXN }, kTxnId));
   ASSERT_EQ(vector<TxnParticipant::TxnEntry>({
       { kTxnId, kCommitInProgress, -1 },
@@ -308,8 +328,9 @@ TEST_F(TxnParticipantTest, TestIllegalTransitions) {
 
   // Once we've begun finalizing, we can't do anything.
   NO_FATALS(check_valid_op(ParticipantOpPB::FINALIZE_COMMIT, kTxnId));
+  NO_FATALS(check_already_applied({ ParticipantOpPB::BEGIN_COMMIT }, kTxnId, true));
+  NO_FATALS(check_already_applied({ ParticipantOpPB::FINALIZE_COMMIT }, kTxnId, false));
   NO_FATALS(check_bad_ops({ ParticipantOpPB::BEGIN_TXN,
-                            ParticipantOpPB::BEGIN_COMMIT,
                             ParticipantOpPB::ABORT_TXN }, kTxnId));
   ASSERT_EQ(vector<TxnParticipant::TxnEntry>({
       { kTxnId, kCommitted, kDummyCommitTimestamp },
@@ -779,8 +800,8 @@ TEST_P(MetadataFlushTxnParticipantTest, TestReplayUpdatesToTransactionalMRS) {
   ASSERT_EQ(1, rows.size());
 }
 
-INSTANTIATE_TEST_CASE_P(ShouldFlushMetadata, MetadataFlushTxnParticipantTest,
-    ::testing::Values(true, false));
+INSTANTIATE_TEST_SUITE_P(ShouldFlushMetadata, MetadataFlushTxnParticipantTest,
+                         ::testing::Values(true, false));
 
 // Similar to the above test, but checking that in-flight ops anchor the WALs.
 TEST_F(TxnParticipantTest, TestActiveParticipantOpsAnchorWALs) {
@@ -1344,7 +1365,7 @@ TEST_P(TxnParticipantConcurrencyTest, TestConcurrentDisjointInsertsTxn) {
     ASSERT_EQ(kNumThreads * rows_per_thread * (txn_id + 1) / num_txns, rows.size());
   }
 }
-INSTANTIATE_TEST_CASE_P(ConcurrencyParams, TxnParticipantConcurrencyTest,
+INSTANTIATE_TEST_SUITE_P(ConcurrencyParams, TxnParticipantConcurrencyTest,
     ::testing::Values(
       ConcurrencyParams{ /*num_txns*/1, /*num_rows_per_thread*/1 },
       ConcurrencyParams{ /*num_txns*/10, /*num_rows_per_thread*/1 },

@@ -41,7 +41,6 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
-#include <gmock/gmock-generated-matchers.h>
 #include <gmock/gmock-matchers.h>
 #include <google/protobuf/util/message_differencer.h>
 #include <gtest/gtest.h>
@@ -87,6 +86,7 @@
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/sysinfo.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/data_gen_util.h"
 #include "kudu/master/catalog_manager.h"
@@ -104,7 +104,6 @@
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/txn_coordinator.h"
-#include "kudu/tablet/txn_participant-test-util.h"
 #include "kudu/transactions/transactions.pb.h"
 #include "kudu/transactions/txn_status_manager.h"
 #include "kudu/tserver/mini_tablet_server.h"
@@ -113,7 +112,6 @@
 #include "kudu/tserver/tablet_server_options.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver.pb.h"
-#include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/util/array_view.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/barrier.h"
@@ -142,6 +140,7 @@ DECLARE_bool(disable_txn_system_client_init);
 DECLARE_bool(fail_dns_resolution);
 DECLARE_bool(location_mapping_by_uuid);
 DECLARE_bool(log_inject_latency);
+DECLARE_bool(master_client_location_assignment_enabled);
 DECLARE_bool(master_support_connect_to_master_rpc);
 DECLARE_bool(mock_table_metrics_for_testing);
 DECLARE_bool(rpc_listen_on_unix_domain_socket);
@@ -165,6 +164,7 @@ DECLARE_int32(scanner_gc_check_interval_us);
 DECLARE_int32(scanner_inject_latency_on_each_batch_ms);
 DECLARE_int32(scanner_max_batch_size_bytes);
 DECLARE_int32(scanner_ttl_ms);
+DECLARE_int32(stress_cpu_threads);
 DECLARE_int32(table_locations_ttl_ms);
 DECLARE_int32(txn_status_manager_inject_latency_load_from_tablet_ms);
 DECLARE_int64(live_row_count_for_testing);
@@ -172,6 +172,7 @@ DECLARE_int64(on_disk_size_for_testing);
 DECLARE_string(location_mapping_cmd);
 DECLARE_string(superuser_acl);
 DECLARE_string(user_acl);
+DECLARE_uint32(dns_resolver_cache_capacity_mb);
 DECLARE_uint32(txn_keepalive_interval_ms);
 DECLARE_uint32(txn_staleness_tracker_interval_ms);
 DECLARE_uint32(txn_manager_status_table_num_replicas);
@@ -207,9 +208,6 @@ using kudu::tablet::TabletReplica;
 using kudu::transactions::TxnStatusManager;
 using kudu::transactions::TxnTokenPB;
 using kudu::tserver::MiniTabletServer;
-using kudu::tserver::ParticipantOpPB;
-using kudu::tserver::ParticipantRequestPB;
-using kudu::tserver::ParticipantResponsePB;
 using std::function;
 using std::map;
 using std::pair;
@@ -273,10 +271,6 @@ class ClientTest : public KuduTest {
         .Build(&client_));
 
     NO_FATALS(CreateTable(kTableName, 1, GenerateSplitRows(), {}, &client_table_));
-  }
-
-  void TearDown() override {
-    KuduTest::TearDown();
   }
 
   // Looks up the remote tablet entry for a given partition key in the meta cache.
@@ -361,9 +355,8 @@ class ClientTest : public KuduTest {
   }
 
  protected:
-
-  static const char *kTableName;
-  static const int32_t kNoBound;
+  static constexpr const char* const kTableName = "client-testtb";
+  static constexpr int32_t kNoBound = kint32max;
 
   // Set the location mapping command for the test's masters. Overridden by
   // derived classes to test client location assignment.
@@ -393,24 +386,6 @@ class ClientTest : public KuduTest {
     }
   }
 
-  // TODO(awong): automatically begin transactions when trying to write to a
-  //              transaction for the first time.
-  void BeginTxnOnParticipants(int64_t txn_id) {
-    for (auto i = 0; i < cluster_->num_tablet_servers(); ++i) {
-      auto* tm = cluster_->mini_tablet_server(i)->server()->tablet_manager();
-      vector<scoped_refptr<TabletReplica>> replicas;
-      tm->GetTabletReplicas(&replicas);
-      for (auto& r : replicas) {
-        // Skip partitions of the transaction status manager.
-        if (r->txn_coordinator()) continue;
-        ParticipantResponsePB resp;
-        WARN_NOT_OK(CallParticipantOp(
-            r.get(), txn_id, ParticipantOpPB::BEGIN_TXN, -1, &resp),
-            "failed to start transaction on participant");;
-      }
-    }
-  }
-
   // TODO(aserbin): consider removing this method and update the scenarios it
   //                was used once the transaction orchestration is implemented
   Status FinalizeCommitTransaction(int64_t txn_id) {
@@ -429,7 +404,7 @@ class ClientTest : public KuduTest {
           continue;
         }
         tserver::TabletServerErrorPB ts_error;
-        auto s = c->FinalizeCommitTransaction(txn_id, &ts_error);
+        auto s = c->FinalizeCommitTransaction(txn_id, Timestamp::kInitialTimestamp, &ts_error);
         if (s.IsNotFound()) {
           continue;
         }
@@ -466,7 +441,7 @@ class ClientTest : public KuduTest {
   // Inserts given number of tests rows into the specified table
   // in the context of the session.
   static void InsertTestRows(KuduTable* table, KuduSession* session,
-                      int num_rows, int first_row = 0) {
+                             int num_rows, int first_row = 0) {
     for (int i = first_row; i < num_rows + first_row; ++i) {
       unique_ptr<KuduInsert> insert(BuildTestInsert(table, i));
       ASSERT_OK(session->Apply(insert.release()));
@@ -723,18 +698,22 @@ class ClientTest : public KuduTest {
   }
 
   int CountRowsFromClient(KuduTable* table) {
-    return CountRowsFromClient(table, KuduScanner::READ_LATEST, kNoBound, kNoBound);
+    return CountRowsFromClient(table, KuduScanner::READ_LATEST);
   }
 
-  int CountRowsFromClient(KuduTable* table, KuduScanner::ReadMode scan_mode,
-                          int32_t lower_bound, int32_t upper_bound) {
+  int CountRowsFromClient(KuduTable* table,
+                          KuduScanner::ReadMode scan_mode,
+                          int32_t lower_bound = kNoBound,
+                          int32_t upper_bound = kNoBound) {
     return CountRowsFromClient(table, KuduClient::LEADER_ONLY, scan_mode,
                                lower_bound, upper_bound);
   }
 
-  int CountRowsFromClient(KuduTable* table, KuduClient::ReplicaSelection selection,
+  int CountRowsFromClient(KuduTable* table,
+                          KuduClient::ReplicaSelection selection,
                           KuduScanner::ReadMode scan_mode,
-                          int32_t lower_bound, int32_t upper_bound) {
+                          int32_t lower_bound = kNoBound,
+                          int32_t upper_bound = kNoBound) {
     KuduScanner scanner(table);
     CHECK_OK(scanner.SetSelection(selection));
     CHECK_OK(scanner.SetProjectedColumnNames({}));
@@ -908,9 +887,6 @@ class ClientTest : public KuduTest {
   shared_ptr<KuduClient> client_;
   shared_ptr<KuduTable> client_table_;
 };
-
-const char *ClientTest::kTableName = "client-testtb";
-const int32_t ClientTest::kNoBound = kint32max;
 
 TEST_F(ClientTest, TestClusterId) {
   int leader_idx;
@@ -1319,18 +1295,17 @@ TEST_P(ScanMultiTabletParamTest, Test) {
   }
   FlushSessionOrDie(session);
 
-  ASSERT_EQ(4 * (kTabletsNum - 1),
-            CountRowsFromClient(table.get(), read_mode, kNoBound, kNoBound));
+  ASSERT_EQ(4 * (kTabletsNum - 1), CountRowsFromClient(table.get(), read_mode));
   ASSERT_EQ(3, CountRowsFromClient(table.get(), read_mode, kNoBound, 15));
-  ASSERT_EQ(9, CountRowsFromClient(table.get(), read_mode, 27, kNoBound));
+  ASSERT_EQ(9, CountRowsFromClient(table.get(), read_mode, 27));
   ASSERT_EQ(3, CountRowsFromClient(table.get(), read_mode, 0, 15));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 0, 10));
   ASSERT_EQ(4, CountRowsFromClient(table.get(), read_mode, 0, 20));
   ASSERT_EQ(8, CountRowsFromClient(table.get(), read_mode, 0, 30));
   ASSERT_EQ(6, CountRowsFromClient(table.get(), read_mode, 14, 30));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 30, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, kTabletsNum * kRowsPerTablet,
-                                   kNoBound));
+  ASSERT_EQ(0, CountRowsFromClient(
+      table.get(), read_mode, kTabletsNum * kRowsPerTablet));
 
   // Update every other row
   for (int i = 1; i < kTabletsNum; ++i) {
@@ -1343,18 +1318,17 @@ TEST_P(ScanMultiTabletParamTest, Test) {
   FlushSessionOrDie(session);
 
   // Check all counts the same (make sure updates don't change # of rows)
-  ASSERT_EQ(4 * (kTabletsNum - 1),
-            CountRowsFromClient(table.get(), read_mode, kNoBound, kNoBound));
+  ASSERT_EQ(4 * (kTabletsNum - 1), CountRowsFromClient(table.get(), read_mode));
   ASSERT_EQ(3, CountRowsFromClient(table.get(), read_mode, kNoBound, 15));
-  ASSERT_EQ(9, CountRowsFromClient(table.get(), read_mode, 27, kNoBound));
+  ASSERT_EQ(9, CountRowsFromClient(table.get(), read_mode, 27));
   ASSERT_EQ(3, CountRowsFromClient(table.get(), read_mode, 0, 15));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 0, 10));
   ASSERT_EQ(4, CountRowsFromClient(table.get(), read_mode, 0, 20));
   ASSERT_EQ(8, CountRowsFromClient(table.get(), read_mode, 0, 30));
   ASSERT_EQ(6, CountRowsFromClient(table.get(), read_mode, 14, 30));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 30, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, kTabletsNum * kRowsPerTablet,
-                                   kNoBound));
+  ASSERT_EQ(0, CountRowsFromClient(
+      table.get(), read_mode, kTabletsNum * kRowsPerTablet));
 
   // Delete half the rows
   for (int i = 1; i < kTabletsNum; ++i) {
@@ -1368,17 +1342,17 @@ TEST_P(ScanMultiTabletParamTest, Test) {
 
   // Check counts changed accordingly
   ASSERT_EQ(2 * (kTabletsNum - 1),
-            CountRowsFromClient(table.get(), read_mode, kNoBound, kNoBound));
+            CountRowsFromClient(table.get(), read_mode));
   ASSERT_EQ(2, CountRowsFromClient(table.get(), read_mode, kNoBound, 15));
-  ASSERT_EQ(4, CountRowsFromClient(table.get(), read_mode, 27, kNoBound));
+  ASSERT_EQ(4, CountRowsFromClient(table.get(), read_mode, 27));
   ASSERT_EQ(2, CountRowsFromClient(table.get(), read_mode, 0, 15));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 0, 10));
   ASSERT_EQ(2, CountRowsFromClient(table.get(), read_mode, 0, 20));
   ASSERT_EQ(4, CountRowsFromClient(table.get(), read_mode, 0, 30));
   ASSERT_EQ(2, CountRowsFromClient(table.get(), read_mode, 14, 30));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 30, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, kTabletsNum * kRowsPerTablet,
-                                   kNoBound));
+  ASSERT_EQ(0, CountRowsFromClient(
+      table.get(), read_mode, kTabletsNum * kRowsPerTablet));
 
   // Delete rest of rows
   for (int i = 1; i < kTabletsNum; ++i) {
@@ -1391,20 +1365,20 @@ TEST_P(ScanMultiTabletParamTest, Test) {
   FlushSessionOrDie(session);
 
   // Check counts changed accordingly
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, kNoBound, kNoBound));
+  ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, kNoBound, 15));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 27, kNoBound));
+  ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 27));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 0, 15));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 0, 10));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 0, 20));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 0, 30));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 14, 30));
   ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, 30, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), read_mode, kTabletsNum * kRowsPerTablet,
-                                   kNoBound));
+  ASSERT_EQ(0, CountRowsFromClient(
+      table.get(), read_mode, kTabletsNum * kRowsPerTablet));
 }
-INSTANTIATE_TEST_CASE_P(Params, ScanMultiTabletParamTest,
-                        testing::ValuesIn(read_modes));
+INSTANTIATE_TEST_SUITE_P(Params, ScanMultiTabletParamTest,
+                         testing::ValuesIn(read_modes));
 
 TEST_F(ClientTest, TestScanEmptyTable) {
   KuduScanner scanner(client_table_.get());
@@ -1622,14 +1596,12 @@ TEST_F(ClientTest, TestScanYourWrites) {
   // achieve read-your-writes/read-your-reads.
   uint64_t count = CountRowsFromClient(client_table_.get(),
                                        KuduClient::LEADER_ONLY,
-                                       KuduScanner::READ_YOUR_WRITES,
-                                       kNoBound, kNoBound);
+                                       KuduScanner::READ_YOUR_WRITES);
   ASSERT_EQ(FLAGS_test_scan_num_rows, count);
 
   count = CountRowsFromClient(client_table_.get(),
                               KuduClient::CLOSEST_REPLICA,
-                              KuduScanner::READ_YOUR_WRITES,
-                              kNoBound, kNoBound);
+                              KuduScanner::READ_YOUR_WRITES);
   ASSERT_EQ(FLAGS_test_scan_num_rows, count);
 }
 
@@ -3194,42 +3166,56 @@ TEST_F(ClientTest, TestWriteWhileRestarting) {
 }
 
 TEST_F(ClientTest, TestFailedDnsResolution) {
-  shared_ptr<KuduSession> session = client_->NewSession();
+  // Create a dedicated instance of a client which doesn't cache DNS resolution
+  // results. This is to avoid using the DNS resolver cache if the hostname/IP
+  // address of tablet server is the same as master's address. The latter is
+  // the case when using other than UNIQUE_LOOPBACK binding mode for the
+  // server components of the test mini-cluster.
+  FLAGS_dns_resolver_cache_capacity_mb = 0;
+  shared_ptr<KuduClient> c;
+  ASSERT_OK(KuduClientBuilder()
+      .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr().ToString())
+      .Build(&c));
+  shared_ptr<KuduTable> t;
+  ASSERT_OK(c->OpenTable(kTableName, &t));
+
+  shared_ptr<KuduSession> session = c->NewSession();
   ASSERT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
-  const string kMasterError = "timed out after deadline expired: GetTableLocations RPC";
 
-  // First time disable dns resolution.
-  // Set the timeout to be short since we know it can't succeed, but not to the point where we
-  // can timeout before getting the dns error.
-  {
-    for (int i = 0;;i++) {
-      google::FlagSaver saver;
-      FLAGS_fail_dns_resolution = true;
-      session->SetTimeoutMillis(500);
-      ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "row"));
-      Status s = session->Flush();
-      ASSERT_TRUE(s.IsIOError()) << "unexpected status: " << s.ToString();
-      unique_ptr<KuduError> error = GetSingleErrorFromSession(session.get());
-      ASSERT_TRUE(error->status().IsTimedOut()) << error->status().ToString();
+  // First, make DNS resolution time out.
+  // Set the timeout to be short since we know it can't succeed, but not to the
+  // point where we can timeout before getting the DNS error.
+  FLAGS_fail_dns_resolution = true;
+  session->SetTimeoutMillis(1000);
 
-      // Due to KUDU-1466 there is a narrow window in which the error reported might be that the
-      // GetTableLocations RPC to the master timed out instead of the expected dns resolution error.
-      // In that case just loop again.
-
-      if (error->status().ToString().find(kMasterError) != std::string::npos) {
-        ASSERT_LE(i, 10) << "Didn't get a dns resolution error after 10 tries.";
-        continue;
-      }
-
-      ASSERT_STR_CONTAINS(error->status().ToString(),
-                          "Network error: Failed to resolve address for TS");
-      break;
+  // Due to KUDU-1466, there is a narrow window in which the error reported
+  // might be that the GetTableLocations RPC to the master timed out instead of
+  // the expected DNS resolution error while trying to send Write RPC to
+  // tablet server.
+  for (auto i = 0;; ++i) {
+    constexpr const char* const kMasterErrors[] = {
+      "timed out after deadline expired: GetTableLocations RPC",
+      "LookupRpc timed out after deadline expired",
+    };
+    ASSERT_OK(ApplyInsertToSession(session.get(), t, 1, 1, "row"));
+    auto s = session->Flush();
+    ASSERT_TRUE(s.IsIOError()) << s.ToString();
+    unique_ptr<KuduError> error = GetSingleErrorFromSession(session.get());
+    ASSERT_TRUE(error->status().IsTimedOut()) << error->status().ToString();
+    const auto row_status_str = error->status().ToString();
+    if (row_status_str.find(kMasterErrors[0]) != std::string::npos ||
+        row_status_str.find(kMasterErrors[1]) != std::string::npos) {
+      ASSERT_LE(i, 10) << "could not get DNS resolution error after 10 tries";
+      continue;
     }
+    ASSERT_STR_CONTAINS(row_status_str,
+                        "Network error: Failed to resolve address for TS");
+    break;
   }
 
-  // Now re-enable dns resolution, the write should succeed.
+  // Now, re-enable the DNS resolution: the write should succeed.
   FLAGS_fail_dns_resolution = false;
-  ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "row"));
+  ASSERT_OK(ApplyInsertToSession(session.get(), t, 1, 1, "row"));
   ASSERT_OK(session->Flush());
 }
 
@@ -3861,10 +3847,7 @@ class FlushModeOpRatesTest : public ClientTest,
 // in AUTO_FLUSH and AUTO_FLUSH_BACKGROUND mode; all the operations have
 // the same pre-defined size.
 TEST_P(FlushModeOpRatesTest, RunComparison) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   const size_t kBufferSizeBytes = 1024;
   const size_t kRowNum = 256;
@@ -3905,9 +3888,8 @@ TEST_P(FlushModeOpRatesTest, RunComparison) {
   EXPECT_GT(t_afs_wall, t_afb_wall);
 }
 
-INSTANTIATE_TEST_CASE_P(,
-                        FlushModeOpRatesTest,
-                        ::testing::Values(RowSize::CONSTANT, RowSize::RANDOM));
+INSTANTIATE_TEST_SUITE_P(, FlushModeOpRatesTest,
+                         ::testing::Values(RowSize::CONSTANT, RowSize::RANDOM));
 
 // A test to verify that it's safe to perform synchronous and/or asynchronous
 // flush while having the auto-flusher thread running in the background.
@@ -4933,8 +4915,7 @@ TEST_F(ClientTest, TestReplicatedMultiTabletTableFailover) {
     tries++;
     int num_rows = CountRowsFromClient(table.get(),
                                        KuduClient::LEADER_ONLY,
-                                       KuduScanner::READ_LATEST,
-                                       kNoBound, kNoBound);
+                                       KuduScanner::READ_LATEST);
     int master_rpcs = CountMasterLookupRPCs() - master_rpcs_before;
 
     // Regression test for KUDU-1387: we should not have any tight loops
@@ -4995,8 +4976,7 @@ TEST_F(ClientTest, TestReplicatedTabletWritesWithLeaderElection) {
   LOG(INFO) << "Counting rows...";
   ASSERT_EQ(2 * kNumRowsToWrite, CountRowsFromClient(table.get(),
                                                      KuduClient::LEADER_ONLY,
-                                                     KuduScanner::READ_LATEST,
-                                                     kNoBound, kNoBound));
+                                                     KuduScanner::READ_LATEST));
 }
 
 namespace {
@@ -5247,10 +5227,7 @@ shared_ptr<KuduSession> LoadedSession(const shared_ptr<KuduClient>& client,
 // half update rows in descending order.
 // This ensures that we don't hit a deadlock in such a situation.
 TEST_F(ClientTest, TestDeadlockSimulation) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "TestDeadlockSimulation disabled since slow.";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   // Make reverse client who will make batches that update rows
   // in reverse order. Separate client used so rpc calls come in at same time.
@@ -5664,8 +5641,8 @@ TEST_P(LatestObservedTimestampParamTest, Test) {
     latest_ts = ts;
   }
 }
-INSTANTIATE_TEST_CASE_P(Params, LatestObservedTimestampParamTest,
-                        testing::ValuesIn(read_modes));
+INSTANTIATE_TEST_SUITE_P(Params, LatestObservedTimestampParamTest,
+                         testing::ValuesIn(read_modes));
 
 // Insert bunch of rows, delete a row, and then insert the row back.
 // Run scans several scan and check the results are consistent with the
@@ -6040,9 +6017,9 @@ TEST_P(IntEncodingNullPredicatesTest, TestIntEncodings) {
   }
 }
 
-INSTANTIATE_TEST_CASE_P(IntColEncodings,
-                        IntEncodingNullPredicatesTest,
-                        ::testing::Values(kPlain, kBitShuffle, kRunLength));
+INSTANTIATE_TEST_SUITE_P(IntColEncodings,
+                         IntEncodingNullPredicatesTest,
+                         ::testing::Values(kPlain, kBitShuffle, kRunLength));
 
 
 enum BinaryEncoding {
@@ -6137,9 +6114,9 @@ TEST_P(BinaryEncodingNullPredicatesTest, TestBinaryEncodings) {
   }
 }
 
-INSTANTIATE_TEST_CASE_P(BinaryColEncodings,
-                        BinaryEncodingNullPredicatesTest,
-                        ::testing::Values(kPlainBin, kPrefix, kDictionary));
+INSTANTIATE_TEST_SUITE_P(BinaryColEncodings,
+                         BinaryEncodingNullPredicatesTest,
+                         ::testing::Values(kPlainBin, kPrefix, kDictionary));
 
 TEST_F(ClientTest, TestClonePredicates) {
   NO_FATALS(InsertTestRows(client_table_.get(), 2, 0));
@@ -6616,7 +6593,7 @@ static const ServiceUnavailableRetryParams service_unavailable_retry_cases[] = {
   },
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     , ServiceUnavailableRetryClientTest,
     ::testing::ValuesIn(service_unavailable_retry_cases));
 
@@ -6925,16 +6902,26 @@ TEST_F(ClientTest, TestCacheAuthzTokens) {
 // Test to ensure that we don't send calls to retrieve authz tokens when one is
 // already in-flight for the same table ID.
 TEST_F(ClientTest, TestRetrieveAuthzTokenInParallel) {
-  const int kThreads = 20;
+  const auto kThreads = base::NumCPUs();
+  if (kThreads < 2) {
+    LOG(WARNING) << "no sense to run at a single CPU core";
+    GTEST_SKIP();
+  }
+  if (FLAGS_stress_cpu_threads > 0) {
+    LOG(WARNING) << "test is not designed to run with --stress_cpu_threads";
+    GTEST_SKIP();
+  }
+
   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
   vector<Synchronizer> syncs(kThreads);
   vector<thread> threads;
   Barrier barrier(kThreads);
+  const auto deadline = MonoTime::Now() + kTimeout;
   for (auto& s : syncs) {
     threads.emplace_back([&] {
       barrier.Wait();
-      client_->data_->RetrieveAuthzTokenAsync(client_table_.get(), s.AsStatusCallback(),
-                                              MonoTime::Now() + kTimeout);
+      client_->data_->RetrieveAuthzTokenAsync(
+          client_table_.get(), s.AsStatusCallback(), deadline);
     });
   }
   for (int i = 0 ; i < kThreads; i++) {
@@ -7096,10 +7083,6 @@ TEST_F(ClientTest, TestClientLocationNoLocationMappingCmd) {
 }
 
 // Check basic operations of the transaction-related API.
-// TODO(aserbin): add more scenarios and update existing ones to remove explicit
-//                FinalizeCommitTransaction() call when transaction
-//                orchestration is ready (i.e. FinalizeCommitTransaction() is
-//                called for all registered participants by the backend itself).
 TEST_F(ClientTest, TxnBasicOperations) {
   // KuduClient::NewTransaction() populates the output parameter on success.
   {
@@ -7122,22 +7105,12 @@ TEST_F(ClientTest, TxnBasicOperations) {
     ASSERT_OK(txn->Rollback());
   }
 
-  // It's possible to rollback a transaction that hasn't yet finalized
-  // its commit phase.
-  {
-    shared_ptr<KuduTransaction> txn;
-    ASSERT_OK(client_->NewTransaction(&txn));
-    ASSERT_OK(txn->Commit(false /* wait */));
-    ASSERT_OK(txn->Rollback());
-  }
-
   // It's impossible to rollback a transaction that has finalized
   // its commit phase.
   {
     shared_ptr<KuduTransaction> txn;
     ASSERT_OK(client_->NewTransaction(&txn));
-    ASSERT_OK(txn->Commit(false /* wait */));
-    ASSERT_OK(FinalizeCommitTransaction(txn));
+    ASSERT_OK(txn->Commit());
     auto cs = Status::Incomplete("other than Status::OK() initial status");
     bool is_complete = false;
     ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
@@ -7154,12 +7127,9 @@ TEST_F(ClientTest, TxnBasicOperations) {
     ASSERT_OK(txn->Rollback());
     auto s = txn->Commit(false /* wait */);
     ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
-    ASSERT_STR_CONTAINS(s.ToString(), "is not open: state: ABORTED");
+    ASSERT_STR_CONTAINS(s.ToString(), "is not open: state: ABORT");
   }
 
-  // TODO(aserbin): uncomment this when other parts of transaction lifecycle
-  //                are properly implemented
-#if 0
   // Insert rows in a transactional session, then rollback the transaction
   // and make sure the rows are gone.
   {
@@ -7183,10 +7153,9 @@ TEST_F(ClientTest, TxnBasicOperations) {
     NO_FATALS(InsertTestRows(client_table_.get(), session.get(), kRowsNum));
     ASSERT_OK(txn->Commit());
     ASSERT_EQ(kRowsNum, CountRowsFromClient(
-        client_table_.get(), KuduScanner::READ_YOUR_WRITES, kNoBound, kNoBound));
+        client_table_.get(), KuduScanner::READ_YOUR_WRITES));
     ASSERT_EQ(0, session->CountPendingErrors());
   }
-#endif
 }
 
 // Verify the basic functionality of the KuduTransaction::Commit() and
@@ -7203,10 +7172,16 @@ TEST_F(ClientTest, TxnCommit) {
     ASSERT_STR_CONTAINS(cs.ToString(), "transaction is still open");
 
     ASSERT_OK(txn->Rollback());
+    // We need to ASSERT_EVENTUALLY here to allow the abort tasks to complete.
+    // Until then, we may not consider the transaction as complete.
     ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
-    ASSERT_TRUE(is_complete);
     ASSERT_TRUE(cs.IsAborted()) << cs.ToString();
-    ASSERT_STR_CONTAINS(cs.ToString(), "transaction has been aborted");
+    ASSERT_EVENTUALLY([&] {
+      ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
+      ASSERT_TRUE(is_complete);
+      ASSERT_TRUE(cs.IsAborted()) << cs.ToString();
+      ASSERT_STR_CONTAINS(cs.ToString(), "transaction has been aborted");
+    });
   }
 
   {
@@ -7214,17 +7189,12 @@ TEST_F(ClientTest, TxnCommit) {
     {
       shared_ptr<KuduTransaction> txn;
       ASSERT_OK(client_->NewTransaction(&txn));
-      ASSERT_OK(txn->Commit(false /* wait */));
-      // TODO(aserbin): when txn lifecycle is properly implemented, inject a
-      //                delay into the txn finalizing code to make sure
-      //                the transaction stays in the COMMIT_IN_PROGRESS state
-      //                for a while
-      bool is_complete = true;
+      ASSERT_OK(txn->Commit());
+      bool is_complete = false;
       Status cs;
       ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
-      ASSERT_FALSE(is_complete);
-      ASSERT_TRUE(cs.IsIncomplete()) << cs.ToString();
-      ASSERT_STR_CONTAINS(cs.ToString(), "commit is still in progress");
+      ASSERT_TRUE(is_complete);
+      ASSERT_OK(cs);
       ASSERT_OK(txn->Serialize(&txn_token));
     }
 
@@ -7232,35 +7202,13 @@ TEST_F(ClientTest, TxnCommit) {
     // goes out of scope.
     shared_ptr<KuduTransaction> serdes_txn;
     ASSERT_OK(KuduTransaction::Deserialize(client_, txn_token, &serdes_txn));
-    bool is_complete = true;
+    bool is_complete = false;
     Status cs;
     ASSERT_OK(serdes_txn->IsCommitComplete(&is_complete, &cs));
-    ASSERT_FALSE(is_complete);
-    ASSERT_TRUE(cs.IsIncomplete()) << cs.ToString();
-    ASSERT_STR_CONTAINS(cs.ToString(), "commit is still in progress");
+    ASSERT_TRUE(is_complete);
+    ASSERT_OK(cs);
   }
 
-  {
-    shared_ptr<KuduTransaction> txn;
-    ASSERT_OK(client_->NewTransaction(&txn));
-    ASSERT_OK(txn->Commit(false /* wait */));
-    bool is_complete = true;
-    Status cs;
-    ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
-    ASSERT_FALSE(is_complete);
-    ASSERT_TRUE(cs.IsIncomplete()) << cs.ToString();
-    ASSERT_OK(FinalizeCommitTransaction(txn));
-    {
-      bool is_complete = false;
-      auto cs = Status::Incomplete("other than Status::OK() initial status");
-      ASSERT_OK(txn->IsCommitComplete(&is_complete, &cs));
-      ASSERT_TRUE(is_complete);
-      ASSERT_OK(cs);
-    }
-  }
-
-  // TODO(aserbin): uncomment this when txn lifecycle is properly implemented
-#if 0
   {
     shared_ptr<KuduTransaction> txn;
     ASSERT_OK(client_->NewTransaction(&txn));
@@ -7284,7 +7232,6 @@ TEST_F(ClientTest, TxnCommit) {
     ASSERT_TRUE(is_complete);
     ASSERT_OK(cs);
   }
-#endif
 }
 
 // This test verifies the behavior of KuduTransaction instance when the bound
@@ -7380,9 +7327,6 @@ TEST_F(ClientTest, TxnToken) {
   ASSERT_OK(serdes_txn->Serialize(&serdes_txn_token));
   ASSERT_EQ(txn_token, serdes_txn_token);
 
-  // TODO(awong): remove once we register participants automatically before
-  // inserting.
-  BeginTxnOnParticipants(txn_id);
   {
     static constexpr auto kNumRows = 10;
     shared_ptr<KuduSession> session;
@@ -7526,8 +7470,7 @@ TEST_F(ClientTest, TxnKeepAlive) {
 
     SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_txn_keepalive_interval_ms));
 
-    ASSERT_OK(txn->Commit(false /* wait */));
-    ASSERT_OK(FinalizeCommitTransaction(txn));
+    ASSERT_OK(txn->Commit());
   }
 
   // Begin a transaction and move its KuduTransaction object out of the
@@ -7550,7 +7493,7 @@ TEST_F(ClientTest, TxnKeepAlive) {
     ASSERT_OK(KuduTransaction::Deserialize(client_, txn_token, &serdes_txn));
     auto s = serdes_txn->Commit(false /* wait */);
     ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
-    ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORTED");
+    ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORT");
   }
 
   // Begin a new transaction and move the KuduTransaction object out of the
@@ -7573,7 +7516,7 @@ TEST_F(ClientTest, TxnKeepAlive) {
 
     auto s = serdes_txn->Commit(false /* wait */);
     ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
-    ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORTED");
+    ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORT");
   }
 
   // Begin a new transaction and move the KuduTransaction object out of the
@@ -7598,8 +7541,7 @@ TEST_F(ClientTest, TxnKeepAlive) {
 
     SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_txn_keepalive_interval_ms));
 
-    ASSERT_OK(serdes_txn->Commit(false /* wait */));
-    ASSERT_OK(FinalizeCommitTransaction(serdes_txn));
+    ASSERT_OK(serdes_txn->Commit());
   }
 }
 
@@ -7655,8 +7597,7 @@ TEST_F(ClientTest, TxnKeepAliveAndUnavailableTxnManagerShortTime) {
 
   // Now, when masters are back and running, the client should be able
   // to commit the transaction. It should not be automatically aborted.
-  ASSERT_OK(txn->Commit(false /* wait */));
-  ASSERT_OK(FinalizeCommitTransaction(txn));
+  ASSERT_OK(txn->Commit());
 }
 
 // A scenario to explicitly show that long-running transactions are
@@ -7694,7 +7635,7 @@ TEST_F(ClientTest, TxnKeepAliveAndUnavailableTxnManagerLongTime) {
   {
     auto s = txn->Commit(false /* wait */);
     ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
-    ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORTED");
+    ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORT");
   }
 }
 
@@ -7713,6 +7654,9 @@ class ClientWithLocationTest : public ClientTest {
     // Some of these tests assume no client activity, so disable the
     // transaction system client.
     FLAGS_disable_txn_system_client_init = true;
+
+    // By default, master doesn't assing locations to connecting clients.
+    FLAGS_master_client_location_assignment_enabled = true;
   }
 };
 
@@ -7896,6 +7840,79 @@ TEST_F(ClientTestUnixSocket, TestConnectViaUnixSocket) {
     total_unix_conns += counter->value();
   }
   ASSERT_EQ(1, total_unix_conns);
+}
+
+class WriteRestartTest : public ClientTest {
+ public:
+  void SetUp() override {
+    KuduTest::SetUp();
+
+    // Start minicluster and wait for tablet servers to connect to master.
+    InternalMiniClusterOptions options;
+    options.num_tablet_servers = 3;
+    cluster_.reset(new InternalMiniCluster(env_, std::move(options)));
+    ASSERT_OK(cluster_->StartSync());
+
+    // Scenarios of this test might require multiple retries from the client if
+    // running on a slow or overloaded machine. The timeout for RPC operations
+    // is set higher than the default to avoid false positives.
+    KuduClientBuilder builder;
+    builder.default_admin_operation_timeout(MonoDelta::FromSeconds(60));
+    builder.default_rpc_timeout(MonoDelta::FromSeconds(60));
+    ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    ASSERT_OK(table_creator->table_name(kTableName)
+        .schema(&schema_)
+        .add_hash_partitions({ "key" }, 2)
+        .num_replicas(3)
+        .Create());
+    ASSERT_OK(client_->OpenTable(kTableName, &client_table_));
+  }
+};
+
+// Restart one tablet server in a round-robin fashion with every row written,
+// not waiting for the tablet server to be up and running before trying
+// to write the next row. Count the number of rows once done. There should be
+// no errors: client should retry any operations failed due to tablet server
+// restarting. The result row count should match the number of total rows
+// written by the client.
+TEST_F(ClientTest, WriteWhileRestartingMultipleTabletServers) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  constexpr const auto read_mode_to_string =
+      [](KuduScanner::ReadMode mode) constexpr {
+    switch (mode) {
+      case KuduScanner::READ_LATEST:
+        return "READ_LATEST";
+      case KuduScanner::READ_AT_SNAPSHOT:
+        return "READ_AT_SNAPSHOT";
+      case KuduScanner::READ_YOUR_WRITES:
+        return "READ_YOUR_WRITES";
+      default:
+        return "UNKNOWN";
+    }
+  };
+
+  shared_ptr<KuduSession> session = client_->NewSession();
+  ASSERT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_SYNC));
+
+  static constexpr auto kNumRows = 32;
+  const auto num_servers = cluster_->num_tablet_servers();
+  int64_t key = 0;
+  for (auto row_idx = 0; row_idx < kNumRows; ++row_idx) {
+    NO_FATALS(InsertTestRows(client_table_.get(), session.get(), 1, key++));
+    auto* ts = cluster_->mini_tablet_server(row_idx % num_servers);
+    ts->Shutdown();
+    ASSERT_OK(ts->Restart());
+  }
+  for (auto mode : {KuduScanner::READ_LATEST, KuduScanner::READ_YOUR_WRITES}) {
+    SCOPED_TRACE(Substitute("read mode $0", read_mode_to_string(mode)));
+    auto row_count = CountRowsFromClient(client_table_.get(),
+                                         KuduClient::LEADER_ONLY,
+                                         mode);
+    ASSERT_EQ(kNumRows, row_count);
+  }
 }
 
 } // namespace client

@@ -18,8 +18,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <ostream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -83,7 +83,13 @@ TEST_F(ClientLocationAssignmentITest, Basic) {
     EmplaceOrDie(&info, Substitute("/L$0", i), i == client_loc_idx ? 2 : 1);
   }
   FLAGS_num_replicas = FLAGS_num_tablet_servers;
-  NO_FATALS(BuildAndStart({}, {}, std::move(info)));
+  const vector<string> master_flags = {
+    // Assigning locations to clients is turned off by default, but this
+    // scenario exercises functionality related to that, so it's necessary
+    // to turn it on.
+    "--master_client_location_assignment_enabled=true",
+  };
+  NO_FATALS(BuildAndStart({}, master_flags, std::move(info)));
 
   // Find the tablet server that is colocated with the client, if there is one.
   const auto timeout = MonoDelta::FromSeconds(30);
@@ -208,10 +214,7 @@ class TsLocationAssignmentITest :
 // is assigned the same location after restart once the location assignment
 // script is kept the same between restarts.
 TEST_P(TsLocationAssignmentITest, Basic) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   NO_FATALS(StartCluster());
   NO_FATALS(CheckLocationInfo());
@@ -227,10 +230,7 @@ TEST_P(TsLocationAssignmentITest, Basic) {
 // Verify the behavior of the location mapping cache upon tablet server
 // registrations.
 TEST_P(TsLocationAssignmentITest, LocationMappingCacheOnTabletServerRestart) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   NO_FATALS(StartCluster());
   NO_FATALS(CheckLocationInfo());
@@ -292,8 +292,8 @@ TEST_P(TsLocationAssignmentITest, LocationMappingCacheOnTabletServerRestart) {
   });
 }
 
-INSTANTIATE_TEST_CASE_P(, TsLocationAssignmentITest,
-    ::testing::Combine(::testing::Values(1, 3),
-                       ::testing::Values(1, 8, 16, 32)));
+INSTANTIATE_TEST_SUITE_P(, TsLocationAssignmentITest,
+                         ::testing::Combine(::testing::Values(1, 3),
+                                            ::testing::Values(1, 8, 16, 32)));
 
 } // namespace kudu

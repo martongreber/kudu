@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "kudu/common/wire_protocol.pb.h"
@@ -112,10 +113,15 @@ class Master : public kserver::KuduServer {
   // request.
   Status ListMasters(std::vector<ServerEntryPB>* masters) const;
 
-  // Gets the HostPorts for all of the VOTER masters in the cluster.
+  enum MasterType {
+    ALL,
+    VOTER_ONLY
+  };
+
+  // Gets the HostPorts of masters in the cluster of the specified 'type'.
   // This is not as complete as ListMasters() above, but operates just
   // based on local state.
-  Status GetMasterHostPorts(std::vector<HostPort>* hostports) const;
+  Status GetMasterHostPorts(std::vector<HostPort>* hostports, MasterType type = VOTER_ONLY) const;
 
   bool IsShutdown() const {
     return state_ == kStopped;
@@ -123,8 +129,13 @@ class Master : public kserver::KuduServer {
 
   // Adds the master specified by 'hp' by initiating change config request.
   // RpContext 'rpc' will be used to respond back to the client asynchronously.
-  // Returns the status of the master addition request.
+  // Returns the status of initiating the master addition request.
   Status AddMaster(const HostPort& hp, rpc::RpcContext* rpc);
+
+  // Removes the master specified by 'hp' and optional 'uuid' by initiating change config request.
+  // RpContext 'rpc' will be used to respond back to the client asynchronously.
+  // Returns the status of initiating the master removal request.
+  Status RemoveMaster(const HostPort& hp, const std::string& uuid, rpc::RpcContext* rpc);
 
   MaintenanceManager* maintenance_manager() {
     return maintenance_manager_.get();
@@ -158,7 +169,7 @@ class Master : public kserver::KuduServer {
     kStopping,
   };
 
-  MasterState state_;
+  std::atomic<MasterState> state_;
 
   std::unique_ptr<MasterCertAuthority> cert_authority_;
   std::unique_ptr<security::TokenSigner> token_signer_;

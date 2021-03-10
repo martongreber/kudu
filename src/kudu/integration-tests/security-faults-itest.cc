@@ -19,7 +19,6 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
-#include <ostream>
 #include <string>
 #include <vector>
 
@@ -165,10 +164,7 @@ class SecurityComponentsFaultsITest : public KuduTest {
 // Check how the system behaves when KDC is not available upon start-up
 // of Kudu server-side components.
 TEST_F(SecurityComponentsFaultsITest, NoKdcOnStart) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   // Start with the KDC first: let's generate generate keytabs, get initial
   // kerberos tickets, etc.
@@ -191,7 +187,7 @@ TEST_F(SecurityComponentsFaultsITest, NoKdcOnStart) {
     const Status s = server->Restart();
     ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
-                        "kudu-master: process exited with non-zero status 3");
+                        "kudu: process exited with non-zero status 1");
   }
   {
     auto server = cluster_->tablet_server(0);
@@ -199,17 +195,14 @@ TEST_F(SecurityComponentsFaultsITest, NoKdcOnStart) {
     const Status s = server->Restart();
     ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
-                        "kudu-tserver: process exited with non-zero status 3");
+                        "kudu: process exited with non-zero status 1");
   }
 }
 
 // Check that restarting KDC does not affect running master and tablet servers:
 // they are able to operate with no issues past ticket TTL once KDC is back.
 TEST_F(SecurityComponentsFaultsITest, KdcRestartsInTheMiddle) {
-  if (!AllowSlowTests()) {
-    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
-    return;
-  }
+  SKIP_IF_SLOW_NOT_ALLOWED();
 
   // Enable KRPC negotiation tracing for the Kudu client running smoke test
   // workload.

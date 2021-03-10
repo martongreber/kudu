@@ -83,10 +83,9 @@ DEFINE_bool(master_non_leader_masters_propagate_tsk, false,
             "tests scenarios only and should not be used elsewhere.");
 TAG_FLAG(master_non_leader_masters_propagate_tsk, hidden);
 
-DEFINE_bool(master_client_location_assignment_enabled, true,
+DEFINE_bool(master_client_location_assignment_enabled, false,
             "Whether masters assign locations to connecting clients. "
-            "By default they do if the location assignment command is set, "
-            "but setting this flag to 'false' makes masters assign "
+            "Setting this flag to 'false' makes masters assign "
             "locations only to tablet servers, not clients.");
 TAG_FLAG(master_client_location_assignment_enabled, advanced);
 TAG_FLAG(master_client_location_assignment_enabled, runtime);
@@ -244,6 +243,10 @@ void MasterServiceImpl::ChangeTServerState(const ChangeTServerStateRequestPB* re
 void MasterServiceImpl::AddMaster(const AddMasterRequestPB* req,
                                   AddMasterResponsePB* resp,
                                   rpc::RpcContext* rpc) {
+  // This feature flag is part of SupportsFeature() function in master service but it's possible
+  // that a client may not specify the feature flag.
+  // This check protects access to the server feature irrespective of whether the
+  // feature flag is specified in the client.
   if (!FLAGS_master_support_change_config) {
     rpc->RespondFailure(Status::NotSupported("Adding master is not supported"));
     return;
@@ -259,10 +262,56 @@ void MasterServiceImpl::AddMaster(const AddMasterRequestPB* req,
     return;
   }
 
-  Status s = server_->AddMaster(HostPortFromPB(req->rpc_addr()), rpc);
+  HostPort hp = HostPortFromPB(req->rpc_addr());
+  Status s = server_->AddMaster(hp, rpc);
   if (!s.ok()) {
-    LOG(ERROR) << Substitute("Failed adding master $0:$1. $2", req->rpc_addr().host(),
-                             req->rpc_addr().port(), s.ToString());
+    // Special handling for master already present error for retry scenarios.
+    // Responding back using RespondFailure() will clobber the error code
+    // and hence responding with success and setting the error code.
+    if (s.IsAlreadyPresent()) {
+      LOG(WARNING) << Substitute("Master $0 already present", hp.ToString());
+      StatusToPB(s, resp->mutable_error()->mutable_status());
+      resp->mutable_error()->set_code(MasterErrorPB::MASTER_ALREADY_PRESENT);
+      rpc->RespondSuccess();
+      return;
+    }
+    LOG(ERROR) << Substitute("Failed adding master $0. $1", hp.ToString(), s.ToString());
+    rpc->RespondFailure(s);
+    return;
+  }
+  // ChangeConfig request successfully submitted. Once the ChangeConfig request is complete
+  // the completion callback will respond back with the result to the RPC client.
+  // See completion_cb in CatalogManager::InitiateMasterChangeConfig().
+}
+
+void MasterServiceImpl::RemoveMaster(const RemoveMasterRequestPB* req,
+                                     RemoveMasterResponsePB* resp,
+                                     rpc::RpcContext* rpc) {
+  // This feature flag is part of SupportsFeature() function in master service but it's possible
+  // that a client may not specify the feature flag.
+  // This check protects access to the server feature irrespective of whether the
+  // feature flag is specified in the client.
+  if (!FLAGS_master_support_change_config) {
+    rpc->RespondFailure(Status::NotSupported("Removing master is not supported"));
+    return;
+  }
+
+  if (!req->has_rpc_addr()) {
+    rpc->RespondFailure(Status::InvalidArgument(
+        "RPC address of the master to be removed not supplied"));
+    return;
+  }
+
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+
+  HostPort hp = HostPortFromPB(req->rpc_addr());
+  string uuid = req->has_master_uuid() ? req->master_uuid() : string();
+  Status s = server_->RemoveMaster(hp, uuid, rpc);
+  if (!s.ok()) {
+    LOG(ERROR) << Substitute("Failed removing master $0. $1", hp.ToString(), s.ToString());
     rpc->RespondFailure(s);
     return;
   }
@@ -793,8 +842,8 @@ void MasterServiceImpl::RefreshAuthzCache(
 
 bool MasterServiceImpl::SupportsFeature(uint32_t feature) const {
   switch (feature) {
-    case MasterFeatures::RANGE_PARTITION_BOUNDS:    FALLTHROUGH_INTENDED;
-    case MasterFeatures::ADD_DROP_RANGE_PARTITIONS: FALLTHROUGH_INTENDED;
+    case MasterFeatures::RANGE_PARTITION_BOUNDS:    [[fallthrough]];
+    case MasterFeatures::ADD_DROP_RANGE_PARTITIONS: [[fallthrough]];
     case MasterFeatures::REPLICA_MANAGEMENT:
       return true;
     case MasterFeatures::GENERATE_AUTHZ_TOKEN:

@@ -84,6 +84,9 @@ message MasterErrorPB {
 
     // The caller is not authorized to perform the attempted operation.
     NOT_AUTHORIZED = 14;
+
+    // Master is already part of the Raft configuration.
+    MASTER_ALREADY_PRESENT = 15;
   }
 
   // The error code.
@@ -937,6 +940,17 @@ message AddMasterResponsePB {
   optional MasterErrorPB error = 1;
 }
 
+message RemoveMasterRequestPB {
+  // HostPort of the master to be removed
+  optional HostPortPB rpc_addr = 1;
+  // Optional UUID of the master to be removed.
+  optional string master_uuid = 2;
+}
+
+message RemoveMasterResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
 // GetMasterRegistrationRequest/Response: get the instance id and
 // HTTP/RPC addresses for this Master server.
 message GetMasterRegistrationRequestPB {
@@ -1103,8 +1117,13 @@ service MasterService {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
   }
 
-  // Add a new master to existing cluster.
+  // Add a new master to the existing cluster.
   rpc AddMaster(AddMasterRequestPB) returns (AddMasterResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
+  }
+
+  // Remove a master from the existing cluster.
+  rpc RemoveMaster(RemoveMasterRequestPB) returns (RemoveMasterResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
   }
 

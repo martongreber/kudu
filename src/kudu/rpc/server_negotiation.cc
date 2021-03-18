@@ -160,6 +160,7 @@ ServerNegotiation::ServerNegotiation(unique_ptr<Socket> socket,
     : socket_(std::move(socket)),
       helper_(SaslHelper::SERVER),
       tls_context_(tls_context),
+      tls_handshake_(security::TlsHandshakeType::SERVER),
       encryption_(encryption),
       tls_negotiated_(false),
       token_verifier_(token_verifier),
@@ -223,8 +224,7 @@ Status ServerNegotiation::Negotiate() {
   if (encryption_ != RpcEncryption::DISABLED &&
       tls_context_->has_cert() &&
       ContainsKey(client_features_, TLS)) {
-    RETURN_NOT_OK(tls_context_->InitiateHandshake(security::TlsHandshakeType::SERVER,
-                                                  &tls_handshake_));
+    RETURN_NOT_OK(tls_context_->InitiateHandshake(&tls_handshake_));
 
     if (negotiated_authn_ != AuthenticationType::CERTIFICATE) {
       // The server does not need to verify the client's certificate unless it's
@@ -335,7 +335,8 @@ Status ServerNegotiation::PreflightCheckGSSAPI(const std::string& sasl_proto_nam
 Status ServerNegotiation::RecvNegotiatePB(NegotiatePB* msg, faststring* recv_buf) {
   RequestHeader header;
   Slice param_buf;
-  RETURN_NOT_OK(ReceiveFramedMessageBlocking(socket(), recv_buf, &header, &param_buf, deadline_));
+  RETURN_NOT_OK(ReceiveFramedMessageBlocking(
+      socket_.get(), recv_buf, &header, &param_buf, deadline_));
   Status s = helper_.CheckNegotiateCallId(header.call_id());
   if (!s.ok()) {
     RETURN_NOT_OK(SendError(ErrorStatusPB::FATAL_INVALID_RPC_HEADER, s));
@@ -361,7 +362,7 @@ Status ServerNegotiation::SendNegotiatePB(const NegotiatePB& msg) {
   DCHECK(msg.has_step()) << "message must have a step";
 
   TRACE("Sending $0 NegotiatePB response", NegotiatePB::NegotiateStep_Name(msg.step()));
-  return SendFramedMessageBlocking(socket(), header, msg, deadline_);
+  return SendFramedMessageBlocking(socket_.get(), header, msg, deadline_);
 }
 
 Status ServerNegotiation::SendError(ErrorStatusPB::RpcErrorCodePB code, const Status& err) {
@@ -378,9 +379,7 @@ Status ServerNegotiation::SendError(ErrorStatusPB::RpcErrorCodePB code, const St
   msg.set_message(err.ToString());
 
   TRACE("Sending RPC error: $0: $1", ErrorStatusPB::RpcErrorCodePB_Name(code), err.ToString());
-  RETURN_NOT_OK(SendFramedMessageBlocking(socket(), header, msg, deadline_));
-
-  return Status::OK();
+  return SendFramedMessageBlocking(socket_.get(), header, msg, deadline_);
 }
 
 Status ServerNegotiation::ValidateConnectionHeader(faststring* recv_buf) {
@@ -919,15 +918,15 @@ Status ServerNegotiation::SendSaslSuccess() {
     }
   }
 
-  RETURN_NOT_OK(SendNegotiatePB(response));
-  return Status::OK();
+  return SendNegotiatePB(response);
 }
 
 Status ServerNegotiation::RecvConnectionContext(faststring* recv_buf) {
   TRACE("Waiting for connection context");
   RequestHeader header;
   Slice param_buf;
-  RETURN_NOT_OK(ReceiveFramedMessageBlocking(socket(), recv_buf, &header, &param_buf, deadline_));
+  RETURN_NOT_OK(ReceiveFramedMessageBlocking(
+      socket_.get(), recv_buf, &header, &param_buf, deadline_));
   DCHECK(header.IsInitialized());
 
   if (header.call_id() != kConnectionContextCallId) {

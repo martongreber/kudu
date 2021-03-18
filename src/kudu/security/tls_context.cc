@@ -78,6 +78,7 @@
 #define TLS1_2_VERSION 0x0303
 #endif
 
+using kudu::security::ca::CertRequestGenerator;
 using strings::Substitute;
 using std::string;
 using std::unique_lock;
@@ -96,8 +97,6 @@ TAG_FLAG(openssl_security_level_override, unsafe);
 
 namespace kudu {
 namespace security {
-
-using ca::CertRequestGenerator;
 
 template<> struct SslTypeTraits<SSL> {
   static constexpr auto kFreeFunc = &SSL_free;
@@ -127,8 +126,8 @@ Status CheckMaxSupportedTlsVersion(int tls_version, const char* tls_version_str)
 } // anonymous namespace
 
 TlsContext::TlsContext()
-    : tls_ciphers_(kudu::security::SecurityDefaults::kDefaultTlsCiphers),
-      tls_min_protocol_(kudu::security::SecurityDefaults::kDefaultTlsMinVersion),
+    : tls_ciphers_(SecurityDefaults::kDefaultTlsCiphers),
+      tls_min_protocol_(SecurityDefaults::kDefaultTlsMinVersion),
       lock_(RWMutex::Priority::PREFER_READING),
       trusted_cert_count_(0),
       has_cert_(false),
@@ -188,6 +187,15 @@ Status TlsContext::Init() {
   options |= SSL_OP_NO_TLSv1_3;
 
   SSL_CTX_set_options(ctx_.get(), options);
+
+  // Disable the TLS session cache on both the client and server sides. In Kudu
+  // RPC, connections are not re-established based on TLS sessions anyway. Every
+  // connection attempt from a client to a server results in a new connection
+  // negotiation. Disabling the TLS session cache helps to avoid using extra
+  // resources to store TLS session information and running the automatic check
+  // for expired sessions every 255 connections, as mentioned at
+  // https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_session_cache_mode.html
+  SSL_CTX_set_session_cache_mode(ctx_.get(), SSL_SESS_CACHE_OFF);
 
   OPENSSL_RET_NOT_OK(
       SSL_CTX_set_cipher_list(ctx_.get(), tls_ciphers_.c_str()),
@@ -531,33 +539,21 @@ Status TlsContext::LoadCertificateAuthority(const string& certificate_path) {
   return AddTrustedCertificate(c);
 }
 
-Status TlsContext::InitiateHandshake(TlsHandshakeType handshake_type,
-                                     TlsHandshake* handshake) const {
+Status TlsContext::InitiateHandshake(TlsHandshake* handshake) const {
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
+  DCHECK(handshake);
   CHECK(ctx_);
-  CHECK(!handshake->ssl_);
+  c_unique_ptr<SSL> ssl;
   {
+    // This lock is to protect against concurrent change of certificates
+    // while calling SSL_new() here.
     shared_lock<RWMutex> lock(lock_);
-    handshake->adopt_ssl(ssl_make_unique(SSL_new(ctx_.get())));
+    ssl = ssl_make_unique(SSL_new(ctx_.get()));
   }
-  if (!handshake->ssl_) {
+  if (!ssl) {
     return Status::RuntimeError("failed to create SSL handle", GetOpenSSLErrors());
   }
-
-  SSL_set_bio(handshake->ssl(),
-              BIO_new(BIO_s_mem()),
-              BIO_new(BIO_s_mem()));
-
-  switch (handshake_type) {
-    case TlsHandshakeType::SERVER:
-      SSL_set_accept_state(handshake->ssl());
-      break;
-    case TlsHandshakeType::CLIENT:
-      SSL_set_connect_state(handshake->ssl());
-      break;
-  }
-
-  return Status::OK();
+  return handshake->Init(std::move(ssl));
 }
 
 } // namespace security

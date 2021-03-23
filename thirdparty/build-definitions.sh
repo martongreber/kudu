@@ -128,11 +128,8 @@ build_libcxxabi() {
 build_libcxx() {
   local BUILD_TYPE=$1
   case $BUILD_TYPE in
-    "normal")
-      SANITIZER_ARG=
-      ;;
     "tsan")
-      SANITIZER_ARG="-DLLVM_USE_SANITIZER=Thread"
+      SANITIZER_TYPE=Thread
       ;;
     *)
       echo "Unknown build type: $BUILD_TYPE"
@@ -155,7 +152,7 @@ build_libcxx() {
     -DLIBCXX_CXX_ABI=libcxxabi \
     -DLIBCXX_CXX_ABI_INCLUDE_PATHS=$LLVM_SOURCE/projects/libcxxabi/include \
     -DLIBCXX_CXX_ABI_LIBRARY_PATH=$PREFIX/lib \
-    $SANITIZER_ARG \
+    -DLLVM_USE_SANITIZER=$SANITIZER_TYPE \
     $EXTRA_CMAKE_FLAGS \
     $LLVM_SOURCE/projects/libcxx
   ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install

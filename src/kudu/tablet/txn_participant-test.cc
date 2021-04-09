@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <ostream>
@@ -49,6 +50,7 @@
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/ops/op.h"
 #include "kudu/tablet/ops/op_driver.h"
 #include "kudu/tablet/ops/op_tracker.h"
@@ -82,6 +84,7 @@ using std::string;
 using std::thread;
 using std::unique_ptr;
 using std::vector;
+using strings::Substitute;
 
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_bool(log_preallocate_segments);
@@ -246,26 +249,30 @@ TEST_F(TxnParticipantTest, TestSuccessfulSequences) {
 }
 
 TEST_F(TxnParticipantTest, TestParticipantOpsWhenNotBegun) {
-  const auto check_bad_ops = [&] (const vector<ParticipantOpPB::ParticipantOpType>& ops,
-                                  int64_t txn_id) {
-    for (const auto& type : ops) {
-      ParticipantResponsePB resp;
-      ASSERT_OK(CallParticipantOp(
-          tablet_replica_.get(), txn_id, type, kDummyCommitTimestamp, &resp));
-      SCOPED_TRACE(SecureShortDebugString(resp));
-      ASSERT_TRUE(resp.has_error());
-      ASSERT_TRUE(resp.error().has_status());
-      ASSERT_EQ(TabletServerErrorPB::UNKNOWN_ERROR, resp.error().code());
-      ASSERT_EQ(AppStatusPB::ILLEGAL_STATE, resp.error().status().code());
-      ASSERT_FALSE(resp.has_timestamp());
-    }
-  };
-  NO_FATALS(check_bad_ops({
-    ParticipantOpPB::BEGIN_COMMIT,
-    ParticipantOpPB::FINALIZE_COMMIT,
-    ParticipantOpPB::ABORT_TXN,
-  }, 1));
-  ASSERT_TRUE(txn_participant()->GetTxnsForTests().empty());
+  auto txn_id = 0;
+  for (auto type : { ParticipantOpPB::BEGIN_COMMIT,
+                     ParticipantOpPB::FINALIZE_COMMIT }) {
+    ParticipantResponsePB resp;
+    ASSERT_OK(CallParticipantOp(
+        tablet_replica_.get(), txn_id++, type, kDummyCommitTimestamp, &resp));
+    SCOPED_TRACE(SecureShortDebugString(resp));
+    ASSERT_TRUE(resp.has_error());
+    ASSERT_TRUE(resp.error().has_status());
+    ASSERT_EQ(TabletServerErrorPB::TXN_ILLEGAL_STATE, resp.error().code());
+    ASSERT_EQ(AppStatusPB::ILLEGAL_STATE, resp.error().status().code());
+    ASSERT_FALSE(resp.has_timestamp());
+    ASSERT_TRUE(txn_participant()->GetTxnsForTests().empty());
+  }
+  ParticipantResponsePB resp;
+  ASSERT_OK(CallParticipantOp(
+      tablet_replica_.get(), txn_id++, ParticipantOpPB::ABORT_TXN, kDummyCommitTimestamp, &resp));
+  SCOPED_TRACE(SecureShortDebugString(resp));
+  ASSERT_FALSE(resp.has_error());
+  ASSERT_FALSE(resp.error().has_status());
+  ASSERT_TRUE(resp.has_timestamp());
+  ASSERT_EQ(vector<TxnParticipant::TxnEntry>({
+      { 2, kAborted, -1 },
+  }), txn_participant()->GetTxnsForTests());
 }
 
 TEST_F(TxnParticipantTest, TestIllegalTransitions) {
@@ -405,24 +412,27 @@ TEST_F(TxnParticipantTest, TestConcurrentOps) {
   const auto status_for_op = [&] (ParticipantOpPB::ParticipantOpType type) {
     return statuses[FindOrDie(kIndexByOps, type)];
   };
-  // Regardless of order, we should have been able to begin the transaction.
-  ASSERT_OK(status_for_op(ParticipantOpPB::BEGIN_TXN));
+  // The only way we could have failed to begin a transaction is if we
+  // replicated an ABORT_TXN first.
+  ASSERT_TRUE(status_for_op(ParticipantOpPB::BEGIN_TXN).ok() ||
+              status_for_op(ParticipantOpPB::ABORT_TXN).ok()) <<
+      Substitute("BEGIN_TXN error: $0, ABORT_TXN error: $1",
+                 status_for_op(ParticipantOpPB::BEGIN_TXN).ToString(),
+                 status_for_op(ParticipantOpPB::ABORT_TXN).ToString());
 
-  // If we finalized the commit, we should have begun committing, and we must
-  // not have been able to abort.
+  // If we finalized the commit, we must not have been able to abort.
   if (status_for_op(ParticipantOpPB::FINALIZE_COMMIT).ok()) {
     ASSERT_EQ(vector<TxnParticipant::TxnEntry>({
         { kTxnId, kCommitted, kDummyCommitTimestamp },
     }), txn_participant()->GetTxnsForTests());
-    ASSERT_OK(statuses[FindOrDie(kIndexByOps, ParticipantOpPB::BEGIN_COMMIT)]);
-    ASSERT_FALSE(statuses[FindOrDie(kIndexByOps, ParticipantOpPB::ABORT_TXN)].ok());
+    ASSERT_FALSE(status_for_op(ParticipantOpPB::ABORT_TXN).ok());
 
   // If we aborted the commit, we could not have finalized the commit.
   } else if (status_for_op(ParticipantOpPB::ABORT_TXN).ok()) {
     ASSERT_EQ(vector<TxnParticipant::TxnEntry>({
         { kTxnId, kAborted, -1 },
     }), txn_participant()->GetTxnsForTests());
-    ASSERT_FALSE(statuses[FindOrDie(kIndexByOps, ParticipantOpPB::FINALIZE_COMMIT)].ok());
+    ASSERT_FALSE(status_for_op(ParticipantOpPB::FINALIZE_COMMIT).ok());
 
   // If we neither aborted nor finalized, but we began to commit, we should be
   // left with the commit in progress.

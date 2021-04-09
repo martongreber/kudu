@@ -301,6 +301,12 @@ public class KuduTransaction implements AutoCloseable {
    * Check whether the commit phase for a transaction is complete.
    *
    * @return {@code true} if transaction has finalized, otherwise {@code false}
+   * @throws NonRecoverableException with Status.Aborted()
+   *   if transaction has been or is being aborted
+   * @throws NonRecoverableException with Status.IllegalState()
+   *   if transaction is still open (i.e. commit() hasn't been called yet)
+   * @throws NonRecoverableException with Status.NotSupported()
+   *   if transaction is in unexpected state (non-compatible backend?)
    * @throws KuduException if an error happens while querying the system about
    *                       the state of the transaction
    */
@@ -600,7 +606,7 @@ public class KuduTransaction implements AutoCloseable {
   private void startKeepaliveHeartbeating() {
     if (keepaliveEnabled) {
       LOG.debug("starting keepalive heartbeating with period {} ms (txn ID {})",
-          txnId, keepalivePeriodForTimeout(keepaliveMillis));
+          keepalivePeriodForTimeout(keepaliveMillis), txnId);
       doStartKeepaliveHeartbeating();
     } else {
       LOG.debug("keepalive heartbeating disabled for this handle (txn ID {})", txnId);

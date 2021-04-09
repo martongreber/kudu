@@ -231,24 +231,14 @@ void CommitTasks::BeginCommitAsyncTask(int participant_idx) {
       BeginCommitAsyncTask(participant_idx);
       return;
     }
-    if (PREDICT_FALSE(s.IsNotFound())) {
-      // If the participant has been deleted, treat it as though it's already
-      // been committed, rather than attempting to abort or something. This is
-      // important to ensure retries of the commit tasks reliably result in the
-      // same operations being performed.
-      LOG(INFO) << Substitute("Participant $0 was not found for BEGIN_COMMIT, aborting: $1",
-                              participant_ids_[participant_idx], s.ToString());
+    if (PREDICT_FALSE(!s.ok())) {
+      // We might see errors if the participant was deleted, or because the
+      // participant didn't successfully start the transaction. In any case,
+      // abort the transaction.
+      LOG(INFO) << Substitute("Participant $0 of txn $1 returned error for BEGIN_COMMIT op, "
+                              "aborting: $2", participant_ids_[participant_idx],
+                              txn_id_.ToString(), s.ToString());
       SetNeedsBeginAbort();
-    } else if (PREDICT_FALSE(!s.ok())) {
-      // For any other kind of error, just exit without completing.
-      // TODO(awong): we're presuming that such errors wouldn't benefit from
-      // just retrying.
-      // TODO(awong): we don't expect them, but if we ever somehow find
-      // ourselves with an aborted transaction on the participant, we should
-      // probably abort here.
-      LOG(WARNING) << Substitute("Participant $0 BEGIN_COMMIT op returned $1",
-                                 participant_ids_[participant_idx], s.ToString());
-      stop_task_ = true;
     }
 
     // If this was the last participant op for this task, we have some cleanup
@@ -371,8 +361,11 @@ void CommitTasks::AbortTxnAsync() {
   if (participant_ids_.empty()) {
     ScheduleFinalizeAbortTxnWrite();
   } else {
-    ops_in_flight_ = participant_ids_.size();
-    for (int i = 0; i < participant_ids_.size(); i++) {
+    // NOTE: the final AbortTxnAsyncTask() call may destruct this CommitTask
+    // and its members, so cache the participant ID size.
+    const auto participant_ids_size = participant_ids_.size();
+    ops_in_flight_ = participant_ids_size;
+    for (int i = 0; i < participant_ids_size; i++) {
       AbortTxnAsyncTask(i);
     }
   }
@@ -444,8 +437,11 @@ void CommitTasks::FinalizeCommitAsync() {
   // tasks to complete.
   auto old_val = ops_in_flight_.exchange(participant_ids_.size());
   DCHECK_EQ(0, old_val);
-  ops_in_flight_ = participant_ids_.size();
-  for (int i = 0; i < participant_ids_.size(); i++) {
+  // NOTE: the final FinalizeCommitAsyncTask() call may destruct this
+  // CommitTask and its members, so cache the participant ID size.
+  const auto participant_ids_size = participant_ids_.size();
+  ops_in_flight_ = participant_ids_size;
+  for (int i = 0; i < participant_ids_size; i++) {
     FinalizeCommitAsyncTask(i);
   }
 }
@@ -1020,10 +1016,14 @@ void CommitTasks::BeginCommitAsync() {
     // If there are some participants, schedule beginning commit tasks so
     // we can determine a finalized commit timestamp.
     //
+    // NOTE: the final BeginCommitAsyncTask() call may destruct this CommitTask
+    // and its members, so cache the participant ID size.
+    //
     // TODO(awong): consider an approach in which clients propagate
     // timestamps in such a way that the client's call to begin commit
     // includes the expected finalized commit timestamp.
-    for (int i = 0; i < participant_ids_.size(); i++) {
+    const auto participant_ids_size = participant_ids_.size();
+    for (int i = 0; i < participant_ids_size; i++) {
       BeginCommitAsyncTask(i);
     }
   }

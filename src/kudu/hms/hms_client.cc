@@ -49,7 +49,7 @@
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/string_case.h"
 
-DEFINE_bool(disable_hms_incompatible_column_type_check, false,
+DEFINE_bool(disable_hms_incompatible_column_type_check, true,
             "Whether or not to disable the check for the "
             "'hive.metastore.disallow.incompatible.col.type.changes' "
             "configuration in the Hive Metastore. This check is important to "

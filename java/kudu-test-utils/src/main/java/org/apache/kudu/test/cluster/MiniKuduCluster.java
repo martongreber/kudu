@@ -58,6 +58,8 @@ import org.apache.kudu.tools.Tool.GetMastersRequestPB;
 import org.apache.kudu.tools.Tool.GetTServersRequestPB;
 import org.apache.kudu.tools.Tool.KdestroyRequestPB;
 import org.apache.kudu.tools.Tool.KinitRequestPB;
+import org.apache.kudu.tools.Tool.PauseDaemonRequestPB;
+import org.apache.kudu.tools.Tool.ResumeDaemonRequestPB;
 import org.apache.kudu.tools.Tool.SetDaemonFlagRequestPB;
 import org.apache.kudu.tools.Tool.StartClusterRequestPB;
 import org.apache.kudu.tools.Tool.StartDaemonRequestPB;
@@ -90,6 +92,7 @@ public final class MiniKuduCluster implements AutoCloseable {
   private static class DaemonInfo {
     DaemonIdentifierPB id;
     boolean isRunning;
+    boolean isPaused;
   }
 
   // Map of master addresses to daemon information.
@@ -106,6 +109,7 @@ public final class MiniKuduCluster implements AutoCloseable {
   private final ImmutableList<String> extraMasterFlags;
   private final ImmutableList<String> locationInfo;
   private final String clusterRoot;
+  private final String principal;
 
   private MiniKdcOptionsPB kdcOptionsPb;
   private final Common.HmsMode hmsMode;
@@ -118,7 +122,8 @@ public final class MiniKuduCluster implements AutoCloseable {
       List<String> locationInfo,
       MiniKdcOptionsPB kdcOptionsPb,
       String clusterRoot,
-      Common.HmsMode hmsMode) {
+      Common.HmsMode hmsMode,
+      String principal) {
     this.enableKerberos = enableKerberos;
     this.numMasters = numMasters;
     this.numTservers = numTservers;
@@ -126,6 +131,7 @@ public final class MiniKuduCluster implements AutoCloseable {
     this.extraMasterFlags = ImmutableList.copyOf(extraMasterFlags);
     this.locationInfo = ImmutableList.copyOf(locationInfo);
     this.kdcOptionsPb = kdcOptionsPb;
+    this.principal = principal;
     this.hmsMode = hmsMode;
 
     if (clusterRoot == null) {
@@ -220,7 +226,8 @@ public final class MiniKuduCluster implements AutoCloseable {
         .addAllExtraMasterFlags(extraMasterFlags)
         .addAllExtraTserverFlags(extraTserverFlags)
         .setMiniKdcOptions(kdcOptionsPb)
-        .setClusterRoot(clusterRoot);
+        .setClusterRoot(clusterRoot)
+        .setPrincipal(principal);
 
     // Set up the location mapping command flag if there is location info.
     if (!locationInfo.isEmpty()) {
@@ -272,6 +279,7 @@ public final class MiniKuduCluster implements AutoCloseable {
       DaemonInfo d = new DaemonInfo();
       d.id = info.getId();
       d.isRunning = true;
+      d.isPaused = false;
       masterServers.put(ProtobufHelper.hostAndPortFromPB(info.getBoundRpcAddress()), d);
     }
     resp = sendRequestToCluster(
@@ -282,6 +290,7 @@ public final class MiniKuduCluster implements AutoCloseable {
       DaemonInfo d = new DaemonInfo();
       d.id = info.getId();
       d.isRunning = true;
+      d.isPaused = false;
       tabletServers.put(ProtobufHelper.hostAndPortFromPB(info.getBoundRpcAddress()), d);
     }
   }
@@ -346,6 +355,44 @@ public final class MiniKuduCluster implements AutoCloseable {
   }
 
   /**
+   * Pauses a master identified identified by the specified host and port.
+   * Does nothing if the master is already paused.
+   *
+   * @param hp unique host and port identifying the server
+   * @throws IOException if something went wrong in transit
+   */
+  public void pauseMasterServer(HostAndPort hp) throws IOException {
+    DaemonInfo d = getMasterServer(hp);
+    if (d.isPaused) {
+      return;
+    }
+    LOG.info("pausing master server {}", hp);
+    sendRequestToCluster(ControlShellRequestPB.newBuilder()
+        .setPauseDaemon(PauseDaemonRequestPB.newBuilder().setId(d.id).build())
+        .build());
+    d.isPaused = true;
+  }
+
+  /**
+   * Resumes a master identified identified by the specified host and port.
+   * Does nothing if the master isn't paused.
+   *
+   * @param hp unique host and port identifying the server
+   * @throws IOException if something went wrong in transit
+   */
+  public void resumeMasterServer(HostAndPort hp) throws IOException {
+    DaemonInfo d = getMasterServer(hp);
+    if (!d.isPaused) {
+      return;
+    }
+    LOG.info("resuming master server {}", hp);
+    sendRequestToCluster(ControlShellRequestPB.newBuilder()
+        .setResumeDaemon(ResumeDaemonRequestPB.newBuilder().setId(d.id).build())
+        .build());
+    d.isPaused = false;
+  }
+
+  /**
    * Starts a tablet server identified by an host and port.
    * Does nothing if the server was already running.
    *
@@ -381,6 +428,44 @@ public final class MiniKuduCluster implements AutoCloseable {
         .setStopDaemon(StopDaemonRequestPB.newBuilder().setId(d.id).build())
         .build());
     d.isRunning = false;
+  }
+
+  /**
+   * Pauses a tablet server identified by the specified host and port.
+   * Does nothing if the tablet server is already paused.
+   *
+   * @param hp unique host and port identifying the server
+   * @throws IOException if something went wrong in transit
+   */
+  public void pauseTabletServer(HostAndPort hp) throws IOException {
+    DaemonInfo d = getTabletServer(hp);
+    if (d.isPaused) {
+      return;
+    }
+    LOG.info("pausing tablet server {}", hp);
+    sendRequestToCluster(ControlShellRequestPB.newBuilder()
+        .setPauseDaemon(PauseDaemonRequestPB.newBuilder().setId(d.id).build())
+        .build());
+    d.isPaused = true;
+  }
+
+  /**
+   * Resumes a tablet server identified by the specified host and port.
+   * Does nothing if the tablet server isn't paused.
+   *
+   * @param hp unique host and port identifying the server
+   * @throws IOException if something went wrong in transit
+   */
+  public void resumeTabletServer(HostAndPort hp) throws IOException {
+    DaemonInfo d = getTabletServer(hp);
+    if (!d.isPaused) {
+      return;
+    }
+    LOG.info("resuming tablet server {}", hp);
+    sendRequestToCluster(ControlShellRequestPB.newBuilder()
+        .setResumeDaemon(ResumeDaemonRequestPB.newBuilder().setId(d.id).build())
+        .build());
+    d.isPaused = true;
   }
 
   /**
@@ -610,6 +695,7 @@ public final class MiniKuduCluster implements AutoCloseable {
     private final List<String> extraMasterServerFlags = new ArrayList<>();
     private final List<String> locationInfo = new ArrayList<>();
     private String clusterRoot = null;
+    private String principal = "kudu";
 
     private MiniKdcOptionsPB.Builder kdcOptionsPb = MiniKdcOptionsPB.newBuilder();
     private Common.HmsMode hmsMode = Common.HmsMode.NONE;
@@ -690,6 +776,11 @@ public final class MiniKuduCluster implements AutoCloseable {
       return this;
     }
 
+    public MiniKuduClusterBuilder principal(String principal) {
+      this.principal = principal;
+      return this;
+    }
+
     /**
      * Builds and starts a new {@link MiniKuduCluster} using builder state.
      * @return the newly started {@link MiniKuduCluster}
@@ -700,7 +791,7 @@ public final class MiniKuduCluster implements AutoCloseable {
           new MiniKuduCluster(enableKerberos,
               numMasterServers, numTabletServers,
               extraTabletServerFlags, extraMasterServerFlags, locationInfo,
-              kdcOptionsPb.build(), clusterRoot, hmsMode);
+              kdcOptionsPb.build(), clusterRoot, hmsMode, principal);
       try {
         cluster.start();
       } catch (IOException e) {

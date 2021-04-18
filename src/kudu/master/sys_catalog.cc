@@ -39,12 +39,12 @@
 #include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/rowblock.h"
 #include "kudu/common/rowblock_memory.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus_meta.h"
 #include "kudu/consensus/consensus_meta_manager.h"
 #include "kudu/consensus/consensus_peers.h"
@@ -94,13 +94,6 @@ DEFINE_string(master_address_add_new_master, "",
               "Address of master to add as a NON_VOTER on creating a distributed master config.");
 TAG_FLAG(master_address_add_new_master, unsafe);
 TAG_FLAG(master_address_add_new_master, hidden);
-
-DEFINE_bool(master_consensus_allow_status_msg_for_failed_peer, false,
-            "Allows status-only Raft messages to be sent to a master peer in FAILED_UNRECOVERABLE "
-            "state.");
-TAG_FLAG(master_consensus_allow_status_msg_for_failed_peer, advanced);
-TAG_FLAG(master_consensus_allow_status_msg_for_failed_peer, hidden);
-TAG_FLAG(master_consensus_allow_status_msg_for_failed_peer, runtime);
 
 DECLARE_bool(master_support_change_config);
 DECLARE_int64(rpc_max_message_size);
@@ -480,7 +473,10 @@ Status SysCatalogTable::SetupTablet(
   consensus::ServerContext server_ctx{/*quiescing*/nullptr,
                                       master_->num_raft_leaders(),
                                       master_->raft_pool(),
-                                      &FLAGS_master_consensus_allow_status_msg_for_failed_peer};
+                                      // Allow sending status-only Raft messages to a master peer
+                                      // in FAILED_UNRECOVERABLE state if we allow dynamically
+                                      // adding/removing masters.
+                                      &FLAGS_master_support_change_config};
   RETURN_NOT_OK_SHUTDOWN(tablet_replica_->Init(std::move(server_ctx)),
                          "failed to initialize system catalog replica");
 

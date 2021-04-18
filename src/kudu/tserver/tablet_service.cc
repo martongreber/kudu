@@ -44,6 +44,7 @@
 #include "kudu/common/iterator_stats.h"
 #include "kudu/common/key_range.h"
 #include "kudu/common/partition.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/rowblock.h"
 #include "kudu/common/rowblock_memory.h"
 #include "kudu/common/scan_spec.h"
@@ -110,7 +111,6 @@
 #include "kudu/util/random_util.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
-#include "kudu/util/status_callback.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/threadpool.h"
 #include "kudu/util/trace.h"
@@ -1631,9 +1631,9 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
     // This functor is to schedule preliminary tasks prior to submitting
     // the write operation via TabletReplica::SubmitWrite().
     const auto scheduler = [this, &username, replica, deadline](
-        int64_t txn_id, StatusCallback cb) {
+        int64_t txn_id, tablet::RegisteredTxnCallback began_txn_cb) {
       return server_->tablet_manager()->SchedulePreliminaryTasksForTxnWrite(
-          std::move(replica), txn_id, username, deadline, std::move(cb));
+          std::move(replica), txn_id, username, deadline, std::move(began_txn_cb));
     };
     s = replica->SubmitTxnWrite(std::move(op_state), scheduler);
     VLOG(2) << Substitute("submitting txn write op: $0", s.ToString());
@@ -2189,7 +2189,8 @@ void TabletServiceImpl::ListTablets(const ListTabletsRequestPB* req,
     if (req->need_schema_info()) {
       CHECK_OK(SchemaToPB(replica->tablet_metadata()->schema(),
                           status->mutable_schema()));
-      replica->tablet_metadata()->partition_schema().ToPB(status->mutable_partition_schema());
+      CHECK_OK(replica->tablet_metadata()->partition_schema().ToPB(
+          replica->tablet_metadata()->schema(), status->mutable_partition_schema()));
     }
   }
   context->RespondSuccess();

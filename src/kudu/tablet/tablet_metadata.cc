@@ -738,7 +738,7 @@ Status TabletMetadata::ToSuperBlockUnlocked(TabletSuperBlockPB* super_block,
   partition_.ToPB(pb.mutable_partition());
   pb.set_last_durable_mrs_id(last_durable_mrs_id_);
   pb.set_schema_version(schema_version_);
-  partition_schema_.ToPB(pb.mutable_partition_schema());
+  RETURN_NOT_OK(partition_schema_.ToPB(*schema_, pb.mutable_partition_schema()));
   pb.set_table_name(table_name_);
 
   for (const shared_ptr<RowSetMetadata>& meta : rowsets) {
@@ -822,8 +822,7 @@ void TabletMetadata::AddTxnMetadata(int64_t txn_id, unique_ptr<MinLogIndexAnchor
 void TabletMetadata::BeginCommitTransaction(int64_t txn_id, Timestamp mvcc_op_timestamp,
                                             unique_ptr<MinLogIndexAnchorer> log_anchor) {
   std::lock_guard<LockType> l(data_lock_);
-  auto txn_metadata = FindPtrOrNull(txn_metadata_by_txn_id_, txn_id);
-  CHECK(txn_metadata);
+  auto txn_metadata = FindOrDie(txn_metadata_by_txn_id_, txn_id);
   // NOTE: we may already have an MVCC op timestamp if we are bootstrapping and
   // the timestamp was persisted already, in which case, we don't need to
   // anchor the WAL to ensure the timestamp's persistence in metadata.
@@ -836,15 +835,17 @@ void TabletMetadata::BeginCommitTransaction(int64_t txn_id, Timestamp mvcc_op_ti
 void TabletMetadata::AddCommitTimestamp(int64_t txn_id, Timestamp commit_timestamp,
                                         unique_ptr<MinLogIndexAnchorer> log_anchor) {
   std::lock_guard<LockType> l(data_lock_);
-  auto txn_metadata = FindPtrOrNull(txn_metadata_by_txn_id_, txn_id);
-  CHECK(txn_metadata);
+  auto txn_metadata = FindOrDie(txn_metadata_by_txn_id_, txn_id);
   txn_metadata->set_commit_timestamp(commit_timestamp);
   anchors_needing_flush_.emplace_back(std::move(log_anchor));
 }
 
 void TabletMetadata::AbortTransaction(int64_t txn_id, unique_ptr<MinLogIndexAnchorer> log_anchor) {
   std::lock_guard<LockType> l(data_lock_);
-  auto txn_metadata = FindPtrOrNull(txn_metadata_by_txn_id_, txn_id);
+  // NOTE: we can't emplace with a raw pointer here; if the lookup succeeds, we
+  // wouldn't use it and we'd have a memory leak, so use scoped_refptr.
+  auto txn_metadata = LookupOrEmplace(&txn_metadata_by_txn_id_, txn_id,
+                                      scoped_refptr<TxnMetadata>(new TxnMetadata));
   CHECK(txn_metadata);
   txn_metadata->set_aborted();
   anchors_needing_flush_.emplace_back(std::move(log_anchor));

@@ -24,7 +24,6 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
-#include <map>
 #include <memory>
 #include <ostream>
 #include <set>
@@ -40,7 +39,6 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/blocking_ops.h"
 #include "kudu/rpc/constants.h"
-#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/sasl_helper.h"
@@ -64,14 +62,13 @@
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif // #if defined(__APPLE__)
 
-using std::map;
+DECLARE_bool(rpc_encrypt_loopback_connections);
+
+using kudu::security::RpcEncryption;
 using std::set;
 using std::string;
 using std::unique_ptr;
-
 using strings::Substitute;
-
-DECLARE_bool(rpc_encrypt_loopback_connections);
 
 namespace kudu {
 namespace rpc {
@@ -126,6 +123,7 @@ ClientNegotiation::ClientNegotiation(unique_ptr<Socket> socket,
     : socket_(std::move(socket)),
       helper_(SaslHelper::CLIENT),
       tls_context_(tls_context),
+      tls_handshake_(security::TlsHandshakeType::CLIENT),
       encryption_(encryption),
       tls_negotiated_(false),
       authn_token_(std::move(authn_token)),
@@ -191,8 +189,7 @@ Status ClientNegotiation::Negotiate(unique_ptr<ErrorStatusPB>* rpc_error) {
   // TODO(KUDU-1921): allow the client to require TLS.
   if (encryption_ != RpcEncryption::DISABLED &&
       ContainsKey(server_features_, TLS)) {
-    RETURN_NOT_OK(tls_context_->InitiateHandshake(security::TlsHandshakeType::CLIENT,
-                                                  &tls_handshake_));
+    RETURN_NOT_OK(tls_context_->InitiateHandshake(&tls_handshake_));
 
     if (negotiated_authn_ == AuthenticationType::SASL) {
       // When using SASL authentication, verifying the server's certificate is
@@ -247,7 +244,7 @@ Status ClientNegotiation::SendNegotiatePB(const NegotiatePB& msg) {
   DCHECK(msg.has_step()) << "message must have a step";
 
   TRACE("Sending $0 NegotiatePB request", NegotiatePB::NegotiateStep_Name(msg.step()));
-  return SendFramedMessageBlocking(socket(), header, msg, deadline_);
+  return SendFramedMessageBlocking(socket_.get(), header, msg, deadline_);
 }
 
 Status ClientNegotiation::RecvNegotiatePB(NegotiatePB* msg,
@@ -255,7 +252,8 @@ Status ClientNegotiation::RecvNegotiatePB(NegotiatePB* msg,
                                           unique_ptr<ErrorStatusPB>* rpc_error) {
   ResponseHeader header;
   Slice param_buf;
-  RETURN_NOT_OK(ReceiveFramedMessageBlocking(socket(), buffer, &header, &param_buf, deadline_));
+  RETURN_NOT_OK(ReceiveFramedMessageBlocking(
+      socket_.get(), buffer, &header, &param_buf, deadline_));
   RETURN_NOT_OK(helper_.CheckNegotiateCallId(header.call_id()));
 
   if (header.is_error()) {
@@ -263,7 +261,8 @@ Status ClientNegotiation::RecvNegotiatePB(NegotiatePB* msg,
   }
 
   RETURN_NOT_OK(helper_.ParseNegotiatePB(param_buf, msg));
-  TRACE("Received $0 NegotiatePB response", NegotiatePB::NegotiateStep_Name(msg->step()));
+  TRACE("Received $0 NegotiatePB response",
+        NegotiatePB::NegotiateStep_Name(msg->step()));
   return Status::OK();
 }
 
@@ -288,7 +287,7 @@ Status ClientNegotiation::SendConnectionHeader() {
   uint8_t buf[buflen];
   serialization::SerializeConnHeader(buf);
   size_t nsent;
-  return socket()->BlockingWrite(buf, buflen, &nsent, deadline_);
+  return socket_->BlockingWrite(buf, buflen, &nsent, deadline_);
 }
 
 Status ClientNegotiation::InitSaslClient() {
@@ -352,8 +351,7 @@ Status ClientNegotiation::SendNegotiate() {
     return Status::NotAuthorized("client is not configured with an authentication type");
   }
 
-  RETURN_NOT_OK(SendNegotiatePB(msg));
-  return Status::OK();
+  return SendNegotiatePB(msg);
 }
 
 Status ClientNegotiation::HandleNegotiate(const NegotiatePB& response) {
@@ -434,7 +432,6 @@ Status ClientNegotiation::HandleNegotiate(const NegotiatePB& response) {
   // TODO(KUDU-1921): allow the client to require authentication.
   if (ContainsKey(client_mechs, SaslMechanism::GSSAPI) &&
       ContainsKey(server_mechs, SaslMechanism::GSSAPI)) {
-
     // Check that the client has local Kerberos credentials, and if not fall
     // back to an alternate mechanism.
     Status s = CheckGSSAPI();
@@ -499,8 +496,7 @@ Status ClientNegotiation::HandleTlsHandshake(const NegotiatePB& response) {
 
   string token;
   Status s = tls_handshake_.Continue(response.tls_handshake(), &token);
-  if (s.IsIncomplete()) {
-    // Another roundtrip is required to complete the handshake.
+  if (tls_handshake_.NeedsExtraStep(s, token)) {
     RETURN_NOT_OK(SendTlsHandshake(std::move(token)));
   }
 
@@ -730,7 +726,7 @@ Status ClientNegotiation::SendConnectionContext() {
     *conn_context.mutable_encoded_nonce() = ciphertext.ToString();
   }
 
-  return SendFramedMessageBlocking(socket(), header, conn_context, deadline_);
+  return SendFramedMessageBlocking(socket_.get(), header, conn_context, deadline_);
 }
 
 int ClientNegotiation::GetOptionCb(const char* plugin_name, const char* option,

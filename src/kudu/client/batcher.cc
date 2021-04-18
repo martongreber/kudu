@@ -470,7 +470,9 @@ RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
     }
   }
 
-  if (result.status.IsServiceUnavailable()) {
+  if (result.status.IsServiceUnavailable() ||
+      (resp_.has_error() &&
+       resp_.error().code() == tserver::TabletServerErrorPB::TXN_LOCKED_RETRY_OP)) {
     result.result = RetriableRpcStatus::SERVICE_UNAVAILABLE;
     return result;
   }
@@ -506,6 +508,13 @@ RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
     return result;
   }
 
+  if (resp_.has_error() &&
+      (resp_.error().code() == tserver::TabletServerErrorPB::TXN_ILLEGAL_STATE ||
+       resp_.error().code() == tserver::TabletServerErrorPB::TXN_LOCKED_ABORT)) {
+    result.result = RetriableRpcStatus::NON_RETRIABLE_ERROR;
+    return result;
+  }
+
   // Alternatively, when we get a status code of IllegalState or Aborted, we
   // assume this means that the replica we attempted to write to is not the
   // current leader (maybe it got partitioned or slow and another node took
@@ -520,8 +529,9 @@ RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
     //                becomes a real issue when handling responses to write
     //                operations in the context of multi-row transactions.
     //                For example, Status::IllegalState() originated from
-    //                TabletServerErrorPB::TXN_ILLEGAL_STATE responses are
-    //                needlessly retried.
+    //                TabletServerErrorPB::TXN_ILLEGAL_STATE response and
+    //                Status::Abort() originated from TabletServerErrorPB::TXN_LOCKED_ABORT
+    //                response are needlessly retried.
     result.result = RetriableRpcStatus::REPLICA_NOT_LEADER;
     return result;
   }

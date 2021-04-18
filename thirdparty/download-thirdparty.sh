@@ -301,11 +301,12 @@ fetch_and_patch \
  $GCOVR_SOURCE \
  $GCOVR_PATCHLEVEL
 
-CURL_PATCHLEVEL=0
+CURL_PATCHLEVEL=1
 fetch_and_patch \
  curl-${CURL_VERSION}.tar.gz \
  $CURL_SOURCE \
  $CURL_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/curl-custom-openssl-library.patch" \
  "autoreconf -fvi"
 
 CRCUTIL_PATCHLEVEL=0
@@ -359,19 +360,6 @@ fetch_and_patch \
  boost_${BOOST_VERSION}.tar.gz \
  $BOOST_SOURCE \
  $BOOST_PATCHLEVEL
-
-# Return 0 if the current system appears to be el6 (either CentOS or proper RHEL)
-needs_openssl_workaround() {
-  test -f /etc/redhat-release || return 1
-  rel="$(cat /etc/redhat-release)"
-  pat="(CentOS|Red Hat Enterprise).* release 6.*"
-  [[ "$rel" =~ $pat ]]
-  return $?
-}
-if needs_openssl_workaround && [ ! -d "$OPENSSL_WORKAROUND_DIR" ] ; then
-  echo Building on el6: installing OpenSSL from CentOS 6.4.
-  $TP_DIR/install-openssl-el6-workaround.sh
-fi
 
 BREAKPAD_PATCHLEVEL=2
 fetch_and_patch \

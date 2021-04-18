@@ -34,6 +34,7 @@
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/tablet/lock_manager.h"
 #include "kudu/tablet/mvcc.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tserver/tserver.pb.h"
@@ -108,6 +109,13 @@ class Txn : public RefCountedThreadSafe<Txn> {
   void AcquireWriteLock(std::unique_lock<rw_semaphore>* txn_lock);
   void AcquireReadLock(shared_lock<rw_semaphore>* txn_lock);
 
+  // Adopts the input partition lock, maintaining it until the transaction is
+  // complete (aborted or finalized). Rather than maintaining multiple
+  // ScopedPartitionLocks, this will release any currently-held lock and
+  // acquire the new one. It is thus expected that repeat callers are taking
+  // the same lock.
+  void AdoptPartitionLock(ScopedPartitionLock partition_lock);
+
   // Validates that the transaction is in the appropriate state to perform the
   // given operation. Should be called while holding the state lock before
   // replicating a participant op.
@@ -140,6 +148,7 @@ class Txn : public RefCountedThreadSafe<Txn> {
       Timestamp timestamp;
       TxnState meta_state;
       if (!tablet_metadata_->HasTxnMetadata(txn_id_, &meta_state, &timestamp)) {
+        *code = tserver::TabletServerErrorPB::TXN_ILLEGAL_STATE;
         return Status::IllegalState("Transaction hasn't been successfully started");
       }
       if (PREDICT_FALSE(meta_state != kCommitted && meta_state != kCommitInProgress)) {
@@ -180,13 +189,13 @@ class Txn : public RefCountedThreadSafe<Txn> {
   }
   Status ValidateFinalize(tserver::TabletServerErrorPB::Code* code) const {
     DCHECK(state_lock_.is_locked());
-    RETURN_NOT_OK(CheckFinishedInitializing(code, kCommitted));
+    RETURN_NOT_OK(CheckPersistedMetadataState(code, kCommitted));
     if (PREDICT_FALSE(state_ == kCommitted)) {
       *code = tserver::TabletServerErrorPB::TXN_OP_ALREADY_APPLIED;
       return Status::IllegalState(
           strings::Substitute("Transaction $0 has already been committed", txn_id_));
     }
-    if (PREDICT_FALSE(state_ != kCommitInProgress)) {
+    if (PREDICT_FALSE(state_ != kInitializing && state_ != kCommitInProgress)) {
       *code = tserver::TabletServerErrorPB::TXN_ILLEGAL_STATE;
       return Status::IllegalState(
           strings::Substitute("Cannot finalize transaction in state: $0",
@@ -196,14 +205,16 @@ class Txn : public RefCountedThreadSafe<Txn> {
   }
   Status ValidateAbort(tserver::TabletServerErrorPB::Code* code) const {
     DCHECK(state_lock_.is_locked());
-    RETURN_NOT_OK(CheckFinishedInitializing(code, kAborted));
+    // NOTE: it's allowed that we replicate an ABORT_TXN op even if the
+    // transaction doesn't exist. This allows us to ensure we remove any
+    // pending TxnOpDispatchers.
+    RETURN_NOT_OK(CheckPersistedMetadataState(code, kAborted));
     if (PREDICT_FALSE(state_ == kAborted)) {
       *code = tserver::TabletServerErrorPB::TXN_OP_ALREADY_APPLIED;
       return Status::IllegalState(
           strings::Substitute("Transaction $0 has already been aborted", txn_id_));
     }
-    if (PREDICT_FALSE(state_ != kOpen &&
-                      state_ != kCommitInProgress)) {
+    if (PREDICT_FALSE(state_ == kCommitted)) {
       *code = tserver::TabletServerErrorPB::TXN_ILLEGAL_STATE;
       return Status::IllegalState(
           strings::Substitute("Cannot abort transaction in state: $0",
@@ -253,6 +264,10 @@ class Txn : public RefCountedThreadSafe<Txn> {
     return commit_op_.get();
   }
 
+  void ReleasePartitionLock() {
+    partition_lock_.Release();
+  }
+
  private:
   friend class RefCountedThreadSafe<Txn>;
 
@@ -262,38 +277,51 @@ class Txn : public RefCountedThreadSafe<Txn> {
     state_ = s;
   }
 
-  // Returns an error if the transaction has not finished initializing. This
-  // may mean that an in-flight transaction didn't exist so we created a new
-  // one, in which case we need to check if there's existing metadata for it.
+  // If we're initializing a new transaction, checks for any persisted
+  // transaction metadata, ensuring it's compatible with our expected state,
+  // and returning an error otherwise.
   //
   // NOTE: we only need to check the expected metadata state when we're
   // aborting or finalizing a commit, since these end the in-flight
   // transaction. In other cases, we should be able to check the state of the
   // in-flight transaction.
-  Status CheckFinishedInitializing(
+  Status CheckPersistedMetadataState(
       tserver::TabletServerErrorPB::Code* code,
       TxnState expected_metadata_state = kNone) const {
-    DCHECK(expected_metadata_state == kNone ||
-           expected_metadata_state == kAborted ||
-           expected_metadata_state == kCommitted);
-    if (PREDICT_FALSE(state_ == kInitializing)) {
-      TxnState meta_state;
-      if (tablet_metadata_->HasTxnMetadata(txn_id_, &meta_state)) {
-        if (expected_metadata_state != kNone && expected_metadata_state == meta_state) {
-          *code = tserver::TabletServerErrorPB::TXN_OP_ALREADY_APPLIED;
-          return Status::IllegalState(
-              strings::Substitute("Transaction metadata for transaction $0 already set",
-                                  txn_id_));
-        }
-        // We created this transaction as a part of this op (i.e. it was not
-        // already in flight), and there is existing metadata for it.
-        *code = tserver::TabletServerErrorPB::TXN_ILLEGAL_STATE;
+    DCHECK(expected_metadata_state == kAborted || expected_metadata_state == kCommitted);
+    // If we're not initializing a new transaction, there's an already
+    // in-flight, non-persisted transaction, and we'll check its state
+    // elsewhere.
+    if (PREDICT_TRUE(state_ != kInitializing)) {
+      return Status::OK();
+    }
+    TxnState meta_state;
+    if (tablet_metadata_->HasTxnMetadata(txn_id_, &meta_state)) {
+      if (expected_metadata_state == meta_state) {
+        *code = tserver::TabletServerErrorPB::TXN_OP_ALREADY_APPLIED;
         return Status::IllegalState(
-            strings::Substitute("Transaction metadata for transaction $0 already exists",
+            strings::Substitute("Transaction metadata for transaction $0 already set",
                                 txn_id_));
       }
-      // TODO(awong): add another code for this?
-      return Status::IllegalState("Transaction hasn't been successfully started");
+      // We created this transaction as a part of this op (i.e. it was not
+      // already in flight), and there is existing metadata for it that doesn't
+      // match the expected state.
+      *code = tserver::TabletServerErrorPB::TXN_ILLEGAL_STATE;
+      return Status::IllegalState(
+          strings::Substitute("Transaction metadata for transaction $0 already exists",
+                              txn_id_));
+    }
+    // If we don't have metadata for the transaction, it depends on what the
+    // expected state is. E.g. ABORT_TXN ops can and should be replicated even
+    // if we haven't successfully initialized the transaction. This is possible
+    // if we've successfully registered the participant, but haven't yet
+    // replicated the BEGIN_TXN op. The same can't be said for FINALIZE_COMMIT
+    // ops, so return an error here in that case.
+    if (expected_metadata_state == kCommitted) {
+      *code = tserver::TabletServerErrorPB::TXN_ILLEGAL_STATE;
+      return Status::IllegalState(
+          strings::Substitute("Transaction metadata for transaction $0 does not exist",
+                              txn_id_));
     }
     return Status::OK();
   }
@@ -328,6 +356,9 @@ class Txn : public RefCountedThreadSafe<Txn> {
   // before proceeding with a scan. This ensures scans on this participant are
   // repeatable.
   std::unique_ptr<ScopedOp> commit_op_;
+
+  // Holds the partition lock acquired for this transaction.
+  ScopedPartitionLock partition_lock_;
 
   DISALLOW_COPY_AND_ASSIGN(Txn);
 };

@@ -18,7 +18,6 @@
 package org.apache.kudu.client;
 
 import java.io.IOException;
-import javax.annotation.Nullable;
 
 import com.google.common.base.Preconditions;
 import com.google.protobuf.CodedInputStream;
@@ -301,6 +300,12 @@ public class KuduTransaction implements AutoCloseable {
    * Check whether the commit phase for a transaction is complete.
    *
    * @return {@code true} if transaction has finalized, otherwise {@code false}
+   * @throws NonRecoverableException with Status.Aborted()
+   *   if transaction has been or is being aborted
+   * @throws NonRecoverableException with Status.IllegalState()
+   *   if transaction is still open (i.e. commit() hasn't been called yet)
+   * @throws NonRecoverableException with Status.NotSupported()
+   *   if transaction is in unexpected state (non-compatible backend?)
    * @throws KuduException if an error happens while querying the system about
    *                       the state of the transaction
    */
@@ -317,6 +322,7 @@ public class KuduTransaction implements AutoCloseable {
         throw new NonRecoverableException(Status.IllegalState("transaction is still open"));
       case COMMITTED:
         return true;
+      case FINALIZE_IN_PROGRESS:
       case COMMIT_IN_PROGRESS:
         return false;
       default:
@@ -596,75 +602,139 @@ public class KuduTransaction implements AutoCloseable {
     return period;
   }
 
+  /**
+   * Return timeout for sending heartbeat messages given the specified
+   * keepalive timeout for a transaction (both in milliseconds). If something
+   * goes wrong and keepalive RPC fails, it should be possible to retry sending
+   * keepalive message a couple of times before the transaction is automatically
+   * aborted by the backend after not receiving keepalive messages for longer
+   * than the keepalive timeout for the transaction.
+   *
+   * @param keepaliveMillis keepalive timeout interval for a transaction (ms)
+   * @return a proper timeout for sending keepalive RPC from the client side
+   */
+  private static long keepaliveRequestTimeout(long keepaliveMillis) {
+    long timeout = keepalivePeriodForTimeout(keepaliveMillis) / 2;
+    if (timeout <= 0) {
+      timeout = 1;
+    }
+    return timeout;
+  }
+
   private void startKeepaliveHeartbeating() {
     if (keepaliveEnabled) {
       LOG.debug("starting keepalive heartbeating with period {} ms (txn ID {})",
-          txnId, keepalivePeriodForTimeout(keepaliveMillis));
+          keepalivePeriodForTimeout(keepaliveMillis), txnId);
       doStartKeepaliveHeartbeating();
     } else {
       LOG.debug("keepalive heartbeating disabled for this handle (txn ID {})", txnId);
     }
   }
 
-  private final class SendKeepaliveTask implements TimerTask {
-    /**
-     * Send keepalive heartbeat message for the transaction represented by
-     * this {@link KuduTransaction} handle and re-schedule itself
-     * (i.e. this task) to send next heartbeat interval
-     *
-     * @param timeout a handle which is associated with this task
-     */
-    @Override
-    public void run(Timeout timeout) throws Exception {
-      if (timeout.isCancelled()) {
-        LOG.debug("terminating keepalive task (txn ID {})", txnId);
-        return;
-      }
-      try {
-        doSendKeepalive();
-      } catch (RecoverableException e) {
-        // Just continue sending heartbeats as required: the recoverable
-        // exception means the condition is transient.
-        // TODO(aserbin): should we send next heartbeat sooner? E.g., retry
-        //                immediately, and do such retry only once after a
-        //                failure like this. The idea is to avoid missing
-        //                heartbeats in situations where the second attempt
-        //                after keepaliveMillis/2 would as well due to a network
-        //                issue, but immediate retry could succeed.
-        LOG.debug("continuing keepalive heartbeating (txn ID {}): {}",
-            txnId, e.toString());
-      } catch (Exception e) {
-        LOG.debug("terminating keepalive task (txn ID {}) due to exception {}",
-            txnId, e.toString());
-        return;
-      }
-      synchronized (keepaliveTaskHandleSync) {
-        // Re-schedule the task, refreshing the task handle.
-        keepaliveTaskHandle = AsyncKuduClient.newTimeout(
-            timeout.timer(), this, keepalivePeriodForTimeout(keepaliveMillis));
-      }
-    }
-
-    private void doSendKeepalive() throws KuduException {
-      KeepTransactionAliveRequest request = new KeepTransactionAliveRequest(
-          client.getMasterTable(),
-          client.getTimer(),
-          client.getDefaultAdminOperationTimeoutMs(),
-          txnId);
-      Deferred<KeepTransactionAliveResponse> d = client.sendRpcToTablet(request);
-      KuduClient.joinAndHandleException(d);
-    }
-  }
-
   void doStartKeepaliveHeartbeating() {
     Preconditions.checkState(keepaliveEnabled);
+    Preconditions.checkArgument(txnId > AsyncKuduClient.INVALID_TXN_ID);
     synchronized (keepaliveTaskHandleSync) {
       Preconditions.checkState(keepaliveTaskHandle == null,
           "keepalive heartbeating has already started");
-      keepaliveTaskHandle = AsyncKuduClient.newTimeout(
-          client.getTimer(),
-          new SendKeepaliveTask(),
-          keepalivePeriodForTimeout(keepaliveMillis));
+      long sleepTimeMillis = keepalivePeriodForTimeout(keepaliveMillis);
+      keepaliveTaskHandle = delayedSendKeepTransactionAlive(sleepTimeMillis,
+          getSendKeepTransactionAliveCB(), getSendKeepTransactionAliveEB());
     }
+  }
+
+  /**
+   * Send keepalive message to TxnManager for this transaction.
+   *
+   * @return a future object to handle the results of the sent RPC
+   */
+  private Deferred<KeepTransactionAliveResponse> doSendKeepTransactionAlive() {
+    // The timeout for the keepalive RPC is dictated by the keepalive
+    // timeout for the transaction.
+    long timeoutMs = keepaliveRequestTimeout(keepaliveMillis);
+    KeepTransactionAliveRequest request = new KeepTransactionAliveRequest(
+        client.getMasterTable(), client.getTimer(), timeoutMs, txnId);
+    return client.sendRpcToTablet(request);
+  }
+
+  /**
+   * Schedule a timer to send a KeepTransactiveAlive RPC to TxnManager after
+   * @c sleepTimeMillis milliseconds.
+   *
+   * @param runAfterMillis time delta from now when to run the task
+   * @param callback callback to call on successfully sent RPC
+   * @param errback errback to call if something goes wrong with sending RPC
+   */
+  private Timeout delayedSendKeepTransactionAlive(
+      long runAfterMillis,
+      final Callback<Void, KeepTransactionAliveResponse> callback,
+      final Callback<Void, Exception> errback) {
+
+    final class RetryTimer implements TimerTask {
+      @Override
+      public void run(final Timeout timeout) {
+        doSendKeepTransactionAlive().addCallbacks(callback, errback);
+      }
+    }
+
+    return client.newTimeout(client.getTimer(), new RetryTimer(), runAfterMillis);
+  }
+
+  private Callback<Void, KeepTransactionAliveResponse> getSendKeepTransactionAliveCB() {
+    // Time interval to wait before sending next KeepTransactionAlive request.
+    long sleepTimeMillis = keepalivePeriodForTimeout(keepaliveMillis);
+    return resp -> {
+      // Store the Deferred locally; callback() below will reset it and we'd
+      // return a different, non-triggered Deferred.
+      synchronized (keepaliveTaskHandleSync) {
+        if (!keepaliveTaskHandle.isCancelled()) {
+          keepaliveTaskHandle = delayedSendKeepTransactionAlive(
+              sleepTimeMillis,
+              getSendKeepTransactionAliveCB(),
+              getSendKeepTransactionAliveEB());
+        }
+      }
+      return null;
+    };
+  }
+
+  private Callback<Void, Exception> getSendKeepTransactionAliveEB() {
+    return e -> {
+      boolean scheduleNextRun = false;
+      long nextRunAfterMillis = -1;
+      if (e instanceof RecoverableException) {
+        scheduleNextRun = true;
+        nextRunAfterMillis = keepaliveRequestTimeout(keepaliveMillis);
+        // Continue sending heartbeats as required: the recoverable exception
+        // means the condition is transient. However, attempt sending next
+        // keepalive message sooner since one has just been missed.
+        LOG.debug("continuing keepalive heartbeating (txn ID {}): {}",
+            txnId, e.toString());
+      } else if (e instanceof NonRecoverableException) {
+        NonRecoverableException ex = (NonRecoverableException) e;
+        if (ex.getStatus().isTimedOut()) {
+          // Send next keepalive message sooner: it's been a long timeout.
+          scheduleNextRun = true;
+          nextRunAfterMillis = 1;
+          LOG.debug("sending keepalive message after prior one timed out (txn ID {}): {}",
+              txnId, e.toString());
+        } else {
+          LOG.debug("terminating keepalive task (txn ID {}) due to exception {}",
+              txnId, e.toString());
+        }
+      }
+      if (scheduleNextRun) {
+        Preconditions.checkArgument(nextRunAfterMillis >= 0);
+        synchronized (keepaliveTaskHandleSync) {
+          if (!keepaliveTaskHandle.isCancelled()) {
+            keepaliveTaskHandle = delayedSendKeepTransactionAlive(
+                nextRunAfterMillis,
+                getSendKeepTransactionAliveCB(),
+                getSendKeepTransactionAliveEB());
+          }
+        }
+      }
+      return null;
+    };
   }
 }

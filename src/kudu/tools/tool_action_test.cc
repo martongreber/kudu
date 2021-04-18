@@ -175,6 +175,9 @@ Status ProcessRequest(const ControlShellRequestPB& req,
         opts.mini_kdc_options.data_root = JoinPathSegments(opts.cluster_root, "krb5kdc");
         opts.mini_kdc_options.ticket_lifetime = cc.mini_kdc_options().ticket_lifetime();
         opts.mini_kdc_options.renew_lifetime = cc.mini_kdc_options().renew_lifetime();
+        if (cc.has_principal()) {
+          opts.principal = cc.principal();
+        }
       }
 
       cluster->reset(new ExternalMiniCluster(std::move(opts)));
@@ -302,6 +305,40 @@ Status ProcessRequest(const ControlShellRequestPB& req,
       RETURN_NOT_OK(FindDaemon(*cluster, id, &daemon, &kdc));
       DCHECK(daemon);
       RETURN_NOT_OK((*cluster)->SetFlag(daemon, r.flag(), r.value()));
+      break;
+    }
+    case ControlShellRequestPB::kPauseDaemon:
+    {
+      const auto& r = req.pause_daemon();
+      if (!r.has_id()) {
+        RETURN_NOT_OK(Status::InvalidArgument("missing process id"));
+      }
+      const auto& id = r.id();
+      if (id.type() == DaemonType::KDC) {
+        return Status::InvalidArgument("mini-KDC doesn't support pausing");
+      }
+      ExternalDaemon* daemon;
+      MiniKdc* kdc;
+      RETURN_NOT_OK(FindDaemon(*cluster, id, &daemon, &kdc));
+      DCHECK(daemon);
+      RETURN_NOT_OK(daemon->Pause());
+      break;
+    }
+    case ControlShellRequestPB::kResumeDaemon:
+    {
+      const auto& r = req.resume_daemon();
+      if (!r.has_id()) {
+        RETURN_NOT_OK(Status::InvalidArgument("missing process id"));
+      }
+      const auto& id = r.id();
+      if (id.type() == DaemonType::KDC) {
+        return Status::InvalidArgument("mini-KDC doesn't support resuming");
+      }
+      ExternalDaemon* daemon;
+      MiniKdc* kdc;
+      RETURN_NOT_OK(FindDaemon(*cluster, id, &daemon, &kdc));
+      DCHECK(daemon);
+      RETURN_NOT_OK(daemon->Resume());
       break;
     }
     default:

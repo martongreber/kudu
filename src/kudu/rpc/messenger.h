@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -47,12 +48,9 @@ class ThreadPool;
 namespace security {
 class TlsContext;
 class TokenVerifier;
-}
+} // namespace security
 
 namespace rpc {
-
-using security::RpcAuthentication;
-using security::RpcEncryption;
 
 class AcceptorPool;
 class DumpConnectionsRequestPB;
@@ -87,80 +85,167 @@ class MessengerBuilder {
   explicit MessengerBuilder(std::string name);
 
   // Set the length of time we will keep a TCP connection will alive with no traffic.
-  MessengerBuilder &set_connection_keepalive_time(const MonoDelta &keepalive);
+  MessengerBuilder& set_connection_keepalive_time(const MonoDelta& keepalive) {
+    connection_keepalive_time_ = keepalive;
+    return *this;
+  }
 
   // Set the number of reactor threads that will be used for sending and
   // receiving.
-  MessengerBuilder &set_num_reactors(int num_reactors);
+  MessengerBuilder& set_num_reactors(int num_reactors) {
+    num_reactors_ = num_reactors;
+    return *this;
+  }
 
   // Set the minimum number of connection-negotiation threads that will be used
   // to handle the blocking connection-negotiation step.
-  MessengerBuilder &set_min_negotiation_threads(int min_negotiation_threads);
+  MessengerBuilder& set_min_negotiation_threads(int min_negotiation_threads) {
+    min_negotiation_threads_ = min_negotiation_threads;
+    return *this;
+  }
 
   // Set the maximum number of connection-negotiation threads that will be used
   // to handle the blocking connection-negotiation step.
-  MessengerBuilder &set_max_negotiation_threads(int max_negotiation_threads);
+  MessengerBuilder& set_max_negotiation_threads(int max_negotiation_threads) {
+    max_negotiation_threads_ = max_negotiation_threads;
+    return *this;
+  }
 
   // Set the granularity with which connections are checked for keepalive.
-  MessengerBuilder &set_coarse_timer_granularity(const MonoDelta &granularity);
+  MessengerBuilder& set_coarse_timer_granularity(const MonoDelta& granularity) {
+    coarse_timer_granularity_ = granularity;
+    return *this;
+  }
 
   // Set metric entity for use by RPC systems.
-  MessengerBuilder &set_metric_entity(const scoped_refptr<MetricEntity>& metric_entity);
+  MessengerBuilder& set_metric_entity(
+      const scoped_refptr<MetricEntity>& metric_entity) {
+    metric_entity_ = metric_entity;
+    return *this;
+  }
 
   // Set the time in milliseconds after which an idle connection from a client will be
   // disconnected by the server.
-  MessengerBuilder &set_connection_keep_alive_time(int32_t time_in_ms);
+  MessengerBuilder& set_connection_keep_alive_time(int32_t time_in_ms) {
+    connection_keepalive_time_ = MonoDelta::FromMilliseconds(time_in_ms);
+    return *this;
+  }
 
   // Set the timeout for negotiating an RPC connection.
-  MessengerBuilder &set_rpc_negotiation_timeout_ms(int64_t time_in_ms);
+  MessengerBuilder& set_rpc_negotiation_timeout_ms(int64_t time_in_ms) {
+    rpc_negotiation_timeout_ms_ = time_in_ms;
+    return *this;
+  }
 
   // Set the SASL protocol name that is used for the SASL negotiation.
-  MessengerBuilder &set_sasl_proto_name(const std::string& sasl_proto_name);
+  MessengerBuilder& set_sasl_proto_name(const std::string& sasl_proto_name) {
+    sasl_proto_name_ = sasl_proto_name;
+    return *this;
+  }
 
   // Set the state of authentication required. If 'optional', authentication will be used when
   // the remote end supports it. If 'required', connections which are not able to authenticate
   // (because the remote end lacks support) are rejected.
-  MessengerBuilder &set_rpc_authentication(const std::string& rpc_authentication);
+  MessengerBuilder& set_rpc_authentication(const std::string& rpc_authentication) {
+    rpc_authentication_ = rpc_authentication;
+    return *this;
+  }
 
   // Set the state of encryption required. If 'optional', encryption will be used when the
   // remote end supports it. If 'required', connections which are not able to use encryption
   // (because the remote end lacks support) are rejected. If 'disabled', encryption will not
   // be used, and RPC authentication (--rpc_authentication) must also be disabled as well.
-  MessengerBuilder &set_rpc_encryption(const std::string& rpc_encryption);
+  MessengerBuilder& set_rpc_encryption(const std::string& rpc_encryption) {
+    rpc_encryption_ = rpc_encryption;
+    return *this;
+  }
 
-  // Set the cipher suite preferences to use for TLS-secured RPC connections. Uses the OpenSSL
-  // cipher preference list format. See man (1) ciphers for more information.
-  MessengerBuilder &set_rpc_tls_ciphers(const std::string& rpc_tls_ciphers);
+  // Set TLSv1.2 and earlier cipher suite preferences to use for TLS-secured RPC
+  // connections. Uses the OpenSSL cipher preference list format. Under the
+  // hood, SSL_CTX_set_cipher_list() is eventually being called with
+  // 'rpc_tls_ciphers'. See 'man (1) ciphers' for more information on the syntax
+  // of the cipher suite preference list and
+  // https://www.openssl.org/docs/man1.1.1/man3/SSL_CTX_set_ciphersuites.html
+  // for SSL_CTX_set_cipher_list() API details.
+  MessengerBuilder& set_rpc_tls_ciphers(const std::string& rpc_tls_ciphers) {
+    rpc_tls_ciphers_ = rpc_tls_ciphers;
+    return *this;
+  }
 
-  // Set the minimum protocol version to allow when for securing RPC connections with TLS. May be
-  // one of 'TLSv1', 'TLSv1.1', or 'TLSv1.2'.
-  MessengerBuilder &set_rpc_tls_min_protocol(const std::string& rpc_tls_min_protocol);
+  // Set TLSv1.3-specific cipher suite preferences to use for TLS-secured RPC
+  // connections. Uses the OpenSSL ciphersuite preference list format for
+  // TLSv1.3. Under the hood, SSL_CTX_set_ciphersuites() is eventually being
+  // called with 'rpc_tls_ciphersuites'. See 'man (1) ciphers' for more
+  // information on the TLSv1.3-specific syntax for the cipher suite preference
+  // list and
+  // https://www.openssl.org/docs/man1.1.1/man3/SSL_CTX_set_ciphersuites.html
+  // for SSL_CTX_set_ciphersuites() API details.
+  MessengerBuilder &set_rpc_tls_ciphersuites(
+      const std::string& rpc_tls_ciphersuites) {
+    rpc_tls_ciphersuites_ = rpc_tls_ciphersuites;
+    return *this;
+  }
+
+  // Set the minimum protocol version to allow when for securing RPC connections
+  // with TLS. May be one of 'TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3'.
+  MessengerBuilder &set_rpc_tls_min_protocol(
+      const std::string& rpc_tls_min_protocol) {
+    rpc_tls_min_protocol_ = rpc_tls_min_protocol;
+    return *this;
+  }
+
+  // Set the list of TLS protocols to avoid when securing RPC connections. The
+  // elements might be from the list of 'TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3'.
+  MessengerBuilder& set_rpc_tls_excluded_protocols(
+      std::vector<std::string> rpc_tls_excluded_protocols) {
+    rpc_tls_excluded_protocols_ = std::move(rpc_tls_excluded_protocols);
+    return *this;
+  }
 
   // Set the TLS server certificate and private key files paths. If this is set in conjunction
   // with enable_inbound_tls(), internal PKI will not be used for encrypted communication and
   // external PKI will be used instead.
-  MessengerBuilder &set_epki_cert_key_files(
-      const std::string& cert, const std::string& private_key);
+  MessengerBuilder& set_epki_cert_key_files(
+      const std::string& cert, const std::string& private_key) {
+    rpc_certificate_file_ = cert;
+    rpc_private_key_file_ = private_key;
+    return *this;
+  }
 
   // Set the TLS Certificate Authority file path. Must always be set with set_epki_cert_key_files().
   // If this is set in conjunction with enable_inbound_tls(), internal PKI will not be used for
   // encrypted communication and external PKI will be used instead.
-  MessengerBuilder &set_epki_certificate_authority_file(const std::string& ca);
+  MessengerBuilder& set_epki_certificate_authority_file(const std::string& ca) {
+    rpc_ca_certificate_file_ = ca;
+    return *this;
+  }
 
   // Set a Unix command whose output returns the password used to decrypt the RPC server's private
   // key file specified via set_epki_cert_key_files(). If the .PEM key file is not
   // password-protected, this flag does not need to be set. Trailing whitespace will be trimmed
   // before it is used to decrypt the private key.
-  MessengerBuilder &set_epki_private_password_key_cmd(const std::string& cmd);
+  MessengerBuilder& set_epki_private_password_key_cmd(const std::string& cmd) {
+    rpc_private_key_password_cmd_ = cmd;
+    return *this;
+  }
 
   // Set the path to the Kerberos Keytab file for this server.
-  MessengerBuilder &set_keytab_file(const std::string& keytab_file);
+  MessengerBuilder& set_keytab_file(const std::string& keytab_file) {
+    keytab_file_ = keytab_file;
+    return *this;
+  }
 
   // Configure the messenger to enable TLS encryption on inbound connections.
-  MessengerBuilder& enable_inbound_tls();
+  MessengerBuilder& enable_inbound_tls() {
+    enable_inbound_tls_ = true;
+    return *this;
+  }
 
   // Configure the messenger to set the SO_REUSEPORT socket option.
-  MessengerBuilder& set_reuseport();
+  MessengerBuilder& set_reuseport() {
+    reuseport_ = true;
+    return *this;
+  }
 
   Status Build(std::shared_ptr<Messenger>* msgr);
 
@@ -176,8 +261,10 @@ class MessengerBuilder {
   std::string sasl_proto_name_;
   std::string rpc_authentication_;
   std::string rpc_encryption_;
-  std::string rpc_tls_ciphers_;
+  std::string rpc_tls_ciphers_;       // pre-TLSv1.3 cipher suites
+  std::string rpc_tls_ciphersuites_;  // TLSv1.3-related cipher suites
   std::string rpc_tls_min_protocol_;
+  std::vector<std::string> rpc_tls_excluded_protocols_;
   std::string rpc_certificate_file_;
   std::string rpc_private_key_file_;
   std::string rpc_ca_certificate_file_;
@@ -231,7 +318,7 @@ class Messenger {
   // If Kerberos is enabled, this also runs a pre-flight check that makes
   // sure the environment is appropriately configured to authenticate
   // clients via Kerberos. If not, this returns a RuntimeError.
-  Status AddAcceptorPool(const Sockaddr &accept_addr,
+  Status AddAcceptorPool(const Sockaddr& accept_addr,
                          std::shared_ptr<AcceptorPool>* pool);
 
   // Register a new RpcService to handle inbound requests.
@@ -252,16 +339,16 @@ class Messenger {
 
   // Queue a call for transmission. This will pick the appropriate reactor,
   // and enqueue a task on that reactor to assign and send the call.
-  void QueueOutboundCall(const std::shared_ptr<OutboundCall> &call);
+  void QueueOutboundCall(const std::shared_ptr<OutboundCall>& call);
 
   // Enqueue a call for processing on the server.
   void QueueInboundCall(std::unique_ptr<InboundCall> call);
 
   // Queue a cancellation for the given outbound call.
-  void QueueCancellation(const std::shared_ptr<OutboundCall> &call);
+  void QueueCancellation(const std::shared_ptr<OutboundCall>& call);
 
   // Take ownership of the socket via Socket::Release
-  void RegisterInboundSocket(Socket *new_socket, const Sockaddr &remote);
+  void RegisterInboundSocket(Socket* new_socket, const Sockaddr& remote);
 
   // Dump info on related TCP connections into the given protobuf.
   Status DumpConnections(const DumpConnectionsRequestPB& req,
@@ -292,8 +379,8 @@ class Messenger {
     authn_token_ = token;
   }
 
-  RpcAuthentication authentication() const { return authentication_; }
-  RpcEncryption encryption() const { return encryption_; }
+  security::RpcAuthentication authentication() const { return authentication_; }
+  security::RpcEncryption encryption() const { return encryption_; }
 
   ThreadPool* negotiation_pool(Connection::Direction dir);
 
@@ -337,9 +424,9 @@ class Messenger {
   FRIEND_TEST(TestRpc, TestConnectionNetworkPlane);
   FRIEND_TEST(TestRpc, TestReopenOutboundConnections);
 
-  explicit Messenger(const MessengerBuilder &bld);
+  explicit Messenger(const MessengerBuilder& bld);
 
-  Reactor* RemoteToReactor(const Sockaddr &remote);
+  Reactor* RemoteToReactor(const Sockaddr& remote);
   Status Init();
   void RunTimeoutThread();
   void UpdateCurTime();
@@ -384,8 +471,8 @@ class Messenger {
   // by this messenger.
   // TODO(KUDU-1928): scope these to individual proxies, so that messengers can be
   // reused by different clients.
-  RpcAuthentication authentication_;
-  RpcEncryption encryption_;
+  security::RpcAuthentication authentication_;
+  security::RpcEncryption encryption_;
 
   // Pools which are listening on behalf of this messenger.
   // Note that the user may have called Shutdown() on one of these
@@ -478,4 +565,3 @@ class Messenger {
 
 } // namespace rpc
 } // namespace kudu
-

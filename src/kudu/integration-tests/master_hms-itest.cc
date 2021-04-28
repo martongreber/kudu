@@ -75,6 +75,7 @@ class MasterHmsTest : public ExternalMiniClusterITestBase {
     opts.num_masters = 1;
     opts.num_tablet_servers = 1;
     opts.enable_kerberos = EnableKerberos();
+    opts.principal = Principal();
     // Tune down the notification log poll period in order to speed up catalog convergence.
     opts.extra_master_flags.emplace_back("--hive_metastore_notification_log_poll_period_seconds=1");
     StartClusterWithOpts(std::move(opts));
@@ -163,6 +164,10 @@ class MasterHmsTest : public ExternalMiniClusterITestBase {
 
   virtual bool EnableKerberos() {
     return false;
+  }
+
+  virtual string Principal() {
+    return "kudu";
   }
 };
 
@@ -711,11 +716,13 @@ TEST_F(MasterHmsUpgradeTest, TestConflictingNormalizedNames) {
   // itself leader, in which case ExternalMiniCluster::Restart() can succeed. In
   // this situation a fallback to a leader-only API will deterministically fail.
   Status s = cluster_->Restart();
-  if (s.ok()) {
+  if (!s.ok()) {
+    ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+  } else {
     vector<string> tables;
     s = client_->ListTables(&tables);
+    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
   }
-  ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
 
   // Disable the metastore integration and rename one of the conflicting tables.
   cluster_->ShutdownNodes(cluster::ClusterNodes::MASTERS_ONLY);
@@ -768,6 +775,9 @@ class MasterHmsKerberizedTest : public MasterHmsTest {
  public:
   bool EnableKerberos() override {
     return true;
+  }
+  string Principal() override {
+    return "oryx";
   }
 };
 

@@ -50,8 +50,8 @@
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
-#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/consensus.proxy.h"
 #include "kudu/gutil/map-util.h"
@@ -60,6 +60,7 @@
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
+#include "kudu/integration-tests/test_workload.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/rpc/rpc_controller.h"
@@ -140,8 +141,10 @@ DECLARE_bool(txn_manager_enabled);
 DECLARE_bool(txn_manager_lazily_initialized);
 DECLARE_int32(txn_participant_begin_op_inject_latency_ms);
 DECLARE_int32(txn_participant_registration_inject_latency_ms);
+DECLARE_int64(txn_system_client_op_timeout_ms);
 DECLARE_uint32(tablet_max_pending_txn_write_ops);
 DECLARE_uint32(txn_manager_status_table_num_replicas);
+DECLARE_uint32(txn_staleness_tracker_interval_ms);
 
 namespace kudu {
 
@@ -186,6 +189,7 @@ int64_t GetTxnId(const shared_ptr<KuduTransaction>& txn) {
 
 Status CountRows(KuduTable* table, size_t* num_rows) {
   KuduScanner scanner(table);
+  RETURN_NOT_OK(scanner.SetReadMode(KuduScanner::READ_YOUR_WRITES));
   RETURN_NOT_OK(scanner.SetSelection(KuduClient::LEADER_ONLY));
   RETURN_NOT_OK(scanner.Open());
   size_t count = 0;
@@ -196,6 +200,12 @@ Status CountRows(KuduTable* table, size_t* num_rows) {
   }
   *num_rows = count;
   return Status::OK();
+}
+
+Status CountRows(KuduClient* client, const string& table_name, size_t* num_rows) {
+  shared_ptr<KuduTable> table;
+  RETURN_NOT_OK(client->OpenTable(table_name, &table));
+  return CountRows(table.get(), num_rows);
 }
 
 Status GetSingleRowError(KuduSession* session) {
@@ -295,11 +305,113 @@ class TxnWriteOpsITest : public ExternalMiniClusterITestBase {
   string tablet_uuid_;
 };
 
+// Make sure txn commit timestamp is being propagated to a client with a call
+// to KuduTransaction::IsCommitComplete(). This includes committing a
+// transaction synchronously by calling KuduTransaction::Commit().
+TEST_F(TxnWriteOpsITest, CommitTimestampPropagation) {
+  static constexpr int kRowsNum = 1000;
+
+  const vector<string> master_flags = {
+    // Enable TxnManager in Kudu masters.
+    // TODO(aserbin): remove this customization once the flag is 'on' by default
+    "--txn_manager_enabled=true",
+
+    // Scenarios based on this test fixture assume the txn status table
+    // is created at start, not on first transaction-related operation.
+    "--txn_manager_lazily_initialized=false",
+  };
+  NO_FATALS(StartCluster({}, master_flags, kNumTabletServers));
+  NO_FATALS(Prepare());
+
+  // Start a transaction, write a bunch or rows into the test table, and then
+  // commit the transaction asynchronously. Check for transaction status and
+  // make sure the latest observed timestamp changes accordingly once the
+  // transaction is committed.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    shared_ptr<KuduSession> session;
+    ASSERT_OK(txn->CreateSession(&session));
+    ASSERT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
+    NO_FATALS(InsertRows(table_.get(), session.get(), kRowsNum));
+    ASSERT_OK(session->Flush());
+    ASSERT_EQ(0, session->CountPendingErrors());
+
+    const auto ts_before_commit = client_->GetLatestObservedTimestamp();
+    ASSERT_OK(txn->Commit(false));
+    const auto ts_after_commit_async = client_->GetLatestObservedTimestamp();
+    ASSERT_EQ(ts_before_commit, ts_after_commit_async);
+
+    uint64_t ts_after_committed = 0;
+    ASSERT_EVENTUALLY([&] {
+      bool is_complete = false;
+      Status completion_status;
+      ASSERT_OK(txn->IsCommitComplete(&is_complete, &completion_status));
+      ASSERT_TRUE(is_complete);
+      ts_after_committed = client_->GetLatestObservedTimestamp();
+    });
+    ASSERT_GT(ts_after_committed, ts_before_commit);
+
+    // A sanity check: calling IsCommitComplete() again after the commit
+    // timestamp has been propagated doesn't change the timestamp observed
+    // by the client.
+    for (auto i = 0; i < 10; ++i) {
+      bool is_complete = false;
+      Status completion_status;
+      ASSERT_OK(txn->IsCommitComplete(&is_complete, &completion_status));
+      ASSERT_TRUE(is_complete);
+      ASSERT_EQ(ts_after_committed, client_->GetLatestObservedTimestamp());
+      SleepFor(MonoDelta::FromMilliseconds(10));
+    }
+
+    size_t count;
+    ASSERT_OK(CountRows(table_.get(), &count));
+    ASSERT_EQ(kRowsNum, count);
+  }
+
+  // Start a transaction, write a bunch or rows into the test table, and then
+  // commit the transaction synchronously. Make sure the latest observed
+  // timestamp changes accordingly once the transaction is committed.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+    shared_ptr<KuduSession> session;
+    ASSERT_OK(txn->CreateSession(&session));
+    ASSERT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
+    NO_FATALS(InsertRows(table_.get(), session.get(), kRowsNum, kRowsNum));
+    ASSERT_OK(session->Flush());
+    ASSERT_EQ(0, session->CountPendingErrors());
+
+    const auto ts_before_commit = client_->GetLatestObservedTimestamp();
+    ASSERT_OK(txn->Commit());
+    const auto ts_after_sync_commit = client_->GetLatestObservedTimestamp();
+    ASSERT_GT(ts_after_sync_commit, ts_before_commit);
+
+    size_t count;
+    ASSERT_OK(CountRows(table_.get(), &count));
+    ASSERT_EQ(2 * kRowsNum, count);
+  }
+
+  // An empty transaction doesn't have a timestamp, so there is nothing to
+  // propagate back to client when an empty transaction is committed.
+  {
+    shared_ptr<KuduTransaction> txn;
+    ASSERT_OK(client_->NewTransaction(&txn));
+
+    const auto ts_before_commit = client_->GetLatestObservedTimestamp();
+    ASSERT_OK(txn->Commit());
+    const auto ts_after_sync_commit = client_->GetLatestObservedTimestamp();
+    ASSERT_EQ(ts_before_commit, ts_after_sync_commit);
+
+    size_t count;
+    ASSERT_OK(CountRows(table_.get(), &count));
+    ASSERT_EQ(2 * kRowsNum, count);
+  }
+}
+
 // Test that our deadlock prevention mechanisms work by writing across
 // different tablets concurrently from multiple transactions.
-// TODO(awong): it'd be much more convenient to take control of aborting the
-// transactions ourselves, rather than relying on the application user.
-TEST_F(TxnWriteOpsITest, TestClientSideDeadlockPrevention) {
+TEST_F(TxnWriteOpsITest, DeadlockPrevention) {
   constexpr const int kNumTxns = 8;
   const vector<string> master_flags = {
     "--txn_manager_enabled=true",
@@ -309,8 +421,7 @@ TEST_F(TxnWriteOpsITest, TestClientSideDeadlockPrevention) {
     "--txn_manager_lazily_initialized=false",
   };
   NO_FATALS(StartCluster({}, master_flags, kNumTabletServers));
-  vector<string> tablets_uuids;
-  NO_FATALS(Prepare(&tablets_uuids));
+  NO_FATALS(Prepare());
   vector<thread> threads;
   threads.reserve(kNumTxns);
   vector<int> random_keys(kNumTxns * 2);
@@ -338,8 +449,8 @@ TEST_F(TxnWriteOpsITest, TestClientSideDeadlockPrevention) {
           Status s = session->Apply(insert.release());
           LOG(INFO) << Substitute("Txn $0 wrote row $1: $2",
                                   token.txn_id(), row_key, s.ToString());
-          // If the write op failed because of a locking error, roll the
-          // transaction back and retry the transaction after waiting a bit.
+          // If the write op failed because of a locking error, retry the
+          // transaction after waiting a bit.
           if (!s.ok()) {
             vector<KuduError*> errors;
             ElementDeleter d(&errors);
@@ -354,7 +465,6 @@ TEST_F(TxnWriteOpsITest, TestClientSideDeadlockPrevention) {
             // in wait-die, that get retried) will still time out, after
             // contending a bit with other ops.
             ASSERT_TRUE(error.IsAborted() || error.IsTimedOut()) << error.ToString();
-            ASSERT_OK(txn->Rollback());
             needs_retry = true;
 
             // Wait a bit before retrying the entire transaction to allow for
@@ -394,8 +504,7 @@ TEST_F(TxnWriteOpsITest, TxnMultipleSingleRowWritesCommit) {
   };
   NO_FATALS(StartCluster({}, master_flags, kNumTabletServers));
 
-  vector<string> tablets_uuids;
-  NO_FATALS(Prepare(&tablets_uuids));
+  NO_FATALS(Prepare());
   shared_ptr<KuduTransaction> txn;
   ASSERT_OK(client_->NewTransaction(&txn));
   shared_ptr<KuduSession> session;
@@ -830,20 +939,31 @@ class TxnOpDispatcherITest : public KuduTest {
     CHECK_OK(BuildSchema(&schema_));
   }
 
-  void Prepare(int num_tservers) {
+  void SetupCluster(int num_tservers, int num_replicas = 0) {
+    if (num_replicas == 0) {
+      num_replicas = num_tservers;
+    }
     FLAGS_txn_manager_enabled = true;
     FLAGS_txn_manager_lazily_initialized = false;
-    FLAGS_txn_manager_status_table_num_replicas = num_tservers;
+    FLAGS_txn_manager_status_table_num_replicas = num_replicas;
 
     InternalMiniClusterOptions opts;
     opts.num_tablet_servers = num_tservers;
     cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
     ASSERT_OK(cluster_->StartSync());
+  }
 
+  void Prepare(int num_tservers, bool create_table = true, int num_replicas = 0) {
+    if (num_replicas == 0) {
+      num_replicas = num_tservers;
+    }
+    NO_FATALS(SetupCluster(num_tservers, num_replicas));
     KuduClientBuilder builder;
     builder.default_admin_operation_timeout(kTimeout);
     ASSERT_OK(cluster_->CreateClient(&builder, &client_));
-    ASSERT_OK(CreateTable(num_tservers));
+    if (create_table) {
+      ASSERT_OK(CreateTable(num_replicas));
+    }
     for (auto i = 0; i < cluster_->num_tablet_servers(); ++i) {
       auto* ts = cluster_->mini_tablet_server(i);
       ASSERT_OK(ts->WaitStarted());
@@ -885,14 +1005,15 @@ class TxnOpDispatcherITest : public KuduTest {
   }
 
   // Get all replicas of the test table.
-  vector<scoped_refptr<TabletReplica>> GetAllReplicas() const {
+  vector<scoped_refptr<TabletReplica>> GetAllReplicas(const string& table_name = "") const {
+    const string& target_table = table_name.empty() ? kTableName : table_name;
     vector<scoped_refptr<TabletReplica>> result;
     for (auto i = 0; i < cluster_->num_tablet_servers(); ++i) {
       auto* server = cluster_->mini_tablet_server(i)->server();
       vector<scoped_refptr<TabletReplica>> replicas;
       server->tablet_manager()->GetTabletReplicas(&replicas);
       for (auto& r : replicas) {
-        if (r->tablet()->metadata()->table_name() == kTableName) {
+        if (r->tablet()->metadata()->table_name() == target_table) {
           result.emplace_back(std::move(r));
         }
       }
@@ -901,10 +1022,11 @@ class TxnOpDispatcherITest : public KuduTest {
   }
 
   size_t GetTxnOpDispatchersTotalCount(
-      vector<scoped_refptr<TabletReplica>> replicas = {}) {
+      vector<scoped_refptr<TabletReplica>> replicas = {},
+      const string& table_name = "") {
     if (replicas.empty()) {
       // No replicas were specified, get the list of all test table's replicas.
-      replicas = GetAllReplicas();
+      replicas = GetAllReplicas(table_name);
     }
     size_t elem_count = 0;
     for (auto& r : replicas) {
@@ -934,8 +1056,8 @@ class TxnOpDispatcherITest : public KuduTest {
   typedef vector<std::shared_ptr<typename TabletReplica::TxnOpDispatcher>>
       OpDispatchers;
   typedef map<int64_t, OpDispatchers> OpDispatchersPerTxnId;
-  OpDispatchersPerTxnId GetTxnOpDispatchers() {
-    auto replicas = GetAllReplicas();
+  OpDispatchersPerTxnId GetTxnOpDispatchers(const string& table_name = "") {
+    auto replicas = GetAllReplicas(table_name);
     OpDispatchersPerTxnId result;
     for (auto& r : replicas) {
       std::lock_guard<simple_spinlock> guard(r->txn_op_dispatchers_lock_);
@@ -1063,6 +1185,72 @@ TEST_F(TxnOpDispatcherITest, LifecycleBasic) {
   }
 }
 
+// Test that the automatic abort to avoid deadlock gets retried if the op times
+// out.
+TEST_F(TxnOpDispatcherITest, TestRetryWaitDieAbortsWhenTServerUnavailable) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  // Disable the staleness tracker so we know any aborts were done by the
+  // wait-die deadlock prevention.
+  FLAGS_txn_staleness_tracker_interval_ms = 0;
+  // Set a low system client timeout to make sure our abort task retries.
+  FLAGS_txn_system_client_op_timeout_ms = 1000;
+
+  NO_FATALS(Prepare(/*num_tservers*/2, /*create_table*/false, /*num_replicas*/1));
+  // First, figure out which tablet server hosts the TxnStatusManager.
+  tserver::MiniTabletServer* tsm_server = nullptr;
+  ASSERT_EVENTUALLY([&] {
+    for (int i = 0; i < cluster_->num_tablet_servers() && tsm_server == nullptr; i++) {
+      auto* mts = cluster_->mini_tablet_server(i);
+      auto* tablet_manager = mts->server()->tablet_manager();
+      vector<scoped_refptr<TabletReplica>> replicas;
+      tablet_manager->GetTabletReplicas(&replicas);
+      if (!replicas.empty()) {
+        tsm_server = mts;
+      }
+    }
+    ASSERT_FALSE(tsm_server == nullptr);
+  });
+
+  // Create a single-tablet table so shutting down the TxnStatusManager doesn't
+  // affect writes.
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kTableName)
+            .schema(&schema_)
+            .set_range_partition_columns({ "key" })
+            .num_replicas(1)
+            .Create());
+  ASSERT_OK(client_->OpenTable(kTableName, &table_));
+  shared_ptr<KuduTransaction> first_txn;
+  shared_ptr<KuduTransaction> second_txn;
+  ASSERT_OK(client_->NewTransaction(&first_txn));
+  ASSERT_OK(client_->NewTransaction(&second_txn));
+
+  int64_t key = 0;
+  ASSERT_OK(InsertRows(first_txn.get(), 1, &key));
+
+  // The second transaction should always fail because it's attempting to lock
+  // a tablet that's already locked.
+  Status s = InsertRows(second_txn.get(), 1, &key);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+
+  // Immediately shutdown, reducing the likelihood that the automatic abort
+  // task will complete. Then sleep for long enough that the system client
+  // would timeout and try again.
+  tsm_server->Shutdown();
+  SleepFor(MonoDelta::FromMilliseconds(3 * FLAGS_txn_system_client_op_timeout_ms));
+  ASSERT_OK(tsm_server->Restart());
+  ASSERT_EVENTUALLY([&] {
+    bool is_complete = false;
+    Status completion_status;
+    ASSERT_OK(second_txn->IsCommitComplete(&is_complete, &completion_status));
+    ASSERT_TRUE(completion_status.IsAborted()) << completion_status.ToString();
+    ASSERT_TRUE(is_complete);
+  });
+}
+
+// Test that when attempting to lock a transaction that is locked by an earlier
+// transaction, we abort the newer transaction.
 TEST_F(TxnOpDispatcherITest, BeginTxnLockAbort) {
   NO_FATALS(Prepare(1));
 
@@ -1118,21 +1306,31 @@ TEST_F(TxnOpDispatcherITest, BeginTxnLockAbort) {
     ASSERT_TRUE(row_status.IsAborted()) << row_status.ToString();
     ASSERT_STR_CONTAINS(row_status.ToString(), "should be aborted");
 
-    // We should have an extra dispatcher for the new transactional write.
-    ASSERT_EQ(1 + kNumPartitions, GetTxnOpDispatchersTotalCount());
+    // The dispatcher for the new transactional write should eventually
+    // disappear because the transaction is automatically aborted.
+    ASSERT_EVENTUALLY([&] {
+      ASSERT_EQ(kNumPartitions, GetTxnOpDispatchersTotalCount());
+    });
   }
   {
     // Now, commit the first transaction.
     ASSERT_OK(first_txn->Commit());
 
     // All dispatchers should be unregistered once the transaction is committed.
-    ASSERT_EQ(1, GetTxnOpDispatchersTotalCount());
+    ASSERT_EQ(0, GetTxnOpDispatchersTotalCount());
 
-    // Writes to the second transaction should now succeed.
-    ASSERT_OK(InsertRows(second_txn.get(), 1, &key));
-    ASSERT_EQ(1, GetTxnOpDispatchersTotalCount());
-
-    ASSERT_OK(second_txn->Commit());
+    // The second transaction should have been automatically aborted in its
+    // attempt to write to avoid deadlock.
+    Status s = InsertRows(second_txn.get(), 1, &key);
+    ASSERT_TRUE(s.IsIOError());
+    ASSERT_EQ(0, GetTxnOpDispatchersTotalCount());
+    ASSERT_EVENTUALLY([&] {
+      bool is_complete;
+      Status commit_status;
+      ASSERT_OK(second_txn->IsCommitComplete(&is_complete, &commit_status));
+      ASSERT_TRUE(is_complete);
+      ASSERT_TRUE(commit_status.IsAborted()) << commit_status.ToString();
+    });
     ASSERT_EQ(0, GetTxnOpDispatchersTotalCount());
   }
 }
@@ -2007,5 +2205,124 @@ TEST_F(TxnOpDispatcherITest, DISABLED_TxnMultipleSingleRowsWithServerRestart) {
     ASSERT_EQ(16, row_count);
   }
 }
+
+// Test beginning and aborting a transaction from the same test workload.
+TEST_F(TxnOpDispatcherITest, TestBeginAbortTransactionalTestWorkload) {
+  NO_FATALS(SetupCluster(1));
+  TestWorkload w(cluster_.get(), TestWorkload::PartitioningType::HASH);
+  w.set_num_replicas(1);
+  w.set_num_tablets(3);
+  w.set_begin_txn();
+  w.set_rollback_txn();
+  w.Setup();
+  w.Start();
+  const auto& table_name = w.table_name();
+  while (w.rows_inserted() < 1000) {
+    SleepFor(MonoDelta::FromMilliseconds(5));
+  }
+  // Each participant should have a dispatcher.
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(3, GetTxnOpDispatchersTotalCount({}, table_name));
+  });
+  w.StopAndJoin();
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(0, GetTxnOpDispatchersTotalCount({}, table_name));
+  });
+  // By the end of it, we should have aborted the rows and they should not be
+  // visible to clients.
+  size_t num_rows;
+  ASSERT_OK(CountRows(w.client().get(), table_name, &num_rows));
+  ASSERT_EQ(0, num_rows);
+}
+
+// Test beginning and committing a transaction from the same test workload.
+TEST_F(TxnOpDispatcherITest, TestBeginCommitTransactionalTestWorkload) {
+  NO_FATALS(SetupCluster(1));
+  TestWorkload w(cluster_.get(), TestWorkload::PartitioningType::HASH);
+  w.set_num_replicas(1);
+  w.set_num_tablets(3);
+  w.set_begin_txn();
+  w.set_commit_txn();
+  w.Setup();
+  w.Start();
+  const auto& table_name = w.table_name();
+  while (w.rows_inserted() < 1000) {
+    SleepFor(MonoDelta::FromMilliseconds(5));
+  }
+  // Each participant should have a dispatcher.
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(3, GetTxnOpDispatchersTotalCount({}, table_name));
+  });
+  w.StopAndJoin();
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(0, GetTxnOpDispatchersTotalCount({}, table_name));
+  });
+  // By the end of it, we should have committed the rows and they should be
+  // visible to clients.
+  size_t num_rows;
+  ASSERT_OK(CountRows(w.client().get(), table_name, &num_rows));
+  ASSERT_EQ(w.rows_inserted(), num_rows);
+}
+
+// Test beginning and committing a transaction from separate test workloads.
+TEST_F(TxnOpDispatcherITest, TestSeparateBeginCommitTestWorkloads) {
+  NO_FATALS(SetupCluster(1));
+  int64_t txn_id;
+  string first_table_name;
+  size_t first_rows_inserted;
+  {
+    TestWorkload w(cluster_.get(), TestWorkload::PartitioningType::HASH);
+    w.set_begin_txn();
+    w.set_num_replicas(1);
+    w.set_num_tablets(3);
+    w.Setup();
+    w.Start();
+    while (w.rows_inserted() < 1000) {
+      SleepFor(MonoDelta::FromMilliseconds(5));
+    }
+    first_table_name = w.table_name();
+    ASSERT_EVENTUALLY([&] {
+      ASSERT_EQ(3, GetTxnOpDispatchersTotalCount({}, first_table_name));
+    });
+    w.StopAndJoin();
+    first_rows_inserted = w.rows_inserted();
+    txn_id = w.txn_id();
+    size_t num_rows;
+    ASSERT_OK(CountRows(w.client().get(), first_table_name, &num_rows));
+    ASSERT_EQ(0, num_rows);
+  }
+  // Create a new workload, and insert as a part of the same transaction.
+  {
+    TestWorkload w(cluster_.get(), TestWorkload::PartitioningType::HASH);
+    const auto& kSecondTableName = "default.second_table";
+    w.set_txn_id(txn_id);
+    w.set_commit_txn();
+    w.set_table_name(kSecondTableName);
+    w.set_num_replicas(1);
+    w.set_num_tablets(3);
+    w.Setup();
+    w.Start();
+    while (w.rows_inserted() < 1000) {
+      SleepFor(MonoDelta::FromMilliseconds(5));
+    }
+    // We should have dispatchers for both tables.
+    ASSERT_EVENTUALLY([&] {
+      ASSERT_EQ(3, GetTxnOpDispatchersTotalCount({}, first_table_name));
+      ASSERT_EQ(3, GetTxnOpDispatchersTotalCount({}, kSecondTableName));
+    });
+    w.StopAndJoin();
+    // Once committed, the dispatchers should be unregistered.
+    ASSERT_EVENTUALLY([&] {
+      ASSERT_EQ(0, GetTxnOpDispatchersTotalCount({}, first_table_name));
+      ASSERT_EQ(0, GetTxnOpDispatchersTotalCount({}, kSecondTableName));
+    });
+    size_t num_rows;
+    ASSERT_OK(CountRows(w.client().get(), first_table_name, &num_rows));
+    ASSERT_EQ(first_rows_inserted, num_rows);
+    ASSERT_OK(CountRows(w.client().get(), kSecondTableName, &num_rows));
+    ASSERT_EQ(w.rows_inserted(), num_rows);
+  }
+}
+
 
 } // namespace kudu

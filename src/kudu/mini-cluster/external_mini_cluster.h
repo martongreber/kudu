@@ -137,7 +137,7 @@ struct ExternalMiniClusterOptions {
   int num_masters;
 
   // Whether to supply 'master_addresses' field for single master configuration.
-  // Default: False
+  // Default: True
   bool supply_single_master_addr;
 
   // Number of TS to start.
@@ -480,10 +480,6 @@ class ExternalMiniCluster : public MiniCluster {
   // files that reside in the log dir.
   std::string GetLogPath(const std::string& daemon_id) const;
 
-  // Adds a master to the ExternalMiniCluster when the new master has been added
-  // dynamically after bringing up the ExternalMiniCluster.
-  Status AddMaster(const scoped_refptr<ExternalMaster>& master);
-
   // Removes any bookkeeping of the master specified by 'hp' from the ExternalMiniCluster
   // after already having run through a successful master Raft change config to remove it.
   // This helps keep the state of the actual cluster in sync with the state in ExternalMiniCluster.
@@ -565,6 +561,15 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   // Overrides the extra flags specified in the constructor.
   void SetMetastoreIntegration(const std::string& hms_uris,
                                bool enable_kerberos);
+
+  // Create a Kerberos principal and keytab using the 'principal_base' and 'bind_host' hostname
+  // of the form <principal_base>/<bind_host>.
+  // Returns the generated keytab file and service principal as 'flags' and the appropriate
+  // environment variables in 'env_vars' output parameters.
+  static Status CreateKerberosConfig(MiniKdc* kdc, const std::string& principal_base,
+                                     const std::string& bind_host,
+                                     std::vector<std::string>* flags,
+                                     std::map<std::string, std::string>* env_vars);
 
   // Enable Kerberos for this daemon. This creates a Kerberos principal
   // and keytab, and sets the appropriate environment variables in the
@@ -658,6 +663,10 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   // LOG(FATAL) if there are any leaks.
   void CheckForLeaks();
 
+  // Get flags for an ExternalDaemon from the supplied 'opts'.
+  // It does not include executable or any positional arguments.
+  static std::vector<std::string> GetDaemonFlags(const ExternalDaemonOptions& opts);
+
   // Get RPC bind address for daemon.
   const HostPort& rpc_bind_address() const {
     return opts_.rpc_bind_address;
@@ -727,9 +736,16 @@ class ExternalMaster : public ExternalDaemon {
   Status WaitForCatalogManager(
       WaitMode wait_mode = DONT_WAIT_FOR_LEADERSHIP) WARN_UNUSED_RESULT;
 
+  // Get all flags for a master from the supplied 'opts'.
+  // It does not include executable or any positional arguments like "master run".
+  static std::vector<std::string> GetMasterFlags(const ExternalDaemonOptions& opts);
  private:
   friend class RefCountedThreadSafe<ExternalMaster>;
-  static const std::vector<std::string>& GetCommonFlags();
+  // Get flags specific to ExternalMaster where 'rpc_bind_addr' and 'http_addr' are
+  // the RPC and HTTP addresses to bind in case of start or the corresponding bound
+  // addresses in case of restart.
+  static std::vector<std::string> GetCommonFlags(const HostPort& rpc_bind_addr,
+                                                 const HostPort& http_addr = HostPort());
   virtual ~ExternalMaster();
 };
 

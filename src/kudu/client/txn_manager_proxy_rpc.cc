@@ -37,6 +37,7 @@
 #include "kudu/util/logging.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/status_callback.h"
 
@@ -170,18 +171,11 @@ bool AsyncRandomTxnManagerRpc<ReqClass, RespClass>::RetryIfNecessary(
   }
 
   // Network errors may be caused by errors in connecting sockets, which could
-  // mean a TxnManager is down or doesn't exist. If there's another TxnManager
-  // to connect to, connect to it. Otherwise, don't bother retrying.
-  if (s.IsNetworkError()) {
-    if (multi_txn_manager_) {
-      ResetTxnManagerAndRetry(s);
-      return true;
-    }
-  }
-  if (s.IsTimedOut()) {
-    // If establishing connection failed with time out error before the overall
-    // deadline for RPC operation, retry the operation; if multiple TxnManagers
-    // are available, try with another one.
+  // mean a master is down or doesn't exist. This may be transient, so treat
+  // them as we would a timeout and retry.
+  if (s.IsTimedOut() || s.IsNetworkError()) {
+    // If we got here before the deadline and there's still time left for the
+    // operation, try to reconnect to the master(s).
     if (MonoTime::Now() < retrier().deadline()) {
       if (multi_txn_manager_) {
         ResetTxnManagerAndRetry(s);
@@ -191,7 +185,8 @@ bool AsyncRandomTxnManagerRpc<ReqClass, RespClass>::RetryIfNecessary(
       return true;
     }
     // And if we've passed the overall deadline, we shouldn't retry.
-    s = s.CloneAndPrepend(Substitute("$0 timed out after deadline expired", rpc_name_));
+    s = Status::TimedOut(Substitute("$0 timed out after deadline expired: $1",
+                                    rpc_name_, s.message().ToString()));
   }
 
   // Next, parse RPC errors that happened after the connection succeeded.

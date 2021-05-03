@@ -37,6 +37,7 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/status_callback.h"
 
@@ -227,16 +228,10 @@ bool AsyncLeaderMasterRpc<ReqClass, RespClass>::RetryOrReconnectIfNecessary(
     return true;
   }
   // Network errors may be caused by errors in connecting sockets, which could
-  // mean a master is down or doesn't exist. If there's another master to
-  // connect to, connect to it. Otherwise, don't bother retrying.
-  if (s.IsNetworkError()) {
-    if (is_multi_master) {
-      ResetMasterLeaderAndRetry(CredentialsPolicy::ANY_CREDENTIALS);
-      return true;
-    }
-  }
-  if (s.IsTimedOut()) {
-    // If we timed out before the deadline and there's still time left for the
+  // mean a master is down or doesn't exist. This may be transient, so treat
+  // them as we would a timeout and retry.
+  if (s.IsTimedOut() || s.IsNetworkError()) {
+    // If we got here before the deadline and there's still time left for the
     // operation, try to reconnect to the master(s).
     if (MonoTime::Now() < retrier().deadline()) {
       if (is_multi_master) {
@@ -247,7 +242,8 @@ bool AsyncLeaderMasterRpc<ReqClass, RespClass>::RetryOrReconnectIfNecessary(
       return true;
     }
     // And if we've passed the overall deadline, we shouldn't retry.
-    s = s.CloneAndPrepend(Substitute("$0 timed out after deadline expired", rpc_name_));
+    s = Status::TimedOut(Substitute("$0 timed out after deadline expired: $1",
+                                    rpc_name_, s.message().ToString()));
   }
 
   // Next, parse RPC errors that happened after the connection succeeded.

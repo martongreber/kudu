@@ -19,6 +19,7 @@ package org.apache.kudu.client;
 
 import static org.apache.kudu.test.ClientTestUtil.countRowsInScan;
 import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
+import static org.apache.kudu.test.junit.AssertHelpers.assertEventuallyTrue;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -42,6 +43,7 @@ import org.apache.kudu.test.ClientTestUtil;
 import org.apache.kudu.test.KuduTestHarness;
 import org.apache.kudu.test.KuduTestHarness.MasterServerConfig;
 import org.apache.kudu.test.KuduTestHarness.TabletServerConfig;
+import org.apache.kudu.test.junit.AssertHelpers.BooleanExpression;
 import org.apache.kudu.transactions.Transactions.TxnTokenPB;
 
 
@@ -234,14 +236,12 @@ public class TestKuduTransaction {
       "--txn_manager_enabled",
   })
   @TabletServerConfig(flags = {
-      "--txn_schedule_background_tasks=false"
+      "--txn_schedule_background_tasks=false",
+      "--txn_status_manager_inject_latency_finalize_commit_ms=1000",
   })
   public void testIsCommitComplete() throws Exception {
     KuduTransaction txn = client.newTransaction();
-
     txn.commit(false);
-    // TODO(aserbin): artificially delay the transaction's commit phase once
-    //                the transaction commit orchestration is implemented
     assertFalse(txn.isCommitComplete());
   }
 
@@ -305,34 +305,15 @@ public class TestKuduTransaction {
   }
 
   /**
-   * Test scenario that starts a new transaction and commits it in a synchronous
-   * way (i.e. waits for the transaction to be committed).
+   * Test scenario that starts a new empty transaction and commits it in a
+   * synchronous way (i.e. waits for the transaction to be committed).
    *
-   * TODO(aserbin): uncomment this once txn commit orchestration is ready
+   */
   @Test(timeout = 100000)
   @MasterServerConfig(flags = {
       "--txn_manager_enabled",
   })
   public void testCommitAnEmptyTransactionWait() throws Exception {
-    KuduTransaction txn = client.newTransaction();
-    txn.commit(true);
-    assertTrue(txn.isCommitComplete());
-  }
-   */
-
-  /**
-   * A test scenario to start a new transaction and commit it in a synchronous
-   * way (i.e. wait for the transaction to be committed) when the back-end is
-   * running in the test-only mode to immediately finalize a transaction
-   * right after transitioning its state to COMMIT_IN_PROGRESS.
-   *
-   * TODO(aserbin): remove this scenario once txn commit orchestration is ready
-   */
-  @Test(timeout = 100000)
-  @MasterServerConfig(flags = {
-      "--txn_manager_enabled",
-  })
-  public void testCommitAnEmptyTransactionWaitFake2PCO() throws Exception {
     KuduTransaction txn = client.newTransaction();
     txn.commit(true);
     assertTrue(txn.isCommitComplete());
@@ -394,18 +375,40 @@ public class TestKuduTransaction {
       "--txn_manager_enabled",
   })
   public void testNewTransactionalSession() throws Exception {
+    final String TABLE_NAME = "new_transactional_session";
+    client.createTable(
+        TABLE_NAME,
+        ClientTestUtil.getBasicSchema(),
+        new CreateTableOptions().addHashPartitions(ImmutableList.of("key"), 2));
+
     KuduTransaction txn = client.newTransaction();
     assertNotNull(txn);
     KuduSession session = txn.newKuduSession();
     assertNotNull(session);
-    // TODO(aserbin): insert a few rows and rollback the transaction; run a
-    //                table scan: the rows should not be there
+    session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
+
+    KuduTable table = client.openTable(TABLE_NAME);
+    Insert insert = createBasicSchemaInsert(table, 1);
+    session.apply(insert);
+    session.flush();
+
+    // Rollback the transaction.
     txn.rollback();
+
+    assertFalse(session.isClosed());
+    assertEquals(0, session.countPendingErrors());
+
+    KuduScanner scanner = new KuduScanner.KuduScannerBuilder(asyncClient, table)
+        .readMode(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES)
+        .build();
+    assertEquals(0, countRowsInScan(scanner));
   }
 
   /**
    * Test scenario that starts a transaction and creates a new transactional
-   * AsyncKuduSession based on the newly started transaction.
+   * AsyncKuduSession based on the newly started transaction. No rows are
+   * inserted: it should be possible to rollback the empty transaction with
+   * no errors reported.
    */
   @Test(timeout = 100000)
   @MasterServerConfig(flags = {
@@ -416,9 +419,12 @@ public class TestKuduTransaction {
     assertNotNull(txn);
     AsyncKuduSession session = txn.newAsyncKuduSession();
     assertNotNull(session);
-    // TODO(aserbin): insert a few rows and rollback the transaction; run a
-    //                table scan: the rows should not be there
+
+    // Rollback the empty transaction.
     txn.rollback();
+
+    assertFalse(session.isClosed());
+    assertEquals(0, session.countPendingErrors());
   }
 
   /**
@@ -715,6 +721,114 @@ public class TestKuduTransaction {
       serdesTxn.isCommitComplete();
       txn.commit(false);
       txn.isCommitComplete();
+    }
+  }
+
+  /**
+   * This scenario validates the propagation of the commit timestamp for a
+   * multi-row transaction when committing the transaction synchronously via
+   * {@link KuduTransaction#commit(boolean wait = true)} or calling
+   * {@link KuduTransaction#isCommitComplete()} once the transaction's commit
+   * has started to run asynchronously.
+   */
+  @Test(timeout = 100000)
+  @MasterServerConfig(flags = {
+      // TxnManager functionality is necessary for this scenario.
+      "--txn_manager_enabled",
+  })
+  @TabletServerConfig(flags = {
+      // Inject latency to have a chance spotting the transaction in the
+      // FINALIZE_IN_PROGRESS state and make KuduTransaction.isCommitComplete()
+      // to return 'false' at least once before returning 'true'.
+      "--txn_status_manager_inject_latency_finalize_commit_ms=250",
+  })
+  public void testPropagateTxnCommitTimestamp() throws Exception {
+    final String TABLE_NAME = "propagate_txn_commit_timestamp";
+    client.createTable(
+        TABLE_NAME,
+        ClientTestUtil.getBasicSchema(),
+        new CreateTableOptions().addHashPartitions(ImmutableList.of("key"), 8));
+
+    KuduTable table = client.openTable(TABLE_NAME);
+
+    // Make sure the commit timestamp for a transaction is propagated to the
+    // client upon synchronously committing a transaction.
+    {
+      KuduTransaction txn = client.newTransaction();
+      KuduSession session = txn.newKuduSession();
+      session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
+
+      // Insert many rows: the goal is to get at least one row inserted into
+      // every tablet of the hash-partitioned test table, so every tablet would
+      // be a participant in the transaction, and most likely every tablet
+      // server would be involved.
+      for (int key = 0; key < 128; ++key) {
+        session.apply(createBasicSchemaInsert(table, key));
+      }
+      session.flush();
+      assertEquals(0, session.countPendingErrors());
+
+      final long tsBeforeCommit = client.getLastPropagatedTimestamp();
+      txn.commit(true /*wait*/);
+      final long tsAfterCommit = client.getLastPropagatedTimestamp();
+      assertTrue(tsAfterCommit > tsBeforeCommit);
+    }
+
+    // Make sure the commit timestamp for a transaction is propagated to the
+    // client upon calling KuduTransaction.isCommitComplete().
+    {
+      KuduTransaction txn = client.newTransaction();
+      KuduSession session = txn.newKuduSession();
+      session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
+
+      // Insert many rows: the goal is to get at least one row inserted into
+      // every tablet of the hash-partitioned test table, so every tablet would
+      // be a participant in the transaction, and most likely every tablet
+      // server would be involved.
+      for (int key = 128; key < 256; ++key) {
+        session.apply(createBasicSchemaInsert(table, key));
+      }
+      session.flush();
+      assertEquals(0, session.countPendingErrors());
+
+      final long tsBeforeCommit = client.getLastPropagatedTimestamp();
+      txn.commit(false /*wait*/);
+      assertEquals(tsBeforeCommit, client.getLastPropagatedTimestamp());
+
+      assertEventuallyTrue("commit should eventually finalize",
+          new BooleanExpression() {
+            @Override
+            public boolean get() throws Exception {
+              return txn.isCommitComplete();
+            }
+          }, 30000/*timeoutMillis*/);
+      long tsAfterCommitFinalized = client.getLastPropagatedTimestamp();
+      assertTrue(tsAfterCommitFinalized > tsBeforeCommit);
+
+      // A sanity check: calling isCommitComplete() again after the commit phase
+      // has been finalized doesn't change last propagated timestamp at the
+      // client side.
+      for (int i = 0; i < 10; ++i) {
+        assertTrue(txn.isCommitComplete());
+        assertEquals(tsAfterCommitFinalized, client.getLastPropagatedTimestamp());
+        Thread.sleep(10);
+      }
+    }
+
+    // An empty transaction doesn't have a timestamp, so there is nothing to
+    // propagate back to client when an empty transaction is committed, so the
+    // timestamp propagated to the client side should stay unchanged.
+    {
+      KuduTransaction txn = client.newTransaction();
+      final long tsBeforeCommit = client.getLastPropagatedTimestamp();
+      txn.commit(true /*wait*/);
+
+      // Just in case, linger a bit after commit has been finalized, checking
+      // for the timestamp propagated to the client side.
+      for (int i = 0; i < 10; ++i) {
+        Thread.sleep(10);
+        assertEquals(tsBeforeCommit, client.getLastPropagatedTimestamp());
+      }
     }
   }
 
@@ -1040,7 +1154,6 @@ public class TestKuduTransaction {
     // context of the transaction.
     KuduScanner scanner = new KuduScanner.KuduScannerBuilder(asyncClient, table)
         .readMode(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES)
-        .replicaSelection(ReplicaSelection.LEADER_ONLY)
         .build();
     assertEquals(numMasters, countRowsInScan(scanner));
   }

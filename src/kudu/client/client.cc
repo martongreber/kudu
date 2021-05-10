@@ -65,6 +65,7 @@
 #include "kudu/common/partition.h"
 #include "kudu/common/partition_pruner.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/txn_id.h"
@@ -139,6 +140,7 @@ using std::string;
 using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
+
 
 MAKE_ENUM_LIMITS(kudu::client::KuduSession::FlushMode,
                  kudu::client::KuduSession::AUTO_FLUSH_SYNC,
@@ -438,8 +440,12 @@ Status KuduTransaction::CreateSession(sp::shared_ptr<KuduSession>* session) {
   return data_->CreateSession(session);
 }
 
-Status KuduTransaction::Commit(bool wait) {
-  return data_->Commit(wait);
+Status KuduTransaction::Commit() {
+  return data_->Commit(KuduTransaction::Data::CommitMode::WAIT_FOR_COMPLETION);
+}
+
+Status KuduTransaction::StartCommit() {
+  return data_->Commit(KuduTransaction::Data::CommitMode::START_ONLY);
 }
 
 Status KuduTransaction::IsCommitComplete(
@@ -523,6 +529,7 @@ Status KuduClient::GetTableSchema(const string& table_name,
                                nullptr, // table name
                                nullptr, // number of replicas
                                nullptr, // owner
+                               nullptr, // comment
                                nullptr); // extra configs
 }
 
@@ -690,7 +697,9 @@ Status KuduClient::GetTableStatistics(const string& table_name,
   unique_ptr<KuduTableStatistics> table_statistics(new KuduTableStatistics);
   table_statistics->data_ = new KuduTableStatistics::Data(
       resp.has_on_disk_size() ? boost::optional<int64_t>(resp.on_disk_size()) : boost::none,
-      resp.has_live_row_count() ? boost::optional<int64_t>(resp.live_row_count()) : boost::none);
+      resp.has_live_row_count() ? boost::optional<int64_t>(resp.live_row_count()) : boost::none,
+      resp.has_disk_size_limit() ? boost::optional<int64_t>(resp.disk_size_limit()) : boost::none,
+      resp.has_row_count_limit() ? boost::optional<int64_t>(resp.row_count_limit()) : boost::none);
 
   *statistics = table_statistics.release();
   return Status::OK();
@@ -834,6 +843,11 @@ KuduTableCreator& KuduTableCreator::set_owner(const string& owner) {
   return *this;
 }
 
+KuduTableCreator& KuduTableCreator::set_comment(const string& comment) {
+  data_->comment_ = comment;
+  return *this;
+}
+
 KuduTableCreator& KuduTableCreator::split_rows(const vector<const KuduPartialRow*>& rows) {
   for (const KuduPartialRow* row : rows) {
     data_->range_partition_splits_.emplace_back(const_cast<KuduPartialRow*>(row));
@@ -909,6 +923,9 @@ Status KuduTableCreator::Create() {
   }
   if (data_->owner_ != boost::none) {
     req.set_owner(data_->owner_.get());
+  }
+  if (data_->comment_ != boost::none) {
+    req.set_comment(data_->comment_.get());
   }
   RETURN_NOT_OK_PREPEND(SchemaToPB(*data_->schema_->schema_, req.mutable_schema(),
                                    SCHEMA_PB_WITHOUT_WRITE_DEFAULT),
@@ -993,6 +1010,14 @@ int64_t KuduTableStatistics::live_row_count() const {
   return data_->live_row_count_ ? *data_->live_row_count_ : -1;
 }
 
+int64_t KuduTableStatistics::on_disk_size_limit() const {
+  return data_->on_disk_size_limit_ ? *data_->on_disk_size_limit_ : -1;
+}
+
+int64_t KuduTableStatistics::live_row_count_limit() const {
+  return data_->live_row_count_limit_ ? *data_->live_row_count_limit_ : -1;
+}
+
 std::string KuduTableStatistics::ToString() const {
   return data_->ToString();
 }
@@ -1006,10 +1031,11 @@ KuduTable::KuduTable(const shared_ptr<KuduClient>& client,
                      const string& id,
                      int num_replicas,
                      const string& owner,
+                     const string& comment,
                      const KuduSchema& schema,
                      const PartitionSchema& partition_schema,
                      const map<string, string>& extra_configs)
-  : data_(new KuduTable::Data(client, name, id, num_replicas, owner,
+  : data_(new KuduTable::Data(client, name, id, num_replicas, owner, comment,
                               schema, partition_schema, extra_configs)) {
 }
 
@@ -1027,6 +1053,10 @@ const string& KuduTable::id() const {
 
 const KuduSchema& KuduTable::schema() const {
   return data_->schema_;
+}
+
+const string& KuduTable::comment() const {
+  return data_->comment_;
 }
 
 int KuduTable::num_replicas() const {
@@ -1365,6 +1395,11 @@ KuduTableAlterer* KuduTableAlterer::SetOwner(const string& new_owner) {
   return this;
 }
 
+KuduTableAlterer* KuduTableAlterer::SetComment(const string& new_comment) {
+  data_->set_comment_to_ = new_comment;
+  return this;
+}
+
 KuduColumnSpec* KuduTableAlterer::AddColumn(const string& name) {
   Data::Step s = { AlterTableRequestPB::ADD_COLUMN,
                    new KuduColumnSpec(name), nullptr, nullptr };
@@ -1464,6 +1499,16 @@ KuduTableAlterer* KuduTableAlterer::DropRangePartition(
 
 KuduTableAlterer* KuduTableAlterer::AlterExtraConfig(const map<string, string>& extra_configs) {
   data_->new_extra_configs_ = extra_configs;
+  return this;
+}
+
+KuduTableAlterer* KuduTableAlterer::SetTableDiskSizeLimit(int64_t disk_size_limit) {
+  data_->disk_size_limit_ = disk_size_limit;
+  return this;
+}
+
+KuduTableAlterer* KuduTableAlterer::SetTableRowCountLimit(int64_t row_count_limit) {
+  data_->row_count_limit_ = row_count_limit;
   return this;
 }
 

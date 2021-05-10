@@ -27,9 +27,9 @@
 #include "kudu/client/schema-internal.h"
 #include "kudu/client/schema.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/master/master.pb.h"
 
 using std::string;
@@ -60,6 +60,9 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
   if (!rename_to_.is_initialized() &&
       !new_extra_configs_ &&
       !set_owner_to_.is_initialized() &&
+      !set_comment_to_.is_initialized() &&
+      !disk_size_limit_ &&
+      !row_count_limit_ &&
       steps_.empty()) {
     return Status::InvalidArgument("No alter steps provided");
   }
@@ -77,12 +80,22 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
   if (set_owner_to_.is_initialized()) {
     req->set_new_table_owner(set_owner_to_.get());
   }
+  if (set_comment_to_.is_initialized()) {
+    req->set_new_table_comment(set_comment_to_.get());
+  }
 
   if (schema_ != nullptr) {
     RETURN_NOT_OK(SchemaToPB(*schema_, req->mutable_schema(),
                              SCHEMA_PB_WITHOUT_IDS |
                              SCHEMA_PB_WITHOUT_WRITE_DEFAULT |
                              SCHEMA_PB_WITHOUT_COMMENT));
+  }
+
+  if (disk_size_limit_) {
+    req->set_disk_size_limit(disk_size_limit_.get());
+  }
+  if (row_count_limit_) {
+    req->set_row_count_limit(row_count_limit_.get());
   }
 
   for (const Step& s : steps_) {

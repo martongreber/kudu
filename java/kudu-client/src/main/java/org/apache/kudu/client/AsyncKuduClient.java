@@ -415,7 +415,7 @@ public class AsyncKuduClient implements AutoCloseable {
     this.bootstrap = b.createBootstrap();
     this.masterAddresses = b.masterAddresses;
     this.masterTable = new KuduTable(this, MASTER_TABLE_NAME_PLACEHOLDER,
-        MASTER_TABLE_NAME_PLACEHOLDER, null, null, 1, null, null);
+        MASTER_TABLE_NAME_PLACEHOLDER, null, null, 1, null, null, null);
     this.defaultOperationTimeoutMs = b.defaultOperationTimeoutMs;
     this.defaultAdminOperationTimeoutMs = b.defaultAdminOperationTimeoutMs;
     this.statisticsDisabled = b.statisticsDisabled;
@@ -847,7 +847,8 @@ public class AsyncKuduClient implements AutoCloseable {
                            resp.getPartitionSchema(),
                            resp.getNumReplicas(),
                            resp.getExtraConfig(),
-                           resp.getOwner());
+                           resp.getOwner(),
+                           resp.getComment());
     });
   }
 
@@ -2427,9 +2428,10 @@ public class AsyncKuduClient implements AutoCloseable {
     // right away. If not, we throw an exception that RetryRpcErrback will understand as needing to
     // sleep before retrying.
     TableLocationsCache.Entry entry = locationsCache.get(requestPartitionKey);
-    if (!entry.isNonCoveredRange() && entry.getTablet().getLeaderServerInfo() == null) {
+    if (entry != null && !entry.isNonCoveredRange() &&
+        entry.getTablet().getLeaderServerInfo() == null) {
       throw new NoLeaderFoundException(
-          Status.NotFound("Tablet " + entry.toString() + " doesn't have a leader"));
+          Status.NotFound("Tablet " + entry + " doesn't have a leader"));
     }
   }
 

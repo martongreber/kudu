@@ -158,6 +158,7 @@ DECLARE_int32(log_inject_latency_ms_stddev);
 DECLARE_int32(master_inject_latency_on_tablet_lookups_ms);
 DECLARE_int32(max_column_comment_length);
 DECLARE_int32(max_create_tablets_per_ts);
+DECLARE_int32(max_table_comment_length);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_int32(scanner_batch_size_rows);
 DECLARE_int32(scanner_gc_check_interval_us);
@@ -5815,26 +5816,30 @@ TEST_F(ClientTest, TestReadAtSnapshotNoTimestampSet) {
 
 TEST_F(ClientTest, TestCreateTableWithValidComment) {
   const string kTableName = "table_comment";
-  const string kLongComment(FLAGS_max_column_comment_length, 'x');
+  const string kLongColumnComment(FLAGS_max_column_comment_length, 'x');
+  const string kLongTableComment(FLAGS_max_table_comment_length, 'x');
 
-  // Create a table with comment.
+  // Create a table with a table and column comment.
   {
     KuduSchema schema;
     KuduSchemaBuilder schema_builder;
     schema_builder.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
-    schema_builder.AddColumn("val")->Type(KuduColumnSchema::INT32)->Comment(kLongComment);
+    schema_builder.AddColumn("val")->Type(KuduColumnSchema::INT32)->Comment(kLongColumnComment);
     ASSERT_OK(schema_builder.Build(&schema));
     unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
     ASSERT_OK(table_creator->table_name(kTableName)
-      .schema(&schema).num_replicas(1).set_range_partition_columns({ "key" }).Create());
+      .schema(&schema).num_replicas(1).set_range_partition_columns({ "key" })
+      .set_comment(kLongTableComment)
+      .Create());
   }
 
-  // Open the table and verify the comment.
+  // Open the table and verify the comments.
   {
-    KuduSchema schema;
-    ASSERT_OK(client_->GetTableSchema(kTableName, &schema));
-    ASSERT_EQ(schema.Column(1).name(), "val");
-    ASSERT_EQ(schema.Column(1).comment(), kLongComment);
+    shared_ptr<KuduTable> table;
+    ASSERT_OK(client_->OpenTable(kTableName, &table));
+    ASSERT_EQ(table->comment(), kLongTableComment);
+    ASSERT_EQ(table->schema().Column(1).name(), "val");
+    ASSERT_EQ(table->schema().Column(1).comment(), kLongColumnComment);
   }
 }
 
@@ -5842,31 +5847,36 @@ TEST_F(ClientTest, TestAlterTableWithValidComment) {
   const string kTableName = "table_comment";
   const auto AlterAndVerify = [&] (int i) {
     {
-      // The comment length should be less and equal than FLAGS_max_column_comment_length.
+      // The comment length should be less and equal than FLAGS_max_column_comment_length
+      // and FLAGS_max_table_comment_length.
       string kLongComment(i * 16, 'x');
 
-      // Alter the table with comment.
+      // Alter the table with a table and column comment.
       unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+      table_alterer->SetComment(kLongComment);
       table_alterer->AlterColumn("val")->Comment(kLongComment);
       ASSERT_OK(table_alterer->Alter());
 
-      // Open the table and verify the comment.
-      KuduSchema schema;
-      ASSERT_OK(client_->GetTableSchema(kTableName, &schema));
-      ASSERT_EQ(schema.Column(1).name(), "val");
-      ASSERT_EQ(schema.Column(1).comment(), kLongComment);
+      // Open the table and verify the comments.
+      shared_ptr<KuduTable> table;
+      ASSERT_OK(client_->OpenTable(kTableName, &table));
+      ASSERT_EQ(table->comment(), kLongComment);
+      ASSERT_EQ(table->schema().Column(1).name(), "val");
+      ASSERT_EQ(table->schema().Column(1).comment(), kLongComment);
     }
     {
       // Delete the comment.
       unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+      table_alterer->SetComment("");
       table_alterer->AlterColumn("val")->Comment("");
       ASSERT_OK(table_alterer->Alter());
 
-      // Open the table and verify the comment.
-      KuduSchema schema;
-      ASSERT_OK(client_->GetTableSchema(kTableName, &schema));
-      ASSERT_EQ(schema.Column(1).name(), "val");
-      ASSERT_EQ(schema.Column(1).comment(), "");
+      // Open the table and verify the comments.
+      shared_ptr<KuduTable> table;
+      ASSERT_OK(client_->OpenTable(kTableName, &table));
+      ASSERT_EQ(table->comment(), "");
+      ASSERT_EQ(table->schema().Column(1).name(), "val");
+      ASSERT_EQ(table->schema().Column(1).comment(), "");
     }
   };
 
@@ -5887,7 +5897,7 @@ TEST_F(ClientTest, TestAlterTableWithValidComment) {
   }
 }
 
-TEST_F(ClientTest, TestCreateAndAlterTableWithInvalidComment) {
+TEST_F(ClientTest, TestCreateAndAlterTableWithInvalidColumnComment) {
   const string kTableName = "table_comment";
   const vector<pair<string, string>> kCases = {
     {string(FLAGS_max_column_comment_length + 1, 'x'), "longer than maximum permitted length"},
@@ -5895,7 +5905,7 @@ TEST_F(ClientTest, TestCreateAndAlterTableWithInvalidComment) {
     {string("foo\xf0\x28\x8c\xbc", 7), "invalid column comment: invalid UTF8 sequence"}
   };
 
-  // Create tables with invalid comment.
+  // Create tables with invalid column comment.
   for (const auto& test_case : kCases) {
     const auto& comment = test_case.first;
     const auto& substr = test_case.second;
@@ -5924,7 +5934,7 @@ TEST_F(ClientTest, TestCreateAndAlterTableWithInvalidComment) {
         .schema(&schema).num_replicas(1).set_range_partition_columns({ "key" }).Create());
   }
 
-  // Alter tables with invalid comment.
+  // Alter tables with invalid column comment.
   for (const auto& test_case : kCases) {
     const auto& comment = test_case.first;
     const auto& substr = test_case.second;
@@ -5933,6 +5943,59 @@ TEST_F(ClientTest, TestCreateAndAlterTableWithInvalidComment) {
     // Alter the table.
     unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->AlterColumn("val")->Comment(comment);
+    Status s = table_alterer->Alter();
+    ASSERT_STR_CONTAINS(s.ToString(), substr);
+  }
+}
+
+TEST_F(ClientTest, TestCreateAndAlterTableWithInvalidTableComment) {
+  const string kTableName = "table_comment";
+  const vector<pair<string, string>> kCases = {
+      {string(FLAGS_max_table_comment_length + 1, 'x'), "longer than maximum permitted length"},
+      {string("foo\0bar", 7), "invalid table comment: identifier must not contain null bytes"},
+      {string("foo\xf0\x28\x8c\xbc", 7), "invalid table comment: invalid UTF8 sequence"}
+  };
+
+  // Create tables with invalid table comment.
+  for (const auto& test_case : kCases) {
+    const auto& comment = test_case.first;
+    const auto& substr = test_case.second;
+    SCOPED_TRACE(comment);
+
+    KuduSchema schema;
+    KuduSchemaBuilder schema_builder;
+    schema_builder.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+    schema_builder.AddColumn("val")->Type(KuduColumnSchema::INT32);
+    ASSERT_OK(schema_builder.Build(&schema));
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    Status s = table_creator->table_name(kTableName)
+        .schema(&schema).num_replicas(1).set_range_partition_columns({ "key" })
+        .set_comment(comment)
+        .Create();
+    ASSERT_STR_CONTAINS(s.ToString(), substr);
+  }
+
+  // Create a table for later alterer.
+  {
+    KuduSchema schema;
+    KuduSchemaBuilder schema_builder;
+    schema_builder.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+    schema_builder.AddColumn("val")->Type(KuduColumnSchema::INT32);
+    ASSERT_OK(schema_builder.Build(&schema));
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    ASSERT_OK(table_creator->table_name(kTableName)
+        .schema(&schema).num_replicas(1).set_range_partition_columns({ "key" }).Create());
+  }
+
+  // Alter tables with invalid table comment.
+  for (const auto& test_case : kCases) {
+    const auto& comment = test_case.first;
+    const auto& substr = test_case.second;
+    SCOPED_TRACE(comment);
+
+    // Alter the table.
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->SetComment(comment);
     Status s = table_alterer->Alter();
     ASSERT_STR_CONTAINS(s.ToString(), substr);
   }
@@ -7169,7 +7232,7 @@ TEST_F(ClientTest, TxnBasicOperations) {
     shared_ptr<KuduTransaction> txn;
     ASSERT_OK(client_->NewTransaction(&txn));
     ASSERT_OK(txn->Rollback());
-    auto s = txn->Commit(false /* wait */);
+    auto s = txn->StartCommit();
     ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "is not open: state: ABORT");
   }
@@ -7256,7 +7319,7 @@ TEST_F(ClientTest, TxnCommit) {
   {
     shared_ptr<KuduTransaction> txn;
     ASSERT_OK(client_->NewTransaction(&txn));
-    ASSERT_OK(txn->Commit(false /* wait */));
+    ASSERT_OK(txn->StartCommit());
     ASSERT_EVENTUALLY([&] {
       bool is_complete = false;
       Status cs;
@@ -7376,7 +7439,7 @@ TEST_F(ClientTest, TxnToken) {
     shared_ptr<KuduSession> session;
     ASSERT_OK(serdes_txn->CreateSession(&session));
     NO_FATALS(InsertTestRows(client_table_.get(), session.get(), kNumRows));
-    ASSERT_OK(serdes_txn->Commit(false /* wait */));
+    ASSERT_OK(serdes_txn->StartCommit());
 
     // The state of a transaction isn't stored in the token, so initiating
     // commit of the transaction doesn't change the result of the serialization.
@@ -7438,7 +7501,7 @@ TEST_F(ClientTest, AttemptToControlTxnByOtherUser) {
   ASSERT_OK(KuduTransaction::Deserialize(client, txn_token, &serdes_txn));
   const vector<pair<string, Status>> txn_ctl_results = {
     { "rollback", serdes_txn->Rollback() },
-    { "commit", serdes_txn->Commit(false /* wait */) },
+    { "commit", serdes_txn->StartCommit() },
   };
   for (const auto& op_and_status : txn_ctl_results) {
     SCOPED_TRACE(op_and_status.first);
@@ -7468,7 +7531,7 @@ TEST_F(ClientTest, NoTxnManager) {
 
   const vector<pair<string, Status>> txn_ctl_results = {
     { "rollback", txn->Rollback() },
-    { "commit", txn->Commit(false /* wait */) },
+    { "commit", txn->StartCommit() },
   };
   for (const auto& op_and_status : txn_ctl_results) {
     SCOPED_TRACE(op_and_status.first);
@@ -7537,7 +7600,7 @@ TEST_F(ClientTest, TxnKeepAlive) {
     // of the scope.
     shared_ptr<KuduTransaction> serdes_txn;
     ASSERT_OK(KuduTransaction::Deserialize(client_, txn_token, &serdes_txn));
-    auto s = serdes_txn->Commit(false /* wait */);
+    auto s = serdes_txn->StartCommit();
     ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORT");
   }
@@ -7560,7 +7623,7 @@ TEST_F(ClientTest, TxnKeepAlive) {
 
     SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_txn_keepalive_interval_ms));
 
-    auto s = serdes_txn->Commit(false /* wait */);
+    auto s = serdes_txn->StartCommit();
     ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORT");
   }
@@ -7626,7 +7689,7 @@ TEST_F(ClientTest, TxnKeepAliveAndUnavailableTxnManagerShortTime) {
 
   // An attempt to commit a transaction should fail due to unreachable masters.
   {
-    auto s = txn->Commit(false /* wait */);
+    auto s = txn->StartCommit();
     ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
   }
 
@@ -7663,7 +7726,7 @@ TEST_F(ClientTest, TxnKeepAliveAndUnavailableTxnManagerLongTime) {
 
   // An attempt to commit a transaction should fail due to unreachable masters.
   {
-    auto s = txn->Commit(false /* wait */);
+    auto s = txn->StartCommit();
     ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
   }
 
@@ -7678,7 +7741,7 @@ TEST_F(ClientTest, TxnKeepAliveAndUnavailableTxnManagerLongTime) {
   // any txn keepalive messages for longer than prescribed by the
   // --txn_keepalive_interval_ms flag.
   {
-    auto s = txn->Commit(false /* wait */);
+    auto s = txn->StartCommit();
     ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "not open: state: ABORT");
   }

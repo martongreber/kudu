@@ -40,9 +40,9 @@
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
@@ -1265,12 +1265,13 @@ TEST_F(TableLocationsCacheMultiMasterTest, ResetCache) {
   int former_leader_master_idx;
   ASSERT_OK(cluster_->GetLeaderMasterIndex(&former_leader_master_idx));
 
+  int leader_master_idx = -1;
   ASSERT_EVENTUALLY([&] {
     // Induce a change in master leadership (maybe, even few of them, up to the
     // number of masters in the cluster).
     for (auto idx = 0; idx < cluster_->num_masters(); ++idx) {
       ASSERT_OK(cluster_->master(idx)->Pause());
-      // Make one master to stop sending hearbeats, and give the rest about
+      // Make one master to stop sending heartbeats, and give the rest about
       // three heartbeat periods to elect a new leader in case if the stopped
       // master was a leader.
       SleepFor(MonoDelta::FromMilliseconds(
@@ -1278,15 +1279,14 @@ TEST_F(TableLocationsCacheMultiMasterTest, ResetCache) {
           3 * kRaftHeartbeatIntervalMs));
       ASSERT_OK(cluster_->master(idx)->Resume());
     }
-    int leader_master_idx;
     ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_master_idx));
     ASSERT_NE(former_leader_master_idx, leader_master_idx);
   });
+  // An extra sanity check.
+  ASSERT_NE(-1, leader_master_idx);
 
   // Make sure all the cache's metrics are reset once master just has become
   // a leader.
-  int leader_master_idx;
-  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_master_idx));
   NO_FATALS(CheckCacheMetricsReset(leader_master_idx));
 }
 

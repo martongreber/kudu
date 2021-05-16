@@ -205,7 +205,7 @@ public class TestKuduTransaction {
     } catch (NonRecoverableException e) {
       final String errmsg = e.getMessage();
       final Status status = e.getStatus();
-      assertTrue(status.toString(), status.isNotFound());
+      assertTrue(status.toString(), status.isInvalidArgument());
       assertTrue(errmsg, errmsg.matches(".*transaction ID .* not found.*"));
     } catch (Exception e) {
       fail("unexpected exception: " + e.toString());
@@ -219,10 +219,61 @@ public class TestKuduTransaction {
     } catch (NonRecoverableException e) {
       final String errmsg = e.getMessage();
       final Status status = e.getStatus();
-      assertTrue(status.toString(), status.isNotFound());
+      assertTrue(status.toString(), status.isInvalidArgument());
       assertTrue(errmsg, errmsg.matches(".*transaction ID .* not found.*"));
     } catch (Exception e) {
       fail("unexpected exception: " + e.toString());
+    }
+  }
+
+  /**
+   * Transactional sessions can be closed as regular ones.
+   */
+  @Test(timeout = 100000)
+  @MasterServerConfig(flags = {
+      "--txn_manager_enabled",
+  })
+  public void testTxnSessionClose() throws Exception {
+    final String TABLE_NAME = "txn_session_close";
+    client.createTable(
+        TABLE_NAME,
+        ClientTestUtil.getBasicSchema(),
+        new CreateTableOptions().addHashPartitions(ImmutableList.of("key"), 2));
+    KuduTable table = client.openTable(TABLE_NAME);
+
+    // Open and close an empty transaction session.
+    {
+      KuduTransaction txn = client.newTransaction();
+      assertNotNull(txn);
+      KuduSession session = txn.newKuduSession();
+      assertNotNull(session);
+      assertFalse(session.isClosed());
+      session.close();
+      assertTrue(session.isClosed());
+    }
+
+    // Open new transaction, insert one row for a session, close the session
+    // and then rollback the transaction. No rows should be persisted.
+    {
+      KuduTransaction txn = client.newTransaction();
+      assertNotNull(txn);
+      KuduSession session = txn.newKuduSession();
+      assertNotNull(session);
+      session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
+
+      Insert insert = createBasicSchemaInsert(table, 1);
+      session.apply(insert);
+      session.close();
+
+      txn.rollback();
+
+      assertTrue(session.isClosed());
+      assertEquals(0, session.countPendingErrors());
+
+      KuduScanner scanner = new KuduScanner.KuduScannerBuilder(asyncClient, table)
+          .readMode(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES)
+          .build();
+      assertEquals(0, countRowsInScan(scanner));
     }
   }
 
@@ -298,7 +349,7 @@ public class TestKuduTransaction {
             }
           });
       final Status status = ex.getStatus();
-      assertTrue(status.toString(), status.isNotFound());
+      assertTrue(status.toString(), status.isInvalidArgument());
       final String errmsg = ex.getMessage();
       assertTrue(errmsg, errmsg.matches(".*transaction ID .* not found.*"));
     }
@@ -336,7 +387,7 @@ public class TestKuduTransaction {
     } catch (NonRecoverableException e) {
       final String errmsg = e.getMessage();
       final Status status = e.getStatus();
-      assertTrue(status.toString(), status.isNotFound());
+      assertTrue(status.toString(), status.isInvalidArgument());
       assertTrue(errmsg, errmsg.matches(".*transaction ID .* not found.*"));
     } catch (Exception e) {
       fail("unexpected exception: " + e.toString());

@@ -234,6 +234,7 @@ using kudu::tablet::TABLET_DATA_TOMBSTONED;
 using kudu::tablet::Tablet;
 using kudu::tablet::TabletReplica;
 using kudu::tablet::TabletStatePB;
+using kudu::tablet::TxnMetadataPB;;
 using kudu::tablet::WriteAuthorizationContext;
 using kudu::tablet::WriteOpState;
 using kudu::tablet::WritePrivilegeType;
@@ -1336,6 +1337,15 @@ void TabletServiceAdminImpl::CoordinateTransaction(const CoordinateTransactionRe
 void TabletServiceAdminImpl::ParticipateInTransaction(const ParticipantRequestPB* req,
                                                       ParticipantResponsePB* resp,
                                                       RpcContext* context) {
+  if (!req->has_op() || !req->op().has_type() || !req->op().has_txn_id() ||
+      !req->has_tablet_id()) {
+    Status s = Status::InvalidArgument(
+        Substitute("Missing fields in request: $0", SecureShortDebugString(*req)));
+    SetupErrorAndRespond(resp->mutable_error(), s,
+                         TabletServerErrorPB::UNKNOWN_ERROR,
+                         context);
+    return;
+  }
   scoped_refptr<TabletReplica> replica;
   if (!LookupRunningTabletReplicaOrRespond(server_->tablet_manager(), req->tablet_id(), resp,
                                            context, &replica)) {
@@ -1348,6 +1358,23 @@ void TabletServiceAdminImpl::ParticipateInTransaction(const ParticipantRequestPB
     SetupErrorAndRespond(resp->mutable_error(), s, error_code, context);
     return;
   }
+  const auto& op = req->op();
+  if (op.type() == ParticipantOpPB::GET_METADATA) {
+    TxnMetadataPB pb;
+    const auto* meta = tablet->metadata();
+    if (meta->GetTxnMetadataPB(op.txn_id(), &pb)) {
+      *resp->mutable_metadata() = std::move(pb);
+      context->RespondSuccess();
+      return;
+    }
+    SetupErrorAndRespond(
+        resp->mutable_error(),
+        Status::InvalidArgument(Substitute("txn ID $0 has no metadata", op.txn_id())),
+        TabletServerErrorPB::UNKNOWN_ERROR,
+        context);
+    return;
+  }
+
   // TODO(awong): consider memory-based throttling?
   // TODO(awong): we should also persist the transaction's owner, and prevent
   // other users from mutating it.
@@ -1368,7 +1395,7 @@ bool TabletServiceAdminImpl::SupportsFeature(uint32_t feature) const {
     case TabletServerFeatures::COLUMN_PREDICATES:
     case TabletServerFeatures::PAD_UNIXTIME_MICROS_TO_16_BYTES:
     case TabletServerFeatures::QUIESCING:
-    case TabletServerFeatures::BLOOM_FILTER_PREDICATE:
+    case TabletServerFeatures::BLOOM_FILTER_PREDICATE_V2:
     // TODO(awong): once transactions are useable, add a feature flag.
       return true;
     default:
@@ -2498,7 +2525,7 @@ bool TabletServiceImpl::SupportsFeature(uint32_t feature) const {
     case TabletServerFeatures::COLUMN_PREDICATES:
     case TabletServerFeatures::PAD_UNIXTIME_MICROS_TO_16_BYTES:
     case TabletServerFeatures::QUIESCING:
-    case TabletServerFeatures::BLOOM_FILTER_PREDICATE:
+    case TabletServerFeatures::BLOOM_FILTER_PREDICATE_V2:
     case TabletServerFeatures::COLUMNAR_LAYOUT_FEATURE:
       return true;
     default:

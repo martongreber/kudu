@@ -348,12 +348,6 @@ EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --no-parallel"
 # KUDU-2524: temporarily disable scalafmt until we can work out its JDK
 # incompatibility issue.
 EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DskipFormat"
-# Include the downstream CSD modules.
-# We don't include the CSD modules for LINT builds because they require
-# a built binary and the LINT build does not build the Kudu binaries.
-if [ "$BUILD_TYPE" != "LINT" ]; then
-  EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -PbuildCSD"
-fi
 EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS $GRADLE_FLAGS"
 
 # Assemble the cmake command line, starting with environment variables.

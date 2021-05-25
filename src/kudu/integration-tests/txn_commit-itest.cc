@@ -49,6 +49,7 @@
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
+#include "kudu/rpc/messenger.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
@@ -68,6 +69,7 @@
 #include "kudu/util/test_util.h"
 
 DECLARE_bool(enable_txn_partition_lock);
+DECLARE_bool(enable_txn_system_client_init);
 DECLARE_bool(txn_manager_enabled);
 DECLARE_bool(txn_manager_lazily_initialized);
 DECLARE_bool(txn_schedule_background_tasks);
@@ -121,6 +123,7 @@ class TxnCommitITest : public KuduTest {
   // Sets up a cluster with the given number of tservers, creating a
   // single-replica transaction status table and user-defined table.
   void SetUpClusterAndTable(int num_tservers, int num_replicas = 1) {
+    FLAGS_enable_txn_system_client_init = true;
     FLAGS_txn_manager_enabled = true;
     FLAGS_txn_manager_lazily_initialized = false;
     FLAGS_txn_manager_status_table_num_replicas = num_replicas;
@@ -140,7 +143,9 @@ class TxnCommitITest : public KuduTest {
       }
       ASSERT_FALSE(tsm_id_.empty());
     });
-    TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_client_);
+    TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                            cluster_->messenger()->sasl_proto_name(),
+                            &txn_client_);
     ASSERT_OK(txn_client_->OpenTxnStatusTable());
 
     client::KuduClientBuilder builder;

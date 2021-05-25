@@ -41,6 +41,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/transactions/coordinator_rpc.h"
 #include "kudu/transactions/participant_rpc.h"
@@ -55,11 +56,11 @@
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/threadpool.h"
 
-DEFINE_bool(disable_txn_system_client_init, false,
+DEFINE_bool(enable_txn_system_client_init, false,
             "Whether or not background TxnSystemClient initialization should "
-            "be disabled. This is useful for tests that do not expect any "
-            "client connections.");
-TAG_FLAG(disable_txn_system_client_init, unsafe);
+            "be enabled. Setting this to 'true' allows the server's "
+            "TxnSystemClient to participate in orchestrating transactions.");
+TAG_FLAG(enable_txn_system_client_init, experimental);
 
 DEFINE_int64(txn_system_client_op_timeout_ms, 10 * 1000,
              "Op timeout used by the TxnSystemClient when making transactions-related "
@@ -95,6 +96,7 @@ namespace kudu {
 namespace transactions {
 
 Status TxnSystemClient::Create(const vector<HostPort>& master_addrs,
+                               const string& sasl_protocol_name,
                                unique_ptr<TxnSystemClient>* sys_client) {
   vector<string> master_strings;
   for (const auto& hp : master_addrs) {
@@ -103,6 +105,7 @@ Status TxnSystemClient::Create(const vector<HostPort>& master_addrs,
   DCHECK(!master_addrs.empty());
   KuduClientBuilder builder;
   builder.master_server_addrs(master_strings);
+  builder.sasl_protocol_name(sasl_protocol_name);
   client::sp::shared_ptr<KuduClient> client;
   RETURN_NOT_OK(builder.Build(&client));
   sys_client->reset(new TxnSystemClient(std::move(client)));
@@ -426,6 +429,13 @@ TxnSystemClientInitializer::~TxnSystemClientInitializer() {
 
 Status TxnSystemClientInitializer::Init(const shared_ptr<Messenger>& messenger,
                                         vector<HostPort> master_addrs) {
+  if (PREDICT_FALSE(!FLAGS_enable_txn_system_client_init)) {
+    // If we're set to not enable the system client, return early. Further
+    // attempts to access the client will fail since initialization never
+    // completes.
+    LOG(INFO) << "TxnSystemClient initialization is disabled...";
+    return Status::OK();
+  }
   RETURN_NOT_OK(ThreadPoolBuilder("txn-client-init")
       .set_max_threads(1)
       .Build(&txn_client_init_pool_));
@@ -433,14 +443,6 @@ Status TxnSystemClientInitializer::Init(const shared_ptr<Messenger>& messenger,
   return txn_client_init_pool_->Submit([this, messenger, master_addrs = std::move(master_addrs)] {
       unique_ptr<TxnSystemClient> txn_client;
       while (!shutting_down_) {
-        static const MonoDelta kRetryInterval = MonoDelta::FromSeconds(1);
-        if (PREDICT_FALSE(FLAGS_disable_txn_system_client_init)) {
-          KLOG_EVERY_N_SECS(WARNING, 60) <<
-              Substitute("initialization of TxnSystemClient disabled, will retry in $0",
-                         kRetryInterval.ToString());
-          SleepFor(kRetryInterval);
-          continue;
-        }
         // HACK: if the master addresses are all totally unreachable,
         // KuduClientBuilder::Build() will hang, attempting fruitlessly to
         // retry, in the below call to Create(). So first, make sure we can at
@@ -468,13 +470,16 @@ Status TxnSystemClientInitializer::Init(const shared_ptr<Messenger>& messenger,
         // Only if we can reach at least one of the masters should we try
         // connecting.
         if (PREDICT_TRUE(s.ok())) {
-          s = TxnSystemClient::Create(master_addrs, &txn_client);
+          s = TxnSystemClient::Create(master_addrs,
+                                      messenger->sasl_proto_name(),
+                                      &txn_client);
         }
         if (PREDICT_TRUE(s.ok())) {
           txn_client_ = std::move(txn_client);
           init_complete_ = true;
           return;
         }
+        static const MonoDelta kRetryInterval = MonoDelta::FromSeconds(1);
         KLOG_EVERY_N_SECS(WARNING, 60) <<
             Substitute("unable to initialize TxnSystemClient, will retry in $0: $1",
                        kRetryInterval.ToString(), s.ToString());
@@ -516,8 +521,10 @@ Status TxnSystemClientInitializer::WaitForClient(const MonoDelta& timeout,
 
 void TxnSystemClientInitializer::Shutdown() {
   shutting_down_ = true;
-  txn_client_init_pool_->Wait();
-  txn_client_init_pool_->Shutdown();
+  if (FLAGS_enable_txn_system_client_init) {
+    txn_client_init_pool_->Wait();
+    txn_client_init_pool_->Shutdown();
+  }
 }
 
 } // namespace transactions

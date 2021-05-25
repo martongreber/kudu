@@ -49,6 +49,7 @@
 #include "kudu/master/ts_manager.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/mini-cluster/mini_cluster.h"
+#include "kudu/rpc/messenger.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
@@ -66,6 +67,7 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+DECLARE_bool(enable_txn_system_client_init);
 DECLARE_bool(raft_enable_pre_election);
 DECLARE_bool(txn_schedule_background_tasks);
 DECLARE_bool(txn_status_tablet_failover_inject_timeout_error);
@@ -119,11 +121,14 @@ class TxnStatusTableITest : public KuduTest {
     // Several of these tests rely on checking transaction state, which is
     // easier to work with without committing in the background.
     FLAGS_txn_schedule_background_tasks = false;
+    FLAGS_enable_txn_system_client_init = true;
     cluster_.reset(new InternalMiniCluster(env_, {}));
     ASSERT_OK(cluster_->Start());
 
     // Create the txn system client with which to communicate with the cluster.
-    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                                      cluster_->messenger()->sasl_proto_name(),
+                                      &txn_sys_client_));
   }
 
   // Ensures that all replicas have the right table type set.
@@ -801,7 +806,9 @@ TEST_F(TxnStatusTableITest, CheckOpenTxnStatusTable) {
     // Behind the scenes, create tablets for the next transaction IDs range
     // and start a new transaction.
     unique_ptr<TxnSystemClient> tsc;
-    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &tsc));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                                      cluster_->messenger()->sasl_proto_name(),
+                                      &tsc));
     // Re-open the system table.
     ASSERT_OK(tsc->OpenTxnStatusTable());
     ASSERT_OK(tsc->AddTxnStatusTableRange(kPartitionWidth, 2 * kPartitionWidth));
@@ -858,11 +865,14 @@ class MultiServerTxnStatusTableITest : public TxnStatusTableITest {
  public:
   void SetUp() override {
     KuduTest::SetUp();
+    FLAGS_enable_txn_system_client_init = true;
     InternalMiniClusterOptions opts;
     opts.num_tablet_servers = 4;
     cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
     ASSERT_OK(cluster_->Start());
-    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                                      cluster_->messenger()->sasl_proto_name(),
+                                      &txn_sys_client_));
 
     // Create the initial transaction status table partitions and start an
     // initial transaction.
@@ -1026,6 +1036,7 @@ class TxnStatusTableElectionStormITest : public TxnStatusTableITest {
  public:
   void SetUp() override {
     KuduTest::SetUp();
+    FLAGS_enable_txn_system_client_init = true;
 
     // Make leader elections more frequent to get through this test a bit more
     // quickly.
@@ -1035,7 +1046,9 @@ class TxnStatusTableElectionStormITest : public TxnStatusTableITest {
     opts.num_tablet_servers = 3;
     cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
     ASSERT_OK(cluster_->Start());
-    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                                      cluster_->messenger()->sasl_proto_name(),
+                                      &txn_sys_client_));
 
     // Create the initial transaction status table partitions.
     ASSERT_OK(txn_sys_client_->CreateTxnStatusTable(100, 3));

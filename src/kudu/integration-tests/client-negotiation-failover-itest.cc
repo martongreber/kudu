@@ -81,6 +81,7 @@ class ClientFailoverOnNegotiationTimeoutITest : public KuduTest {
         "--leader_failure_exp_backoff_max_delta_ms=1000",
         // Decreasing TS->master heartbeat interval speeds up the test.
         "--heartbeat_interval_ms=25",
+        "--enable_txn_system_client_init=true",
     };
     cluster_opts_.extra_master_flags = {
         // Speed up Raft elections.
@@ -203,7 +204,9 @@ TEST_F(ClientFailoverOnNegotiationTimeoutITest, TestTxnSystemClientRetryOnPause)
   ASSERT_OK(CreateAndStartCluster());
 
   unique_ptr<TxnSystemClient> txn_client;
-  ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_client));
+  ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                                    cluster_->service_principal(),
+                                    &txn_client));
   ASSERT_OK(txn_client->CreateTxnStatusTable(100, kNumTabletServers));
   ASSERT_OK(txn_client->OpenTxnStatusTable());
 

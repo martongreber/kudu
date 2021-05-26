@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -81,6 +82,8 @@ using kudu::client::KuduSchema;
 using kudu::client::KuduSession;
 using kudu::client::KuduTable;
 using kudu::client::KuduTableCreator;
+using kudu::client::KuduTransaction;
+using kudu::client::sp::shared_ptr;
 using kudu::cluster::ExternalMiniCluster;
 using kudu::cluster::ExternalMiniClusterOptions;
 using kudu::rpc::Messenger;
@@ -91,7 +94,7 @@ using strings::Substitute;
 
 namespace kudu {
 
-static const char* kTableName = "test-table";
+static const char* const kTableName = "test-table";
 static const Schema kTestSchema = CreateKeyValueTestSchema();
 static const KuduSchema kTestKuduSchema = client::KuduSchema::FromSchema(kTestSchema);
 
@@ -124,7 +127,7 @@ class SecurityITest : public KuduTest {
     return proxy.SetFlag(req, &resp, &controller);
   }
 
-  Status CreateTestTable(const client::sp::shared_ptr<KuduClient>& client) {
+  static Status CreateTestTable(const shared_ptr<KuduClient>& client) {
     unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
     return table_creator->table_name(kTableName)
         .set_range_partition_columns({ "key" })
@@ -133,9 +136,9 @@ class SecurityITest : public KuduTest {
         .Create();
   }
 
-  // Create a table, insert a row, scan it back, and delete the table.
-  void SmokeTestCluster(const client::sp::shared_ptr<KuduClient>& client);
-  void SmokeTestCluster();
+  // Create a table, insert a row, scan it back, and then drop the table.
+  void SmokeTestCluster(const shared_ptr<KuduClient>& client = {},
+                        bool transactional = false);
 
   Status TryRegisterAsTS() {
     // Make a new messenger so that we don't reuse any cached connections from
@@ -199,33 +202,43 @@ class SecurityITest : public KuduTest {
   unique_ptr<ExternalMiniCluster> cluster_;
 };
 
-void SecurityITest::SmokeTestCluster(const client::sp::shared_ptr<KuduClient>& client) {
+void SecurityITest::SmokeTestCluster(const shared_ptr<KuduClient>& client,
+                                     const bool transactional) {
+  shared_ptr<KuduClient> new_client;
+  const shared_ptr<KuduClient>& c = client ? client : new_client;
+  if (!client) {
+    ASSERT_OK(cluster_->CreateClient(nullptr, &new_client));
+  }
+
   // Create a table.
-  ASSERT_OK(CreateTestTable(client));
+  ASSERT_OK(CreateTestTable(c));
 
   // Insert a row.
-  client::sp::shared_ptr<KuduTable> table;
-  ASSERT_OK(client->OpenTable(kTableName, &table));
-  client::sp::shared_ptr<KuduSession> session = client->NewSession();
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(c->OpenTable(kTableName, &table));
+  shared_ptr<KuduTransaction> txn;
+  shared_ptr<KuduSession> session;
+  if (transactional) {
+    ASSERT_OK(c->NewTransaction(&txn));
+    ASSERT_OK(txn->CreateSession(&session));
+  } else {
+    session = c->NewSession();
+  }
   session->SetTimeoutMillis(60000);
   unique_ptr<KuduInsert> ins(table->NewInsert());
   ASSERT_OK(ins->mutable_row()->SetInt32(0, 12345));
   ASSERT_OK(ins->mutable_row()->SetInt32(1, 54321));
   ASSERT_OK(session->Apply(ins.release()));
   FlushSessionOrDie(session);
+  if (transactional) {
+    ASSERT_OK(txn->Commit());
+  }
 
-  // Read it back.
+  // Read the inserted row back.
   ASSERT_EQ(1, CountTableRows(table.get()));
 
-  // Delete the table.
-  ASSERT_OK(client->DeleteTable(kTableName));
-}
-
-void SecurityITest::SmokeTestCluster() {
-  client::sp::shared_ptr<KuduClient> client;
-  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
-
-  SmokeTestCluster(client);
+  // Drop the table.
+  ASSERT_OK(c->DeleteTable(kTableName));
 }
 
 // Test authorizing list tablets.
@@ -245,7 +258,7 @@ TEST_F(SecurityITest, TestAuthorizationOnListTablets) {
 TEST_F(SecurityITest, TestAuthorizationOnChecksum) {
   cluster_opts_.extra_tserver_flags.emplace_back("--tserver_enforce_access_control");
   ASSERT_OK(StartCluster());
-  client::sp::shared_ptr<KuduClient> client;
+  shared_ptr<KuduClient> client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &client));
   ASSERT_OK(CreateTestTable(client));
   vector<string> tablet_ids;
@@ -269,10 +282,15 @@ TEST_F(SecurityITest, TestAuthorizationOnChecksum) {
 // Test creating a table, writing some data, reading data, and dropping
 // the table.
 TEST_F(SecurityITest, SmokeTestAsAuthorizedUser) {
+  cluster_opts_.extra_master_flags.emplace_back("--txn_manager_enabled=true");
+  cluster_opts_.extra_tserver_flags.emplace_back("--enable_txn_system_client_init=true");
   ASSERT_OK(StartCluster());
 
   ASSERT_OK(cluster_->kdc()->Kinit("test-user"));
-  NO_FATALS(SmokeTestCluster());
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  NO_FATALS(SmokeTestCluster(client));
+  NO_FATALS(SmokeTestCluster(client, /* transactional */ true));
 
   // Non-superuser clients should not be able to set flags.
   Status s = TrySetFlagOnTS();
@@ -290,7 +308,7 @@ TEST_F(SecurityITest, TestNoKerberosCredentials) {
   ASSERT_OK(StartCluster());
   ASSERT_OK(cluster_->kdc()->Kdestroy());
 
-  client::sp::shared_ptr<KuduClient> client;
+  shared_ptr<KuduClient> client;
   Status s = cluster_->CreateClient(nullptr, &client);
   ASSERT_STR_MATCHES(s.ToString(),
                      "Not authorized: Could not connect to the cluster: "
@@ -310,7 +328,7 @@ TEST_F(SecurityITest, SaslPlainFallback) {
   ASSERT_OK(StartCluster());
   ASSERT_OK(cluster_->kdc()->Kdestroy());
 
-  client::sp::shared_ptr<KuduClient> client;
+  shared_ptr<KuduClient> client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &client));
 
   // Check client can successfully call ListTables().
@@ -322,7 +340,7 @@ TEST_F(SecurityITest, SaslPlainFallback) {
 TEST_F(SecurityITest, TestUnauthorizedClientKerberosCredentials) {
   ASSERT_OK(StartCluster());
   ASSERT_OK(cluster_->kdc()->Kinit("joe-interloper"));
-  client::sp::shared_ptr<KuduClient> client;
+  shared_ptr<KuduClient> client;
   Status s = cluster_->CreateClient(nullptr, &client);
   ASSERT_EQ("Remote error: Could not connect to the cluster: "
             "Not authorized: unauthorized access to method: ConnectToMaster",
@@ -453,11 +471,22 @@ TEST_F(SecurityITest, TestCorruptKerberosCC) {
 TEST_F(SecurityITest, TestNonDefaultPrincipal) {
   const string kPrincipal = "oryx";
   cluster_opts_.principal = kPrincipal;
+  // Enable TxnManager in Kudu masters: it's necessary to test txn-related
+  // operations along with others.
+  cluster_opts_.extra_master_flags.emplace_back("--txn_manager_enabled=true");
+  cluster_opts_.extra_tserver_flags.emplace_back("--enable_txn_system_client_init=true");
   ASSERT_OK(StartCluster());
 
-  // A client with the default SASL proto shouldn't be able to connect
-  {
-    client::sp::shared_ptr<KuduClient> client;
+  // A client with the default SASL proto shouldn't be able to connect to
+  // a cluster using custom Kerberos principal for Kudu service user.
+  for (const auto& username : {"test-user", "test-admin"}) {
+    // Verify that for both the regular and the super-user.
+    ASSERT_OK(cluster_->kdc()->Kinit(username));
+
+    // Instantiate a KuduClientBuilder outside of this cluster's context, so
+    // the custom service principals for this cluster don't affect the default
+    // SASL proto name when creating this separate client instance.
+    shared_ptr<KuduClient> client;
     KuduClientBuilder builder;
     for (auto i = 0; i < cluster_->num_masters(); ++i) {
       builder.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
@@ -467,12 +496,19 @@ TEST_F(SecurityITest, TestNonDefaultPrincipal) {
     ASSERT_STR_CONTAINS(s.ToString(), "not found in Kerberos database");
   }
 
+  // Create a client with the matching SASL proto name and verify it's able to
+  // connect to the cluster and perform basic actions.
   {
-    // Create a client with the matching SASL proto name and verify it's able to
-    // connect to the cluster and perform basic actions.
-    client::sp::shared_ptr<KuduClient> client;
+    // StartCluster() does 'kinit' as test-admin super-user. Anyways, let's
+    // switch to a regular user credentials to perform user-specific tasks.
+    ASSERT_OK(cluster_->kdc()->Kinit("test-user"));
+
+    // Here we don't use out-of-this-cluster KuduClientBuilder instance,
+    // so the client is created with matching SASL proto name.
+    shared_ptr<KuduClient> client;
     ASSERT_OK(cluster_->CreateClient(nullptr, &client));
     SmokeTestCluster(client);
+    SmokeTestCluster(client, /*transactional*/ true);
   }
 }
 
@@ -660,7 +696,7 @@ TEST_P(AuthTokenIssuingTest, ChannelConfidentiality) {
 
   // In current implementation, KuduClientBuilder calls ConnectToCluster() on
   // the newly created instance of the KuduClient.
-  client::sp::shared_ptr<KuduClient> client;
+  shared_ptr<KuduClient> client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &client));
 
   string authn_creds;
@@ -728,7 +764,7 @@ TEST_P(ConnectToFollowerMasterTest, AuthnTokenVerifierHaveKeys) {
   // Get authentication credentials.
   string authn_creds;
   {
-    client::sp::shared_ptr<KuduClient> client;
+    shared_ptr<KuduClient> client;
     ASSERT_OK(cluster_->CreateClient(nullptr, &client));
     ASSERT_OK(client->ExportAuthenticationCredentials(&authn_creds));
   }
@@ -739,7 +775,7 @@ TEST_P(ConnectToFollowerMasterTest, AuthnTokenVerifierHaveKeys) {
   // Make sure it's not possible to connect without authn token at this point:
   // the server side is configured to require authentication.
   {
-    client::sp::shared_ptr<KuduClient> client;
+    shared_ptr<KuduClient> client;
     KuduClientBuilder builder;
     for (auto i = 0; i < cluster_->num_masters(); ++i) {
       builder.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
@@ -756,7 +792,7 @@ TEST_P(ConnectToFollowerMasterTest, AuthnTokenVerifierHaveKeys) {
   // of masters' endpoints while trying to connect to a multi-master Kudu cluster.
   ASSERT_EVENTUALLY([&] {
     for (auto i = 1; i < cluster_->num_masters(); ++i) {
-      client::sp::shared_ptr<KuduClient> client;
+      shared_ptr<KuduClient> client;
       const auto s = KuduClientBuilder()
           .add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString())
           .import_authentication_credentials(authn_creds)
@@ -772,7 +808,7 @@ TEST_P(ConnectToFollowerMasterTest, AuthnTokenVerifierHaveKeys) {
   // to connect and perform basic operations (like listing tables) when using
   // secondary credentials only (i.e. authn token).
   {
-    client::sp::shared_ptr<KuduClient> client;
+    shared_ptr<KuduClient> client;
     KuduClientBuilder builder;
     for (auto i = 0; i < cluster_->num_masters(); ++i) {
       builder.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());

@@ -49,6 +49,7 @@
 #include "kudu/master/ts_manager.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/mini-cluster/mini_cluster.h"
+#include "kudu/rpc/messenger.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
@@ -66,6 +67,7 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+DECLARE_bool(enable_txn_system_client_init);
 DECLARE_bool(raft_enable_pre_election);
 DECLARE_bool(txn_schedule_background_tasks);
 DECLARE_bool(txn_status_tablet_failover_inject_timeout_error);
@@ -119,11 +121,14 @@ class TxnStatusTableITest : public KuduTest {
     // Several of these tests rely on checking transaction state, which is
     // easier to work with without committing in the background.
     FLAGS_txn_schedule_background_tasks = false;
+    FLAGS_enable_txn_system_client_init = true;
     cluster_.reset(new InternalMiniCluster(env_, {}));
     ASSERT_OK(cluster_->Start());
 
     // Create the txn system client with which to communicate with the cluster.
-    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                                      cluster_->messenger()->sasl_proto_name(),
+                                      &txn_sys_client_));
   }
 
   // Ensures that all replicas have the right table type set.
@@ -313,10 +318,10 @@ TEST_F(TxnStatusTableITest, TestProtectAccess) {
     Status _s = (s); \
     results.emplace_back(_s.CloneAndPrepend(msg)); \
   } while (0)
-  const auto attempt_accesses_and_delete = [&] (KuduClient* client) {
-    // Go through various table access methods on the transaction status table.
-    // Collect the results so we can verify whether we were authorized
-    // properly.
+  const auto attempt_accesses = [&] (KuduClient* client) {
+    // Go through various table access methods on the transaction status table,
+    // except for dropping/deleting it. Collect the results so we can verify
+    // whether we were authorized properly.
     vector<Status> results;
     bool unused;
     STORE_AND_PREPEND(client->TableExists(kTableName, &unused), "failed to check existence");
@@ -325,6 +330,13 @@ TEST_F(TxnStatusTableITest, TestProtectAccess) {
     client::KuduTableStatistics* unused_stats = nullptr;
     STORE_AND_PREPEND(client->GetTableStatistics(kTableName, &unused_stats), "failed to get stats");
     unique_ptr<client::KuduTableStatistics> unused_unique_stats(unused_stats);
+    return results;
+  };
+  const auto attempt_accesses_and_delete = [&] (KuduClient* client) {
+    // Go through various table access methods on the transaction status table,
+    // including dropping the table. Collect the results so we can verify
+    // whether we were authorized properly.
+    vector<Status> results = attempt_accesses(client);
     STORE_AND_PREPEND(client->DeleteTable(kTableName), "failed to delete table");
     return results;
   };
@@ -339,13 +351,21 @@ TEST_F(TxnStatusTableITest, TestProtectAccess) {
   // Even though we're the service user, we shouldn't be able to access
   // anything because most RPCs require us to be a super-user or user.
   NO_FATALS(SetSuperuserAndUser("nobody", "nobody"));
-  results = attempt_accesses_and_delete(client_sp.get());
+  results = attempt_accesses(client_sp.get());
   for (const auto& r : results) {
     // NOTE: we don't check the type because authorization errors may surface
     // as RemoteErrors or NotAuthorized errors.
-    ASSERT_FALSE(r.ok());
-    ASSERT_STR_CONTAINS(r.ToString(), "Not authorized");
+    ASSERT_TRUE(r.ok()) << r.ToString();
   }
+
+  {
+    const auto s = client_sp->DeleteTable(kTableName);
+    const auto errmsg = s.ToString();
+    ASSERT_TRUE(s.IsRemoteError()) << errmsg;
+    ASSERT_STR_CONTAINS(
+        errmsg, "Not authorized: unauthorized access to method: DeleteTable");
+  }
+
   // As a sanity check, our last delete have failed, and we should be unable to
   // create another transaction status table.
   Status s = txn_sys_client_->CreateTxnStatusTable(100);
@@ -786,7 +806,9 @@ TEST_F(TxnStatusTableITest, CheckOpenTxnStatusTable) {
     // Behind the scenes, create tablets for the next transaction IDs range
     // and start a new transaction.
     unique_ptr<TxnSystemClient> tsc;
-    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &tsc));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                                      cluster_->messenger()->sasl_proto_name(),
+                                      &tsc));
     // Re-open the system table.
     ASSERT_OK(tsc->OpenTxnStatusTable());
     ASSERT_OK(tsc->AddTxnStatusTableRange(kPartitionWidth, 2 * kPartitionWidth));
@@ -843,11 +865,14 @@ class MultiServerTxnStatusTableITest : public TxnStatusTableITest {
  public:
   void SetUp() override {
     KuduTest::SetUp();
+    FLAGS_enable_txn_system_client_init = true;
     InternalMiniClusterOptions opts;
     opts.num_tablet_servers = 4;
     cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
     ASSERT_OK(cluster_->Start());
-    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                                      cluster_->messenger()->sasl_proto_name(),
+                                      &txn_sys_client_));
 
     // Create the initial transaction status table partitions and start an
     // initial transaction.
@@ -1011,6 +1036,7 @@ class TxnStatusTableElectionStormITest : public TxnStatusTableITest {
  public:
   void SetUp() override {
     KuduTest::SetUp();
+    FLAGS_enable_txn_system_client_init = true;
 
     // Make leader elections more frequent to get through this test a bit more
     // quickly.
@@ -1020,7 +1046,9 @@ class TxnStatusTableElectionStormITest : public TxnStatusTableITest {
     opts.num_tablet_servers = 3;
     cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
     ASSERT_OK(cluster_->Start());
-    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(),
+                                      cluster_->messenger()->sasl_proto_name(),
+                                      &txn_sys_client_));
 
     // Create the initial transaction status table partitions.
     ASSERT_OK(txn_sys_client_->CreateTxnStatusTable(100, 3));

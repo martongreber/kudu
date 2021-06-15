@@ -100,6 +100,15 @@ build-support/mini-cluster/build_mini_cluster_binaries.sh
 # the Jars that are installed to the local maven repo at the end of the build.
 build-support/mini-cluster/publish_mini_cluster_binaries.sh --action install
 
+# Build the docker images (only on Redhat/Centos 7 given we don't need to build them for each OS)
+# See docker_images.yml for which images/tags will be published.
+if [[ -f /etc/redhat-release ]] && grep 'release 7\.' /etc/redhat-release; then
+    echo "### This is Redhat/Centos 7: building docker images ###"
+    ./docker/docker-build.py --bases centos:7 --use-ubi --force-latest --repository kudu --targets kudu
+else
+    echo "### This is not Redhat/Centos 7: skipping build of docker images ###"
+fi
+
 # Copy the published artifacts to a versioned staging directory.
 mkdir -p ../kudu-${VERSION}/java
 mkdir -p ../kudu-${VERSION}/thirdparty

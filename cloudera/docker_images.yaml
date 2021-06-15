@@ -1,0 +1,6 @@
+docker_images:
+  kudu: kudu
+
+registry: docker-private.infra.cloudera.com/cloudera/
+docker_image_tag:
+  build_tag: latest

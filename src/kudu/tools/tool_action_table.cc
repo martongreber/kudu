@@ -115,6 +115,8 @@ DEFINE_string(upper_bound_type, "EXCLUSIVE_BOUND",
               "The type of the upper bound, either inclusive or exclusive. "
               "Defaults to exclusive. This flag is case-insensitive.");
 
+DECLARE_bool(row_count_only);
+DECLARE_bool(show_scanner_stats);
 DECLARE_bool(show_values);
 DECLARE_string(tables);
 
@@ -482,7 +484,9 @@ Status ScanTable(const RunnerContext &context) {
 
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
 
-  FLAGS_show_values = true;
+  if (!FLAGS_row_count_only) {
+    FLAGS_show_values = true;
+  }
   TableScanner scanner(client, table_name);
   scanner.SetOutput(&cout);
   return scanner.StartScan();
@@ -900,6 +904,26 @@ Status ColumnSetBlockSize(const RunnerContext& context) {
   return alterer->Alter();
 }
 
+Status ClearComment(const RunnerContext& context) {
+  const string& table_name = FindOrDie(context.required_args, kTableNameArg);
+  client::sp::shared_ptr<KuduClient> client;
+  RETURN_NOT_OK(CreateKuduClient(context, &client));
+  unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
+  alterer->SetComment("");
+  return alterer->Alter();
+}
+
+Status SetComment(const RunnerContext& context) {
+  const string& table_name = FindOrDie(context.required_args, kTableNameArg);
+  const string& table_comment = FindOrDie(context.required_args, kColumnCommentArg);
+
+  client::sp::shared_ptr<KuduClient> client;
+  RETURN_NOT_OK(CreateKuduClient(context, &client));
+  unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
+  alterer->SetComment(table_comment);
+  return alterer->Alter();
+}
+
 Status ColumnSetComment(const RunnerContext& context) {
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
   const string& column_name = FindOrDie(context.required_args, kColumnNameArg);
@@ -1292,6 +1316,8 @@ unique_ptr<Mode> BuildTableMode() {
                         "for the --predicates flag on how predicates can be specified.")
       .AddRequiredParameter({ kTableNameArg, "Name of the table to scan"})
       .AddOptionalParameter("columns")
+      .AddOptionalParameter("row_count_only")
+      .AddOptionalParameter("report_scanner_stats")
       .AddOptionalParameter("fill_cache")
       .AddOptionalParameter("num_threads")
       .AddOptionalParameter("predicates")
@@ -1420,6 +1446,18 @@ unique_ptr<Mode> BuildTableMode() {
       .AddRequiredParameter({ kColumnNameArg, "Name of the table column to delete" })
       .Build();
 
+  unique_ptr<Action> set_comment =
+      ClusterActionBuilder("set_comment", &SetComment)
+      .Description("Set the comment for a table")
+      .AddRequiredParameter({ kTableNameArg, "Name of the table to alter" })
+      .AddRequiredParameter({ kColumnCommentArg, "Comment of the table" })
+      .Build();
+
+  unique_ptr<Action> clear_comment =
+      ClusterActionBuilder("clear_comment", &ClearComment)
+      .Description("Clear the comment for a table")
+      .AddRequiredParameter({ kTableNameArg, "Name of the table to alter" })
+      .Build();
 
   unique_ptr<Action> statistics =
       ClusterActionBuilder("statistics", &GetTableStatistics)
@@ -1451,6 +1489,7 @@ unique_ptr<Mode> BuildTableMode() {
       .Description("Operate on Kudu tables")
       .AddMode(BuildSetTableLimitMode())
       .AddAction(std::move(add_range_partition))
+      .AddAction(std::move(clear_comment))
       .AddAction(std::move(column_remove_default))
       .AddAction(std::move(column_set_block_size))
       .AddAction(std::move(column_set_compression))
@@ -1469,6 +1508,7 @@ unique_ptr<Mode> BuildTableMode() {
       .AddAction(std::move(rename_column))
       .AddAction(std::move(rename_table))
       .AddAction(std::move(scan_table))
+      .AddAction(std::move(set_comment))
       .AddAction(std::move(set_extra_config))
       .AddAction(std::move(statistics))
       .Build();

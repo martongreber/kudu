@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdlib.h>
 #include <sys/stat.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <initializer_list>
@@ -612,7 +612,7 @@ class ToolTest : public KuduTest {
                  kDstTableName, args.columns), &dst_lines));
 
     if (args.mode == TableCopyMode::COPY_SCHEMA_ONLY) {
-      ASSERT_GT(dst_lines.size(), 1);
+      ASSERT_GE(dst_lines.size(), 1);
       ASSERT_STR_CONTAINS(*dst_lines.rbegin(), "Total count 0 ");
     } else {
       // Rows scanned from source table can be found in destination table.
@@ -1177,6 +1177,7 @@ TEST_F(ToolTest, TestModeHelp) {
     const string kCmd = "table";
     const vector<string> kTableModeRegexes = {
         "add_range_partition.*Add a range partition for table",
+        "clear_comment.*Clear the comment for a table",
         "column_remove_default.*Remove write_default value for a column",
         "column_set_block_size.*Set block size for a column",
         "column_set_compression.*Set compression type for a column",
@@ -1195,6 +1196,7 @@ TEST_F(ToolTest, TestModeHelp) {
         "rename_column.*Rename a column",
         "rename_table.*Rename a table",
         "scan.*Scan rows from a table",
+        "set_comment.*Set the comment for a table",
         "set_extra_config.*Change a extra configuration value on a table",
         "set_limit.*Set the write limit for a table",
         "statistics.*Get table statistics",
@@ -1202,6 +1204,7 @@ TEST_F(ToolTest, TestModeHelp) {
     NO_FATALS(RunTestHelp(kCmd, kTableModeRegexes));
     NO_FATALS(RunTestHelpRpcFlags(kCmd,
         { "add_range_partition",
+          "clear_comment",
           "column_remove_default",
           "column_set_block_size",
           "column_set_compression",
@@ -1220,6 +1223,7 @@ TEST_F(ToolTest, TestModeHelp) {
           "rename_column",
           "rename_table",
           "scan",
+          "set_comment",
           "set_extra_config",
           "statistics",
         }));
@@ -2827,6 +2831,49 @@ TEST_F(ToolTest, TestPerfTableScan) {
   NO_FATALS(RunScanTableCheck(kTableName, "", 1, 2000, {}, "perf table_scan"));
 }
 
+TEST_F(ToolTest, PerfTableScanCountOnly) {
+  constexpr const char* const kTableName = "perf.table_scan.row_count_only";
+  // Be specific about the number of threads even if it matches the default
+  // value for the --num_threads flag. This is to be explicit about the expected
+  // number of rows written into the table.
+  NO_FATALS(RunLoadgen(1,
+                       {
+                         "--num_threads=2",
+                         "--num_rows_per_thread=1234",
+                       },
+                       kTableName));
+
+  // Run table_scan with --row_count_only option
+  {
+    string out;
+    string err;
+    vector<string> out_lines;
+    const auto s = RunTool(
+        Substitute("perf table_scan $0 $1 --row_count_only",
+                   cluster_->master()->bound_rpc_addr().ToString(), kTableName),
+        &out, &err, &out_lines);
+    ASSERT_TRUE(s.ok()) << s.ToString() << ": " << err;
+    ASSERT_EQ(1, out_lines.size()) << out;
+    ASSERT_STR_CONTAINS(out, "Total count 2468 ");
+  }
+
+  // Add the --report_scanner_stats flag as well.
+  {
+    string out;
+    string err;
+    const auto s = RunTool(Substitute(
+        "perf table_scan $0 $1 --row_count_only --report_scanner_stats",
+        cluster_->master()->bound_rpc_addr().ToString(), kTableName),
+        &out, &err);
+    ASSERT_TRUE(s.ok()) << s.ToString() << ": " << err;
+    ASSERT_STR_CONTAINS(out, "bytes_read               0");
+    ASSERT_STR_CONTAINS(out, "cfile_cache_hit_bytes               0");
+    ASSERT_STR_CONTAINS(out, "cfile_cache_miss_bytes               0");
+    ASSERT_STR_CONTAINS(out, "total_duration_nanos ");
+    ASSERT_STR_CONTAINS(out, "Total count 2468 ");
+  }
+}
+
 TEST_F(ToolTest, TestPerfTabletScan) {
   // Create a table.
   constexpr const char* const kTableName = "perf.tablet_scan";
@@ -3858,6 +3905,49 @@ TEST_F(ToolTest, TestScanTableMultiPredicates) {
   ASSERT_LE(lines.size(), mid);
 }
 
+TEST_F(ToolTest, TableScanRowCountOnly) {
+  constexpr const char* const kTableName = "kudu.table.scan.row_count_only";
+  // Be specific about the number of threads even if it matches the default
+  // value for the --num_threads flag. This is to be explicit about the expected
+  // number of rows written into the table.
+  NO_FATALS(RunLoadgen(1,
+                       {
+                         "--num_threads=2",
+                         "--num_rows_per_thread=1234",
+                       },
+                       kTableName));
+
+  // Run table_scan with --row_count_only option
+  {
+    string out;
+    string err;
+    vector<string> out_lines;
+    const auto s = RunTool(
+        Substitute("table scan $0 $1 --row_count_only",
+                   cluster_->master()->bound_rpc_addr().ToString(), kTableName),
+        &out, &err, &out_lines);
+    ASSERT_TRUE(s.ok()) << s.ToString() << ": " << err;
+    ASSERT_EQ(1, out_lines.size()) << out;
+    ASSERT_STR_CONTAINS(out, "Total count 2468 ");
+  }
+
+  // Add the --report_scanner_stats flag as well.
+  {
+    string out;
+    string err;
+    const auto s = RunTool(
+        Substitute("table scan $0 $1 --row_count_only --report_scanner_stats",
+                   cluster_->master()->bound_rpc_addr().ToString(), kTableName),
+                   &out, &err);
+    ASSERT_TRUE(s.ok()) << s.ToString() << ": " << err;
+    ASSERT_STR_CONTAINS(out, "bytes_read               0");
+    ASSERT_STR_CONTAINS(out, "cfile_cache_hit_bytes               0");
+    ASSERT_STR_CONTAINS(out, "cfile_cache_miss_bytes               0");
+    ASSERT_STR_CONTAINS(out, "total_duration_nanos ");
+    ASSERT_STR_CONTAINS(out, "Total count 2468 ");
+  }
+}
+
 TEST_P(ToolTestCopyTableParameterized, TestCopyTable) {
   for (const auto& arg : GenerateArgs()) {
     NO_FATALS(RunCopyTableCheck(arg));
@@ -3974,6 +4064,50 @@ TEST_F(ToolTest, TestAlterColumn) {
   for (int i = 0; i < table->schema().num_columns(); ++i) {
     NO_FATALS(alter_comment(i));
   }
+}
+
+TEST_F(ToolTest, TestTableComment) {
+  NO_FATALS(StartExternalMiniCluster());
+  const string& kTableName = "kudu.test_alter_comment";
+  // Create the table.
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_num_replicas(1);
+  workload.Setup();
+
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  // Check the table comment starts out empty.
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(KuduClientBuilder()
+                .add_master_server_addr(master_addr)
+                .Build(&client));
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  ASSERT_TRUE(table->comment().empty()) << table->comment();
+
+  ObjectIdGenerator generator;
+  const auto table_comment = generator.Next();
+  NO_FATALS(RunActionStdoutNone(Substitute("table set_comment $0 $1 $2",
+                                           master_addr,
+                                           kTableName,
+                                           table_comment)));
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  ASSERT_EQ(table_comment, table->comment());
+
+  // Make attempt to "remove" the comment by replacing it with quotes. This
+  // doesn't actually clear the comment.
+  NO_FATALS(RunActionStdoutNone(Substitute("table set_comment $0 $1 \"\"",
+                                           master_addr,
+                                           kTableName)));
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  ASSERT_EQ("\"\"", table->comment());
+
+  // Using the 'clear_comment' command, we can remove it.
+  NO_FATALS(RunActionStdoutNone(Substitute("table clear_comment $0 $1",
+                                           master_addr,
+                                           kTableName)));
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  ASSERT_TRUE(table->comment().empty()) << table->comment();
 }
 
 TEST_F(ToolTest, TestColumnSetDefault) {

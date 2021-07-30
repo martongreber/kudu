@@ -155,13 +155,14 @@ class PartitionSchema {
 
   typedef std::vector<HashBucketSchema> HashBucketSchemas;
   // Holds each bound's HashBucketSchemas.
-  typedef std::vector<HashBucketSchemas> RangeHashSchema;
+  typedef std::vector<HashBucketSchemas> PerRangeHashBucketSchemas;
 
   struct RangeWithHashSchemas {
     std::string lower;
     std::string upper;
     HashBucketSchemas hash_schemas;
   };
+  typedef std::vector<RangeWithHashSchemas> RangesWithHashSchemas;
 
   // Extracts HashBucketSchemas from a protobuf repeated field of hash buckets.
   static Status ExtractHashBucketSchemasFromPB(
@@ -197,12 +198,12 @@ class PartitionSchema {
   // its order corresponds to the bounds in 'range_bounds'.
   // If 'range_hash_schemas' is empty, the table wide hash schema is used per range.
   // Size of 'range_hash_schemas' and 'range_bounds' are equal if 'range_hash_schema' isn't empty.
-  Status CreatePartitions(const std::vector<KuduPartialRow>& split_rows,
-                          const std::vector<std::pair<KuduPartialRow,
-                                                      KuduPartialRow>>& range_bounds,
-                          const RangeHashSchema& range_hash_schemas,
-                          const Schema& schema,
-                          std::vector<Partition>* partitions) const WARN_UNUSED_RESULT;
+  Status CreatePartitions(
+      const std::vector<KuduPartialRow>& split_rows,
+      const std::vector<std::pair<KuduPartialRow, KuduPartialRow>>& range_bounds,
+      const PerRangeHashBucketSchemas& range_hash_schemas,
+      const Schema& schema,
+      std::vector<Partition>* partitions) const WARN_UNUSED_RESULT;
 
   // Tests if the partition contains the row.
   Status PartitionContainsRow(const Partition& partition,
@@ -305,7 +306,7 @@ class PartitionSchema {
     return hash_bucket_schemas_;
   }
 
-  const std::vector<RangeWithHashSchemas>& ranges_with_hash_schemas() const {
+  const RangesWithHashSchemas& ranges_with_hash_schemas() const {
     return ranges_with_hash_schemas_;
   }
 
@@ -442,19 +443,19 @@ class PartitionSchema {
   // inserts them into 'bounds_with_hash_schemas' in sorted order. The hash schemas
   // per range are stored within 'range_hash_schemas'. If 'range_hash_schemas' is empty,
   // it indicates that the table wide hash schema will be used per range.
-  Status EncodeRangeBounds(const std::vector<std::pair<KuduPartialRow,
-                                                       KuduPartialRow>>& range_bounds,
-                           const RangeHashSchema& range_hash_schemas,
-                           const Schema& schema,
-                           std::vector<RangeWithHashSchemas>* bounds_with_hash_schemas) const;
+  Status EncodeRangeBounds(
+      const std::vector<std::pair<KuduPartialRow, KuduPartialRow>>& range_bounds,
+      const PerRangeHashBucketSchemas& range_hash_schemas,
+      const Schema& schema,
+      RangesWithHashSchemas* bounds_with_hash_schemas) const;
 
   // Splits the encoded range bounds by the split points. The splits and bounds within
   // 'bounds_with_hash_schemas' must be sorted. If `bounds_with_hash_schemas` is empty,
   // then a single unbounded range is assumed. If any of the splits falls outside
   // of the bounds, then an InvalidArgument status is returned.
   Status SplitRangeBounds(const Schema& schema,
-                          std::vector<std::string> splits,
-                          std::vector<RangeWithHashSchemas>* bounds_with_hash_schemas) const;
+                          const std::vector<std::string>& splits,
+                          RangesWithHashSchemas* bounds_with_hash_schemas) const;
 
   // Increments a range partition key, setting 'increment' to true if the
   // increment succeeds, or false if all range partition columns are already the
@@ -463,8 +464,7 @@ class PartitionSchema {
 
   HashBucketSchemas hash_bucket_schemas_;
   RangeSchema range_schema_;
-
-  std::vector<RangeWithHashSchemas> ranges_with_hash_schemas_;
+  RangesWithHashSchemas ranges_with_hash_schemas_;
 };
 
 } // namespace kudu

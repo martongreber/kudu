@@ -31,14 +31,14 @@ if [[ -f "/usr/bin/yum" ]]; then
         cyrus-sasl-plain flex gcc gcc-c++ gdb git java-1.8.0-openjdk-devel \
         krb5-server krb5-workstation libtool lsof make maven ninja-build nscd ntp openssl-devel \
         patch pkgconfig python python3-devel python-virtualenv redhat-lsb-core rsync unzip vim-common which ; then
-      if sudo yum install -y centos-release-scl-rh && sudo yum install -y devtoolset-8 ; then
+      if sudo yum install --enablerepo=extras* -y centos-release-scl-rh && sudo yum install -y devtoolset-8 ; then
         break;
       fi
     fi
     echo "Failed to yum install required packages after $i attempt(s)"
     if [ $i -eq $num_attempts ]; then
       echo "Retries exhausted!"
-      exit ${EXECUTION_SETUP_FAILURE}
+      exit 1
     fi
     echo Sleeping and retrying...
     sleep 60
@@ -62,7 +62,7 @@ elif [[ -f "/usr/bin/apt-get" ]]; then
     echo "Failed to apt-get install required packages after $i attempt(s)"
     if [ $i -eq $num_attempts ]; then
       echo "Retries exhausted!"
-      exit ${EXECUTION_SETUP_FAILURE}
+      exit 1
     fi
     echo Sleeping and retrying...
     sleep 60

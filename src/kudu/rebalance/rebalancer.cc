@@ -60,20 +60,20 @@ using strings::Substitute;
 namespace kudu {
 namespace rebalance {
 
-Rebalancer::Config::Config(
-    vector<string> ignored_tservers_param,
-    vector<string> master_addresses,
-    vector<string> table_filters,
-    size_t max_moves_per_server,
-    size_t max_staleness_interval_sec,
-    int64_t max_run_time_sec,
-    bool move_replicas_from_ignored_tservers,
-    bool move_rf1_replicas,
-    bool output_replica_distribution_details,
-    bool run_policy_fixer,
-    bool run_cross_location_rebalancing,
-    bool run_intra_location_rebalancing,
-    double load_imbalance_threshold)
+Rebalancer::Config::Config(vector<string> ignored_tservers_param,
+                           vector<string> master_addresses,
+                           vector<string> table_filters,
+                           size_t max_moves_per_server,
+                           size_t max_staleness_interval_sec,
+                           int64_t max_run_time_sec,
+                           bool move_replicas_from_ignored_tservers,
+                           bool move_rf1_replicas,
+                           bool output_replica_distribution_details,
+                           bool run_policy_fixer,
+                           bool run_cross_location_rebalancing,
+                           bool run_intra_location_rebalancing,
+                           double load_imbalance_threshold,
+                           bool force_rebalance_replicas_on_maintenance_tservers)
     : ignored_tservers(ignored_tservers_param.begin(), ignored_tservers_param.end()),
       master_addresses(std::move(master_addresses)),
       table_filters(std::move(table_filters)),
@@ -86,7 +86,9 @@ Rebalancer::Config::Config(
       run_policy_fixer(run_policy_fixer),
       run_cross_location_rebalancing(run_cross_location_rebalancing),
       run_intra_location_rebalancing(run_intra_location_rebalancing),
-      load_imbalance_threshold(load_imbalance_threshold) {
+      load_imbalance_threshold(load_imbalance_threshold),
+      force_rebalance_replicas_on_maintenance_tservers(
+          force_rebalance_replicas_on_maintenance_tservers) {
   DCHECK_GE(max_moves_per_server, 0);
 }
 
@@ -302,6 +304,10 @@ Status Rebalancer::BuildClusterInfo(const ClusterRawInfo& raw_info,
   for (const auto& summary : raw_info.tserver_summaries) {
     const auto& ts_id = summary.uuid;
     const auto& ts_location = summary.ts_location;
+    if (ContainsKey(config_.ignored_tservers, ts_id)) {
+      VLOG(1) << Substitute("ignoring tserver $0", ts_id);
+      continue;
+    }
     VLOG(1) << Substitute("found tserver $0 at location '$1'", ts_id, ts_location);
     EmplaceOrDie(&location_by_ts_uuid, ts_id, ts_location);
     auto& ts_ids = LookupOrEmplace(&ts_uuids_by_location,
@@ -448,19 +454,16 @@ Status Rebalancer::BuildClusterInfo(const ClusterRawInfo& raw_info,
     table_info_by_skew.emplace(max_count - min_count, std::move(tbi));
   }
 
-  // Populate ClusterInfo::tservers_to_empty
+  // Populate ClusterInfo::tservers_to_empty.
+  // TODO(zhangyifan): extract this to a seperate method.
   if (config_.move_replicas_from_ignored_tservers) {
     auto& tservers_to_empty = result_info.tservers_to_empty;
     for (const auto& ignored_tserver : config_.ignored_tservers) {
       if (ContainsKey(unhealthy_tablet_servers, ignored_tserver)) {
         continue;
       }
-      const int* replica_count = FindOrNull(tserver_replicas_count, ignored_tserver);
-      if (!replica_count) {
-        return Status::InvalidArgument(Substitute(
-            "ignored tserver $0 is not reported among known tservers", ignored_tserver));
-      }
-      tservers_to_empty.emplace(ignored_tserver, *replica_count);
+      int replica_count = FindWithDefault(tserver_replicas_count, ignored_tserver, 0);
+      tservers_to_empty.emplace(ignored_tserver, replica_count);
     }
   }
 

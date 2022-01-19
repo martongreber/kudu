@@ -39,11 +39,11 @@
 #include "kudu/client/client-internal.h"
 #include "kudu/client/client.h"
 #include "kudu/client/replica_controller-internal.h"
-#include "kudu/client/table_alterer-internal.h"
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/scan_predicate.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
+#include "kudu/client/table_alterer-internal.h"
 #include "kudu/client/value.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
@@ -59,6 +59,7 @@
 #include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/util/jsonreader.h"
+#include "kudu/util/jsonwriter.h"
 #include "kudu/util/status.h"
 #include "kudu/util/string_case.h"
 
@@ -124,6 +125,10 @@ DEFINE_int32(scan_batch_size, -1,
              "means the server-side default is used, where the server-side "
              "default is controlled by the tablet server's "
              "--scanner_default_batch_size_bytes flag.");
+DEFINE_bool(show_avro_format_schema, false,
+            "Display the table schema in avro format. When enabled it only outputs the "
+            "table schema in Avro format without any other information like "
+            "partition/owner/comments. It cannot be used in conjunction with other flags");
 
 DECLARE_bool(row_count_only);
 DECLARE_bool(show_scanner_stats);
@@ -234,6 +239,107 @@ enum PartitionAction {
   DROP,
 };
 
+Status AddLogicalType(JsonWriter* writer, const string& type, const string& logical_type,
+                      const ColumnSchema& col_schema) {
+  writer->StartArray();
+  writer->StartObject();
+  writer->String("type");
+  writer->String(type);
+  writer->String("logicalType");
+  writer->String(logical_type);
+  writer->EndObject();
+  writer->EndArray();
+  if (col_schema.has_read_default()) {
+    writer->String("default");
+    writer->String(col_schema.Stringify(col_schema.read_default_value()));
+  }
+  return Status::OK();
+}
+
+Status AddPrimitiveType(const ColumnSchema& col_schema, const string& type, JsonWriter* writer) {
+  if (col_schema.is_nullable()) {
+    writer->StartArray();
+    writer->String("null");
+    writer->String(type);
+    writer->EndArray();
+  } else {
+    writer->String(type);
+  }
+  if (col_schema.has_read_default()) {
+    writer->String("default");
+    writer->String(col_schema.Stringify(col_schema.read_default_value()));
+  }
+  return Status::OK();
+}
+
+Status PopulateAvroSchema(const string& table_name,
+                          const string& cluster_id,
+                          const KuduSchema& kudu_schema) {
+  std::ostringstream out;
+  JsonWriter writer(&out, JsonWriter::Mode::PRETTY);
+  // Start writing in Json format
+  writer.StartObject();
+  vector<string> json_attributes = {"type", "table", "name", table_name,
+                                    "namespace", "kudu.cluster." + cluster_id, "fields"};
+  for (const string& json: json_attributes) {
+    writer.String(json);
+  }
+  writer.StartArray();
+  const Schema schema = kudu::client::KuduSchema::ToSchema(kudu_schema);
+  // Each column type is a nested field
+  for (int i = 0; i < schema.num_columns(); i++) {
+    writer.StartObject();
+    writer.String("name");
+    writer.String(kudu_schema.Column(i).name());
+    writer.String("type");
+    switch (kudu_schema.Column(i).type()) {
+      case kudu::client::KuduColumnSchema::INT8:
+      case kudu::client::KuduColumnSchema::INT16:
+      case kudu::client::KuduColumnSchema::INT32:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "int", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::INT64:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "long", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::STRING:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "string", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::BOOL:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "bool", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::FLOAT:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "float", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::DOUBLE:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "double", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::BINARY:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "bytes", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::VARCHAR:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "string", &writer));
+        break;
+      // Each logical type in avro schema has sub-nested fields
+      case kudu::client::KuduColumnSchema::UNIXTIME_MICROS:
+        RETURN_NOT_OK(AddLogicalType(&writer, "long", "time-micros", schema.column(i)));
+        break;
+      case kudu::client::KuduColumnSchema::DATE:
+        RETURN_NOT_OK(AddLogicalType(&writer, "int", "date", schema.column(i)));
+        break;
+      case kudu::client::KuduColumnSchema::DECIMAL:
+        RETURN_NOT_OK(AddLogicalType(&writer, "bytes", "decimal", schema.column(i)));
+        break;
+      default:
+        LOG(DFATAL) << kudu_schema.Column(i).name() << ": Invalid column type";
+    }
+    writer.EndObject();
+  }
+  writer.EndArray();
+  writer.EndObject();
+  cout << out.str() << endl;
+  return Status::OK();
+}
+
 Status DeleteTable(const RunnerContext& context) {
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
   client::sp::shared_ptr<KuduClient> client;
@@ -251,8 +357,11 @@ Status DescribeTable(const RunnerContext& context) {
 
   // The schema.
   const KuduSchema& schema = table->schema();
+  if (FLAGS_show_avro_format_schema) {
+    return PopulateAvroSchema(FindOrDie(context.required_args, kTableNameArg),
+                                         client->cluster_id(), schema);
+  }
   cout << "TABLE " << table_name << " " << schema.ToString() << endl;
-
   // The partition schema with current range partitions.
   vector<Partition> partitions;
   RETURN_NOT_OK_PREPEND(table->ListPartitions(&partitions),
@@ -285,7 +394,6 @@ Status DescribeTable(const RunnerContext& context) {
 
   // The comment.
   cout << "COMMENT " << table->comment() << endl;
-
   return Status::OK();
 }
 
@@ -1374,6 +1482,7 @@ unique_ptr<Mode> BuildTableMode() {
       .Description("Describe a table")
       .AddRequiredParameter({ kTableNameArg, "Name of the table to describe" })
       .AddOptionalParameter("show_attributes")
+      .AddOptionalParameter("show_avro_format_schema")
       .Build();
 
   unique_ptr<Action> list_tables =

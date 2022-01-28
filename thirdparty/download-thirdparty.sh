@@ -193,12 +193,13 @@ fetch_and_patch \
  $GFLAGS_SOURCE \
  $GFLAGS_PATCHLEVEL
 
-GPERFTOOLS_PATCHLEVEL=2
+GPERFTOOLS_PATCHLEVEL=3
 fetch_and_patch \
  gperftools-${GPERFTOOLS_VERSION}.tar.gz \
  $GPERFTOOLS_SOURCE \
  $GPERFTOOLS_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/gperftools-Replace-namespace-base-with-namespace-tcmalloc.patch" \
+ "patch -p1 < $TP_DIR/patches/gperftools-tcmalloc-osx-fix.patch" \
  "autoreconf -fvi"
 
 # NOTE: creating an empty 'third_party/googletest/m4' subdir is a recipe from
@@ -488,6 +489,11 @@ fetch_and_patch \
  $OATPP_SWAGGER_PATCHLEVEL \
 "patch -p1 < $TP_DIR/patches/oatpp-swagger-remove-version-from-path.patch"
 
+JWT_CPP_PATCHLEVEL=0
+fetch_and_patch \
+  $JWT_CPP_NAME.tar.gz \
+  $JWT_CPP_SOURCE \
+  $JWT_CPP_PATCHLEVEL
 
 echo "---------------"
 echo "Thirdparty dependencies downloaded successfully"

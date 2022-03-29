@@ -84,7 +84,7 @@ curl -fLSs http://cloudera-thirdparty-libs.s3.amazonaws.com/isolate \
     --output isolate-bin/isolate --retry 5
 chmod 755 isolate-bin/isolate
 rm -rf dist_test
-git clone git://github.com/cloudera/dist_test.git
+git clone https://github.com/cloudera/dist_test.git
 popd
 
 export ENABLE_DIST_TEST=1

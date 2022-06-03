@@ -17,6 +17,8 @@
 #ifndef KUDU_CLIENT_WRITE_OP_H
 #define KUDU_CLIENT_WRITE_OP_H
 
+// NOTE: using stdint.h instead of cstdint because this file is supposed
+//       to be processed by a compiler lacking C++11 support.
 #include <stdint.h>
 
 // IWYU pragma: no_include <memory>
@@ -59,7 +61,7 @@ class KuduTable;
 ///   KuduInsert* t = table->NewInsert();
 ///   KUDU_CHECK_OK(t->mutable_row()->SetInt32("key", 1234));
 ///   KUDU_CHECK_OK(t->mutable_row()->SetStringCopy("foo", "bar"));
-///   session->Apply(t);
+///   KUDU_CHECK_OK(session->Apply(t));
 /// @endcode
 class KUDU_EXPORT KuduWriteOperation {
  public:
@@ -91,6 +93,9 @@ class KUDU_EXPORT KuduWriteOperation {
   /// @note this method does note redact row values. The
   ///   caller must handle redaction themselves, if necessary.
   virtual std::string ToString() const = 0;
+
+  const KuduTable* table() const { return table_.get(); }
+
  protected:
   /// @cond PROTECTED_MEMBERS_DOCUMENTED
 
@@ -118,8 +123,6 @@ class KUDU_EXPORT KuduWriteOperation {
   friend class internal::WriteRpc;
   friend class internal::ErrorCollector;
   friend class KuduSession;
-
-  const KuduTable* table() const { return table_.get(); }
 
   // Return the number of bytes required to buffer this operation,
   // including direct and indirect data. Once called, the result is cached

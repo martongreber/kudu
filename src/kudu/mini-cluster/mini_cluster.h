@@ -16,6 +16,7 @@
 // under the License.
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -133,6 +134,10 @@ class MiniCluster {
   // Returns the Env on which the cluster operates.
   virtual Env* env() const = 0;
 
+  virtual Env* ts_env(int ts_idx) const = 0;
+
+  virtual Env* master_env(int master_idx) const = 0;
+
   /// Reserves a unique socket address for a mini-cluster daemon. The address
   /// can be ascertained through the returned socket, and will remain reserved
   /// for the life of the socket. The daemon must use the SO_REUSEPORT socket
@@ -140,7 +145,8 @@ class MiniCluster {
   static Status ReserveDaemonSocket(DaemonType type,
                                     int index,
                                     BindMode bind_mode,
-                                    std::unique_ptr<Socket>* socket);
+                                    std::unique_ptr<Socket>* socket,
+                                    uint16_t port = 0);
 
  protected:
   // Return the IP address that the daemon with the given type and index will

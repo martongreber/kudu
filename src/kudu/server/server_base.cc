@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -40,6 +41,7 @@
 #include "kudu/fs/fs_manager.h"
 #include "kudu/fs/fs_report.h"
 #include "kudu/gutil/integral_types.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
@@ -62,6 +64,7 @@
 #include "kudu/server/rpcz-path-handler.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base_options.h"
+#include "kudu/server/startup_path_handler.h"
 #include "kudu/server/tcmalloc_metrics.h"
 #include "kudu/server/tracing_path_handlers.h"
 #include "kudu/server/webserver.h"
@@ -82,6 +85,7 @@
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/timer.h"
 #ifdef TCMALLOC_ENABLED
 #include "kudu/util/process_memory.h"
 #endif
@@ -240,6 +244,10 @@ DECLARE_bool(use_hybrid_clock);
 DECLARE_int32(dns_resolver_max_threads_num);
 DECLARE_uint32(dns_resolver_cache_capacity_mb);
 DECLARE_uint32(dns_resolver_cache_ttl_sec);
+DECLARE_int32(fs_data_dirs_available_space_cache_seconds);
+DECLARE_int32(fs_wal_dir_available_space_cache_seconds);
+DECLARE_int64(fs_wal_dir_reserved_bytes);
+DECLARE_int64(fs_data_dirs_reserved_bytes);
 DECLARE_string(log_filename);
 DECLARE_string(keytab_file);
 DECLARE_string(principal);
@@ -249,6 +257,18 @@ METRIC_DEFINE_gauge_int64(server, uptime,
                           "Server Uptime",
                           kudu::MetricUnit::kMicroseconds,
                           "Time interval since the server has started",
+                          kudu::MetricLevel::kInfo);
+METRIC_DEFINE_gauge_int64(server, wal_dir_space_available_bytes,
+                          "WAL Directory Space Free",
+                          kudu::MetricUnit::kBytes,
+                          "Total WAL directory space available. Set to "
+                          "-1 if reading the disk fails",
+                          kudu::MetricLevel::kInfo);
+METRIC_DEFINE_gauge_int64(server, data_dirs_space_available_bytes,
+                          "Data Directories Space Free",
+                          kudu::MetricUnit::kBytes,
+                          "Total space available in all the data directories. Set to "
+                          "-1 if reading any of the disks fails",
                           kudu::MetricLevel::kInfo);
 
 using kudu::security::RpcAuthentication;
@@ -413,6 +433,19 @@ shared_ptr<MemTracker> CreateMemTrackerForServer() {
   return shared_ptr<MemTracker>(MemTracker::CreateTracker(-1, id_str));
 }
 
+// Calculates the free space on the given WAL/data directory's disk. Returns -1 in case of disk
+// failure.
+inline int64_t CalculateAvailableSpace(const ServerBaseOptions& options, const string& dir,
+                                       int64_t flag_reserved_bytes, SpaceInfo* space_info) {
+  if (!options.env->GetSpaceInfo(dir, space_info).ok()) {
+    return -1;
+  }
+  bool should_reserve_one_percent = flag_reserved_bytes == -1;
+  int reserved_bytes = should_reserve_one_percent ?
+      space_info->capacity_bytes / 100 : flag_reserved_bytes;
+  return std::max(static_cast<int64_t>(0), space_info->free_bytes - reserved_bytes);
+}
+
 int64_t GetFileCacheCapacity(Env* env) {
   // Maximize this process' open file limit first, if possible.
   static std::once_flag once;
@@ -462,6 +495,7 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
       file_cache_(new FileCache("file cache", options.env,
                                 GetFileCacheCapacity(options.env), metric_entity_)),
       rpc_server_(new RpcServer(options.rpc_opts)),
+      startup_path_handler_(new StartupPathHandler(metric_entity_)),
       result_tracker_(new rpc::ResultTracker(shared_ptr<MemTracker>(
           MemTracker::CreateTracker(-1, "result-tracker", mem_tracker_)))),
       is_first_run_(false),
@@ -533,6 +567,9 @@ void ServerBase::GenerateInstanceID() {
 }
 
 Status ServerBase::Init() {
+  Timer* init = startup_path_handler_->init_progress();
+  Timer* read_filesystem = startup_path_handler_->read_filesystem_progress();
+  init->Start();
   glog_metrics_.reset(new ScopedGLogMetrics(metric_entity_));
   tcmalloc::RegisterMetrics(metric_entity_);
   RegisterSpinLockContentionMetrics(metric_entity_);
@@ -546,22 +583,49 @@ Status ServerBase::Init() {
   RETURN_NOT_OK(security::InitKerberosForServer(FLAGS_principal, FLAGS_keytab_file));
   RETURN_NOT_OK(file_cache_->Init());
 
+  // Register the startup web handler and start the web server to make the web UI
+  // available while the server is initializing, loading the file system, etc.
+  //
+  // NOTE: unlike the other path handlers, we register this path handler
+  // separately, as the startup handler is meant to be displayed before all of
+  // Kudu's subsystems have finished initializing.
+  if (options_.fs_opts.block_manager_type == "file") {
+    startup_path_handler_->set_is_using_lbm(false);
+  }
+  if (web_server_) {
+    startup_path_handler_->RegisterStartupPathHandler(web_server_.get());
+    AddPreInitializedDefaultPathHandlers(web_server_.get());
+    web_server_->set_footer_html(FooterHtml());
+    RETURN_NOT_OK(web_server_->Start());
+  }
+
   fs::FsReport report;
-  Status s = fs_manager_->Open(&report);
+  init->Stop();
+  read_filesystem->Start();
+  Status s = fs_manager_->Open(&report,
+                               startup_path_handler_->read_instance_metadata_files_progress(),
+                               startup_path_handler_->read_data_directories_progress(),
+                               startup_path_handler_->containers_processed(),
+                               startup_path_handler_->containers_total());
   // No instance files existed. Try creating a new FS layout.
   if (s.IsNotFound()) {
     LOG(INFO) << "This appears to be a new deployment of Kudu; creating new FS layout";
     is_first_run_ = true;
-    s = fs_manager_->CreateInitialFileSystemLayout();
+    if (options_.server_key.empty()) {
+      s = fs_manager_->CreateInitialFileSystemLayout();
+    } else {
+      s = fs_manager_->CreateInitialFileSystemLayout(boost::none, options_.server_key);
+    }
     if (s.IsAlreadyPresent()) {
       return s.CloneAndPrepend("FS layout already exists; not overwriting existing layout");
     }
     RETURN_NOT_OK_PREPEND(s, "Could not create new FS layout");
-    s = fs_manager_->Open(&report);
+    s = fs_manager_->Open(&report, startup_path_handler_->read_instance_metadata_files_progress(),
+                          startup_path_handler_->read_data_directories_progress());
   }
   RETURN_NOT_OK_PREPEND(s, "Failed to load FS layout");
   RETURN_NOT_OK(report.LogAndCheckForFatalErrors());
-
+  read_filesystem->Stop();
   RETURN_NOT_OK(InitAcls());
 
   vector<string> rpc_tls_excluded_protocols = strings::Split(
@@ -633,7 +697,7 @@ Status ServerBase::InitAcls() {
     // If we aren't logged in from a keytab, then just assume that the services
     // will be running as the same Unix user as we are.
     RETURN_NOT_OK_PREPEND(GetLoggedInUser(&service_user),
-                          "could not deterine local username");
+                          "could not determine local username");
   }
 
   // If the user has specified a superuser acl, use that. Otherwise, assume
@@ -662,26 +726,18 @@ Status ServerBase::GetStatusPB(ServerStatusPB* status) const {
 
   // RPC ports
   {
-    vector<Sockaddr> addrs;
-    RETURN_NOT_OK_PREPEND(rpc_server_->GetBoundAddresses(&addrs),
-                          "could not get bound RPC addresses");
-    for (const Sockaddr& addr : addrs) {
-      HostPort hp;
-      RETURN_NOT_OK_PREPEND(HostPortFromSockaddrReplaceWildcard(addr, &hp),
-                            "could not get RPC hostport");
+    vector<HostPort> hps;
+    RETURN_NOT_OK(rpc_server_->GetBoundHostPorts(&hps));
+    for (const auto& hp : hps) {
       *status->add_bound_rpc_addresses() = HostPortToPB(hp);
     }
   }
 
   // HTTP ports
   if (web_server_) {
-    vector<Sockaddr> addrs;
-    RETURN_NOT_OK_PREPEND(web_server_->GetBoundAddresses(&addrs),
-                          "could not get bound web addresses");
-    for (const Sockaddr& addr : addrs) {
-      HostPort hp;
-      RETURN_NOT_OK_PREPEND(HostPortFromSockaddrReplaceWildcard(addr, &hp),
-                            "could not get web hostport");
+    vector<HostPort> hps;
+    RETURN_NOT_OK(web_server_->GetBoundHostPorts(&hps));
+    for (const auto& hp : hps) {
       *status->add_bound_http_addresses() = HostPortToPB(hp);
     }
   }
@@ -817,6 +873,8 @@ void ServerBase::ShutdownImpl() {
     tcmalloc_memory_gc_thread_->Join();
   }
 #endif
+
+  security::DestroyKerberosForServer();
 }
 
 #ifdef TCMALLOC_ENABLED
@@ -840,13 +898,25 @@ void ServerBase::TcmallocMemoryGcThread() {
 #endif
 
 std::string ServerBase::FooterHtml() const {
-  return Substitute("<pre>$0\nserver uuid $1</pre>",
-                    VersionInfo::GetVersionInfo(),
-                    instance_pb_->permanent_uuid());
+  if (instance_pb_) {
+      return Substitute("<pre>$0\nserver uuid $1</pre>",
+                        VersionInfo::GetVersionInfo(),
+                        instance_pb_->permanent_uuid());
+  }
+  // Load the footer with UUID only if the UUID is available
+  return Substitute("<pre>$0\n</pre>",
+                    VersionInfo::GetVersionInfo());
 }
 
 Status ServerBase::Start() {
   GenerateInstanceID();
+
+  metric_entity_->SetAttribute("uuid", fs_manager_->uuid());
+  // Get the FQDN. If that fails server_hostname will have either the local hostname
+  // (if GetHostname() succeeds) or still be empty (if GetHostname() fails)
+  string server_hostname = "";
+  WARN_NOT_OK(GetFQDN(&server_hostname), "could not determine host FQDN");
+  metric_entity_->SetAttribute("hostname", server_hostname);
 
   RETURN_NOT_OK(RegisterService(
       unique_ptr<rpc::ServiceIf>(new GenericServiceImpl(this))));
@@ -857,11 +927,29 @@ Status ServerBase::Start() {
   // information ready at this point.
   start_time_ = MonoTime::Now();
   start_walltime_ = static_cast<int64_t>(WallTime_Now());
+  wal_dir_space_last_check_ = MonoTime::Min();
+  wal_dir_available_space_ = -1;
+  data_dirs_space_last_check_ = MonoTime::Min();
+  data_dirs_available_space_ = -1;
 
   METRIC_uptime.InstantiateFunctionGauge(
       metric_entity_,
       [this]() {return (MonoTime::Now() - this->start_time()).ToMicroseconds();})->
           AutoDetachToLastValue(&metric_detacher_);
+  METRIC_data_dirs_space_available_bytes.InstantiateFunctionGauge(
+      metric_entity_,
+      [this]() {
+        return RefreshDataDirAvailableSpaceIfExpired(options_, *fs_manager_);
+      })
+      ->AutoDetachToLastValue(&metric_detacher_);
+
+  METRIC_wal_dir_space_available_bytes.InstantiateFunctionGauge(
+      metric_entity_,
+      [this]() {
+        return RefreshWalDirAvailableSpaceIfExpired(options_, *fs_manager_);
+      })
+      ->AutoDetachToLastValue(&metric_detacher_);
+
 
   RETURN_NOT_OK_PREPEND(StartMetricsLogging(), "Could not enable metrics logging");
 
@@ -870,16 +958,17 @@ Status ServerBase::Start() {
 #ifdef TCMALLOC_ENABLED
   RETURN_NOT_OK(StartTcmallocMemoryGcThread());
 #endif
-
+  Timer* start_rpc_server = startup_path_handler_->start_rpc_server_progress();
+  start_rpc_server->Start();
   RETURN_NOT_OK(rpc_server_->Start());
-
+  start_rpc_server->Stop();
   if (web_server_) {
-    AddDefaultPathHandlers(web_server_.get());
+    AddPostInitializedDefaultPathHandlers(web_server_.get());
     AddRpczPathHandlers(messenger_, web_server_.get());
     RegisterMetricsJsonHandler(web_server_.get(), metric_registry_.get());
     TracingPathHandlers::RegisterHandlers(web_server_.get());
     web_server_->set_footer_html(FooterHtml());
-    RETURN_NOT_OK(web_server_->Start());
+    web_server_->SetStartupComplete(true);
   }
 
   if (!options_.dump_info_path.empty()) {
@@ -888,6 +977,53 @@ Status ServerBase::Start() {
   }
 
   return Status::OK();
+}
+
+int64_t ServerBase::RefreshWalDirAvailableSpaceIfExpired(const ServerBaseOptions& options,
+                                                         const FsManager& fs_manager) {
+  {
+    std::lock_guard<simple_spinlock> l(lock_);
+    if (MonoTime::Now() < wal_dir_space_last_check_ + MonoDelta::FromSeconds(
+            FLAGS_fs_wal_dir_available_space_cache_seconds))
+      return wal_dir_available_space_;
+  }
+  SpaceInfo space_info_waldir;
+  int64_t wal_dir_space = CalculateAvailableSpace(options, fs_manager.GetWalsRootDir(),
+                                                  FLAGS_fs_wal_dir_reserved_bytes,
+                                                  &space_info_waldir);
+  std::lock_guard<simple_spinlock> l(lock_);
+  wal_dir_space_last_check_ = MonoTime::Now();
+  wal_dir_available_space_ = wal_dir_space;
+  return wal_dir_available_space_;
+}
+
+int64_t ServerBase::RefreshDataDirAvailableSpaceIfExpired(const ServerBaseOptions& options,
+                                                          const FsManager& fs_manager) {
+  {
+    std::lock_guard<simple_spinlock> l(lock_);
+    if (MonoTime::Now() < data_dirs_space_last_check_ + MonoDelta::FromSeconds(
+            FLAGS_fs_data_dirs_available_space_cache_seconds))
+      return data_dirs_available_space_;
+  }
+  SpaceInfo space_info_datadir;
+  std::set<int64_t> fs_id;
+  int64_t data_dirs_available_space = 0;
+  for (const string& data_dir : fs_manager.GetDataRootDirs()) {
+    int64_t available_space = CalculateAvailableSpace(options, data_dir,
+                                                      FLAGS_fs_data_dirs_reserved_bytes,
+                                                      &space_info_datadir);
+    if (available_space == -1) {
+      data_dirs_available_space = -1;
+      break;
+    }
+    if (InsertIfNotPresent(&fs_id, space_info_datadir.filesystem_id)) {
+      data_dirs_available_space += available_space;
+    }
+  }
+  std::lock_guard<simple_spinlock> l(lock_);
+  data_dirs_space_last_check_ = MonoTime::Now();
+  data_dirs_available_space_ = data_dirs_available_space;
+  return data_dirs_available_space_;
 }
 
 void ServerBase::UnregisterAllServices() {

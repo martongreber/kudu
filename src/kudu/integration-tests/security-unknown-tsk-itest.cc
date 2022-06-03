@@ -44,12 +44,12 @@
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/security/crypto.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/security/token_signer.h"
 #include "kudu/security/token_verifier.h"
 #include "kudu/tablet/key_value_test_schema.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -85,7 +85,7 @@ using security::TokenPB;
 using security::TokenSigner;
 using security::TokenSigningPrivateKeyPB;
 using security::TokenVerifier;
-using security::VerificationResult;
+using security::TokenVerificationResult;
 
 class SecurityUnknownTskTest : public KuduTest {
  public:
@@ -151,7 +151,8 @@ class SecurityUnknownTskTest : public KuduTest {
     TokenSigner* signer = cluster_->mini_master()->master()->token_signer();
     TokenPB token;
     const TokenVerifier& verifier = signer->verifier();
-    if (verifier.VerifyTokenSignature(*authn_token, &token) != VerificationResult::VALID) {
+    if (verifier.VerifyTokenSignature(*authn_token, &token) !=
+        TokenVerificationResult::VALID) {
       return Status::RuntimeError("current client authn token is not valid");
     }
 
@@ -286,7 +287,7 @@ TEST_F(SecurityUnknownTskTest, ErrorUnavailableCommonOperations) {
     // The error returned is a generic IOError, and the details are provided
     // by the KuduSession::GetPendingErrors() method.
     ASSERT_TRUE(s_apply.IsIOError()) << s_apply.ToString();
-    ASSERT_STR_CONTAINS(s_apply.ToString(), "Some errors occurred");
+    ASSERT_STR_CONTAINS(s_apply.ToString(), "failed to flush data");
 
     std::vector<KuduError*> errors;
     ElementDeleter cleanup(&errors);

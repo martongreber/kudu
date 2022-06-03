@@ -22,6 +22,7 @@
 ########################################################################
 
 set -e
+set -o pipefail
 ulimit -n 2048
 
 function usage() {
@@ -39,6 +40,7 @@ start_kudu.sh [flags]
                     (default: system_unsync)
 -b, --builddir      Path to the Kudu build directory
 -c  --clusterdir    Path to place the Kudu masters and tablet servers.
+-H, --host          RPC address host (default: 127.0.0.1)
 -T, --tserver-flags Extra flags to be used on the tablet servers. Multiple
                     flags can be specified if wrapped in ""s.
 -M, --master-flags  Extra flags to be used on the master servers. Multiple
@@ -51,11 +53,12 @@ NUM_TSERVERS=3
 MASTER_RPC_PORT_BASE=8764
 TSERVER_RPC_PORT_BASE=9870
 TIME_SOURCE=system_unsync
-BUILDDIR="$PWD"
+BUILDDIR=""
 CLUSTER_DIR="$PWD"
 EXTRA_TSERVER_FLAGS=""
 EXTRA_MASTER_FLAGS=""
-echo $(readlink -f $(dirname $0))
+IP="127.0.0.1"
+
 while (( "$#" )); do
   case "$1" in
     -h|--help)
@@ -98,6 +101,10 @@ while (( "$#" )); do
       EXTRA_MASTER_FLAGS=$2
       shift 2
       ;;
+    -H|--host)
+      IP=$2
+      shift 2
+      ;;
     --) # end argument parsing
       shift
       break
@@ -115,14 +122,29 @@ while (( "$#" )); do
   esac
 done
 
-WEBSERVER_DOC_ROOT="$BUILDDIR/../../www"
+if [ -z "$BUILDDIR" ]; then
+  echo -n "Assuming that the script was started from the build directory. "
+  echo "You can override this with -b|--builddir option."
+  BUILDDIR="$PWD"
+fi
+
+# If $KUDU_HOME is not set or $KUDU_HOME/www doesn't exists, let's default to $BUILDDIR/../../www
+# In case neither is available we'll issue a warning and won't set the --webserver_doc_root flag
+# for kudu-master and kudu-tserver
+if [ -z "$KUDU_HOME" ] || [ ! -d "$KUDU_HOME/www" ]; then
+  WEBSERVER_DOC_ROOT="$BUILDDIR/../../www"
+fi
+
+if [ -n "$WEBSERVER_DOC_ROOT" ] && [ ! -d "$WEBSERVER_DOC_ROOT" ]; then
+  echo  -n "Cannot find webroot directory $WEBSERVER_DOC_ROOT at "
+  echo "\$KUDU_HOME/www or \$BUILDDIR/../../www"
+fi
+
 KUDUMASTER="$BUILDDIR/bin/kudu-master"
 KUDUTSERVER="$BUILDDIR/bin/kudu-tserver"
 echo $KUDUMASTER
 echo $KUDUTSERVER
-IP=127.0.0.1
 
-[ ! -d "$WEBSERVER_DOC_ROOT" ] && { echo "Cannot find webroot directory $WEBSERVER_DOC_ROOT"; exit 1; }
 [ ! -x "$KUDUMASTER" ] && { echo "Cannot find $KUDUMASTER executable";  exit 1; }
 [ ! -x "$KUDUTSERVER" ] && { echo "Cannot find $KUDUTSERVER executable";  exit 1; }
 
@@ -150,10 +172,38 @@ function set_port_vars_and_print() {
   echo "  HTTP port $HTTP_PORT"
 }
 
+# Return a flag to set the hard memory limit for the Kudu server processes
+# running at the same node. Each of the processes is able to set the hard
+# memory limit based on the total amount of memory available, but such a
+# provision assumes there is a single Kudu server process running at a node.
+# Since there is going to be NUM_TSERVERS kudu-tserver and NUM_MASTERS
+# kudu-master processes running, it's necessary to divide the available memory
+# among them.
+function get_memory_limit_hard_bytes_flag() {
+  local num_processes=$1
+  local mem_size_bytes=0
+  if [[ "$OSTYPE" =~ ^linux ]]; then
+    local mem_size_kb=$(grep -E '^MemTotal' /proc/meminfo | awk '{print $2}')
+    mem_size_bytes=$((mem_size_kb * 1024))
+  elif [[ "$OSTYPE" =~ ^darwin ]]; then
+    mem_size_bytes=$(sysctl hw.memsize | awk '{print $2}')
+  fi
+
+  # Do not set the limit for a non-recognized OS.
+  if [ $mem_size_bytes -eq 0 ]; then
+    echo ""
+    return
+  fi
+
+  # Allocate 80% of all available memory to be used by all the Kudu processes.
+  local mem_limit_bytes=$((mem_size_bytes * 4 / 5))
+  mem_limit_bytes=$((mem_limit_bytes / num_processes))
+  echo "--memory_limit_hard_bytes=$mem_limit_bytes"
+}
+
 pids=()
 
-# Start master server function
-
+# Start kudu-master process.
 function start_master() {
   create_dirs_and_set_vars $1
   set_port_vars_and_print $1 $2 $3
@@ -166,15 +216,20 @@ function start_master() {
   ARGS="$ARGS --time_source=$TIME_SOURCE"
   ARGS="$ARGS --unlock_unsafe_flags"
   ARGS="$ARGS --webserver_port=$HTTP_PORT"
-  ARGS="$ARGS --webserver_interface=$IP"
-  ARGS="$ARGS --webserver_doc_root=$WEBSERVER_DOC_ROOT"
+  if [ -d "$WEBSERVER_DOC_ROOT" ]; then
+    ARGS="$ARGS --webserver_doc_root=$WEBSERVER_DOC_ROOT"
+  fi
+  # NOTE: a kudu-master process doesn't usually consume a lot of memory,
+  #       so the memory hard limit isn't set for them; if kudu-master memory
+  #       consumption becomes an issue, provide the necessary flags for
+  #       kudu-master processing using the --master-flags/-M command line
+  #       option
   ARGS="$ARGS $EXTRA_MASTER_FLAGS"
   $ARGS &
   pids+=($!)
 }
 
-# Start tablet server function
-
+# Start kudu-tserver process.
 function start_tserver() {
   create_dirs_and_set_vars $1
   set_port_vars_and_print $1 $2 $3
@@ -186,9 +241,16 @@ function start_tserver() {
   ARGS="$ARGS --time_source=$TIME_SOURCE"
   ARGS="$ARGS --unlock_unsafe_flags"
   ARGS="$ARGS --webserver_port=$HTTP_PORT"
-  ARGS="$ARGS --webserver_interface=$IP"
-  ARGS="$ARGS --webserver_doc_root=$WEBSERVER_DOC_ROOT"
   ARGS="$ARGS --tserver_master_addrs=$4"
+  if [ -d "$WEBSERVER_DOC_ROOT" ]; then
+    ARGS="$ARGS --webserver_doc_root=$WEBSERVER_DOC_ROOT"
+  fi
+
+  # If applicable, set the memory hard limit.
+  local mem_limit_flag=$(get_memory_limit_hard_bytes_flag $NUM_TSERVERS)
+  if [ -n $mem_limit_flag ]; then
+    ARGS="$ARGS $mem_limit_flag"
+  fi
   ARGS="$ARGS $EXTRA_TSERVER_FLAGS"
   $ARGS &
   pids+=($!)
@@ -219,6 +281,5 @@ for i in $(seq 0 $((NUM_TSERVERS - 1))); do
   start_tserver tserver-$i $TSERVER_RPC_PORT $TSERVER_HTTP_PORT $MASTER_ADDRESSES
 done
 
-# Show status of started processes
-
+# Show the status of the started processes.
 ps -wwo args -p ${pids[@]}

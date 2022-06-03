@@ -31,12 +31,36 @@ To edit or update this document, edit `RELEASING.adoc` in `master`.
 
 == Stating Intent to Release
 
+NOTE: All email messages must be sent from your apache.org email address, otherwise with
+company or personal email addresses sometimes emails are not delivered.
+If using gmail.com service for email correspondence, follow
+link:https://support.google.com/mail/answer/22370?hl=en[this guide] to add your apache.org address
+to be used as `From` address when sending email messages.
+
 . *A week before branching*: send an email to dev@kudu.apache.org to
   announce that the branch will be happening, including a deadline for when new
-  commits will need gatekeeper approval.
+  commits will need gatekeeper approval. Start
+  <<_compile_the_release_notes,compiling the release notes>>.
 
 . *A day before branching*: send another email to dev@kudu.apache.org
   to warn about it.
+
+=== Compile the release notes
+
+Start a Google doc for the release notes that is editable by anyone, then use
+https://s.apache.org to generate a short URL like kudu-1.y-rn and share it on
+dev@kudu.apache.org asking for help. The author of a commit probably knows best
+if a change belongs to the release notes, and how to succintly describe the
+change. Of course, there will be contributors who are less active and maybe not
+even monitoring the dev@ list, so you'll still have to write release notes for
+their changes.
+
+Use git shortlog -s <prev-version>..HEAD to get a list of contributions and
+add it to the doc as a summary of all commits. Note the commit hash at HEAD, as
+you'll need to generate another list between this commit and the tip when
+finally branching.
+
+Example doc: https://s.apache.org/kudu1.16rn
 
 == Creating the Branch
 
@@ -55,12 +79,10 @@ To edit or update this document, edit `RELEASING.adoc` in `master`.
   git log --oneline -n1
 ----
 
-. Push the branch to public remotes https://github.com/cloudera/kudu.git and
-  https://gitbox.apache.org/repos/asf/kudu.git. The following example assumes
-  they are called `cloudera` and `apache`.
+. Push the branch to public remote https://gitbox.apache.org/repos/asf/kudu.git.
+  The following example assumes it's called `apache`.
 +
 ----
-  git push cloudera branch-1.x.y
   git push apache branch-1.x.y
 ----
 
@@ -91,11 +113,37 @@ To edit or update this document, edit `RELEASING.adoc` in `master`.
 
 . As needed, patches can be cherry-picked to the new branch.
 
+== Write the release notes
+
+. Copy the release notes from the shared doc to docs/release_notes.adoc.
+
+. Edit and format the release notes.
+
+. Get the number of contributors and the list of new contributors using the
+  following command, and add them to the contributors section (see
+  link:https://kudu.apache.org/releases/1.16.0/docs/release_notes.html#rn_1.16.0_contributors[previous
+  release notes] for examples):
++
+----
+  export PREV="1.15.0" # the previous release
+  git shortlog -sn $PREV.. | wc -l
+  diff <(git shortlog -sn ${PREV} | cut -f 2 | sort) \
+    <(git shortlog -sn ${PREV}.. | cut -f 2 | sort) \
+    | grep -E "^>" | sed 's/>/*/'
+----
++
+. Commit the release notes to the newly created branch and submit it to gerit.
+  Use `git shortlog -sn $PREV..` to list the contributors and add them to
+  the reviewers to give everyone a chance to comment on the release notes of
+  their changes.
+
 == Updating Versions in Master
 
 . Check out the `master` branch and bump the version in `version.txt`. Don't
   update `kudu-version` in `examples/java/java-example/pom.xml` yet: it should
   be updated later on when release artifacts are published (see below).
+
+. Bump the version numbers in docs/release_notes.adoc.
 
 . Commit and push that change to Gerrit.
 
@@ -173,7 +221,7 @@ To edit or update this document, edit `RELEASING.adoc` in `master`.
   `kudu-version` in `examples/java/java-example/pom.xml`, `version` in
   `examples/java/insert-loadgen/pom.xml`, etc.).
   The idea is making all examples use the artifacts of the newly released
-  `1.x.y` version of Kudu.
+  `1.x.y` version of Kudu. Commit and send out the changes for review on Gerrit.
 
 . When ready, create a new lightweight tag and push it to the Apache Git repository.
 +
@@ -204,16 +252,20 @@ To edit or update this document, edit `RELEASING.adoc` in `master`.
   # Run a gpg-agent if you don't normally
   gpg-agent --daemon
   cd java
+  ./gradlew clean assemble
   # Turn off bash history: this is to avoid exposing the credentials
   # via .bash_history file.
   set +o history
-  ./gradlew clean uploadArchives \
+  ./gradlew --no-parallel uploadArchives \
       -Psigning.gnupg.keyName=<8-character-pgp-key-id> \
       -PmavenUsername='<APACHE-LDAP-USERNAME>' \
       -PmavenPassword='<APACHE-LDAP-PASSWORD>'
   # Turn on bash history.
   set -o history
 ----
++
+NOTE: If `uploadArchives` is executed without `--no-parallel`, uploading a
+number of artifacts fails with "peer not authenticated" errors.
 
 . Build and deploy new binary test JARs for the RC on macOS and Linux. Build
   the Linux JAR on a CentOS 6.6 image, and build the macOS JAR on macOS
@@ -329,8 +381,6 @@ in its summary tab
 Note: You can upload to the test PyPi by adding
 `--repository-url https://test.pypi.org/legacy/` to the twine command.
 
-. Add the previous release notes to the `prior_release_notes.adoc` and submit the changes.
-
 . Generate the version-specific documentation from that branch following these
   <<README.adoc#updating-the-site,instructions>>.
 +
@@ -372,11 +422,23 @@ WARNING: The site *MUST NOT* be built on Mac. See the
 
 . Submit these changes to the `gh-pages` Gerrit branch and get them reviewed.
 
-. Once the review is finished and the commit is pushed, update the website following
-  these <<README.adoc#deploying-changes-to-the-apache-kudu-web-site,instructions>>.
-
-. Add a release blog post about the new release, similar to
+. Add a release blog post about the new release and send it out for review, similar to
   link:https://kudu.apache.org/2019/07/09/apache-kudu-1-10-0-release.html[this].
+
+. Once the reviews are finished and the commits are pushed to `gh-pages` branch,
+  update the website following these
+  <<README.adoc#deploying-changes-to-the-apache-kudu-web-site,instructions>>.
+
+. Build and push the Docker images (run the below command from the project
+  root).
++
+----
+ ./docker/docker-build.py --action push --platforms linux/amd64 linux/arm64
+----
++
+To push the images to Dockerhub, you need to be granted permissions by the ASF
+infra team, which you can request via an Apache JIRA ticket similar to
+link:https://issues.apache.org/jira/browse/INFRA-23166[INFRA-23166].
 
 . About 24 hours after all artifacts have been published, send an email to
   user@kudu.apache.org, dev@kudu.apache.org, and announce@apache.org to
@@ -387,7 +449,8 @@ WARNING: The site *MUST NOT* be built on Mac. See the
   gmail.com service for email correspondence, follow
   link:https://support.google.com/mail/answer/22370?hl=en[this guide] to add
   your apache.org address to be used as `From` address when sending email
-  messages.
+  messages. Also post the announcement to the blog and tweet it with the
+  link:https://twitter.com/ApacheKudu[@ApacheKudu] Twitter handle.
 
 . Update the version number on the branch you released from back to a SNAPSHOT
   for the next patch release, such as `1.6.1-SNAPSHOT` after the `1.6.0` release.
@@ -397,6 +460,9 @@ WARNING: The site *MUST NOT* be built on Mac. See the
   fresh artifacts of latest released version.  This should be done only after
   publishing the officially released artifacts, so they are available while
   building the examples.
+
+. In the `master` branch of the project git repo, add the previous release notes to the
+  `prior_release_notes.adoc` and send out the change for review on Gerrit.
 
 . About another 24 hours later, clean up the SVN. If releasing a new minor
   version, delete the oldest minor version branch in the release repo (e.g. if

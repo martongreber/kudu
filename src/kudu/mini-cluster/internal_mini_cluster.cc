@@ -31,6 +31,7 @@
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/master/master_options.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
@@ -155,6 +156,7 @@ Status InternalMiniCluster::StartMasters() {
     for (int i = 0; i < num_masters; i++) {
       auto mini_master(std::make_shared<MiniMaster>(
           GetMasterFsRoot(i), master_rpc_addrs[i]));
+      mini_master->mutable_options()->server_key = KuduTest::GetEncryptionKey();
       if (num_masters > 1 || opts_.supply_single_master_addr) {
         mini_master->SetMasterAddresses(master_rpc_addrs);
       }
@@ -195,26 +197,27 @@ Status InternalMiniCluster::StartSync() {
 }
 
 Status InternalMiniCluster::AddTabletServer() {
-  if (mini_masters_.empty()) {
-    return Status::IllegalState("Master not yet initialized");
-  }
   int new_idx = mini_tablet_servers_.size();
-
   uint16_t ts_rpc_port = 0;
   if (opts_.tserver_rpc_ports.size() > new_idx) {
     ts_rpc_port = opts_.tserver_rpc_ports[new_idx];
   }
-
   string bind_ip = GetBindIpForDaemonWithType(MiniCluster::TSERVER, new_idx, opts_.bind_mode);
-  unique_ptr<MiniTabletServer> tablet_server(new MiniTabletServer(
-      GetTabletServerFsRoot(new_idx),
-      HostPort(bind_ip, ts_rpc_port),
-      opts_.num_data_dirs));
+  return AddTabletServer(HostPort(bind_ip, ts_rpc_port));
+}
 
-  // set the master addresses
+Status InternalMiniCluster::AddTabletServer(const HostPort& hp) {
+  if (mini_masters_.empty()) {
+    return Status::IllegalState("Master not yet initialized");
+  }
+  int new_idx = mini_tablet_servers_.size();
+  unique_ptr<MiniTabletServer> tablet_server(
+      new MiniTabletServer(GetTabletServerFsRoot(new_idx), hp, opts_.num_data_dirs));
   tablet_server->options()->master_addresses = master_rpc_addrs();
+  tablet_server->options()->server_key = KuduTest::GetEncryptionKey();
+
   RETURN_NOT_OK(tablet_server->Start());
-  mini_tablet_servers_.push_back(shared_ptr<MiniTabletServer>(tablet_server.release()));
+  mini_tablet_servers_.emplace_back(std::move(tablet_server));
   return Status::OK();
 }
 

@@ -96,18 +96,6 @@ const char* kTestTablet = "TestTablet";
 void DoNothing(const string& s) {
 }
 
-Status WaitUntilLeaderForTests(RaftConsensus* raft) {
-  MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(15);
-  while (MonoTime::Now() < deadline) {
-    if (raft->role() == RaftPeerPB::LEADER) {
-      return Status::OK();
-    }
-    SleepFor(MonoDelta::FromMilliseconds(10));
-  }
-
-  return Status::TimedOut("Timed out waiting to become leader");
-}
-
 // Test suite for tests that focus on multiple peer interaction, but
 // without integrating with other components, such as ops.
 class RaftConsensusQuorumTest : public KuduTest {
@@ -144,7 +132,12 @@ class RaftConsensusQuorumTest : public KuduTest {
       opts.wal_root = test_path;
       opts.data_roots = { test_path };
       unique_ptr<FsManager> fs_manager(new FsManager(env_, opts));
-      RETURN_NOT_OK(fs_manager->CreateInitialFileSystemLayout());
+      string server_key = GetEncryptionKey();
+      if (server_key.empty()) {
+        RETURN_NOT_OK(fs_manager->CreateInitialFileSystemLayout());
+      } else {
+        RETURN_NOT_OK(fs_manager->CreateInitialFileSystemLayout(boost::none, server_key));
+      }
       RETURN_NOT_OK(fs_manager->Open());
 
       scoped_refptr<Log> log;
@@ -902,7 +895,7 @@ TEST_F(RaftConsensusQuorumTest, TestLeaderElectionWithQuiescedQuorum) {
     LOG(INFO) << "Running election for future leader with index " << (current_config_size - 1);
     ASSERT_OK(new_leader->StartElection(RaftConsensus::ELECT_EVEN_IF_LEADER_IS_ALIVE,
                                         RaftConsensus::EXTERNAL_REQUEST));
-    WaitUntilLeaderForTests(new_leader.get());
+    ASSERT_OK(new_leader->WaitUntilLeader(MonoDelta::FromSeconds(15)));
     LOG(INFO) << "Election won";
     int64_t flush_count_after =
         new_leader->consensus_metadata_for_tests()->flush_count_for_tests();

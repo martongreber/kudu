@@ -303,6 +303,7 @@ public class AsyncKuduClient implements AutoCloseable {
   public static final long INVALID_TXN_ID = -1;
   public static final long DEFAULT_OPERATION_TIMEOUT_MS = 30000;
   public static final long DEFAULT_KEEP_ALIVE_PERIOD_MS = 15000; // 25% of the default scanner ttl.
+  public static final long DEFAULT_NEGOTIATION_TIMEOUT_MS = 10000;
   private static final long MAX_RPC_ATTEMPTS = 100;
 
   /**
@@ -425,7 +426,9 @@ public class AsyncKuduClient implements AutoCloseable {
     this.requestTracker = new RequestTracker(clientId);
 
     this.securityContext = new SecurityContext();
-    this.connectionCache = new ConnectionCache(securityContext, bootstrap, b.saslProtocolName);
+    this.connectionCache = new ConnectionCache(securityContext, bootstrap, b.saslProtocolName,
+        b.requireAuthentication, !b.encryptionPolicy.equals(EncryptionPolicy.OPTIONAL),
+        b.encryptionPolicy.equals(EncryptionPolicy.REQUIRED), b.defaultNegotiationTimeoutMs);
     this.tokenReacquirer = new AuthnTokenReacquirer(this);
     this.authzTokenCache = new AuthzTokenCache(this);
   }
@@ -631,7 +634,7 @@ public class AsyncKuduClient implements AutoCloseable {
       throw new IllegalArgumentException("CreateTableOptions may not be null");
     }
     if (!builder.getBuilder().getPartitionSchema().hasRangeSchema() &&
-        builder.getBuilder().getPartitionSchema().getHashBucketSchemasCount() == 0) {
+        builder.getBuilder().getPartitionSchema().getHashSchemaCount() == 0) {
       throw new IllegalArgumentException("Table partitioning must be specified using " +
                                          "setRangePartitionColumns or addHashPartitions");
 
@@ -2737,6 +2740,18 @@ public class AsyncKuduClient implements AutoCloseable {
     }
   }
 
+  public enum EncryptionPolicy {
+    // Optional, it uses encrypted connection if the server supports it,
+    // but it can connect to insecure servers too.
+    OPTIONAL,
+    // Only connects to remote servers that support encryption, fails
+    // otherwise. It can connect to insecure servers only locally.
+    REQUIRED_REMOTE,
+    // Only connects to any server, including on the loopback interface,
+    // that support encryption, fails otherwise.
+    REQUIRED,
+  }
+
   /**
    * Builder class to use in order to connect to Kudu.
    * All the parameters beyond those in the constructors are optional.
@@ -2750,6 +2765,7 @@ public class AsyncKuduClient implements AutoCloseable {
     private final List<HostAndPort> masterAddresses;
     private long defaultAdminOperationTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS;
     private long defaultOperationTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS;
+    private long defaultNegotiationTimeoutMs = DEFAULT_NEGOTIATION_TIMEOUT_MS;
 
     private final HashedWheelTimer timer = new HashedWheelTimer(
         new ThreadFactoryBuilder().setDaemon(true).build(), 20, MILLISECONDS);
@@ -2757,6 +2773,8 @@ public class AsyncKuduClient implements AutoCloseable {
     private int workerCount = DEFAULT_WORKER_COUNT;
     private boolean statisticsDisabled = false;
     private String saslProtocolName = "kudu";
+    private boolean requireAuthentication = false;
+    private EncryptionPolicy encryptionPolicy = EncryptionPolicy.OPTIONAL;
 
     /**
      * Creates a new builder for a client that will connect to the specified masters.
@@ -2814,6 +2832,18 @@ public class AsyncKuduClient implements AutoCloseable {
      */
     public AsyncKuduClientBuilder defaultOperationTimeoutMs(long timeoutMs) {
       this.defaultOperationTimeoutMs = timeoutMs;
+      return this;
+    }
+
+    /**
+     * Sets the default timeout used for connection negotiation.
+     * Optional.
+     * If not provided, defaults to 10s.
+     * @param timeoutMs a timeout in milliseconds
+     * @return this builder
+     */
+    public AsyncKuduClientBuilder connectionNegotiationTimeoutMs(long timeoutMs) {
+      this.defaultNegotiationTimeoutMs = timeoutMs;
       return this;
     }
 
@@ -2877,6 +2907,38 @@ public class AsyncKuduClient implements AutoCloseable {
     public AsyncKuduClientBuilder workerCount(int workerCount) {
       Preconditions.checkArgument(workerCount > 0, "workerCount should be greater than 0");
       this.workerCount = workerCount;
+      return this;
+    }
+
+    /**
+     * Require authentication for the connection to a remote server.
+     *
+     * If it's set to true, the client will require mutual authentication between
+     * the server and the client. If the server doesn't support authentication,
+     * or it's disabled, the client will fail to connect.
+     */
+    public AsyncKuduClientBuilder requireAuthentication(boolean requireAuthentication) {
+      this.requireAuthentication = requireAuthentication;
+      return this;
+    }
+
+    /**
+     * Require encryption for the connection to a remote server.
+     *
+     * If it's set to REQUIRED_REMOTE or REQUIRED, the client will
+     * require encrypting the traffic between the server and the client.
+     * If the server doesn't support encryption, or if it's disabled, the
+     * client will fail to connect.
+     *
+     * Loopback connections are encrypted only if 'encryption_policy' is
+     * set to REQUIRED, or if it's required by the server.
+     *
+     * The default value is OPTIONAL, which allows connecting to servers without
+     * encryption as well, but it will still attempt to use it if the server
+     * supports it.
+     */
+    public AsyncKuduClientBuilder encryptionPolicy(EncryptionPolicy encryptionPolicy) {
+      this.encryptionPolicy = encryptionPolicy;
       return this;
     }
 

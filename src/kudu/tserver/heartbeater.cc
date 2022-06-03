@@ -35,6 +35,7 @@
 #include <google/protobuf/stubs/common.h>
 #include <google/protobuf/stubs/port.h>
 
+#include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/replica_management.pb.h"
@@ -47,7 +48,6 @@
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/security/cert.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/security/token_verifier.h"
@@ -64,6 +64,7 @@
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/thread.h"
@@ -244,6 +245,7 @@ Status Heartbeater::Start() {
 
   return Status::OK();
 }
+
 Status Heartbeater::Stop() {
   // Stop all threads and return the first failure (if there was one).
   Status first_failure;
@@ -334,10 +336,16 @@ void Heartbeater::Thread::SetupCommonField(master::TSToMasterCommonPB* common) {
 Status Heartbeater::Thread::SetupRegistration(ServerRegistrationPB* reg) {
   reg->Clear();
 
+  vector<HostPort> hps;
+  RETURN_NOT_OK(server_->rpc_server()->GetAdvertisedHostPorts(&hps));
+  for (const auto& hp : hps) {
+    auto* pb = reg->add_rpc_addresses();
+    pb->set_host(hp.host());
+    pb->set_port(hp.port());
+  }
+  // Now fetch any UNIX domain sockets.
   vector<Sockaddr> addrs;
   RETURN_NOT_OK(CHECK_NOTNULL(server_->rpc_server())->GetAdvertisedAddresses(&addrs));
-  RETURN_NOT_OK_PREPEND(AddHostPortPBs(addrs, reg->mutable_rpc_addresses()),
-                        "Failed to add RPC addresses to registration");
   auto unix_socket_it = std::find_if(addrs.begin(), addrs.end(),
                                      [](const Sockaddr& addr) {
                                        return addr.is_unix();

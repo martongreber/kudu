@@ -22,6 +22,7 @@
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <openssl/rand.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -30,7 +31,6 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/data_dirs.h"
 #include "kudu/fs/error_manager.h"
@@ -41,6 +41,7 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/strcat.h"
@@ -51,13 +52,24 @@
 #include "kudu/util/env_util.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/oid_generator.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/timer.h"
+
+DEFINE_bool(cmeta_fsync_override_on_xfs, true,
+            "Whether to ignore --cmeta_force_fsync and instead always flush if Kudu detects "
+            "the server is on XFS. This can prevent consensus metadata corruption in the "
+            "event of sudden server failure. Disabling this flag may cause data loss in "
+            "the event of a system crash. See KUDU-2195 for more details.");
+TAG_FLAG(cmeta_fsync_override_on_xfs, experimental);
+TAG_FLAG(cmeta_fsync_override_on_xfs, advanced);
 
 DEFINE_bool(enable_data_block_fsync, true,
             "Whether to enable fsync() of data blocks, metadata, and their parent directories. "
@@ -97,6 +109,26 @@ DEFINE_string(fs_metadata_dir, "",
               "metadata directory if any exists. If none exists, fs_wal_dir "
               "will be used as the metadata directory.");
 TAG_FLAG(fs_metadata_dir, stable);
+
+DEFINE_int64(fs_wal_dir_reserved_bytes, -1,
+             "Number of bytes to reserve on the log directory filesystem for "
+             "non-Kudu usage. The default, which is represented by -1, is that "
+             "1% of the disk space on each disk will be reserved. Any other "
+             "value specified represents the number of bytes reserved and must "
+             "be greater than or equal to 0. Explicit percentages to reserve "
+             "are not currently supported");
+DEFINE_validator(fs_wal_dir_reserved_bytes, [](const char* /*n*/, int64_t v) { return v >= -1; });
+TAG_FLAG(fs_wal_dir_reserved_bytes, runtime);
+
+METRIC_DEFINE_gauge_int64(server, log_block_manager_containers_processing_time_startup,
+                          "Time taken to open all log block containers during server startup",
+                          kudu::MetricUnit::kMilliseconds,
+                          "The total time taken by the server to open all the container"
+                          "files during the startup",
+                          kudu::MetricLevel::kDebug);
+
+DECLARE_bool(encrypt_data_at_rest);
+DECLARE_int32(encryption_key_length);
 
 using kudu::fs::BlockManagerOptions;
 using kudu::fs::CreateBlockOptions;
@@ -157,7 +189,8 @@ FsManager::FsManager(Env* env, FsManagerOpts opts)
   : env_(DCHECK_NOTNULL(env)),
     opts_(std::move(opts)),
     error_manager_(new FsErrorManager()),
-    initted_(false) {
+    initted_(false),
+    meta_on_xfs_(false) {
   DCHECK(opts_.update_instances == UpdateInstanceBehavior::DONT_UPDATE ||
          !opts_.read_only) << "FsManager can only be for updated if not in read-only mode";
 }
@@ -310,14 +343,14 @@ void FsManager::InitBlockManager() {
 
 Status FsManager::PartialOpen(CanonicalizedRootsList* missing_roots) {
   RETURN_NOT_OK(Init());
-
+  string reference_instance_path;
   for (auto& root : canonicalized_all_fs_roots_) {
     if (!root.status.ok()) {
       continue;
     }
     unique_ptr<InstanceMetadataPB> pb(new InstanceMetadataPB);
     Status s = pb_util::ReadPBContainerFromPath(env_, GetInstanceMetadataPath(root.path),
-                                                pb.get());
+                                                pb.get(), pb_util::NOT_SENSITIVE);
     if (PREDICT_FALSE(!s.ok())) {
       if (s.IsNotFound()) {
         if (missing_roots) {
@@ -334,21 +367,42 @@ Status FsManager::PartialOpen(CanonicalizedRootsList* missing_roots) {
 
     if (!metadata_) {
       metadata_.reset(pb.release());
+      reference_instance_path = root.path;
     } else if (pb->uuid() != metadata_->uuid()) {
       return Status::Corruption(Substitute(
-          "Mismatched UUIDs across filesystem roots: $0 vs. $1; configuring "
-          "multiple Kudu processes with the same directory is not supported",
-          metadata_->uuid(), pb->uuid()));
+          "Mismatched UUIDs across filesystem roots: The path $0 contains UUID $1 vs. "
+          "the path $2 contains UUID $3; configuring multiple Kudu processes with the same "
+          "directory is not supported",
+          reference_instance_path, metadata_->uuid() , root.path, pb->uuid()));
     }
   }
-
   if (!metadata_) {
     return Status::NotFound("could not find a healthy instance file");
   }
+  const auto& meta_root_path = canonicalized_metadata_fs_root_.path;
+  const auto bad_meta_fs_msg =
+      Substitute("Could not determine file system of metadata directory $0",
+                 meta_root_path);
+  Status s = env_->IsOnXfsFilesystem(meta_root_path, &meta_on_xfs_);
+  if (FLAGS_cmeta_fsync_override_on_xfs) {
+    // Err on the side of visibility if we expect a behavior change based on
+    // the file system.
+    RETURN_NOT_OK_PREPEND(s, bad_meta_fs_msg);
+  } else {
+    WARN_NOT_OK(s, bad_meta_fs_msg);
+  }
+  VLOG(1) << Substitute("Detected metadata directory is $0on an XFS mount: $1",
+                        meta_on_xfs_ ? "" : "not ", meta_root_path);
   return Status::OK();
 }
 
-Status FsManager::Open(FsReport* report) {
+Status FsManager::Open(FsReport* report, Timer* read_instance_metadata_files,
+                       Timer* read_data_directories,
+                       std::atomic<int>* containers_processed,
+                       std::atomic<int>* containers_total) {
+  if (read_instance_metadata_files) {
+    read_instance_metadata_files->Start();
+  }
   // Load and verify the instance metadata files.
   //
   // Done first to minimize side effects in the case that the configured roots
@@ -399,6 +453,15 @@ Status FsManager::Open(FsReport* report) {
       RETURN_NOT_OK_PREPEND(s, kUnableToCreateMsg);
     }
   }
+  if (read_instance_metadata_files) {
+    read_instance_metadata_files->Stop();
+  }
+
+  if (!server_key().empty()) {
+    env_->SetEncryptionKey(server_key().length() * 4,
+                           reinterpret_cast<const uint8_t*>(
+                             strings::a2b_hex(server_key()).c_str()));
+  }
 
   // Open the directory manager if it has not been opened already.
   if (!dd_manager_) {
@@ -429,12 +492,25 @@ Status FsManager::Open(FsReport* report) {
 
   // Finally, initialize and open the block manager if needed.
   if (!opts_.skip_block_manager) {
+    if (read_data_directories) {
+      read_data_directories->Start();
+    }
     InitBlockManager();
     LOG_TIMING(INFO, "opening block manager") {
-      RETURN_NOT_OK(block_manager_->Open(report));
+      if (opts_.block_manager_type == "file") {
+        RETURN_NOT_OK(block_manager_->Open(report));
+      } else {
+        RETURN_NOT_OK(block_manager_->Open(report, containers_processed, containers_total));
+      }
+    }
+    if (read_data_directories) {
+      read_data_directories->Stop();
+      if (opts_.metric_entity && opts_.block_manager_type == "log") {
+        METRIC_log_block_manager_containers_processing_time_startup.Instantiate(opts_.metric_entity,
+            (read_data_directories->TimeElapsed()).ToMilliseconds());
+      }
     }
   }
-
   // Report wal and metadata directories.
   if (report) {
     report->wal_dir = canonicalized_wal_fs_root_.path;
@@ -466,7 +542,8 @@ Status FsManager::Open(FsReport* report) {
   return Status::OK();
 }
 
-Status FsManager::CreateInitialFileSystemLayout(boost::optional<string> uuid) {
+Status FsManager::CreateInitialFileSystemLayout(boost::optional<string> uuid,
+                                                boost::optional<string> server_key) {
   CHECK(!opts_.read_only);
 
   RETURN_NOT_OK(Init());
@@ -490,7 +567,7 @@ Status FsManager::CreateInitialFileSystemLayout(boost::optional<string> uuid) {
   //
   // Files/directories created will NOT be synchronized to disk.
   InstanceMetadataPB metadata;
-  RETURN_NOT_OK_PREPEND(CreateInstanceMetadata(std::move(uuid), &metadata),
+  RETURN_NOT_OK_PREPEND(CreateInstanceMetadata(std::move(uuid), std::move(server_key), &metadata),
                         "unable to create instance metadata");
   RETURN_NOT_OK_PREPEND(FsManager::CreateFileSystemRoots(
       canonicalized_all_fs_roots_, metadata, &created_dirs, &created_files),
@@ -585,6 +662,7 @@ Status FsManager::CreateFileSystemRoots(
 }
 
 Status FsManager::CreateInstanceMetadata(boost::optional<string> uuid,
+                                         boost::optional<string> server_key,
                                          InstanceMetadataPB* metadata) {
   if (uuid) {
     string canonicalized_uuid;
@@ -592,6 +670,16 @@ Status FsManager::CreateInstanceMetadata(boost::optional<string> uuid,
     metadata->set_uuid(canonicalized_uuid);
   } else {
     metadata->set_uuid(oid_generator_.Next());
+  }
+  if (server_key) {
+    metadata->set_server_key(server_key.get());
+  } else if (FLAGS_encrypt_data_at_rest) {
+    uint8_t key_bytes[32];
+    int num_bytes = FLAGS_encryption_key_length / 8;
+    DCHECK(num_bytes <= sizeof(key_bytes));
+    OPENSSL_RET_NOT_OK(RAND_bytes(key_bytes, num_bytes),
+                       "Failed to generate random key");
+    strings::b2a_hex(key_bytes, metadata->mutable_server_key(), num_bytes);
   }
 
   string time_str;
@@ -613,7 +701,8 @@ Status FsManager::WriteInstanceMetadata(const InstanceMetadataPB& metadata,
   RETURN_NOT_OK(pb_util::WritePBContainerToPath(env_, path,
                                                 metadata,
                                                 pb_util::NO_OVERWRITE,
-                                                pb_util::SYNC));
+                                                pb_util::SYNC,
+                                                pb_util::NOT_SENSITIVE));
   LOG(INFO) << "Generated new instance metadata in path " << path << ":\n"
             << SecureDebugString(metadata);
   return Status::OK();
@@ -621,6 +710,10 @@ Status FsManager::WriteInstanceMetadata(const InstanceMetadataPB& metadata,
 
 const string& FsManager::uuid() const {
   return CHECK_NOTNULL(metadata_.get())->uuid();
+}
+
+const string& FsManager::server_key() const {
+  return CHECK_NOTNULL(metadata_.get())->server_key();
 }
 
 vector<string> FsManager::GetDataRootDirs() const {
@@ -639,21 +732,20 @@ string FsManager::GetTabletMetadataPath(const string& tablet_id) const {
 
 bool FsManager::IsValidTabletId(const string& fname) {
   // Prevent warning logs for hidden files or ./..
-  if (HasPrefixString(fname, ".")) {
+  if (PREDICT_FALSE(HasPrefixString(fname, "."))) {
     VLOG(1) << "Ignoring hidden file in tablet metadata dir: " << fname;
     return false;
   }
 
   string canonicalized_uuid;
   Status s = oid_generator_.Canonicalize(fname, &canonicalized_uuid);
-
-  if (!s.ok()) {
+  if (PREDICT_FALSE(!s.ok())) {
     LOG(WARNING) << "Ignoring file in tablet metadata dir: " << fname << ": " <<
                  s.message().ToString();
     return false;
   }
 
-  if (fname != canonicalized_uuid) {
+  if (PREDICT_FALSE(fname != canonicalized_uuid)) {
     LOG(WARNING) << "Ignoring file in tablet metadata dir: " << fname << ": " <<
                  Substitute("canonicalized uuid $0 does not match file name",
                             canonicalized_uuid);
@@ -669,12 +761,13 @@ Status FsManager::ListTabletIds(vector<string>* tablet_ids) {
   RETURN_NOT_OK_PREPEND(ListDir(dir, &children),
                         Substitute("Couldn't list tablets in metadata directory $0", dir));
 
-  vector<string> tablets;
-  for (const string& child : children) {
-    if (!IsValidTabletId(child)) {
+  // Suppose all children are valid tablet metadata.
+  tablet_ids->reserve(children.size());
+  for (auto& child : children) {
+    if (PREDICT_FALSE(!IsValidTabletId(child))) {
       continue;
     }
-    tablet_ids->push_back(child);
+    tablet_ids->emplace_back(std::move(child));
   }
   return Status::OK();
 }
@@ -780,10 +873,6 @@ bool FsManager::BlockExists(const BlockId& block_id) const {
   DCHECK(block_manager_);
   unique_ptr<ReadableBlock> block;
   return block_manager_->OpenBlock(block_id, &block).ok();
-}
-
-std::ostream& operator<<(std::ostream& o, const BlockId& block_id) {
-  return o << block_id.ToString();
 }
 
 } // namespace kudu

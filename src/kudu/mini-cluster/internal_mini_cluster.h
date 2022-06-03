@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <glog/logging.h>
+#include <gtest/gtest_prod.h>
 
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/gutil/macros.h"
@@ -48,6 +49,10 @@ class TSDescriptor;
 namespace rpc {
 class Messenger;
 } // namespace rpc
+
+namespace tools {
+class ToolTest_TestRebuildTserverByLocalReplicaCopy_Test;
+} // namespace tools
 
 namespace tserver {
 class MiniTabletServer;
@@ -113,6 +118,10 @@ class InternalMiniCluster : public MiniCluster {
   // Requires that the master is already running.
   Status AddTabletServer();
 
+  // Add a new TS to the cluster with a specific hostname/ip and port.
+  // Requires that the master is already running.
+  Status AddTabletServer(const HostPort& hp);
+
   // If this cluster is configured for a single non-distributed
   // master, return the single master. Exits with a CHECK failure if
   // there are multiple masters.
@@ -152,6 +161,20 @@ class InternalMiniCluster : public MiniCluster {
 
   // Returns the Env on which the cluster operates.
   Env* env() const override {
+    return env_;
+  }
+
+  // Returns the default environment. As the servers in an internal mini-cluster
+  // share the same Env, each tablet server uses the same server key, so the
+  // default Env can be used here.
+  Env* ts_env(int ts_idx) const override {
+    return env_;
+  }
+
+  // Returns the default environment. As the servers in an internal mini-cluster
+  // share the same Env, each master uses the same server key, so the default
+  // Env can be used here.
+  Env* master_env(int master_idx) const override {
     return env_;
   }
 
@@ -211,6 +234,7 @@ class InternalMiniCluster : public MiniCluster {
       int idx) const override;
 
  private:
+  FRIEND_TEST(kudu::tools::ToolTest, TestRebuildTserverByLocalReplicaCopy);
 
   // Creates and starts the cluster masters.
   Status StartMasters();

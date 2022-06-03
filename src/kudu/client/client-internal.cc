@@ -61,13 +61,13 @@
 #include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/cert.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/thread_restrictions.h"
 
 DECLARE_int32(dns_resolver_max_threads_num);
@@ -93,6 +93,8 @@ using kudu::master::IsAlterTableDoneRequestPB;
 using kudu::master::IsAlterTableDoneResponsePB;
 using kudu::master::IsCreateTableDoneRequestPB;
 using kudu::master::IsCreateTableDoneResponsePB;
+using kudu::master::ListTablesRequestPB;
+using kudu::master::ListTablesResponsePB;
 using kudu::master::ListTabletServersRequestPB;
 using kudu::master::ListTabletServersResponsePB;
 using kudu::master::MasterFeatures;
@@ -430,6 +432,37 @@ Status KuduClient::Data::WaitForAlterTableToFinish(
       [&](const MonoTime& deadline, bool* retry) {
         return IsAlterTableInProgress(client, table, deadline, retry);
       });
+}
+
+Status KuduClient::Data::ListTablesWithInfo(KuduClient* client,
+                                            vector<TableInfo>* tables_info,
+                                            const string& filter) {
+  ListTablesRequestPB req;
+  if (!filter.empty()) {
+    req.set_name_filter(filter);
+  }
+
+  auto deadline = MonoTime::Now() + client->default_admin_operation_timeout();
+  Synchronizer sync;
+  ListTablesResponsePB resp;
+  AsyncLeaderMasterRpc<ListTablesRequestPB, ListTablesResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, &resp,
+      &MasterServiceProxy::ListTablesAsync, "ListTables",
+      sync.AsStatusCallback(), {});
+  rpc.SendRpc();
+  RETURN_NOT_OK(sync.Wait());
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  for (const auto& table : resp.tables()) {
+    TableInfo info;
+    info.table_name = table.name();
+    info.live_row_count = table.has_live_row_count() ? table.live_row_count() : 0;
+    info.num_tablets = table.has_num_tablets() ? table.num_tablets() : 0;
+    info.num_replicas = table.has_num_replicas() ? table.num_replicas() : 0;
+    tables_info->emplace_back(std::move(info));
+  }
+  return Status::OK();
 }
 
 Status KuduClient::Data::InitLocalHostNames() {

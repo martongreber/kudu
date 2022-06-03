@@ -17,11 +17,10 @@
 
 #include "kudu/fs/block_manager.h"
 
-#include <stdlib.h>
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <memory>
 #include <ostream>
@@ -328,7 +327,8 @@ void BlockManagerTest<FileBlockManager>::RunMultipathTest(const vector<string>& 
       DirInstanceMetadataPB instance;
       ASSERT_OK(pb_util::ReadPBContainerFromPath(env_,
                                                  JoinPathSegments(path, child),
-                                                 &instance));
+                                                 &instance,
+                                                 pb_util::NOT_SENSITIVE));
     }
   }
   // Create a DataDirGroup for the data that's about to be inserted.
@@ -1051,7 +1051,9 @@ TYPED_TEST(BlockManagerTest, TestGetAllBlockIds) {
                          string("12345"), // not a real block ID
                          ids.begin()->ToString() }) { // not in a block directory
     unique_ptr<WritableFile> writer;
-    ASSERT_OK(this->env_->NewWritableFile(
+    WritableFileOptions opts;
+    opts.is_sensitive = true;
+    ASSERT_OK(this->env_->NewWritableFile(opts,
         JoinPathSegments(this->test_dir_, s), &writer));
     ASSERT_OK(writer->Close());
   }

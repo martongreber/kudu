@@ -275,6 +275,17 @@ void MasterServiceImpl::AddMaster(const AddMasterRequestPB* req,
       rpc->RespondSuccess();
       return;
     }
+    // Several errors may show up in the Raft layer, usually indicating a lack
+    // of or change in leadership, or an otherwise transient issue. Catch these
+    // and return a retriable error.
+    if (s.IsIllegalState() || s.IsServiceUnavailable() || s.IsAborted()) {
+      LOG(WARNING) << Substitute("AddMaster $0 failed with retriable error: $1",
+                                 hp.ToString(), s.ToString());
+      StatusToPB(s, resp->mutable_error()->mutable_status());
+      resp->mutable_error()->set_code(MasterErrorPB::NOT_THE_LEADER);
+      rpc->RespondSuccess();
+      return;
+    }
     LOG(ERROR) << Substitute("Failed adding master $0. $1", hp.ToString(), s.ToString());
     rpc->RespondFailure(s);
     return;
@@ -320,10 +331,26 @@ void MasterServiceImpl::RemoveMaster(const RemoveMasterRequestPB* req,
   // See completion_cb in CatalogManager::InitiateMasterChangeConfig().
 }
 
+void MasterServiceImpl::UnregisterTServer(const UnregisterTServerRequestPB* req,
+                                          UnregisterTServerResponsePB* resp,
+                                          rpc::RpcContext* rpc) {
+  const auto& ts_uuid = req->uuid();
+  bool force_unregister_live_tserver = req->force_unregister_live_tserver();
+
+  Status s = server_->ts_manager()->UnregisterTServer(ts_uuid, force_unregister_live_tserver);
+  if (PREDICT_FALSE(!s.ok() && !s.IsNotFound())) {
+    // Ignore the NotFound error to make this RPC retriable and effectively idempotent.
+    StatusToPB(s, resp->mutable_error()->mutable_status());
+    resp->mutable_error()->set_code(MasterErrorPB::UNKNOWN_ERROR);
+  }
+
+  rpc->RespondSuccess();
+}
+
 void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
                                     TSHeartbeatResponsePB* resp,
                                     rpc::RpcContext* rpc) {
-  // If CatalogManager is not initialized don't even know whether
+  // 1. If CatalogManager is not initialized don't even know whether
   // or not we will be a leader (so we can't tell whether or not we can
   // accept tablet reports).
   CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());

@@ -54,6 +54,7 @@
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/consensus/replica_management.pb.h"
@@ -84,6 +85,7 @@
 #include "kudu/tablet/ops/write_op.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet.pb.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_replica.h"
@@ -206,6 +208,7 @@ using kudu::consensus::LeaderStepDownRequestPB;
 using kudu::consensus::LeaderStepDownResponsePB;
 using kudu::consensus::OpId;
 using kudu::consensus::RaftConsensus;
+using kudu::consensus::RaftPeerPB;
 using kudu::consensus::RunLeaderElectionRequestPB;
 using kudu::consensus::RunLeaderElectionResponsePB;
 using kudu::consensus::StartTabletCopyRequestPB;
@@ -219,7 +222,7 @@ using kudu::fault_injection::MaybeTrue;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::ErrorStatusPB;
-using kudu::rpc::ParseVerificationResult;
+using kudu::rpc::ParseTokenVerificationResult;
 using kudu::rpc::RpcContext;
 using kudu::rpc::RpcSidecar;
 using kudu::security::TokenPB;
@@ -618,7 +621,7 @@ static bool VerifyAuthzTokenOrRespond(const TokenVerifier& token_verifier,
   TokenPB token_pb;
   const auto result = token_verifier.VerifyTokenSignature(req.authz_token(), &token_pb);
   ErrorStatusPB::RpcErrorCodePB error;
-  Status s = ParseVerificationResult(result,
+  Status s = ParseTokenVerificationResult(result,
       ErrorStatusPB::ERROR_INVALID_AUTHORIZATION_TOKEN, &error);
   if (!s.ok()) {
     context->RespondRpcFailure(error, s.CloneAndPrepend("authz token verification failure"));
@@ -1167,8 +1170,9 @@ void TabletServiceAdminImpl::AlterSchema(const AlterSchemaRequestPB* req,
       return;
     }
 
-    Schema tablet_schema = replica->tablet_metadata()->schema();
-    if (req_schema.Equals(tablet_schema)) {
+    const SchemaPtr tablet_schema_ptr = replica->tablet_metadata()->schema();
+    const Schema& tablet_schema = *tablet_schema_ptr;
+    if (req_schema == tablet_schema) {
       context->RespondSuccess();
       return;
     }
@@ -2175,8 +2179,8 @@ void TabletServiceImpl::Scan(const ScanRequestPB* req,
     // If the token doesn't have full scan privileges for the table, check
     // for required privileges based on the scan request.
     if (!privilege.scan_privilege()) {
-      const auto& schema = replica->tablet_metadata()->schema();
-      if (!CheckScanPrivilegesOrRespond(scan_pb, schema, authorized_column_ids,
+      const SchemaPtr schema_ptr = replica->tablet_metadata()->schema();
+      if (!CheckScanPrivilegesOrRespond(scan_pb, *schema_ptr, authorized_column_ids,
                                         "Scan", context)) {
         return;
       }
@@ -2244,12 +2248,19 @@ void TabletServiceImpl::ListTablets(const ListTabletsRequestPB* req,
   for (const scoped_refptr<TabletReplica>& replica : replicas) {
     StatusAndSchemaPB* status = replica_status->Add();
     replica->GetTabletStatusPB(status->mutable_tablet_status());
+    if (status->tablet_status().state() == tablet::RUNNING) {
+      status->set_role(replica->consensus()->role());
+    } else {
+      status->set_role(RaftPeerPB::UNKNOWN_ROLE);
+    }
 
     if (req->need_schema_info()) {
-      CHECK_OK(SchemaToPB(replica->tablet_metadata()->schema(),
-                          status->mutable_schema()));
+      const SchemaPtr schema_ptr = replica->tablet_metadata()->schema();
+      const Schema& tablet_schema = *schema_ptr;
+      CHECK_OK(SchemaToPB(tablet_schema, status->mutable_schema()));
       CHECK_OK(replica->tablet_metadata()->partition_schema().ToPB(
-          replica->tablet_metadata()->schema(), status->mutable_partition_schema()));
+          tablet_schema, status->mutable_partition_schema()));
+      status->set_schema_version(replica->tablet_metadata()->schema_version());
     }
   }
   context->RespondSuccess();
@@ -2291,7 +2302,8 @@ void TabletServiceImpl::SplitKeyRange(const SplitKeyRangeRequestPB* req,
       return;
     }
     if (!privilege.scan_privilege()) {
-      const auto& schema = replica->tablet_metadata()->schema();
+      const SchemaPtr schema_ptr = replica->tablet_metadata()->schema();
+      const Schema& schema = *schema_ptr;
       unordered_set<ColumnId> required_column_privileges;
       if (req->has_start_primary_key() || req->has_stop_primary_key()) {
         const auto& key_cols = schema.get_key_column_ids();
@@ -2336,7 +2348,8 @@ void TabletServiceImpl::SplitKeyRange(const SplitKeyRangeRequestPB* req,
 
   // Decode encoded key
   Arena arena(256);
-  Schema tablet_schema = replica->tablet_metadata()->schema();
+  const SchemaPtr tablet_schema_ptr = replica->tablet_metadata()->schema();
+  const Schema& tablet_schema = *tablet_schema_ptr;
   EncodedKey* start = nullptr;
   EncodedKey* stop = nullptr;
   if (req->has_start_primary_key()) {
@@ -2361,7 +2374,7 @@ void TabletServiceImpl::SplitKeyRange(const SplitKeyRangeRequestPB* req,
   }
   if (req->has_start_primary_key() && req->has_stop_primary_key()) {
     // Validate the start key is less than the stop key, if they are both set
-    if (start->encoded_key().compare(stop->encoded_key()) > 0) {
+    if (start->encoded_key() > stop->encoded_key()) {
       SetupErrorAndRespond(resp->mutable_error(),
                            Status::InvalidArgument("Invalid primary key range"),
                            TabletServerErrorPB::UNKNOWN_ERROR,
@@ -2473,8 +2486,8 @@ void TabletServiceImpl::Checksum(const ChecksumRequestPB* req,
     // If the token doesn't have full scan privileges for the table, check
     // for required privileges based on the checksum request.
     if (!privilege.scan_privilege()) {
-      const auto& schema = replica->tablet_metadata()->schema();
-      if (!CheckScanPrivilegesOrRespond(new_req, schema, authorized_column_ids,
+      const SchemaPtr schema_ptr = replica->tablet_metadata()->schema();
+      if (!CheckScanPrivilegesOrRespond(new_req, *schema_ptr, authorized_column_ids,
                                         "Checksum", context)) {
         return;
       }
@@ -2779,7 +2792,8 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
     }
   }
 
-  const Schema& tablet_schema = replica->tablet_metadata()->schema();
+  const SchemaPtr tablet_schema_ptr = replica->tablet_metadata()->schema();
+  const Schema& tablet_schema = *tablet_schema_ptr;
 
   ScanSpec spec;
   s = SetupScanSpec(scan_pb, tablet_schema, scanner, &spec);

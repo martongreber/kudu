@@ -26,6 +26,7 @@
 #include <ostream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -210,6 +211,11 @@ struct ExternalMiniClusterOptions {
   // Default: false.
   bool enable_ranger;
 
+  // If true, enable data at rest encryption.
+  //
+  // Default: false.
+  bool enable_encryption;
+
   // If true, sends logging output to stderr instead of a log file.
   //
   // Default: true.
@@ -250,6 +256,9 @@ struct ExternalMiniClusterOptions {
   // Default: BuiltinNtpConfigMode::ALL_SERVERS
   BuiltinNtpConfigMode ntp_config_mode;
 #endif // #if !defined(NO_CHRONY) ...
+
+  std::string master_alias_prefix;
+  std::string tserver_alias_prefix;
 };
 
 // A mini-cluster made up of subprocesses running each of the daemons
@@ -278,6 +287,9 @@ class ExternalMiniCluster : public MiniCluster {
   // Add a new TS to the cluster. The new TS is started.
   // Requires that the master is already running.
   Status AddTabletServer();
+
+  // Add a new master to the cluster. The new master is started.
+  Status AddMaster(const std::vector<std::string>& extra_flags = {});
 
 #if !defined(NO_CHRONY)
   // Add a new NTP server to the cluster. The new NTP server is started upon
@@ -390,8 +402,16 @@ class ExternalMiniCluster : public MiniCluster {
   // Returns the UUID for the tablet server 'ts_idx'.
   virtual std::string UuidForTS(int ts_idx) const override;
 
-  // Returns the Env on which the cluster operates.
+  // Returns the Env on which the cluster operates. If encryption is enabled,
+  // the encryption key is incorrect. For reading/writing files, ts_env() and
+  // master_env() should be used instead.
   virtual Env* env() const override;
+
+  // Returns the Env on which a specific tablet server operates.
+  virtual Env* ts_env(int ts_idx) const override;
+
+  // Returns the Env on which a specific master operates.
+  virtual Env* master_env(int master_idx) const override;
 
   BindMode bind_mode() const override {
     return opts_.bind_mode;
@@ -411,9 +431,12 @@ class ExternalMiniCluster : public MiniCluster {
   }
 
   // Wait until the number of registered tablet servers reaches the given count
-  // on all of the running masters. Returns Status::TimedOut if the desired
-  // count is not achieved with the given timeout.
-  Status WaitForTabletServerCount(int count, const MonoDelta& timeout);
+  // on running masters. Returns Status::TimedOut if the desired count is not
+  // achieved or if the masters cannot be reached within the given timeout. If
+  // 'master_idx' is specified, only examines the given master if it's running.
+  // Otherwise, checks all running masters.
+  Status WaitForTabletServerCount(int count, const MonoDelta& timeout,
+                                  int master_idx = -1);
 
   // Runs gtest assertions that no servers have crashed.
   void AssertNoCrashes();
@@ -492,6 +515,19 @@ class ExternalMiniCluster : public MiniCluster {
   // This helps keep the state of the actual cluster in sync with the state in ExternalMiniCluster.
   Status RemoveMaster(const HostPort& hp);
 
+  const std::string& dns_overrides() const {
+    return dns_overrides_;
+  }
+  // Constructs an ExternalMaster based on 'opts_' but with the given set of
+  // master addresses, giving the new master the address in the list
+  // corresponding to 'idx'. Callers are expected to call Start() with the
+  // output 'master'.
+  //
+  // It's expected that the port for the master at 'idx' is reserved, and that
+  // the master can be run with the --rpc_reuseport flag.
+  Status CreateMaster(const std::vector<HostPort>& master_rpc_addrs, int idx,
+                      scoped_refptr<ExternalMaster>* master);
+
  private:
   Status StartMasters();
 
@@ -515,15 +551,19 @@ class ExternalMiniCluster : public MiniCluster {
 
   std::shared_ptr<rpc::Messenger> messenger_;
 
+  std::string dns_overrides_;
+
   DISALLOW_COPY_AND_ASSIGN(ExternalMiniCluster);
 };
 
 struct ExternalDaemonOptions {
   ExternalDaemonOptions()
-      : logtostderr(false) {
+      : logtostderr(false),
+        enable_encryption(false) {
   }
 
   bool logtostderr;
+  bool enable_encryption;
   std::shared_ptr<rpc::Messenger> messenger;
   std::string block_manager_type;
   std::string exe;
@@ -591,6 +631,8 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
                         const std::string& principal_base,
                         const std::string& bind_host);
 
+  Status SetServerKey();
+
   // Sends a SIGSTOP signal to the daemon.
   Status Pause() WARN_UNUSED_RESULT;
 
@@ -643,6 +685,14 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
 
   // Return the options used to create the daemon.
   ExternalDaemonOptions opts() const { return opts_; }
+
+  virtual Env* env() const;
+
+  void SetRpcBindAddress(HostPort rpc_hostport) {
+    DCHECK(!IsProcessAlive());
+    bound_rpc_ = std::move(rpc_hostport);
+    opts_.rpc_bind_address = bound_rpc_;
+  }
 
  protected:
   friend class RefCountedThreadSafe<ExternalDaemon>;
@@ -729,6 +779,8 @@ class ExternalMaster : public ExternalDaemon {
   // Requires that it has previously been shutdown.
   virtual Status Restart() override WARN_UNUSED_RESULT;
 
+  Env* env() const override { return env_.get(); }
+
   // Blocks until the master's catalog manager is initialized and responding to
   // RPCs. If 'wait_mode' is WAIT_FOR_LEADERSHIP, will further block until the
   // master has been elected leader.
@@ -753,6 +805,7 @@ class ExternalMaster : public ExternalDaemon {
   // addresses in case of restart.
   static std::vector<std::string> GetCommonFlags(const HostPort& rpc_bind_addr,
                                                  const HostPort& http_addr = HostPort());
+  const std::unique_ptr<Env> env_;
   virtual ~ExternalMaster();
 };
 
@@ -767,8 +820,10 @@ class ExternalTabletServer : public ExternalDaemon {
   // Requires that it has previously been shutdown.
   virtual Status Restart() override WARN_UNUSED_RESULT;
 
+  Env* env() const override { return env_.get(); }
  private:
   const std::vector<HostPort> master_addrs_;
+  const std::unique_ptr<Env> env_;
 
   friend class RefCountedThreadSafe<ExternalTabletServer>;
   virtual ~ExternalTabletServer();

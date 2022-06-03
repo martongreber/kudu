@@ -808,6 +808,20 @@ KuduColumnTypeAttributes KuduColumnSchema::type_attributes() const {
                                   type_attributes.length);
 }
 
+KuduColumnStorageAttributes KuduColumnSchema::storage_attributes() const {
+  ColumnStorageAttributes storage_attributes = DCHECK_NOTNULL(col_)->attributes();
+  KuduColumnStorageAttributes::EncodingType encoding_type;
+  KuduColumnStorageAttributes::StringToEncodingType(
+      kudu::EncodingType_Name(storage_attributes.encoding),
+      &encoding_type);
+  KuduColumnStorageAttributes::CompressionType compression_type;
+  KuduColumnStorageAttributes::StringToCompressionType(
+      kudu::CompressionType_Name(storage_attributes.compression),
+      &compression_type);
+  return KuduColumnStorageAttributes(encoding_type, compression_type,
+                                     storage_attributes.cfile_block_size);
+}
+
 const string& KuduColumnSchema::comment() const {
   return DCHECK_NOTNULL(col_)->comment();
 }
@@ -864,8 +878,7 @@ Status KuduSchema::Reset(const vector<KuduColumnSchema>& columns, int key_column
 }
 
 bool KuduSchema::operator==(const KuduSchema& rhs) const {
-  return this == &rhs ||
-      (schema_ && rhs.schema_ && schema_->Equals(*rhs.schema_));
+  return this == &rhs || (schema_ && rhs.schema_ && (*schema_ == *rhs.schema_));
 }
 
 bool KuduSchema::operator!=(const KuduSchema& rhs) const {

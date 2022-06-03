@@ -81,11 +81,12 @@ using strings::Substitute;
 namespace kudu {
 namespace tablet {
 
-using pb_util::SecureShortDebugString;
 using consensus::CommitMsg;
 using consensus::DriverType;
 using consensus::ReplicateMsg;
 using consensus::WRITE_OP;
+using pb_util::SecureShortDebugString;
+using tserver::ResourceMetricsPB;
 using tserver::TabletServerErrorPB;
 using tserver::WriteRequestPB;
 using tserver::WriteResponsePB;
@@ -159,7 +160,9 @@ void WriteOp::NewReplicateMsg(unique_ptr<ReplicateMsg>* replicate_msg) {
 
 Status WriteOp::Prepare() {
   TRACE_EVENT0("op", "WriteOp::Prepare");
-  TRACE("PREPARE: Starting.");
+
+  Tablet* tablet = state()->tablet_replica()->tablet();
+  TRACE(Substitute("PREPARE: Starting on tablet $0", tablet->tablet_id()));
   // Decode everything first so that we give up if something major is wrong.
   Schema client_schema;
   RETURN_NOT_OK_PREPEND(SchemaFromPB(state_->request()->schema(), &client_schema),
@@ -171,8 +174,6 @@ Status WriteOp::Prepare() {
     state_->completion_callback()->set_error(s, TabletServerErrorPB::INVALID_SCHEMA);
     return s;
   }
-
-  Tablet* tablet = state()->tablet_replica()->tablet();
 
   // Before taking any other locks, acquire the transaction state lock and
   // ensure it is open.
@@ -224,7 +225,7 @@ Status WriteOp::Prepare() {
   }
   RETURN_NOT_OK(tablet->AcquireRowLocks(state()));
 
-  TRACE("PREPARE: Finished.");
+  TRACE("PREPARE: Finished");
   return Status::OK();
 }
 
@@ -243,19 +244,20 @@ Status WriteOp::Start() {
   return Status::OK();
 }
 
-void WriteOp::UpdatePerRowErrors() {
-  // Add per-row errors to the result, update metrics.
-  for (int i = 0; i < state()->row_ops().size(); ++i) {
-    const RowOp* op = state()->row_ops()[i];
+void WriteOp::UpdatePerRowMetricsAndErrors() {
+  // Update metrics or add per-row errors to the result.
+  size_t idx = 0;
+  for (const auto* op : state()->row_ops()) {
     if (op->result->has_failed_status()) {
       // Replicas disregard the per row errors, for now
       // TODO(unknown): check the per-row errors against the leader's, at least in debug mode
       WriteResponsePB::PerRowErrorPB* error = state()->response()->add_per_row_errors();
-      error->set_row_index(i);
+      error->set_row_index(idx);
       error->mutable_error()->CopyFrom(op->result->failed_status());
+    } else {
+      state()->UpdateMetricsForOp(*op);
     }
-
-    state()->UpdateMetricsForOp(*op);
+    ++idx;
   }
 }
 
@@ -263,7 +265,7 @@ void WriteOp::UpdatePerRowErrors() {
 // it seems pointless to return a Status!
 Status WriteOp::Apply(CommitMsg** commit_msg) {
   TRACE_EVENT0("op", "WriteOp::Apply");
-  TRACE("APPLY: Starting.");
+  TRACE("APPLY: Starting");
 
   if (PREDICT_FALSE(ANNOTATE_UNPROTECTED_READ(
       FLAGS_tablet_inject_latency_on_apply_write_op_ms) > 0)) {
@@ -274,9 +276,9 @@ Status WriteOp::Apply(CommitMsg** commit_msg) {
 
   Tablet* tablet = state()->tablet_replica()->tablet();
   RETURN_NOT_OK(tablet->ApplyRowOperations(state()));
-  TRACE("APPLY: Finished.");
+  TRACE("APPLY: Finished");
 
-  UpdatePerRowErrors();
+  UpdatePerRowMetricsAndErrors();
 
   // Create the Commit message
   *commit_msg = google::protobuf::Arena::CreateMessage<CommitMsg>(state_->pb_arena());
@@ -289,32 +291,38 @@ Status WriteOp::Apply(CommitMsg** commit_msg) {
 void WriteOp::Finish(OpResult result) {
   TRACE_EVENT0("op", "WriteOp::Finish");
 
+  if (result == Op::APPLIED) {
+    // Populate response metrics.
+    state()->FillResponseMetrics(type());
+  }
+
   state()->FinishApplyingOrAbort(result);
 
   if (PREDICT_FALSE(result == Op::ABORTED)) {
-    TRACE("FINISH: Op aborted.");
+    TRACE("FINISH: Op aborted");
     return;
   }
 
   DCHECK_EQ(result, Op::APPLIED);
 
-  TRACE("FINISH: Updating metrics.");
+  TRACE("FINISH: Updating metrics");
 
-  TabletMetrics* metrics = state_->tablet_replica()->tablet()->metrics();
-  if (metrics) {
+  if (auto* metrics = state_->tablet_replica()->tablet()->metrics();
+      PREDICT_TRUE(metrics != nullptr)) {
     // TODO(unknown): should we change this so it's actually incremented by the
     // Tablet code itself instead of this wrapper code?
-    metrics->rows_inserted->IncrementBy(state_->metrics().successful_inserts);
-    metrics->insert_ignore_errors->IncrementBy(state_->metrics().insert_ignore_errors);
-    metrics->rows_upserted->IncrementBy(state_->metrics().successful_upserts);
-    metrics->rows_updated->IncrementBy(state_->metrics().successful_updates);
-    metrics->update_ignore_errors->IncrementBy(state_->metrics().update_ignore_errors);
-    metrics->rows_deleted->IncrementBy(state_->metrics().successful_deletes);
-    metrics->delete_ignore_errors->IncrementBy(state_->metrics().delete_ignore_errors);
+    const auto& op_m = state_->metrics();
+    metrics->rows_inserted->IncrementBy(op_m.successful_inserts);
+    metrics->insert_ignore_errors->IncrementBy(op_m.insert_ignore_errors);
+    metrics->rows_upserted->IncrementBy(op_m.successful_upserts);
+    metrics->rows_updated->IncrementBy(op_m.successful_updates);
+    metrics->update_ignore_errors->IncrementBy(op_m.update_ignore_errors);
+    metrics->rows_deleted->IncrementBy(op_m.successful_deletes);
+    metrics->delete_ignore_errors->IncrementBy(op_m.delete_ignore_errors);
 
     if (type() == consensus::LEADER) {
       if (state()->external_consistency_mode() == COMMIT_WAIT) {
-        metrics->commit_wait_duration->Increment(state_->metrics().commit_wait_duration_usec);
+        metrics->commit_wait_duration->Increment(op_m.commit_wait_duration_usec);
       }
       uint64_t op_duration_usec =
           (MonoTime::Now() - start_time_).ToMicroseconds();
@@ -477,9 +485,7 @@ void WriteOpState::ReleaseTxResultPB(TxResultPB* result) const {
 }
 
 void WriteOpState::UpdateMetricsForOp(const RowOp& op) {
-  if (op.result->has_failed_status()) {
-    return;
-  }
+  DCHECK(!op.result->has_failed_status());
   switch (op.decoded_op.type) {
     case RowOperationsPB::INSERT:
       DCHECK(!op.error_ignored);
@@ -653,6 +659,21 @@ string WriteOpState::ToString() const {
                     SecureShortDebugString(op_id()),
                     ts_str,
                     row_ops_str);
+}
+
+void WriteOpState::FillResponseMetrics(consensus::DriverType type) {
+  const auto& op_m = op_metrics_;
+  tserver::ResourceMetricsPB* resp_metrics = response_->mutable_resource_metrics();
+  resp_metrics->set_successful_inserts(op_m.successful_inserts);
+  resp_metrics->set_insert_ignore_errors(op_m.insert_ignore_errors);
+  resp_metrics->set_successful_upserts(op_m.successful_upserts);
+  resp_metrics->set_successful_updates(op_m.successful_updates);
+  resp_metrics->set_update_ignore_errors(op_m.update_ignore_errors);
+  resp_metrics->set_successful_deletes(op_m.successful_deletes);
+  resp_metrics->set_delete_ignore_errors(op_m.delete_ignore_errors);
+  if (type == consensus::LEADER && external_consistency_mode() == COMMIT_WAIT) {
+    resp_metrics->set_commit_wait_duration_usec(op_m.commit_wait_duration_usec);
+  }
 }
 
 }  // namespace tablet

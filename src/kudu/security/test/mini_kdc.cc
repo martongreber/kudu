@@ -309,9 +309,13 @@ Status MiniKdc::Kinit(const string& username) {
   RETURN_NOT_OK(GetBinaryPath("kinit", &kinit));
   unique_ptr<WritableFile> tmp_cc_file;
   string tmp_cc_path;
-  const auto tmp_template = Substitute("kinit-temp-$0.XXXXXX", username);
+  string tmp_username = username;
+  StripString(&tmp_username, "/", '_');
+  const auto tmp_template = Substitute("kinit-temp-$0.XXXXXX", tmp_username);
+  WritableFileOptions opts;
+  opts.is_sensitive = false;
   RETURN_NOT_OK_PREPEND(Env::Default()->NewTempWritableFile(
-      WritableFileOptions(),
+      opts,
       JoinPathSegments(options_.data_root, tmp_template),
       &tmp_cc_path, &tmp_cc_file),
       "could not create temporary file");

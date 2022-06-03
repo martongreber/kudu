@@ -156,6 +156,7 @@ ServerNegotiation::ServerNegotiation(unique_ptr<Socket> socket,
                                      const security::TlsContext* tls_context,
                                      const security::TokenVerifier* token_verifier,
                                      RpcEncryption encryption,
+                                     bool encrypt_loopback,
                                      std::string sasl_proto_name)
     : socket_(std::move(socket)),
       helper_(SaslHelper::SERVER),
@@ -163,6 +164,7 @@ ServerNegotiation::ServerNegotiation(unique_ptr<Socket> socket,
       tls_handshake_(security::TlsHandshakeType::SERVER),
       encryption_(encryption),
       tls_negotiated_(false),
+      encrypt_loopback_(encrypt_loopback),
       token_verifier_(token_verifier),
       negotiated_authn_(AuthenticationType::INVALID),
       negotiated_mech_(SaslMechanism::INVALID),
@@ -304,7 +306,7 @@ Status ServerNegotiation::PreflightCheckGSSAPI(const std::string& sasl_proto_nam
   // We aren't going to actually send/receive any messages, but
   // this makes it easier to reuse the initialization code.
   ServerNegotiation server(
-      nullptr, nullptr, nullptr, RpcEncryption::OPTIONAL, sasl_proto_name);
+      nullptr, nullptr, nullptr, RpcEncryption::OPTIONAL, false, sasl_proto_name);
   Status s = server.EnableGSSAPI();
   if (!s.ok()) {
     return Status::RuntimeError(s.message());
@@ -542,7 +544,7 @@ Status ServerNegotiation::HandleNegotiate(const NegotiatePB& request) {
     server_features_.insert(TLS);
     // If the remote peer is local, then we allow using TLS for authentication
     // without encryption or integrity.
-    if (socket_->IsLoopbackConnection() && !FLAGS_rpc_encrypt_loopback_connections) {
+    if (socket_->IsLoopbackConnection() && !encrypt_loopback_) {
       server_features_.insert(TLS_AUTHENTICATION_ONLY);
     }
   }
@@ -686,12 +688,17 @@ Status ServerNegotiation::AuthenticateByToken(faststring* recv_buf) {
   NegotiatePB pb;
   RETURN_NOT_OK(RecvNegotiatePB(&pb, recv_buf));
 
-  if (pb.step() != NegotiatePB::TOKEN_EXCHANGE) {
-    Status s =  Status::NotAuthorized("expected TOKEN_EXCHANGE step",
-                                      NegotiatePB::NegotiateStep_Name(pb.step()));
+  if (PREDICT_FALSE(pb.step() != NegotiatePB::TOKEN_EXCHANGE)) {
+    const auto s = Status::NotAuthorized("expected TOKEN_EXCHANGE step",
+                                         NegotiatePB::NegotiateStep_Name(pb.step()));
+    RETURN_NOT_OK(SendError(ErrorStatusPB::FATAL_UNAUTHORIZED, s));
+    return s;
   }
-  if (!pb.has_authn_token()) {
-    Status s = Status::NotAuthorized("TOKEN_EXCHANGE message must include an authentication token");
+  if (PREDICT_FALSE(!pb.has_authn_token())) {
+    const auto s = Status::NotAuthorized(
+        "TOKEN_EXCHANGE message must include an authentication token");
+    RETURN_NOT_OK(SendError(ErrorStatusPB::FATAL_UNAUTHORIZED, s));
+    return s;
   }
 
   // TODO(KUDU-1924): propagate the specific token verification failure back to the client,
@@ -699,9 +706,10 @@ Status ServerNegotiation::AuthenticateByToken(faststring* recv_buf) {
   security::TokenPB token;
   auto verification_result = token_verifier_->VerifyTokenSignature(pb.authn_token(), &token);
   ErrorStatusPB::RpcErrorCodePB error;
-  Status s = ParseVerificationResult(verification_result,
-      ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN, &error);
-  if (!s.ok()) {
+  if (const auto s = ParseTokenVerificationResult(
+        verification_result,
+        ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN,
+        &error); !s.ok()) {
     RETURN_NOT_OK(SendError(error, s));
     return s;
   }
@@ -720,26 +728,26 @@ Status ServerNegotiation::AuthenticateByToken(faststring* recv_buf) {
   }
 
   if (PREDICT_FALSE(FLAGS_rpc_inject_invalid_authn_token_ratio > 0)) {
-    security::VerificationResult res;
+    security::TokenVerificationResult res;
     int sel = rand() % 4;
     switch (sel) {
       case 0:
-        res = security::VerificationResult::INVALID_TOKEN;
+        res = security::TokenVerificationResult::INVALID_TOKEN;
         break;
       case 1:
-        res = security::VerificationResult::INVALID_SIGNATURE;
+        res = security::TokenVerificationResult::INVALID_SIGNATURE;
         break;
       case 2:
-        res = security::VerificationResult::EXPIRED_TOKEN;
+        res = security::TokenVerificationResult::EXPIRED_TOKEN;
         break;
       case 3:
-        res = security::VerificationResult::EXPIRED_SIGNING_KEY;
+        res = security::TokenVerificationResult::EXPIRED_SIGNING_KEY;
         break;
       default:
         LOG(FATAL) << "unreachable";
     }
     if (kudu::fault_injection::MaybeTrue(FLAGS_rpc_inject_invalid_authn_token_ratio)) {
-      Status s = Status::NotAuthorized(VerificationResultToString(res));
+      Status s = Status::NotAuthorized(TokenVerificationResultToString(res));
       RETURN_NOT_OK(SendError(ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN, s));
       return s;
     }

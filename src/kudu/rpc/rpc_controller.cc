@@ -103,6 +103,10 @@ const ErrorStatusPB* RpcController::error_response() const {
   return nullptr;
 }
 
+int32_t RpcController::call_id() const {
+  return call_->call_response_->call_id();
+}
+
 Status RpcController::GetInboundSidecar(int idx, Slice* sidecar) const {
   return call_->call_response_->GetSidecar(idx, sidecar);
 }
@@ -162,6 +166,20 @@ Status RpcController::AddOutboundSidecar(unique_ptr<RpcSidecar> car, int* idx) {
 void RpcController::SetRequestParam(const google::protobuf::Message& req) {
   DCHECK(call_ != nullptr);
   call_->SetRequestPayload(req, std::move(outbound_sidecars_));
+}
+
+void RpcController::FreeOutboundSidecars() {
+  outbound_sidecars_total_bytes_ = 0;
+  call_->FreeSidecars();
+}
+
+std::vector<unique_ptr<RpcSidecar>> RpcController::ReleaseOutboundSidecars() {
+  outbound_sidecars_total_bytes_ = 0;
+  return std::move(outbound_sidecars_);
+}
+
+unique_ptr<RequestPayload> RpcController::ReleaseRequestPayload() {
+  return DCHECK_NOTNULL(call_)->ReleaseRequestPayload();
 }
 
 void RpcController::Cancel() {

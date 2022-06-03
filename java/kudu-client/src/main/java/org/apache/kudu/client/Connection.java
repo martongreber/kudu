@@ -110,6 +110,12 @@ class Connection extends SimpleChannelInboundHandler<Object> {
 
   private final String saslProtocolName;
 
+  private final boolean requireAuthentication;
+
+  private final boolean requireEncryption;
+
+  private final boolean encryptLoopback;
+
   /** The underlying Netty's socket channel. */
   private SocketChannel channel;
 
@@ -132,7 +138,7 @@ class Connection extends SimpleChannelInboundHandler<Object> {
   };
 
   private static final String NEGOTIATION_TIMEOUT_HANDLER = "negotiation-timeout-handler";
-  private static final long NEGOTIATION_TIMEOUT_MS = 10000;
+  private final long negotiationTimeoutMs;
 
   /** Lock to guard access to some of the fields below. */
   private final ReentrantLock lock = new ReentrantLock();
@@ -187,7 +193,11 @@ class Connection extends SimpleChannelInboundHandler<Object> {
              SecurityContext securityContext,
              Bootstrap bootstrap,
              CredentialsPolicy credentialsPolicy,
-             String saslProtocolName) {
+             String saslProtocolName,
+             boolean requireAuthentication,
+             boolean requireEncryption,
+             boolean encryptLoopback,
+             long negotiationTimeoutMs) {
     this.serverInfo = serverInfo;
     this.securityContext = securityContext;
     this.saslProtocolName = saslProtocolName;
@@ -195,6 +205,10 @@ class Connection extends SimpleChannelInboundHandler<Object> {
     this.credentialsPolicy = credentialsPolicy;
     this.bootstrap = bootstrap.clone();
     this.bootstrap.handler(new ConnectionChannelInitializer());
+    this.requireAuthentication = requireAuthentication;
+    this.requireEncryption = requireEncryption;
+    this.encryptLoopback = encryptLoopback;
+    this.negotiationTimeoutMs = negotiationTimeoutMs;
   }
 
   /** {@inheritDoc} */
@@ -213,7 +227,8 @@ class Connection extends SimpleChannelInboundHandler<Object> {
     }
     ctx.writeAndFlush(Unpooled.wrappedBuffer(CONNECTION_HEADER), ctx.voidPromise());
     Negotiator negotiator = new Negotiator(serverInfo.getAndCanonicalizeHostname(), securityContext,
-        (credentialsPolicy == CredentialsPolicy.PRIMARY_CREDENTIALS), saslProtocolName);
+        (credentialsPolicy == CredentialsPolicy.PRIMARY_CREDENTIALS), saslProtocolName,
+        requireAuthentication, requireEncryption, encryptLoopback);
     ctx.pipeline().addBefore(ctx.name(), "negotiation", negotiator);
     negotiator.sendHello(ctx);
   }
@@ -824,7 +839,7 @@ class Connection extends SimpleChannelInboundHandler<Object> {
       // Add a socket read timeout handler to function as a timeout for negotiation.
       // The handler will be removed once the connection is negotiated.
       pipeline.addLast(NEGOTIATION_TIMEOUT_HANDLER,
-              new ReadTimeoutHandler(NEGOTIATION_TIMEOUT_MS, TimeUnit.MILLISECONDS));
+              new ReadTimeoutHandler(negotiationTimeoutMs, TimeUnit.MILLISECONDS));
       pipeline.addLast("kudu-handler", Connection.this);
     }
   }

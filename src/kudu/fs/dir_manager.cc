@@ -224,9 +224,9 @@ Status DirManager::Create() {
     RETURN_NOT_OK_PREPEND(r.status, "Could not create directory manager with disks failed");
   }
   vector<unique_ptr<DirInstanceMetadataFile>> loaded_instances;
-  bool has_existing_instances;
-  RETURN_NOT_OK(LoadInstances(&loaded_instances, &has_existing_instances));
-  if (has_existing_instances) {
+  bool has_healthy_instances = true;
+  RETURN_NOT_OK(LoadInstances(&loaded_instances, &has_healthy_instances));
+  if (has_healthy_instances) {
     return Status::AlreadyPresent("instance files already exist");
   }
 
@@ -386,7 +386,8 @@ Status DirManager::UpdateHealthyInstances(
     CHECK_EQ(1, copies_to_delete.erase(copy_filename));
     Status s = pb_util::WritePBContainerToPath(
         env_, instance_filename, new_pb, pb_util::OVERWRITE,
-        sync_dirs() ? pb_util::SYNC : pb_util::NO_SYNC);
+        sync_dirs() ? pb_util::SYNC : pb_util::NO_SYNC,
+        pb_util::NOT_SENSITIVE);
     // We've failed to update for some reason, so restore our original file.
     // Since we're renaming our copy, we don't have to delete it.
     if (PREDICT_FALSE(!s.ok())) {
@@ -414,7 +415,9 @@ Status DirManager::UpdateHealthyInstances(
 
 Status DirManager::LoadInstances(
     vector<unique_ptr<DirInstanceMetadataFile>>* instance_files,
-    bool* has_existing_instances) {
+    bool* has_healthy_instances) {
+  DCHECK(instance_files);
+
   LockMode lock_mode;
   if (!lock_dirs()) {
     lock_mode = LockMode::NONE;
@@ -423,11 +426,9 @@ Status DirManager::LoadInstances(
   } else {
     lock_mode = LockMode::MANDATORY;
   }
-  vector<string> missing_roots_tmp;
   vector<unique_ptr<DirInstanceMetadataFile>> loaded_instances;
   ObjectIdGenerator gen;
-  for (int i = 0; i < canonicalized_fs_roots_.size(); i++) {
-    const auto& root = canonicalized_fs_roots_[i];
+  for (const auto& root : canonicalized_fs_roots_) {
     string dir = JoinPathSegments(root.path, dir_name());
     string instance_filename = JoinPathSegments(dir, instance_metadata_filename());
 
@@ -470,10 +471,10 @@ Status DirManager::LoadInstances(
       num_healthy_instances++;
     }
   }
-  if (has_existing_instances) {
-    *has_existing_instances = num_healthy_instances > 0;
+  if (has_healthy_instances) {
+    *has_healthy_instances = num_healthy_instances > 0;
   }
-  instance_files->swap(loaded_instances);
+  *instance_files = std::move(loaded_instances);
   return Status::OK();
 }
 
@@ -507,12 +508,12 @@ Status DirManager::Open() {
                                               canonicalized_fs_roots_.size(), max_dirs()));
   }
 
-  vector<unique_ptr<DirInstanceMetadataFile>> loaded_instances;
   // Load the instance files from disk.
-  bool has_existing_instances;
-  RETURN_NOT_OK_PREPEND(LoadInstances(&loaded_instances, &has_existing_instances),
+  bool has_healthy_instances = true;
+  vector<unique_ptr<DirInstanceMetadataFile>> loaded_instances;
+  RETURN_NOT_OK_PREPEND(LoadInstances(&loaded_instances, &has_healthy_instances),
       "failed to load instance files");
-  if (!has_existing_instances) {
+  if (!has_healthy_instances) {
     return Status::NotFound(
         "could not open directory manager, no healthy directories found");
   }
@@ -521,15 +522,16 @@ Status DirManager::Open() {
   if (!opts_.read_only && opts_.dir_type != "file" &&
       opts_.update_instances != UpdateInstanceBehavior::DONT_UPDATE) {
     RETURN_NOT_OK_PREPEND(
-        CreateNewDirectoriesAndUpdateInstances(
-            std::move(loaded_instances)),
-            "could not add new directories");
-    RETURN_NOT_OK_PREPEND(LoadInstances(&loaded_instances, &has_existing_instances),
+        CreateNewDirectoriesAndUpdateInstances(std::move(loaded_instances)),
+        "could not add new directories");
+    vector<unique_ptr<DirInstanceMetadataFile>> new_loaded_instances;
+    RETURN_NOT_OK_PREPEND(LoadInstances(&new_loaded_instances, &has_healthy_instances),
                           "failed to load instance files after updating");
-    if (!has_existing_instances) {
+    if (!has_healthy_instances) {
       return Status::IOError(
           "could not open directory manager, no healthy directories found");
     }
+    loaded_instances = std::move(new_loaded_instances);
   }
 
   // All instances are present and accounted for. Time to create the in-memory
@@ -564,7 +566,7 @@ Status DirManager::Open() {
 
     // Create a per-dir thread pool.
     unique_ptr<ThreadPool> pool;
-    RETURN_NOT_OK(ThreadPoolBuilder(Substitute("dir $0", i))
+    RETURN_NOT_OK(ThreadPoolBuilder(Substitute("dir $0", dir))
                   .set_max_threads(num_threads_per_dir_)
                   .set_trace_metric_prefix("dirs")
                   .Build(&pool));
@@ -672,7 +674,6 @@ Status DirManager::MarkDirFailed(int uuid_idx, const string& error_message) {
   }
   return Status::OK();
 }
-
 
 bool DirManager::IsDirFailed(int uuid_idx) const {
   DCHECK_LT(uuid_idx, dirs_.size());

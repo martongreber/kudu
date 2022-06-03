@@ -47,6 +47,7 @@
 #include <ctime>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -116,7 +117,6 @@
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/crypto.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/security/token_signer.h"
@@ -139,6 +139,7 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/random_util.h"
 #include "kudu/util/scoped_cleanup.h"
@@ -173,11 +174,23 @@ TAG_FLAG(unresponsive_ts_rpc_timeout_ms, advanced);
 DEFINE_int32(default_num_replicas, 3,
              "Default number of replicas for tables that do not have the num_replicas set.");
 TAG_FLAG(default_num_replicas, advanced);
+TAG_FLAG(default_num_replicas, runtime);
 
 DEFINE_int32(max_num_replicas, 7,
              "Maximum number of replicas that may be specified for a table.");
 // Tag as unsafe since we have done very limited testing of higher than 5 replicas.
 TAG_FLAG(max_num_replicas, unsafe);
+TAG_FLAG(max_num_replicas, runtime);
+
+DEFINE_int32(min_num_replicas, 1,
+             "Minimum number of replicas that may be specified when creating "
+             "a table: this is to enforce the minimum replication factor for "
+             "tables created in a Kudu cluster. For example, setting this flag "
+             "to 3 enforces every new table to have at least 3 replicas for "
+             "each of its tablets, so there cannot be a data loss when a "
+             "single tablet server fails irrecoverably.");
+TAG_FLAG(min_num_replicas, advanced);
+TAG_FLAG(min_num_replicas, runtime);
 
 DEFINE_int32(max_num_columns, 300,
              "Maximum number of columns that may be in a table.");
@@ -210,6 +223,7 @@ TAG_FLAG(max_identifier_length, unsafe);
 DEFINE_bool(allow_unsafe_replication_factor, false,
             "Allow creating tables with even replication factor.");
 TAG_FLAG(allow_unsafe_replication_factor, unsafe);
+TAG_FLAG(allow_unsafe_replication_factor, runtime);
 
 DEFINE_int32(catalog_manager_bg_task_wait_ms, 1000,
              "Amount of time the catalog manager background task thread waits "
@@ -220,6 +234,7 @@ DEFINE_int32(max_create_tablets_per_ts, 60,
              "The number of tablet replicas per TS that can be requested for a "
              "new table. If 0, no limit is enforced.");
 TAG_FLAG(max_create_tablets_per_ts, advanced);
+TAG_FLAG(max_create_tablets_per_ts, runtime);
 
 DEFINE_int32(master_failover_catchup_timeout_ms, 30 * 1000, // 30 sec
              "Amount of time to give a newly-elected leader master to load"
@@ -243,6 +258,12 @@ DEFINE_bool(catalog_manager_check_ts_count_for_create_table, true,
             "servers to satisfy the provided replication count before allowing "
             "a table to be created.");
 TAG_FLAG(catalog_manager_check_ts_count_for_create_table, hidden);
+
+DEFINE_bool(catalog_manager_check_ts_count_for_alter_table, true,
+            "Whether the master should ensure that there are enough live tablet "
+            "servers to satisfy the provided replication factor before allowing "
+            "a table to be altered.");
+TAG_FLAG(catalog_manager_check_ts_count_for_alter_table, hidden);
 
 DEFINE_int32(table_locations_ttl_ms, 5 * 60 * 1000, // 5 minutes
              "Maximum time in milliseconds which clients may cache table locations. "
@@ -358,26 +379,37 @@ DEFINE_double(table_write_limit_ratio, 0.95,
               "Set the ratio of how much write limit can be reached");
 TAG_FLAG(table_write_limit_ratio, experimental);
 
+DEFINE_bool(enable_metadata_cleanup_for_deleted_tables_and_tablets, false,
+            "Whether to clean up metadata for deleted tables and tablets from master's "
+            "in-memory map and the 'sys.catalog' table.");
+TAG_FLAG(enable_metadata_cleanup_for_deleted_tables_and_tablets, experimental);
+TAG_FLAG(enable_metadata_cleanup_for_deleted_tables_and_tablets, runtime);
+
+DEFINE_int32(metadata_for_deleted_table_and_tablet_reserved_secs, 60 * 60,
+             "After this amount of time, the metadata of a deleted table/tablet will be "
+             "cleaned up if --enable_metadata_cleanup_for_deleted_tables_and_tablets=true.");
+TAG_FLAG(metadata_for_deleted_table_and_tablet_reserved_secs, experimental);
+TAG_FLAG(metadata_for_deleted_table_and_tablet_reserved_secs, runtime);
+
+DEFINE_bool(enable_chunked_tablet_writes, true,
+            "Whether to split tablet actions into chunks when persisting them in sys.catalog "
+            "table. If disabled, any update of the sys.catalog table will be rejected if exceeds "
+            "--rpc_max_message_size.");
+TAG_FLAG(enable_chunked_tablet_writes, experimental);
+TAG_FLAG(enable_chunked_tablet_writes, runtime);
+
+DEFINE_bool(require_new_spec_for_custom_hash_schema_range_bound, false,
+            "Whether to require the client to use newer signature to specify "
+            "range bounds when working with a table having custom hash schema "
+            "per range");
+TAG_FLAG(require_new_spec_for_custom_hash_schema_range_bound, experimental);
+TAG_FLAG(require_new_spec_for_custom_hash_schema_range_bound, runtime);
+
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_int64(tsk_rotation_seconds);
-
-METRIC_DEFINE_entity(table);
-
 DECLARE_string(ranger_config_path);
 
-// Validates that if auto-rebalancing is enabled, the cluster uses 3-4-3 replication
-// (the --raft_prepare_replacement_before_eviction flag must be set to true).
-static bool Validate343SchemeEnabledForAutoRebalancing()  {
-  if (FLAGS_auto_rebalancing_enabled &&
-      !FLAGS_raft_prepare_replacement_before_eviction) {
-    LOG(ERROR) << "If enabling auto-rebalancing, Kudu must be configured"
-                  " with --raft_prepare_replacement_before_eviction.";
-    return false;
-  }
-  return true;
-}
-GROUP_FLAG_VALIDATOR(auto_rebalancing_flags,
-                     Validate343SchemeEnabledForAutoRebalancing);
+METRIC_DEFINE_entity(table);
 
 using base::subtle::NoBarrier_CompareAndSwap;
 using base::subtle::NoBarrier_Load;
@@ -422,10 +454,9 @@ using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
-namespace kudu {
-namespace master {
+namespace {
 
-static bool ValidateTableWriteLimitRatio(const char* flagname, double value) {
+bool ValidateTableWriteLimitRatio(const char* flagname, double value) {
   if (value > 1.0) {
     LOG(ERROR) << Substitute("$0 must be less than or equal to 1.0, value $1 is invalid.",
                              flagname, value);
@@ -439,7 +470,7 @@ static bool ValidateTableWriteLimitRatio(const char* flagname, double value) {
 }
 DEFINE_validator(table_write_limit_ratio, &ValidateTableWriteLimitRatio);
 
-static bool ValidateTableLimit(const char* flag, int64_t limit) {
+bool ValidateTableLimit(const char* flag, int64_t limit) {
   if (limit != -1 && limit < 0) {
      LOG(ERROR) << Substitute("$0 must be greater than or equal to -1, "
                               "$1 is invalid", flag, limit);
@@ -449,9 +480,84 @@ static bool ValidateTableLimit(const char* flag, int64_t limit) {
 }
 DEFINE_validator(table_disk_size_limit, &ValidateTableLimit);
 DEFINE_validator(table_row_count_limit, &ValidateTableLimit);
+
+bool ValidateMinNumReplicas(const char* flagname, int value) {
+  if (value < 1) {
+    LOG(ERROR) << Substitute(
+        "$0: invalid value for flag $1; must be at least 1", value, flagname);
+    return false;
+  }
+  return true;
+}
+DEFINE_validator(min_num_replicas, &ValidateMinNumReplicas);
+
+// Validate that if the auto-rebalancing is enabled, the cluster uses the 3-4-3
+// replication scheme: the --raft_prepare_replacement_before_eviction flag
+// must be set to 'true'.
+bool Validate343SchemeEnabledForAutoRebalancing()  {
+  if (FLAGS_auto_rebalancing_enabled &&
+      !FLAGS_raft_prepare_replacement_before_eviction) {
+    LOG(ERROR) << "if enabling auto-rebalancing, Kudu must be configured "
+                  "with --raft_prepare_replacement_before_eviction";
+    return false;
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(auto_rebalancing_flags,
+                     Validate343SchemeEnabledForAutoRebalancing);
+
+// Check for the replication factor flags' sanity.
+bool ValidateReplicationFactorFlags()  {
+  if (FLAGS_min_num_replicas > FLAGS_max_num_replicas) {
+    LOG(ERROR) << Substitute(
+        "--min_num_replicas ($0) must not be greater than "
+        "--max_num_replicas ($1)",
+        FLAGS_min_num_replicas, FLAGS_max_num_replicas);
+    return false;
+  }
+  if (FLAGS_default_num_replicas > FLAGS_max_num_replicas) {
+    LOG(ERROR) << Substitute(
+        "--default_num_replicas ($0) must not be greater than "
+        "--max_num_replicas ($1)",
+        FLAGS_default_num_replicas, FLAGS_max_num_replicas);
+    return false;
+  }
+  if (FLAGS_default_num_replicas % 2 == 0 &&
+      !FLAGS_allow_unsafe_replication_factor) {
+    LOG(ERROR) << Substitute(
+        "--default_num_replicas ($0) must not be an even number since "
+        "--allow_unsafe_replication_factor is not set",
+        FLAGS_max_num_replicas);
+    return false;
+  }
+  if (FLAGS_min_num_replicas % 2 == 0 &&
+      !FLAGS_allow_unsafe_replication_factor) {
+    LOG(ERROR) << Substitute(
+        "--min_num_replicas ($0) must not be an even number since "
+        "--allow_unsafe_replication_factor is not set",
+        FLAGS_min_num_replicas);
+    return false;
+  }
+  if (FLAGS_max_num_replicas % 2 == 0 &&
+      !FLAGS_allow_unsafe_replication_factor) {
+    LOG(ERROR) << Substitute(
+        "--max_num_replicas ($0) must not be an even number since "
+        "--allow_unsafe_replication_factor is not set",
+        FLAGS_max_num_replicas);
+    return false;
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(replication_factor_flags,
+                     ValidateReplicationFactorFlags);
+} // anonymous namespace
+
 ////////////////////////////////////////////////////////////
 // Table Loader
 ////////////////////////////////////////////////////////////
+
+namespace kudu {
+namespace master {
 
 class TableLoader : public TableVisitor {
  public:
@@ -492,6 +598,10 @@ class TableLoader : public TableVisitor {
       // It's unnecessary to register metrics for the deleted tables.
       table->RegisterMetrics(catalog_manager_->master_->metric_registry(),
           CatalogManager::NormalizeTableName(metadata.name()));
+
+      // Update table's schema related metrics after being loaded.
+      table->UpdateSchemaMetrics();
+
       LOG(INFO) << Substitute("Loaded metadata for table $0", table->ToString());
     }
     VLOG(2) << Substitute("Metadata for table $0: $1",
@@ -696,6 +806,26 @@ void CatalogManagerBgTasks::Run() {
             // TODO(unknown): Add tests for this in the revision that makes
             // create/alter fault tolerant.
             LOG(ERROR) << "Error processing pending assignments: " << s.ToString();
+          }
+        }
+
+        if (FLAGS_enable_metadata_cleanup_for_deleted_tables_and_tablets) {
+          vector<scoped_refptr<TableInfo>> deleted_tables;
+          vector<scoped_refptr<TabletInfo>> deleted_tablets;
+          catalog_manager_->ExtractDeletedTablesAndTablets(&deleted_tables, &deleted_tablets);
+          Status s = Status::OK();
+          // Clean up metadata for deleted tablets first and then clean up metadata for deleted
+          // tables. This is the reverse of the order in which we load them. So for any remaining
+          // tablet, the metadata of the table to which it belongs must exist.
+          const time_t now = time(nullptr);
+          if (!deleted_tablets.empty()) {
+            s = catalog_manager_->ProcessDeletedTablets(deleted_tablets, now);
+          }
+          if (s.ok() && !deleted_tables.empty()) {
+            s = catalog_manager_->ProcessDeletedTables(deleted_tables, now);
+          }
+          if (!s.ok()) {
+            LOG(ERROR) << "Error processing tables/tablets deletions: " << s.ToString();
           }
         }
 
@@ -1734,14 +1864,14 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     return SetupError(Status::InvalidArgument("user requests should not have Column IDs"),
                       resp, MasterErrorPB::INVALID_SCHEMA);
   }
-  Schema schema = client_schema.CopyWithColumnIds();
+  const Schema schema = client_schema.CopyWithColumnIds();
 
   // If the client did not set a partition schema in the create table request,
   // the default partition schema (no hash bucket components and a range
   // partitioned on the primary key columns) will be used.
   PartitionSchema partition_schema;
   RETURN_NOT_OK(SetupError(
-      PartitionSchema::FromPB(req.partition_schema(), schema, client_schema, &partition_schema),
+      PartitionSchema::FromPB(req.partition_schema(), schema, &partition_schema),
       resp, MasterErrorPB::INVALID_SCHEMA));
 
   // Decode split rows.
@@ -1787,20 +1917,45 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     }
   }
 
-  PartitionSchema::RangeHashSchema range_hash_schemas;
+  // TODO(aserbin): make sure range boundaries in
+  //                req.partition_schema().custom_hash_schema_ranges()
+  //                correspond to range_bounds?
+  vector<PartitionSchema::HashSchema> range_hash_schemas;
   if (FLAGS_enable_per_range_hash_schemas) {
-    for (int i = 0; i < req.range_hash_schemas_size(); i++) {
-      PartitionSchema::HashBucketSchemas hash_bucket_schemas;
-      RETURN_NOT_OK(PartitionSchema::ExtractHashBucketSchemasFromPB(
-          schema, req.range_hash_schemas(i).hash_schemas(), &hash_bucket_schemas));
-      range_hash_schemas.emplace_back(std::move(hash_bucket_schemas));
+    // TODO(aserbin): the signature of CreatePartitions() require the
+    //                'range_hash_schemas' parameters: update its signature
+    //                to remove the extra parameter and rely on its
+    //                'ranges_with_hash_schemas_' member field; the path in
+    //                CatalogManager::ApplyAlterPartitioningSteps() involving
+    //                CreatePartitions() should be updated correspondingly.
+    const auto& ps = req.partition_schema();
+    for (int i = 0; i < ps.custom_hash_schema_ranges_size(); i++) {
+      PartitionSchema::HashSchema hash_schema;
+      RETURN_NOT_OK(PartitionSchema::ExtractHashSchemaFromPB(
+          schema, ps.custom_hash_schema_ranges(i).hash_schema(), &hash_schema));
+      range_hash_schemas.emplace_back(std::move(hash_schema));
     }
   }
 
   // Create partitions based on specified partition schema and split rows.
   vector<Partition> partitions;
-  RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, range_bounds,
-                                                  range_hash_schemas, schema, &partitions));
+  RETURN_NOT_OK(partition_schema.CreatePartitions(
+      split_rows, range_bounds, range_hash_schemas, schema, &partitions));
+
+  // Check the restriction on the same number of hash dimensions across all the
+  // ranges. Also, check that the table-wide hash schema has the same number
+  // of hash dimensions as all the partitions with custom hash schemas.
+  //
+  // TODO(aserbin): remove the restriction once the rest of the code is ready
+  //                to handle range partitions with arbitrary hash schemas
+  CHECK(!partitions.empty());
+  const auto hash_dimensions_num = partition_schema.hash_schema().size();
+  for (const auto& p : partitions) {
+    if (p.hash_buckets().size() != hash_dimensions_num) {
+      return Status::NotSupported(
+          "varying number of hash dimensions per range is not yet supported");
+    }
+  }
 
   // If they didn't specify a num_replicas, set it based on the default.
   if (!req.has_num_replicas()) {
@@ -1808,77 +1963,9 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   }
 
   const auto num_replicas = req.num_replicas();
-  // Reject create table with even replication factors, unless master flag
-  // allow_unsafe_replication_factor is on.
-  if (num_replicas % 2 == 0 && !FLAGS_allow_unsafe_replication_factor) {
-    return SetupError(Status::InvalidArgument(
-        Substitute("illegal replication factor $0 (replication factor must be odd)", num_replicas)),
-      resp, MasterErrorPB::EVEN_REPLICATION_FACTOR);
-  }
-
-  if (num_replicas > FLAGS_max_num_replicas) {
-    return SetupError(Status::InvalidArgument(
-          Substitute("illegal replication factor $0 (max replication factor is $1)",
-            num_replicas, FLAGS_max_num_replicas)),
-        resp, MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH);
-  }
-  if (num_replicas <= 0) {
-    return SetupError(Status::InvalidArgument(
-          Substitute("illegal replication factor $0 (replication factor must be positive)",
-            num_replicas, FLAGS_max_num_replicas)),
-        resp, MasterErrorPB::ILLEGAL_REPLICATION_FACTOR);
-  }
-
-  // Verify that the number of replicas isn't larger than the number of live tablet
-  // servers.
-  TSDescriptorVector ts_descs;
-  master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
-  const auto num_live_tservers = ts_descs.size();
-  if (FLAGS_catalog_manager_check_ts_count_for_create_table && num_replicas > num_live_tservers) {
-    // Note: this error message is matched against in master-stress-test.
-    return SetupError(Status::InvalidArgument(Substitute(
-            "not enough live tablet servers to create a table with the requested replication "
-            "factor $0; $1 tablet servers are alive", req.num_replicas(), num_live_tservers)),
-        resp, MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH);
-  }
-
-  // Verify that the total number of replicas is reasonable.
-  //
-  // Table creation can generate a fair amount of load, both in the form of RPC
-  // traffic (due to Raft leader elections) and disk I/O (due to durably writing
-  // several files during both replica creation and leader elections).
-  //
-  // Ideally we would have more effective ways of mitigating this load (such
-  // as more efficient on-disk metadata management), but in lieu of that, we
-  // employ this coarse-grained check that prohibits up-front creation of too
-  // many replicas.
-  //
-  // Note: non-replicated tables are exempt because, by not using replication,
-  // they do not generate much of the load described above.
-  const auto max_replicas_total = FLAGS_max_create_tablets_per_ts * num_live_tservers;
-  if (num_replicas > 1 &&
-      max_replicas_total > 0 &&
-      partitions.size() * num_replicas > max_replicas_total) {
-    return SetupError(Status::InvalidArgument(Substitute(
-        "the requested number of tablet replicas is over the maximum permitted "
-        "at creation time ($0), additional tablets may be added by adding "
-        "range partitions to the table post-creation", max_replicas_total)),
-                      resp, MasterErrorPB::TOO_MANY_TABLETS);
-  }
-
-  // Warn if the number of live tablet servers is not enough to re-replicate
-  // a failed replica of the tablet.
-  const auto num_ts_needed_for_rereplication =
-      num_replicas + (FLAGS_raft_prepare_replacement_before_eviction ? 1 : 0);
-  if (num_replicas > 1 && num_ts_needed_for_rereplication > num_live_tservers) {
-    LOG(WARNING) << Substitute(
-        "The number of live tablet servers is not enough to re-replicate a "
-        "tablet replica of the newly created table $0 in case of a server "
-        "failure: $1 tablet servers would be needed, $2 are available. "
-        "Consider bringing up more tablet servers.",
-        normalized_table_name, num_ts_needed_for_rereplication,
-        num_live_tservers);
-  }
+  RETURN_NOT_OK(ValidateNumberReplicas(normalized_table_name,
+                                       resp, ValidateType::kCreateTable,
+                                       partitions.size(), num_replicas));
 
   // Verify the table's extra configuration properties.
   TableExtraConfigPB extra_config_pb;
@@ -2028,6 +2115,9 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     }
   }
   TRACE("Inserted table and tablets into CatalogManager maps");
+
+  // Update table's schema related metrics after being created.
+  table->UpdateSchemaMetrics();
 
   resp->set_table_id(table->id());
   VLOG(1) << "Created table " << table->ToString();
@@ -2358,8 +2448,10 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
   }
 
   TRACE("Modifying in-memory table state");
-  string deletion_msg = "Table deleted at " + LocalTimeAsString();
+  const time_t timestamp = time(nullptr);
+  string deletion_msg = "Table deleted at " + TimestampAsString(timestamp);
   l.mutable_data()->set_state(SysTablesEntryPB::REMOVED, deletion_msg);
+  l.mutable_data()->pb.set_delete_timestamp(timestamp);
 
   // 2. Look up the tablets, lock them, and mark them as deleted.
   {
@@ -2373,6 +2465,7 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
     for (const auto& t : tablets) {
       t->mutable_metadata()->mutable_dirty()->set_state(
           SysTabletsEntryPB::DELETED, deletion_msg);
+      t->mutable_metadata()->mutable_dirty()->pb.set_delete_timestamp(timestamp);
     }
 
     // 3. Update sys-catalog with the removed table and tablet state.
@@ -2518,11 +2611,13 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     vector<scoped_refptr<TabletInfo>>* tablets_to_add,
     vector<scoped_refptr<TabletInfo>>* tablets_to_drop) {
 
+  // Get the table's schema as it's known to the catalog manager.
   Schema schema;
   RETURN_NOT_OK(SchemaFromPB(l.data().pb.schema(), &schema));
+  // Build current PartitionSchema for the table.
   PartitionSchema partition_schema;
-  RETURN_NOT_OK(PartitionSchema::FromPB(l.data().pb.partition_schema(), schema,
-                                        client_schema, &partition_schema));
+  RETURN_NOT_OK(PartitionSchema::FromPB(
+      l.data().pb.partition_schema(), schema, &partition_schema));
 
   TableInfo::TabletInfoMap existing_tablets = table->tablet_map();
   TableInfo::TabletInfoMap new_tablets;
@@ -2575,8 +2670,8 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     switch (step.type()) {
       case AlterTableRequestPB::ADD_RANGE_PARTITION: {
         for (const Partition& partition : partitions) {
-          const string& lower_bound = partition.partition_key_start();
-          const string& upper_bound = partition.partition_key_end();
+          const auto& lower_bound = partition.begin();
+          const auto& upper_bound = partition.end();
 
           // Check that the new tablet does not overlap with any of the existing
           // tablets. Since the elements of 'existing_tablets' are ordered by
@@ -2588,8 +2683,10 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
             TabletMetadataLock metadata(existing_iter->second.get(),
                                         LockMode::READ);
             const auto& p = metadata.data().pb.partition();
+            const auto p_begin = Partition::StringToPartitionKey(
+                p.partition_key_start(), p.hash_buckets_size());
             // Check for the overlapping ranges.
-            if (upper_bound.empty() || p.partition_key_start() < upper_bound) {
+            if (upper_bound.empty() || p_begin < upper_bound) {
               return Status::InvalidArgument(
                   "new range partition conflicts with existing one",
                   partition_schema.RangePartitionDebugString(*ops[0].split_row,
@@ -2606,17 +2703,19 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
             TabletMetadataLock metadata(std::prev(existing_iter)->second.get(),
                                         LockMode::READ);
             const auto& p = metadata.data().pb.partition();
+            const auto p_begin = Partition::StringToPartitionKey(
+                p.partition_key_start(), p.hash_buckets_size());
+            const auto p_end = Partition::StringToPartitionKey(
+                p.partition_key_end(), p.hash_buckets_size());
             // Check for the exact match of ranges.
-            if (lower_bound == p.partition_key_start() &&
-                upper_bound == p.partition_key_end()) {
+            if (lower_bound == p_begin && upper_bound == p_end) {
               return Status::AlreadyPresent(
                   "range partition already exists",
                   partition_schema.RangePartitionDebugString(*ops[0].split_row,
                                                              *ops[1].split_row));
             }
             // Check for the overlapping ranges.
-            if (p.partition_key_end().empty() ||
-                p.partition_key_end() > lower_bound) {
+            if (p_end.empty() || p_end > lower_bound) {
               return Status::InvalidArgument(
                   "new range partition conflicts with existing one",
                   partition_schema.RangePartitionDebugString(*ops[0].split_row,
@@ -2629,7 +2728,9 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
           if (new_iter != new_tablets.end()) {
             // Check for the overlapping ranges.
             const auto& p = new_iter->second->mutable_metadata()->dirty().pb.partition();
-            if (upper_bound.empty() || p.partition_key_start() < upper_bound) {
+            const auto p_begin = Partition::StringToPartitionKey(
+                p.partition_key_start(), p.hash_buckets_size());
+            if (upper_bound.empty() || p_begin < upper_bound) {
               return Status::InvalidArgument(
                   "new range partition conflicts with another newly added one",
                   partition_schema.RangePartitionDebugString(*ops[0].split_row,
@@ -2638,16 +2739,19 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
           }
           if (new_iter != new_tablets.begin()) {
             const auto& p = std::prev(new_iter)->second->mutable_metadata()->dirty().pb.partition();
+            const auto p_begin = Partition::StringToPartitionKey(
+                p.partition_key_start(), p.hash_buckets_size());
+            const auto p_end = Partition::StringToPartitionKey(
+                p.partition_key_end(), p.hash_buckets_size());
             // Check for the exact match of ranges.
-            if (lower_bound == p.partition_key_start() &&
-                upper_bound == p.partition_key_end()) {
+            if (lower_bound == p_begin && upper_bound == p_end) {
               return Status::AlreadyPresent(
                   "new range partition duplicates another newly added one",
                   partition_schema.RangePartitionDebugString(*ops[0].split_row,
                                                              *ops[1].split_row));
             }
             // Check for the overlapping ranges.
-            if (p.partition_key_end().empty() || p.partition_key_end() > lower_bound) {
+            if (p_end.empty() || p_end > lower_bound) {
               return Status::InvalidArgument(
                   "new range partition conflicts with another newly added one",
                   partition_schema.RangePartitionDebugString(*ops[0].split_row,
@@ -2669,8 +2773,8 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
 
       case AlterTableRequestPB::DROP_RANGE_PARTITION: {
         for (const Partition& partition : partitions) {
-          const string& lower_bound = partition.partition_key_start();
-          const string& upper_bound = partition.partition_key_end();
+          const auto& lower_bound = partition.begin();
+          const auto& upper_bound = partition.end();
 
           // Iter points to the tablet if it exists, or the next tablet, or the end.
           auto existing_iter = existing_tablets.lower_bound(lower_bound);
@@ -2681,14 +2785,20 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
 
           if (existing_iter != existing_tablets.end()) {
             TabletMetadataLock metadata(existing_iter->second.get(), LockMode::READ);
-            const auto& partition = metadata.data().pb.partition();
-            found_existing = partition.partition_key_start() == lower_bound &&
-                             partition.partition_key_end() == upper_bound;
+            const auto& p = metadata.data().pb.partition();
+            const auto p_begin = Partition::StringToPartitionKey(
+                p.partition_key_start(), p.hash_buckets_size());
+            const auto p_end = Partition::StringToPartitionKey(
+                p.partition_key_end(), p.hash_buckets_size());
+            found_existing = p_begin == lower_bound && p_end == upper_bound;
           }
           if (new_iter != new_tablets.end()) {
-            const auto& partition = new_iter->second->mutable_metadata()->dirty().pb.partition();
-            found_new = partition.partition_key_start() == lower_bound &&
-                        partition.partition_key_end() == upper_bound;
+            const auto& p = new_iter->second->mutable_metadata()->dirty().pb.partition();
+            const auto p_begin = Partition::StringToPartitionKey(
+                p.partition_key_start(), p.hash_buckets_size());
+            const auto p_end = Partition::StringToPartitionKey(
+                p.partition_key_end(), p.hash_buckets_size());
+            found_new = p_begin == lower_bound && p_end == upper_bound;
           }
 
           DCHECK(!found_existing || !found_new);
@@ -3086,7 +3196,20 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
           resp, MasterErrorPB::UNKNOWN_ERROR));
   }
 
-  // 8. Alter table's extra configuration properties.
+  // 8. Alter table's replication factor.
+  bool num_replicas_changed = false;
+  if (req.has_num_replicas()) {
+    int num_replicas = req.num_replicas();
+    RETURN_NOT_OK(ValidateNumberReplicas(normalized_table_name,
+                                         resp, ValidateType::kAlterTable,
+                                         boost::none, num_replicas));
+    if (num_replicas != l.data().pb.num_replicas()) {
+      num_replicas_changed = true;
+      l.mutable_data()->pb.set_num_replicas(num_replicas);
+    }
+  }
+
+  // 9. Alter table's extra configuration properties.
   if (!req.new_extra_configs().empty()) {
     TRACE("Apply alter extra-config");
     Map<string, string> new_extra_configs;
@@ -3107,19 +3230,21 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   bool has_metadata_changes = has_schema_changes ||
       req.has_new_table_name() || req.has_new_table_owner() ||
       !req.new_extra_configs().empty() || req.has_disk_size_limit() ||
-      req.has_row_count_limit() || req.has_new_table_comment();
+      req.has_row_count_limit() || req.has_new_table_comment() ||
+      num_replicas_changed;
   // Set to true if there are partitioning changes.
   bool has_partitioning_changes = !alter_partitioning_steps.empty();
   // Set to true if metadata changes need to be applied to existing tablets.
   bool has_metadata_changes_for_existing_tablets =
-    has_metadata_changes && table->num_tablets() > tablets_to_drop.size();
+    has_metadata_changes &&
+    (table->num_tablets() > tablets_to_drop.size() || num_replicas_changed);
 
   // Skip empty requests...
   if (!has_metadata_changes && !has_partitioning_changes) {
     return Status::OK();
   }
 
-  // 9. Serialize the schema and increment the version number.
+  // 10. Serialize the schema and increment the version number.
   if (has_metadata_changes_for_existing_tablets && !l.data().pb.has_fully_applied_schema()) {
     l.mutable_data()->pb.mutable_fully_applied_schema()->CopyFrom(l.data().pb.schema());
   }
@@ -3140,11 +3265,12 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
                                            LocalTimeAsString()));
   }
 
-  const string deletion_msg = "Partition dropped at " + LocalTimeAsString();
+  const time_t timestamp = time(nullptr);
+  const string deletion_msg = "Partition dropped at " + TimestampAsString(timestamp);
   TabletMetadataGroupLock tablets_to_add_lock(LockMode::WRITE);
   TabletMetadataGroupLock tablets_to_drop_lock(LockMode::RELEASED);
 
-  // 10. Update sys-catalog with the new table schema and tablets to add/drop.
+  // 11. Update sys-catalog with the new table schema and tablets to add/drop.
   TRACE("Updating metadata on disk");
   {
     SysCatalogTable::Actions actions;
@@ -3162,6 +3288,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     for (auto& tablet : tablets_to_drop) {
       tablet->mutable_metadata()->mutable_dirty()->set_state(
           SysTabletsEntryPB::DELETED, deletion_msg);
+      tablet->mutable_metadata()->mutable_dirty()->pb.set_delete_timestamp(timestamp);
     }
     actions.tablets_to_update = tablets_to_drop;
 
@@ -3174,7 +3301,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     }
   }
 
-  // 11. Commit the in-memory state.
+  // 12. Commit the in-memory state.
   TRACE("Committing alterations to in-memory state");
   {
     // Commit new tablet in-memory state. This doesn't require taking the global
@@ -3266,11 +3393,14 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     SendDeleteTabletRequest(tablet, l, deletion_msg);
   }
 
-  // 12. Invalidate/purge corresponding entries in the table locations cache.
+  // 13. Invalidate/purge corresponding entries in the table locations cache.
   if (table_locations_cache_ &&
       (!tablets_to_add.empty() || !tablets_to_drop.empty())) {
     table_locations_cache_->Remove(table->id());
   }
+
+  // Update table's schema related metrics after being altered.
+  table->UpdateSchemaMetrics();
 
   background_tasks_->Wake();
   return Status::OK();
@@ -3405,7 +3535,9 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
       }
     }
     InsertOrUpdate(&table_info_by_name, table_name, table_info);
-    EmplaceIfNotPresent(&table_owner_map, table_name, owner == *user);
+    if (user) {
+      EmplaceIfNotPresent(&table_owner_map, table_name, owner == *user);
+    }
   }
 
   MAYBE_INJECT_FIXED_LATENCY(FLAGS_catalog_manager_inject_latency_list_authz_ms);
@@ -3432,15 +3564,22 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
       ListTablesResponsePB::TableInfo* table = resp->add_tables();
       table->set_id(table_info->id());
       table->set_name(table_name);
+      table->set_live_row_count(table_info->GetMetrics()->live_row_count->value());
+      table->set_num_tablets(table_info->num_tablets());
+      table->set_num_replicas(ltm.data().pb.num_replicas());
     }
   } else {
     // Otherwise, pass all tables through.
     for (const auto& name_and_table_info : table_info_by_name) {
       const auto& table_name = name_and_table_info.first;
       const auto& table_info = name_and_table_info.second;
+      TableMetadataLock ltm(table_info.get(), LockMode::READ);
       ListTablesResponsePB::TableInfo* table = resp->add_tables();
       table->set_id(table_info->id());
       table->set_name(table_name);
+      table->set_live_row_count(table_info->GetMetrics()->live_row_count->value());
+      table->set_num_tablets(table_info->num_tablets());
+      table->set_num_replicas(ltm.data().pb.num_replicas());
     }
   }
   return Status::OK();
@@ -3515,31 +3654,27 @@ bool CatalogManager::IsTableWriteDisabled(const scoped_refptr<TableInfo>& table,
     // disable write immediately.
     if (pb.has_table_disk_size_limit()) {
       table_disk_size_limit = pb.table_disk_size_limit();
-      if (static_cast<double>(table_disk_size) >=
-           (static_cast<double>(table_disk_size_limit) *
-            FLAGS_table_write_limit_ratio)) {
-        disallow_write = true;
-      }
+      disallow_write = static_cast<double>(table_disk_size) >=
+          (static_cast<double>(table_disk_size_limit) * FLAGS_table_write_limit_ratio);
     }
-    if (!disallow_write && pb.has_table_row_count_limit()) {
+    if (pb.has_table_row_count_limit()) {
       table_rows_limit = pb.table_row_count_limit();
-      if (static_cast<double>(table_rows) >=
-              (static_cast<double>(table_rows_limit) *
-               FLAGS_table_write_limit_ratio)) {
-        disallow_write = true;
-      }
+      disallow_write |= static_cast<double>(table_rows) >=
+          (static_cast<double>(table_rows_limit) * FLAGS_table_write_limit_ratio);
     }
   }
 
   if (disallow_write) {
     // The writing into the table is disallowed.
     LOG(INFO) << Substitute("table $0 row count is $1, on disk size is $2, "
-                            "row count limit is $3, size limit is $4, writing is forbidden",
+                            "row count limit is $3, size limit is $4, "
+                            "table_write_limit_ratio is $5, writing is forbidden",
                             table_name,
                             table_rows,
                             table_disk_size,
                             table_rows_limit,
-                            table_disk_size_limit);
+                            table_disk_size_limit,
+                            FLAGS_table_write_limit_ratio);
   }
   return disallow_write;
 }
@@ -3552,14 +3687,20 @@ Status CatalogManager::GetTableInfo(const string& table_id, scoped_refptr<TableI
   return Status::OK();
 }
 
-Status CatalogManager::GetAllTables(vector<scoped_refptr<TableInfo>>* tables) {
+void CatalogManager::GetAllTables(vector<scoped_refptr<TableInfo>>* tables) {
   leader_lock_.AssertAcquiredForReading();
 
   tables->clear();
   shared_lock<LockType> l(lock_);
   AppendValuesFromMap(table_ids_map_, tables);
+}
 
-  return Status::OK();
+void CatalogManager::GetAllTabletsForTests(vector<scoped_refptr<TabletInfo>>* tablets) {
+  leader_lock_.AssertAcquiredForReading();
+
+  tablets->clear();
+  shared_lock<LockType> l(lock_);
+  AppendValuesFromMap(tablet_map_, tablets);
 }
 
 Status CatalogManager::TableNameExists(const string& table_name, bool* exists) {
@@ -3705,14 +3846,17 @@ class PickLeaderReplica : public TSPicker {
 //
 // The target tablet server is refreshed before each RPC by consulting the provided
 // TSPicker implementation.
+// Each created RetryingTSRpcTask should be added to TableInfo::pending_tasks_ by
+// calling TableInfo::AddTask(), so 'table' must remain valid for the lifetime of
+// this class.
 class RetryingTSRpcTask : public MonitoredTask {
  public:
-  RetryingTSRpcTask(Master *master,
+  RetryingTSRpcTask(Master* master,
                     unique_ptr<TSPicker> replica_picker,
-                    scoped_refptr<TableInfo> table)
+                    TableInfo* table)
     : master_(master),
       replica_picker_(std::move(replica_picker)),
-      table_(std::move(table)),
+      table_(table),
       start_ts_(MonoTime::Now()),
       deadline_(start_ts_ + MonoDelta::FromMilliseconds(FLAGS_unresponsive_ts_rpc_timeout_ms)),
       attempt_(0),
@@ -3736,7 +3880,7 @@ class RetryingTSRpcTask : public MonitoredTask {
 
   MonoTime start_timestamp() const override { return start_ts_; }
   MonoTime completion_timestamp() const override { return end_ts_; }
-  const scoped_refptr<TableInfo>& table() const { return table_ ; }
+  TableInfo* table() const { return table_; }
 
  protected:
   // Send an RPC request and register a callback.
@@ -3779,7 +3923,8 @@ class RetryingTSRpcTask : public MonitoredTask {
 
   Master * const master_;
   const unique_ptr<TSPicker> replica_picker_;
-  const scoped_refptr<TableInfo> table_;
+  // RetryingTSRpcTask is owned by 'TableInfo', so the backpointer should be raw.
+  TableInfo* table_;
 
   MonoTime start_ts_;
   MonoTime end_ts_;
@@ -3951,7 +4096,7 @@ class RetrySpecificTSRpcTask : public RetryingTSRpcTask {
  public:
   RetrySpecificTSRpcTask(Master* master,
                          const string& permanent_uuid,
-                         const scoped_refptr<TableInfo>& table)
+                         TableInfo* table)
     : RetryingTSRpcTask(master,
                         unique_ptr<TSPicker>(new PickSpecificUUID(permanent_uuid)),
                         table),
@@ -3973,7 +4118,7 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
                      const string& permanent_uuid,
                      const scoped_refptr<TabletInfo>& tablet,
                      const TabletMetadataLock& tablet_lock)
-    : RetrySpecificTSRpcTask(master, permanent_uuid, tablet->table()),
+    : RetrySpecificTSRpcTask(master, permanent_uuid, tablet->table().get()),
       tablet_id_(tablet->id()) {
     deadline_ = start_ts_ + MonoDelta::FromMilliseconds(FLAGS_tablet_creation_timeout_ms);
 
@@ -4039,17 +4184,17 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
 // Send a DeleteTablet() RPC request.
 class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
  public:
-  AsyncDeleteReplica(
-      Master* master, const string& permanent_uuid,
-      const scoped_refptr<TableInfo>& table, string tablet_id,
-      TabletDataState delete_type,
-      optional<int64_t> cas_config_opid_index_less_or_equal,
-      string reason)
+  AsyncDeleteReplica(Master* master,
+                     const string& permanent_uuid,
+                     TableInfo* table,
+                     string tablet_id,
+                     TabletDataState delete_type,
+                     optional<int64_t> cas_config_opid_index_less_or_equal,
+                     string reason)
       : RetrySpecificTSRpcTask(master, permanent_uuid, table),
         tablet_id_(std::move(tablet_id)),
         delete_type_(delete_type),
-        cas_config_opid_index_less_or_equal_(
-            std::move(cas_config_opid_index_less_or_equal)),
+        cas_config_opid_index_less_or_equal_(std::move(cas_config_opid_index_less_or_equal)),
         reason_(std::move(reason)) {}
 
   string type_name() const override {
@@ -4088,6 +4233,12 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
             "because tablet deleting was already in progress. No further retry: $2",
             target_ts_desc_->ToString(), tablet_id_, status.ToString());
           MarkComplete();
+          break;
+        case TabletServerErrorPB::WRONG_SERVER_UUID:
+          LOG(WARNING) << Substitute("TS $0: delete failed for tablet $1 "
+            "because the server uuid is wrong. No further retry: $2",
+            target_ts_desc_->ToString(), tablet_id_, status.ToString());
+          MarkFailed();
           break;
         default:
           KLOG_EVERY_N_SECS(WARNING, 1) <<
@@ -4148,7 +4299,7 @@ class AsyncAlterTable : public RetryingTSRpcTask {
                   scoped_refptr<TabletInfo> tablet)
     : RetryingTSRpcTask(master,
                         unique_ptr<TSPicker>(new PickLeaderReplica(tablet)),
-                        tablet->table()),
+                        tablet->table().get()),
       tablet_(std::move(tablet)) {
   }
 
@@ -4248,7 +4399,7 @@ AsyncChangeConfigTask::AsyncChangeConfigTask(Master* master,
                                              consensus::ChangeConfigType change_config_type)
     : RetryingTSRpcTask(master,
                         unique_ptr<TSPicker>(new PickLeaderReplica(tablet)),
-                        tablet->table()),
+                        tablet->table().get()),
       tablet_(std::move(tablet)),
       cstate_(std::move(cstate)),
       change_config_type_(change_config_type) {
@@ -4566,9 +4717,9 @@ Status CatalogManager::ProcessTabletReport(
         // It'd be unsafe to ask the tserver to delete this tablet without first
         // replicating something to our followers (i.e. to guarantee that we're
         // the leader). For example, if we were a rogue master, we might be
-        // deleting a tablet created by a new master accidentally. But masters
-        // retain metadata for deleted tablets forever, so a tablet can only be
-        // truly unknown in the event of a serious misconfiguration, such as a
+        // deleting a tablet created by a new master accidentally. Though masters
+        // don't always retain metadata for deleted tablets forever, a tablet
+        // may be unknown in the event of a serious misconfiguration, such as a
         // tserver heartbeating to the wrong cluster. Therefore, it should be
         // reasonable to ignore it and wait for an operator fix the situation.
         LOG(WARNING) << "Ignoring report from unknown tablet " << tablet_id;
@@ -4613,7 +4764,7 @@ Status CatalogManager::ProcessTabletReport(
       // TODO(unknown): Cancel tablet creation, instead of deleting, in cases
       // where that might be possible (tablet creation timeout & replacement).
       rpcs.emplace_back(new AsyncDeleteReplica(
-          master_, ts_desc->permanent_uuid(), table, tablet_id,
+          master_, ts_desc->permanent_uuid(), table.get(), tablet_id,
           TABLET_DATA_DELETED, none, msg));
       continue;
     }
@@ -4640,7 +4791,7 @@ Status CatalogManager::ProcessTabletReport(
           "Replica has no consensus available" :
           Substitute("Replica with old config index $0", report_opid_index);
       rpcs.emplace_back(new AsyncDeleteReplica(
-          master_, ts_desc->permanent_uuid(), table, tablet_id,
+          master_, ts_desc->permanent_uuid(), table.get(), tablet_id,
           TABLET_DATA_TOMBSTONED, prev_opid_index,
           Substitute("$0 (current committed config index is $1)",
                      delete_msg, prev_opid_index)));
@@ -4763,7 +4914,7 @@ Status CatalogManager::ProcessTabletReport(
             const string& peer_uuid = p.permanent_uuid();
             if (!ContainsKey(current_member_uuids, peer_uuid)) {
               rpcs.emplace_back(new AsyncDeleteReplica(
-                  master_, peer_uuid, table, tablet_id,
+                  master_, peer_uuid, table.get(), tablet_id,
                   TABLET_DATA_TOMBSTONED, prev_cstate.committed_config().opid_index(),
                   Substitute("TS $0 not found in new config with opid_index $1",
                              peer_uuid, cstate.committed_config().opid_index())));
@@ -4849,7 +5000,7 @@ Status CatalogManager::ProcessTabletReport(
       if (report.has_stats()) {
         // For the versions >= 1.11.x, the tserver reports stats. But keep in
         // mind that 'live_row_count' is not supported for the legacy replicas.
-        tablet->table()->UpdateMetrics(tablet_id, tablet->GetStats(), report.stats());
+        tablet->table()->UpdateStatsMetrics(tablet_id, tablet->GetStats(), report.stats());
         tablet->UpdateStats(report.stats());
       } else {
         // For the versions < 1.11.x, the tserver doesn't report stats. Thus,
@@ -4906,6 +5057,7 @@ Status CatalogManager::ProcessTabletReport(
     const string& tablet_id = e.first;
     const scoped_refptr<TabletInfo>& tablet = e.second;
     const ReportedTabletPB& report = *FindOrDie(reports, tablet_id);
+
     if (report.has_schema_version()) {
       HandleTabletSchemaVersionReport(tablet, report.schema_version());
     }
@@ -5019,7 +5171,7 @@ void CatalogManager::SendDeleteTabletRequest(const scoped_refptr<TabletInfo>& ta
       << " replicas of tablet " << tablet->id();
   for (const auto& peer : cstate.committed_config().peers()) {
     scoped_refptr<AsyncDeleteReplica> task = new AsyncDeleteReplica(
-        master_, peer.permanent_uuid(), tablet->table(), tablet->id(),
+        master_, peer.permanent_uuid(), tablet->table().get(), tablet->id(),
         TABLET_DATA_DELETED, none, deletion_msg);
     tablet->table()->AddTask(tablet->id(), task);
     WARN_NOT_OK(task->Run(), Substitute(
@@ -5055,6 +5207,27 @@ void CatalogManager::ExtractTabletsToProcess(
         continue;
       }
       tablets_to_process->emplace_back(tablet);
+    }
+  }
+}
+
+void CatalogManager::ExtractDeletedTablesAndTablets(
+    vector<scoped_refptr<TableInfo>>* deleted_tables,
+    vector<scoped_refptr<TabletInfo>>* deleted_tablets) {
+  shared_lock<LockType> l(lock_);
+  for (const auto& table_entry : table_ids_map_) {
+    scoped_refptr<TableInfo> table = table_entry.second;
+    TableMetadataLock table_lock(table.get(), LockMode::READ);
+    if (table_lock.data().is_deleted()) {
+      deleted_tables->emplace_back(table);
+    }
+  }
+  for (const auto& tablet_entry : tablet_map_) {
+    scoped_refptr<TabletInfo> tablet = tablet_entry.second;
+    TableMetadataLock table_lock(tablet->table().get(), LockMode::READ);
+    TabletMetadataLock tablet_lock(tablet.get(), LockMode::READ);
+    if (tablet_lock.data().is_deleted() || table_lock.data().is_deleted()) {
+      deleted_tablets->emplace_back(tablet);
     }
   }
 }
@@ -5175,10 +5348,11 @@ void CatalogManager::HandleAssignCreatingTablet(const scoped_refptr<TabletInfo>&
       tablet->ToString(), replacement->id());
 
   // Mark old tablet as replaced.
+  const time_t timestamp = time(nullptr);
   tablet->mutable_metadata()->mutable_dirty()->set_state(
-    SysTabletsEntryPB::REPLACED,
-    Substitute("Replaced by $0 at $1",
-               replacement->id(), LocalTimeAsString()));
+      SysTabletsEntryPB::REPLACED,
+      Substitute("Replaced by $0 at $1", replacement->id(), TimestampAsString(timestamp)));
+  tablet->mutable_metadata()->mutable_dirty()->pb.set_delete_timestamp(timestamp);
 
   // Mark new tablet as being created.
   replacement->mutable_metadata()->mutable_dirty()->set_state(
@@ -5422,6 +5596,72 @@ void CatalogManager::SendCreateTabletRequest(const scoped_refptr<TabletInfo>& ta
   }
 }
 
+Status CatalogManager::ProcessDeletedTablets(const vector<scoped_refptr<TabletInfo>>& tablets,
+                                             time_t current_timestamp) {
+  TabletMetadataGroupLock tablets_lock(LockMode::RELEASED);
+  tablets_lock.AddMutableInfos(tablets);
+  tablets_lock.Lock(LockMode::WRITE);
+
+  vector<scoped_refptr<TabletInfo>> tablets_to_clean_up;
+  for (const auto& tablet : tablets) {
+    if (current_timestamp - tablet->metadata().state().pb.delete_timestamp() >
+        FLAGS_metadata_for_deleted_table_and_tablet_reserved_secs) {
+      tablets_to_clean_up.emplace_back(tablet);
+    }
+  }
+  // Persist the changes to the sys.catalog table.
+  SysCatalogTable::Actions actions;
+  actions.tablets_to_delete = tablets_to_clean_up;
+  const auto write_mode = FLAGS_enable_chunked_tablet_writes ? SysCatalogTable::WriteMode::CHUNKED
+                                                              : SysCatalogTable::WriteMode::ATOMIC;
+  Status s = sys_catalog_->Write(std::move(actions), write_mode);
+  if (PREDICT_FALSE(!s.ok())) {
+    s = s.CloneAndPrepend("an error occurred while writing to the sys-catalog");
+    LOG(WARNING) << s.ToString();
+    return s;
+  }
+  // Remove expired tablets from the global map.
+  {
+    std::lock_guard<LockType> l(lock_);
+    for (const auto& t : tablets_to_clean_up) {
+      DCHECK(ContainsKey(tablet_map_, t->id()));
+      tablet_map_.erase(t->id());
+      VLOG(1) << "Cleaned up deleted tablet: " << t->id();
+    }
+  }
+  tablets_lock.Unlock();
+  return Status::OK();
+}
+
+Status CatalogManager::ProcessDeletedTables(const vector<scoped_refptr<TableInfo>>& tables,
+                                            time_t current_timestamp) {
+  TableMetadataGroupLock tables_lock(LockMode::RELEASED);
+  tables_lock.AddMutableInfos(tables);
+  tables_lock.Lock(LockMode::WRITE);
+
+  for (const auto& table : tables) {
+    if (current_timestamp - table->metadata().state().pb.delete_timestamp() >
+        FLAGS_metadata_for_deleted_table_and_tablet_reserved_secs) {
+      SysCatalogTable::Actions action;
+      action.table_to_delete = table;
+      Status s = sys_catalog_->Write(std::move(action));
+      if (PREDICT_FALSE(!s.ok())) {
+        s = s.CloneAndPrepend("an error occurred while writing to the sys-catalog");
+        LOG(WARNING) << s.ToString();
+        return s;
+      }
+
+      std::lock_guard<LockType> l(lock_);
+      DCHECK(ContainsKey(table_ids_map_, table->id()));
+      table_ids_map_.erase(table->id());
+      VLOG(1) << "Cleaned up deleted table: " << table->ToString();
+    }
+  }
+
+  tables_lock.Unlock();
+  return Status::OK();
+}
+
 Status CatalogManager::BuildLocationsForTablet(
     const scoped_refptr<TabletInfo>& tablet,
     ReplicaTypeFilter filter,
@@ -5582,6 +5822,7 @@ Status CatalogManager::ReplaceTablet(const string& tablet_id, ReplaceTabletRespo
   const string replace_msg = Substitute("replaced by tablet $0", new_tablet->id());
   old_tablet->mutable_metadata()->mutable_dirty()->set_state(SysTabletsEntryPB::DELETED,
                                                              replace_msg);
+  old_tablet->mutable_metadata()->mutable_dirty()->pb.set_delete_timestamp(time(nullptr));
 
   // Persist the changes to the syscatalog table.
   {
@@ -5641,8 +5882,17 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
       && req->partition_key_start() > req->partition_key_end())) {
     return Status::InvalidArgument("start partition key is greater than the end partition key");
   }
-  if (PREDICT_FALSE(req->max_returned_locations() <= 0)) {
-    return Status::InvalidArgument("max_returned_locations must be greater than 0");
+  if (PREDICT_FALSE(req->has_key_start() && req->has_key_end() &&
+                    req->key_start().has_range_key() &&
+                    req->key_end().has_range_key() &&
+                    req->key_start().range_key() > req->key_end().range_key())) {
+    return Status::InvalidArgument("start partition range key must not be "
+                                   "greater than the end partition range key");
+  }
+  if (PREDICT_FALSE(req->has_max_returned_locations() &&
+                    req->max_returned_locations() <= 0)) {
+    return Status::InvalidArgument(
+        "max_returned_locations must be greater than 0 if specified");
   }
 
   leader_lock_.AssertAcquiredForReading();
@@ -5661,7 +5911,7 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   vector<scoped_refptr<TabletInfo>> tablets_in_range;
-  table->GetTabletsInRange(req, &tablets_in_range);
+  RETURN_NOT_OK(table->GetTabletsInRange(req, &tablets_in_range));
 
   // Check for items in the cache.
   if (table_locations_cache_) {
@@ -5821,6 +6071,95 @@ Status CatalogManager::WaitForNotificationLogListenerCatchUp(RespClass* resp,
       MasterErrorPB::HIVE_METASTORE_ERROR;
     return SetupError(s, resp, code);
   }
+  return Status::OK();
+}
+
+template<typename RespClass>
+Status CatalogManager::ValidateNumberReplicas(const std::string& normalized_table_name,
+                                              RespClass* resp, ValidateType type,
+                                              const boost::optional<int>& partitions_count,
+                                              int num_replicas) {
+  if (num_replicas > FLAGS_max_num_replicas) {
+    return SetupError(Status::InvalidArgument(
+        Substitute("illegal replication factor $0: maximum allowed replication "
+                   "factor is $1 (controlled by --max_num_replicas)",
+                   num_replicas, FLAGS_max_num_replicas)),
+        resp, MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH);
+  }
+  if (num_replicas < FLAGS_min_num_replicas) {
+    return SetupError(Status::InvalidArgument(
+        Substitute("illegal replication factor $0: minimum allowed replication "
+                   "factor is $1 (controlled by --min_num_replicas)",
+            num_replicas, FLAGS_min_num_replicas)),
+        resp, MasterErrorPB::ILLEGAL_REPLICATION_FACTOR);
+  }
+  // Reject create/alter table with even replication factors, unless master flag
+  // allow_unsafe_replication_factor is on.
+  if (num_replicas % 2 == 0 && !FLAGS_allow_unsafe_replication_factor) {
+    return SetupError(Status::InvalidArgument(
+        Substitute("illegal replication factor $0: replication factor must be odd",
+                   num_replicas)),
+        resp, MasterErrorPB::EVEN_REPLICATION_FACTOR);
+  }
+
+  // Verify that the number of replicas isn't larger than the number of live tablet
+  // servers.
+  TSDescriptorVector ts_descs;
+  master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
+  const auto num_live_tservers = ts_descs.size();
+  if ((type == ValidateType::kCreateTable ? FLAGS_catalog_manager_check_ts_count_for_create_table :
+                                            FLAGS_catalog_manager_check_ts_count_for_alter_table) &&
+      num_replicas > num_live_tservers) {
+    // Note: this error message is matched against in master-stress-test.
+    return SetupError(Status::InvalidArgument(Substitute(
+        "not enough live tablet servers to $0 a table with the requested replication "
+        "factor $1; $2 tablet servers are alive",
+        type == ValidateType::kCreateTable ? "create" : "alter",
+        num_replicas, num_live_tservers)),
+                      resp, MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH);
+  }
+
+  if (type == ValidateType::kCreateTable) {
+    // Verify that the total number of replicas is reasonable.
+    //
+    // Table creation can generate a fair amount of load, both in the form of RPC
+    // traffic (due to Raft leader elections) and disk I/O (due to durably writing
+    // several files during both replica creation and leader elections).
+    //
+    // Ideally we would have more effective ways of mitigating this load (such
+    // as more efficient on-disk metadata management), but in lieu of that, we
+    // employ this coarse-grained check that prohibits up-front creation of too
+    // many replicas.
+    //
+    // Note: non-replicated tables are exempt because, by not using replication,
+    // they do not generate much of the load described above.
+    const auto max_replicas_total = FLAGS_max_create_tablets_per_ts * num_live_tservers;
+    if (num_replicas > 1 && max_replicas_total > 0 &&
+        *partitions_count * num_replicas > max_replicas_total) {
+      return SetupError(Status::InvalidArgument(Substitute(
+                            "the requested number of tablet replicas is over the maximum permitted "
+                            "at creation time ($0), additional tablets may be added by adding "
+                            "range partitions to the table post-creation",
+                            max_replicas_total)),
+                        resp,
+                        MasterErrorPB::TOO_MANY_TABLETS);
+    }
+  }
+
+  // Warn if the number of live tablet servers is not enough to re-replicate
+  // a failed replica of the tablet.
+  const auto num_ts_needed_for_rereplication =
+      num_replicas + (FLAGS_raft_prepare_replacement_before_eviction ? 1 : 0);
+  if (num_replicas > 1 && num_ts_needed_for_rereplication > num_live_tservers) {
+    LOG(WARNING) << Substitute(
+        "The number of live tablet servers is not enough to re-replicate a "
+        "tablet replica of the $0 table $1 in case of a server "
+        "failure: $2 tablet servers would be needed, $3 are available. "
+        "Consider bringing up more tablet servers.",
+        type == ValidateType::kCreateTable ? "newly created" : "altering", normalized_table_name,
+        num_ts_needed_for_rereplication, num_live_tservers);
+  }
+
   return Status::OK();
 }
 
@@ -6052,6 +6391,7 @@ bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrResp
 
 INITTED_OR_RESPOND(ConnectToMasterResponsePB);
 INITTED_OR_RESPOND(GetMasterRegistrationResponsePB);
+INITTED_OR_RESPOND(UnregisterTServerResponsePB);
 INITTED_OR_RESPOND(TSHeartbeatResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(AddMasterResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(AlterTableResponsePB);
@@ -6112,10 +6452,12 @@ void TabletInfo::set_reported_schema_version(int64_t version) {
   // We also need to hold the tablet metadata lock in order to read the partition
   // key, but it's OK to make a local copy of it (and release the lock) because
   // the key is immutable.
-  string key_start;
+  PartitionKey key_start;
   {
     TabletMetadataLock l(this, LockMode::READ);
-    key_start = l.data().pb.partition().partition_key_start();
+    const auto& p = l.data().pb.partition();
+    key_start = Partition::StringToPartitionKey(
+        p.partition_key_start(), p.hash_buckets_size());
   }
   std::lock_guard<rw_spinlock> table_l(table_->lock_);
   std::lock_guard<simple_spinlock> tablet_l(lock_);
@@ -6154,7 +6496,6 @@ string TabletInfo::ToString() const {
                     (table_ != nullptr ? table_->ToString() : "MISSING"));
 }
 
-
 void TabletInfo::UpdateStats(ReportedTabletStatsPB stats) {
   std::lock_guard<simple_spinlock> l(lock_);
   stats_ = std::move(stats);
@@ -6177,6 +6518,9 @@ void PersistentTabletInfo::set_state(SysTabletsEntryPB::State state, const strin
 TableInfo::TableInfo(string table_id) : table_id_(std::move(table_id)) {}
 
 TableInfo::~TableInfo() {
+  // Abort and wait for all pending tasks completed.
+  AbortTasks();
+  WaitTasksCompletion();
 }
 
 string TableInfo::ToString() const {
@@ -6193,17 +6537,20 @@ void TableInfo::AddRemoveTablets(const vector<scoped_refptr<TabletInfo>>& tablet
                                  const vector<scoped_refptr<TabletInfo>>& tablets_to_drop) {
   std::lock_guard<rw_spinlock> l(lock_);
   for (const auto& tablet : tablets_to_drop) {
-    const auto& lower_bound = tablet->metadata().state().pb.partition().partition_key_start();
+    const auto& p = tablet->metadata().state().pb.partition();
+    const auto& lower_bound = Partition::StringToPartitionKey(
+        p.partition_key_start(), p.hash_buckets_size());
     CHECK(EraseKeyReturnValuePtr(&tablet_map_, lower_bound) != nullptr);
     DecrementSchemaVersionCountUnlocked(tablet->reported_schema_version());
     // Remove the table metrics for the deleted tablets.
     RemoveMetrics(tablet->id(), tablet->GetStats());
   }
   for (const auto& tablet : tablets_to_add) {
+    const auto& p = tablet->metadata().state().pb.partition();
+    const auto& key_start = Partition::StringToPartitionKey(
+        p.partition_key_start(), p.hash_buckets_size());
     TabletInfo* old = nullptr;
-    if (UpdateReturnCopy(&tablet_map_,
-                         tablet->metadata().state().pb.partition().partition_key_start(),
-                         tablet.get(), &old)) {
+    if (UpdateReturnCopy(&tablet_map_, key_start, tablet.get(), &old)) {
       VLOG(1) << Substitute("Replaced tablet $0 with $1",
                             old->id(), tablet->id());
       DecrementSchemaVersionCountUnlocked(old->reported_schema_version());
@@ -6222,14 +6569,68 @@ void TableInfo::AddRemoveTablets(const vector<scoped_refptr<TabletInfo>>& tablet
 #endif
 }
 
-void TableInfo::GetTabletsInRange(const GetTableLocationsRequestPB* req,
-                                  vector<scoped_refptr<TabletInfo>>* ret) const {
-  shared_lock<rw_spinlock> l(lock_);
-  int max_returned_locations = req->max_returned_locations();
+Status TableInfo::GetTabletsInRange(
+    const GetTableLocationsRequestPB* req,
+    vector<scoped_refptr<TabletInfo>>* ret) const {
 
-  RawTabletInfoMap::const_iterator it, it_end;
-  if (req->has_partition_key_start()) {
-    it = tablet_map_.upper_bound(req->partition_key_start());
+  static constexpr const char* const kErrRangeNewSpec =
+      "$0: for a table with custom per-range hash schemas the range must "
+      "be specified using partition_key_range field, not "
+      "partition_key_{start,end} fields";
+
+  size_t hash_dimensions_num = 0;
+  bool has_custom_hash_schemas = false;
+  {
+    TableMetadataLock l(this, LockMode::READ);
+    const auto& ps = l.data().pb.partition_schema();
+    hash_dimensions_num = ps.hash_schema_size();
+    has_custom_hash_schemas = ps.custom_hash_schema_ranges_size() > 0;
+  }
+
+  // Find partition keys for the start and the end of the range in question.
+  // That's done with extra guardrails to ensure the table doesn't have custom
+  // hash schemas per range when using legacy fields
+  // GetTableLocationsRequestPB::{partition_key_start,partition_key_end}.
+  PartitionKey partition_key_start;
+  bool has_key_start = false;
+  if (req->has_key_start()) {
+    const auto& start = req->key_start();
+    if (start.has_hash_key() || start.has_range_key()) {
+      partition_key_start = PartitionKey(start.hash_key(), start.range_key());
+      has_key_start = true;
+    }
+  } else if (req->has_partition_key_start()) {
+    if (has_custom_hash_schemas &&
+        FLAGS_require_new_spec_for_custom_hash_schema_range_bound) {
+      return Status::InvalidArgument(Substitute(kErrRangeNewSpec, ToString()));
+    }
+    partition_key_start = Partition::StringToPartitionKey(
+        req->partition_key_start(), hash_dimensions_num);
+    has_key_start = true;
+  }
+
+  PartitionKey partition_key_end;
+  bool has_key_end = false;
+  if (req->has_key_end()) {
+    const auto& end = req->key_end();
+    if (end.has_hash_key() || end.has_range_key()) {
+      partition_key_end = PartitionKey(end.hash_key(), end.range_key());
+      has_key_end = true;
+    }
+  } else if (req->has_partition_key_end()) {
+    if (has_custom_hash_schemas &&
+        FLAGS_require_new_spec_for_custom_hash_schema_range_bound) {
+      return Status::InvalidArgument(Substitute(kErrRangeNewSpec, ToString()));
+    }
+    partition_key_end = Partition::StringToPartitionKey(
+        req->partition_key_end(), hash_dimensions_num);
+    has_key_end = true;
+  }
+
+  shared_lock<rw_spinlock> l(lock_);
+  RawTabletInfoMap::const_iterator it;
+  if (has_key_start) {
+    it = tablet_map_.upper_bound(partition_key_start);
     if (it != tablet_map_.begin()) {
       --it;
     }
@@ -6237,17 +6638,20 @@ void TableInfo::GetTabletsInRange(const GetTableLocationsRequestPB* req,
     it = tablet_map_.begin();
   }
 
-  if (req->has_partition_key_end()) {
-    it_end = tablet_map_.upper_bound(req->partition_key_end());
-  } else {
-    it_end = tablet_map_.end();
-  }
+  const RawTabletInfoMap::const_iterator it_end = has_key_end
+      ? tablet_map_.upper_bound(partition_key_end)
+      : tablet_map_.end();
 
-  int count = 0;
+  const size_t max_returned_locations =
+      req->has_max_returned_locations() ? req->max_returned_locations()
+                                        : std::numeric_limits<size_t>::max();
+  size_t count = 0;
   for (; it != it_end && count < max_returned_locations; ++it) {
     ret->emplace_back(make_scoped_refptr(it->second));
-    count++;
+    ++count;
   }
+
+  return Status::OK();
 }
 
 bool TableInfo::IsAlterInProgress(uint32_t version) const {
@@ -6358,11 +6762,12 @@ void TableInfo::UnregisterMetrics() {
   }
 }
 
-void TableInfo::UpdateMetrics(const string& tablet_id,
-                              const tablet::ReportedTabletStatsPB& old_stats,
-                              const tablet::ReportedTabletStatsPB& new_stats) {
-  if (!metrics_) return;
-
+void TableInfo::UpdateStatsMetrics(const string& tablet_id,
+                                   const tablet::ReportedTabletStatsPB& old_stats,
+                                   const tablet::ReportedTabletStatsPB& new_stats) {
+  if (!metrics_) {
+    return;
+  }
   if (PREDICT_TRUE(!metrics_->on_disk_size->IsInvisible())) {
     metrics_->on_disk_size->IncrementBy(
         static_cast<int64_t>(new_stats.on_disk_size()) -
@@ -6381,7 +6786,7 @@ void TableInfo::UpdateMetrics(const string& tablet_id,
         {
           std::lock_guard<rw_spinlock> l(lock_);
           for (const auto& e : tablet_map_) {
-            if (e.first != tablet_id) {
+            if (e.second->id() != tablet_id) {
               on_disk_size += e.second->GetStats().on_disk_size();
             }
           }
@@ -6415,7 +6820,7 @@ void TableInfo::UpdateMetrics(const string& tablet_id,
         {
           std::lock_guard<rw_spinlock> l(lock_);
           for (const auto& e : tablet_map_) {
-            if (e.first != tablet_id) {
+            if (e.second->id() != tablet_id) {
               live_row_count += e.second->GetStats().live_row_count();
             }
           }
@@ -6424,6 +6829,13 @@ void TableInfo::UpdateMetrics(const string& tablet_id,
       }
     }
   }
+}
+
+void TableInfo::UpdateSchemaMetrics() {
+  TableMetadataLock l(this, LockMode::READ);
+  const SysTablesEntryPB& pb = metadata().state().pb;
+  metrics_->column_count->set_value(pb.schema().columns().size());
+  metrics_->schema_version->set_value(pb.version());
 }
 
 void TableInfo::InvalidateMetrics(const std::string& tablet_id) {

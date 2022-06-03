@@ -45,13 +45,13 @@
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
-#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/txn_metadata.h"
 #include "kudu/tablet/txn_participant.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/env.h"
+#include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/pb_util.h"
@@ -66,27 +66,30 @@ TAG_FLAG(enable_tablet_orphaned_block_deletion, advanced);
 TAG_FLAG(enable_tablet_orphaned_block_deletion, hidden);
 TAG_FLAG(enable_tablet_orphaned_block_deletion, runtime);
 
+DEFINE_int32(tablet_metadata_load_inject_latency_ms, 0,
+             "Amount of latency in ms to inject when load tablet metadata file. "
+             "Only for testing.");
+TAG_FLAG(tablet_metadata_load_inject_latency_ms, hidden);
+
 using base::subtle::Barrier_AtomicIncrement;
 using kudu::consensus::MinimumOpId;
 using kudu::consensus::OpId;
-using kudu::fs::BlockManager;
 using kudu::fs::BlockDeletionTransaction;
+using kudu::fs::BlockManager;
 using kudu::log::MinLogIndexAnchorer;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using std::memory_order_relaxed;
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::unordered_map;
 using std::unordered_set;
-using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
 namespace kudu {
 namespace tablet {
-
-const int64_t kNoDurableMemStore = -1;
 
 // ============================================================================
 //  Tablet Metadata
@@ -142,6 +145,7 @@ Status TabletMetadata::CreateNew(FsManager* fs_manager,
 Status TabletMetadata::Load(FsManager* fs_manager,
                             const string& tablet_id,
                             scoped_refptr<TabletMetadata>* metadata) {
+  MAYBE_INJECT_FIXED_LATENCY(FLAGS_tablet_metadata_load_inject_latency_ms);
   scoped_refptr<TabletMetadata> ret(new TabletMetadata(fs_manager, tablet_id));
   RETURN_NOT_OK(ret->LoadFromDisk());
   metadata->swap(ret);
@@ -163,9 +167,10 @@ Status TabletMetadata::LoadOrCreate(FsManager* fs_manager,
                                     scoped_refptr<TabletMetadata>* metadata) {
   Status s = Load(fs_manager, tablet_id, metadata);
   if (s.ok()) {
-    if (!(*metadata)->schema().Equals(schema)) {
+    const SchemaPtr schema_ptr = (*metadata)->schema();
+    if (*schema_ptr != schema) {
       return Status::Corruption(Substitute("Schema on disk ($0) does not "
-        "match expected schema ($1)", (*metadata)->schema().ToString(),
+        "match expected schema ($1)", schema_ptr->ToString(),
         schema.ToString()));
     }
     return Status::OK();
@@ -305,9 +310,10 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id,
       table_id_(std::move(table_id)),
       partition_(std::move(partition)),
       fs_manager_(fs_manager),
+      log_prefix_(Substitute("T $0 P $1: ", tablet_id_, fs_manager_->uuid())),
       next_rowset_idx_(0),
       last_durable_mrs_id_(kNoDurableMemStore),
-      schema_(new Schema(schema)),
+      schema_(std::make_shared<Schema>(schema)),
       schema_version_(0),
       table_name_(std::move(table_name)),
       partition_schema_(std::move(partition_schema)),
@@ -326,8 +332,6 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id,
 }
 
 TabletMetadata::~TabletMetadata() {
-  STLDeleteElements(&old_schemas_);
-  delete schema_;
 }
 
 TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id)
@@ -335,7 +339,6 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id)
       tablet_id_(std::move(tablet_id)),
       fs_manager_(fs_manager),
       next_rowset_idx_(0),
-      schema_(nullptr),
       num_flush_pins_(0),
       needs_flush_(false),
       flush_count_for_tests_(0),
@@ -386,11 +389,14 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
     table_name_ = superblock.table_name();
 
     uint32_t schema_version = superblock.schema_version();
-    unique_ptr<Schema> schema(new Schema());
+    SchemaPtr schema = std::make_shared<Schema>();
     RETURN_NOT_OK_PREPEND(SchemaFromPB(superblock.schema(), schema.get()),
                           "Failed to parse Schema from superblock " +
                           SecureShortDebugString(superblock));
-    SetSchemaUnlocked(std::move(schema), schema_version);
+    {
+      SchemaPtr old_schema;
+      SwapSchemaUnlocked(schema, schema_version, &old_schema);
+    }
 
     if (!superblock.has_partition()) {
       // KUDU-818: Possible backward compatibility issue with tables created
@@ -696,7 +702,8 @@ Status TabletMetadata::ReplaceSuperBlockUnlocked(const TabletSuperBlockPB &pb) {
   string path = fs_manager_->GetTabletMetadataPath(tablet_id_);
   RETURN_NOT_OK_PREPEND(pb_util::WritePBContainerToPath(
                             fs_manager_->env(), path, pb,
-                            pb_util::OVERWRITE, pb_util::SYNC),
+                            pb_util::OVERWRITE, pb_util::SYNC,
+                            pb_util::SENSITIVE),
                         Substitute("Failed to write tablet metadata $0", tablet_id_));
   flush_count_for_tests_++;
   RETURN_NOT_OK(UpdateOnDiskSize());
@@ -717,7 +724,7 @@ boost::optional<consensus::OpId> TabletMetadata::tombstone_last_logged_opid() co
 Status TabletMetadata::ReadSuperBlockFromDisk(TabletSuperBlockPB* superblock) const {
   string path = fs_manager_->GetTabletMetadataPath(tablet_id_);
   RETURN_NOT_OK_PREPEND(
-      pb_util::ReadPBContainerFromPath(fs_manager_->env(), path, superblock),
+      pb_util::ReadPBContainerFromPath(fs_manager_->env(), path, superblock, pb_util::SENSITIVE),
       Substitute("Could not load tablet metadata from $0", path));
   return Status::OK();
 }
@@ -932,23 +939,21 @@ RowSetMetadata *TabletMetadata::GetRowSetForTests(int64_t id) {
   return nullptr;
 }
 
-void TabletMetadata::SetSchema(const Schema& schema, uint32_t version) {
-  unique_ptr<Schema> new_schema(new Schema(schema));
-  std::lock_guard<LockType> l(data_lock_);
-  SetSchemaUnlocked(std::move(new_schema), version);
+void TabletMetadata::SetSchema(const SchemaPtr& schema, uint32_t version) {
+  // In case this is the last reference to the schema, destruct the pointer
+  // outside the lock.
+  SchemaPtr old_schema;
+  {
+    std::lock_guard<LockType> l(data_lock_);
+    SwapSchemaUnlocked(schema, version, &old_schema);
+  }
 }
 
-void TabletMetadata::SetSchemaUnlocked(unique_ptr<Schema> new_schema, uint32_t version) {
-  DCHECK(new_schema->has_column_ids());
-
-  Schema* old_schema = schema_;
-  // "Release" barrier ensures that, when we publish the new Schema object,
-  // all of its initialization is also visible.
-  base::subtle::Release_Store(reinterpret_cast<AtomicWord*>(&schema_),
-                              reinterpret_cast<AtomicWord>(new_schema.release()));
-  if (PREDICT_TRUE(old_schema)) {
-    old_schemas_.push_back(old_schema);
-  }
+void TabletMetadata::SwapSchemaUnlocked(SchemaPtr schema, uint32_t version,
+                                        SchemaPtr* old_schema) {
+  DCHECK(schema->has_column_ids());
+  *old_schema = std::move(schema_);
+  schema_ = std::move(schema);
   schema_version_ = version;
 }
 
@@ -975,10 +980,6 @@ void TabletMetadata::set_tablet_data_state(TabletDataState state) {
     tombstone_last_logged_opid_ = boost::none;
   }
   tablet_data_state_ = state;
-}
-
-string TabletMetadata::LogPrefix() const {
-  return Substitute("T $0 P $1: ", tablet_id_, fs_manager_->uuid());
 }
 
 TabletDataState TabletMetadata::tablet_data_state() const {

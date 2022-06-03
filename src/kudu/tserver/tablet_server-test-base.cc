@@ -65,6 +65,7 @@
 DEFINE_int32(rpc_timeout, 1000, "Timeout for RPC calls, in seconds");
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_int32(heartbeat_rpc_timeout_ms);
+DECLARE_string(test_server_key);
 
 METRIC_DEFINE_entity(test);
 
@@ -95,6 +96,8 @@ TabletServerTestBase::TabletServerTestBase()
   // the heartbeat timeout to 1 second speeds up unit tests which
   // purposefully specify non-running Master servers.
   FLAGS_heartbeat_rpc_timeout_ms = 1000;
+
+  FLAGS_test_server_key = GetEncryptionKey();
 }
 
 // Starts the tablet server, override to start it later.
@@ -138,7 +141,7 @@ Status TabletServerTestBase::WaitForTabletRunning(const char *tablet_id) {
   RETURN_NOT_OK(tablet_manager->GetTabletReplica(tablet_id, &tablet_replica));
   RETURN_NOT_OK(tablet_replica->WaitUntilConsensusRunning(kTimeout));
   RETURN_NOT_OK(
-      tablet_replica->consensus()->WaitUntilLeaderForTests(kTimeout));
+      tablet_replica->consensus()->WaitUntilLeader(kTimeout));
 
   // KUDU-2463: Even though the tablet thinks its leader, for correctness, it
   // must wait to finish replicating its no-op (even as a single replica)

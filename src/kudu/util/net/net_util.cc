@@ -55,6 +55,7 @@
 #include "kudu/util/net/socket.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/string_case.h"
 #include "kudu/util/subprocess.h"
 #include "kudu/util/thread_restrictions.h"
 #include "kudu/util/trace.h"
@@ -64,14 +65,28 @@
 #define HOST_NAME_MAX 64
 #endif
 
-DEFINE_bool(fail_dns_resolution, false, "Whether to fail all dns resolution, for tests.");
+DEFINE_bool(fail_dns_resolution, false, "Whether to fail dns resolution, for tests.");
 TAG_FLAG(fail_dns_resolution, hidden);
+DEFINE_string(fail_dns_resolution_hostports, "",
+              "Comma-separated list of hostports that fail dns resolution. If empty, fails all "
+              "dns resolution attempts. Only takes effect if --fail_dns_resolution is 'true'.");
+TAG_FLAG(fail_dns_resolution_hostports, hidden);
+
+DEFINE_string(dns_addr_resolution_override, "",
+              "Comma-separated list of '='-separated pairs of hosts to addresses. The left-hand "
+              "side of the '=' is taken as a host, and will resolve to the right-hand side which "
+              "is expected to be a socket address with no port.");
+TAG_FLAG(dns_addr_resolution_override, hidden);
+
+DEFINE_string(host_for_tests, "", "Host to use when resolving a given server's locally bound or "
+              "advertised addresses.");
 
 using std::function;
 using std::string;
 using std::unordered_set;
 using std::unique_ptr;
 using std::vector;
+using strings::Split;
 using strings::Substitute;
 
 namespace kudu {
@@ -110,6 +125,23 @@ Status GetAddrInfo(const string& hostname,
     return Status::NetworkError(err_msg, ErrnoToString(err), err);
   }
   return Status::NetworkError(err_msg, gai_strerror(rc));
+}
+
+// Converts the given Sockaddr into a HostPort, substituting the FQDN
+// in the case that the provided address is the wildcard.
+//
+// In the case of other addresses, the returned HostPort will contain just the
+// stringified form of the IP.
+Status HostPortFromSockaddrReplaceWildcard(const Sockaddr& addr, HostPort* hp) {
+  string host;
+  if (!FLAGS_host_for_tests.empty() || addr.IsWildcard()) {
+    RETURN_NOT_OK(GetFQDN(&host));
+  } else {
+    host = addr.host();
+  }
+  hp->set_host(host);
+  hp->set_port(addr.port());
+  return Status::OK();
 }
 
 } // anonymous namespace
@@ -188,6 +220,26 @@ Status HostPort::ResolveAddresses(vector<Sockaddr>* addresses) const {
   TRACE_EVENT1("net", "HostPort::ResolveAddresses",
                "host", host_);
   TRACE_COUNTER_SCOPE_LATENCY_US("dns_us");
+  // NOTE: we use this instead of the FLAGS_... variant because this flag may be
+  // changed at runtime in tests and thus needs to be thread-safe.
+  const auto dns_addr_resolution_override_flag =
+      google::GetCommandLineFlagInfoOrDie("dns_addr_resolution_override");
+  if (PREDICT_FALSE(!dns_addr_resolution_override_flag.current_value.empty())) {
+    vector<string> hosts_and_addrs = Split(dns_addr_resolution_override_flag.current_value, ",");
+    for (const auto& ha : hosts_and_addrs) {
+      vector<string> host_and_addr = Split(ha, "=");
+      if (host_and_addr.size() != 2) {
+        return Status::InvalidArgument("failed to parse injected address override");
+      }
+      if (iequals(host_and_addr[0], host_)) {
+        Sockaddr addr;
+        RETURN_NOT_OK_PREPEND(addr.ParseString(host_and_addr[1], port_),
+            "failed to parse injected address override");
+        *addresses = { addr };
+        return Status::OK();
+      }
+    }
+  }
   struct addrinfo hints;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
@@ -215,7 +267,22 @@ Status HostPort::ResolveAddresses(vector<Sockaddr>* addresses) const {
     }
   }
   if (PREDICT_FALSE(FLAGS_fail_dns_resolution)) {
-    return Status::NetworkError("injected DNS resolution failure");
+    if (FLAGS_fail_dns_resolution_hostports.empty()) {
+      return Status::NetworkError("injected DNS resolution failure");
+    }
+    unordered_set<string> failed_hostports =
+        Split(FLAGS_fail_dns_resolution_hostports, ",");
+    for (const auto& hp_str : failed_hostports) {
+      HostPort hp;
+      Status s = hp.ParseString(hp_str, /*default_port=*/0);
+      if (!s.ok()) {
+        LOG(WARNING) << "Could not parse: " << hp_str;
+        continue;
+      }
+      if (hp == *this) {
+        return Status::NetworkError("injected DNS resolution failure", hp_str);
+      }
+    }
   }
   if (addresses) {
     *addresses = std::move(result_addresses);
@@ -340,7 +407,9 @@ Status ParseAddressList(const std::string& addr_list,
                         std::vector<Sockaddr>* addresses) {
   vector<HostPort> host_ports;
   RETURN_NOT_OK(HostPort::ParseStrings(addr_list, default_port, &host_ports));
-  if (host_ports.empty()) return Status::InvalidArgument("No address specified");
+  if (host_ports.empty()) {
+    return Status::InvalidArgument("No address specified");
+  }
   unordered_set<Sockaddr> uniqued;
   for (const HostPort& host_port : host_ports) {
     vector<Sockaddr> this_addresses;
@@ -362,40 +431,53 @@ Status ParseAddressList(const std::string& addr_list,
 
 Status GetHostname(string* hostname) {
   TRACE_EVENT0("net", "GetHostname");
+  if (!FLAGS_host_for_tests.empty()) {
+    *hostname = FLAGS_host_for_tests;
+    return Status::OK();
+  }
   char name[HOST_NAME_MAX];
-  int ret = gethostname(name, HOST_NAME_MAX);
-  if (ret != 0) {
-    return Status::NetworkError("Unable to determine local hostname",
-                                ErrnoToString(errno),
-                                errno);
+  if (gethostname(name, HOST_NAME_MAX) != 0) {
+    const int err = errno;
+    return Status::NetworkError(
+        "Unable to determine local hostname", ErrnoToString(err), err);
   }
   *hostname = name;
   return Status::OK();
 }
 
 Status GetLocalNetworks(std::vector<Network>* net) {
-  struct ifaddrs *ifap = nullptr;
-
-  int ret = getifaddrs(&ifap);
+  struct ifaddrs* ifap = nullptr;
   SCOPED_CLEANUP({
-    if (ifap) freeifaddrs(ifap);
+    if (ifap) {
+      freeifaddrs(ifap);
+    }
   });
 
-  if (ret != 0) {
-    return Status::NetworkError("Unable to determine local network addresses",
-                                ErrnoToString(errno),
-                                errno);
+  if (getifaddrs(&ifap) != 0) {
+    const int err = errno;
+    return Status::NetworkError(
+        "Unable to determine local network addresses", ErrnoToString(err), err);
   }
 
   net->clear();
   for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
-    if (ifa->ifa_addr == nullptr || ifa->ifa_netmask == nullptr) continue;
-
+    if (ifa->ifa_addr == nullptr || ifa->ifa_netmask == nullptr) {
+      continue;
+    }
     if (ifa->ifa_addr->sa_family == AF_INET) {
-      Sockaddr addr(*reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr));
-      Sockaddr netmask(*reinterpret_cast<struct sockaddr_in*>(ifa->ifa_netmask));
-      Network network(addr.ipv4_addr().sin_addr.s_addr, netmask.ipv4_addr().sin_addr.s_addr);
-      net->push_back(network);
+      auto* ifa_address = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+      auto* ifa_netmask = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_netmask);
+      if (ifa_netmask->sin_family == AF_UNSPEC) {
+        // Tunnel interfaces created by some VPN implementations do not have
+        // their network mask's address family (sin_family) properly set. If
+        // the address family for the network mask is left as AF_UNSPEC, this
+        // code sets the address family of the network mask to be the same as
+        // the family of the network address itself. This is to satisfy the
+        // constraints in the Sockaddr class.
+        ifa_netmask->sin_family = ifa_address->sin_family;
+      }
+      net->emplace_back(Sockaddr(*ifa_address).ipv4_addr().sin_addr.s_addr,
+                        Sockaddr(*ifa_netmask).ipv4_addr().sin_addr.s_addr);
     }
   }
 
@@ -406,6 +488,9 @@ Status GetFQDN(string* hostname) {
   TRACE_EVENT0("net", "GetFQDN");
   // Start with the non-qualified hostname
   RETURN_NOT_OK(GetHostname(hostname));
+  if (!FLAGS_host_for_tests.empty()) {
+    return Status::OK();
+  }
 
   struct addrinfo hints;
   memset(&hints, 0, sizeof(hints));
@@ -439,15 +524,15 @@ Status SockaddrFromHostPort(const HostPort& host_port, Sockaddr* addr) {
   return Status::OK();
 }
 
-Status HostPortFromSockaddrReplaceWildcard(const Sockaddr& addr, HostPort* hp) {
-  string host;
-  if (addr.IsWildcard()) {
-    RETURN_NOT_OK(GetFQDN(&host));
-  } else {
-    host = addr.host();
+Status HostPortsFromAddrs(const vector<Sockaddr>& addrs, vector<HostPort>* hps) {
+  DCHECK(!addrs.empty());
+  for (const auto& addr : addrs) {
+    if (!addr.is_ip()) continue;
+    HostPort hp;
+    RETURN_NOT_OK_PREPEND(HostPortFromSockaddrReplaceWildcard(addr, &hp),
+                          "could not get RPC hostport");
+    hps->emplace_back(std::move(hp));
   }
-  hp->set_host(host);
-  hp->set_port(addr.port());
   return Status::OK();
 }
 
@@ -465,7 +550,7 @@ Status GetRandomPort(const string& address, uint16_t* port) {
 
 void TryRunLsof(const Sockaddr& addr, vector<string>* log) {
 #if defined(__APPLE__)
-  string cmd = strings::Substitute(
+  string cmd = Substitute(
       "lsof -n -i 'TCP:$0' -sTCP:LISTEN ; "
       "for pid in $$(lsof -F p -n -i 'TCP:$0' -sTCP:LISTEN | cut -f 2 -dp) ; do"
       "  pstree $$pid || ps h -p $$pid;"
@@ -475,7 +560,7 @@ void TryRunLsof(const Sockaddr& addr, vector<string>* log) {
   // Little inline bash script prints the full ancestry of any pid listening
   // on the same port as 'addr'. We could use 'pstree -s', but that option
   // doesn't exist on el6.
-  string cmd = strings::Substitute(
+  string cmd = Substitute(
       "export PATH=$$PATH:/usr/sbin ; "
       "lsof -n -i 'TCP:$0' -sTCP:LISTEN ; "
       "for pid in $$(lsof -F p -n -i 'TCP:$0' -sTCP:LISTEN | grep p | cut -f 2 -dp) ; do"

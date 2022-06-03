@@ -297,7 +297,9 @@ Status GetOrCreateLog4j2PropertiesFile(Env* env, string* logging_properties_path
     // don't read a partial file (not expected, but just in case).
     unique_ptr<WritableFile> tmp_file;
     string tmp_path;
-    RETURN_NOT_OK(env->NewTempWritableFile(WritableFileOptions(),
+    WritableFileOptions opts;
+    opts.is_sensitive = false;
+    RETURN_NOT_OK(env->NewTempWritableFile(opts,
                                            Substitute("$0.XXXXXX", log4j2_properties_path),
                                            &tmp_path, &tmp_file));
     // If anything fails, clean up the tmp file.
@@ -390,7 +392,8 @@ Status RangerClient::Start() {
   const string fifo_path = SubprocessServer::FifoPath(RangerFifoBase());
   vector<string> argv;
   RETURN_NOT_OK(BuildArgv(fifo_path, log_properties_path, &argv));
-  subprocess_.reset(new RangerSubprocess(env_, fifo_path, std::move(argv), metric_entity_));
+  subprocess_.reset(new RangerSubprocess(env_, fifo_path, std::move(argv), metric_entity_,
+                                         "Ranger client subprocess"));
   return subprocess_->Start();
 }
 

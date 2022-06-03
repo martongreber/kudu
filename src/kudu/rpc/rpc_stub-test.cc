@@ -357,7 +357,7 @@ TEST_F(RpcStubTest, TestCallMissingMethod) {
   Proxy p(client_messenger_, server_addr_, server_addr_.host(),
           CalculatorService::static_service_name());
 
-  Status s = DoTestSyncCall(p, "DoesNotExist");
+  Status s = DoTestSyncCall(&p, "DoesNotExist");
   ASSERT_TRUE(s.IsRemoteError()) << "Bad status: " << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "with an invalid method name: DoesNotExist");
 }
@@ -371,7 +371,7 @@ TEST_F(RpcStubTest, TestApplicationError) {
   req.set_sleep_micros(1);
   req.set_return_app_error(true);
   Status s = p.Sleep(req, &resp, &controller);
-  ASSERT_TRUE(s.IsRemoteError());
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
   EXPECT_EQ("Remote error: Got some error", s.ToString());
   EXPECT_EQ("message: \"Got some error\"\n"
             "[kudu.rpc_test.CalculatorError.app_error_ext] {\n"

@@ -63,6 +63,7 @@
 #include "kudu/master/master_options.h"
 #include "kudu/rpc/result_tracker.h"
 #include "kudu/security/token.pb.h"
+#include "kudu/server/rpc_server.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/ops/op.h"
 #include "kudu/tablet/ops/write_op.h"
@@ -80,7 +81,6 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
-#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/slice.h"
 
@@ -252,9 +252,10 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
   RETURN_NOT_OK(tablet::TabletMetadata::Load(fs_manager, kSysCatalogTabletId, &metadata));
 
   // Verify that the schema is the current one
-  if (!metadata->schema().Equals(BuildTableSchema())) {
+  const SchemaPtr schema_ptr = metadata->schema();
+  if (*schema_ptr != BuildTableSchema()) {
     // TODO: In this case we probably should execute the migration step.
-    return(Status::Corruption("Unexpected schema", metadata->schema().ToString()));
+    return(Status::Corruption("Unexpected schema", schema_ptr->ToString()));
   }
 
   LOG(INFO) << "Verifying existing consensus state";
@@ -291,14 +292,31 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
                                   peer_addrs_from_disk.begin(),
                                   peer_addrs_from_disk.end(),
                                   back_inserter(symm_diff));
-    if (!symm_diff.empty()) {
-      string msg = Substitute(
-          "on-disk master list ($0) and provided master list ($1) differ. "
-          "Their symmetric difference is: $2",
-          JoinStrings(peer_addrs_from_disk, ", "),
-          JoinStrings(peer_addrs_from_opts, ", "),
-          JoinStrings(symm_diff, ", "));
-      return Status::InvalidArgument(msg);
+
+
+    // We should prevent starting with fewer masters than previously. This way if the user wants to
+    // remove a master they would have to do it manually.
+    if (peer_addrs_from_opts.size() < peer_addrs_from_disk.size()) {
+      return Status::InvalidArgument(
+          Substitute("on-disk master list ($0) has more entries than provided master "
+                     "list ($1). Their symmetric difference is: $2. "
+                     "If trying to remove one or more masters from the cluster, please follow the "
+                     "documented steps to do so.",
+                     JoinStrings(peer_addrs_from_disk, ", "),
+                     JoinStrings(peer_addrs_from_opts, ", "),
+                     JoinStrings(symm_diff, ", ")));
+    }
+    if (symm_diff.size() > 1) {
+      return Status::InvalidArgument(
+          Substitute(
+              "on-disk master list ($0) and provided master list ($1) differ by more "
+              "than one address. Their symmetric difference is: $2",
+              JoinStrings(peer_addrs_from_disk, ", "),
+              JoinStrings(peer_addrs_from_opts, ", "),
+              JoinStrings(symm_diff, ", ")));
+    }
+    if (symm_diff.size() == 1) {
+      LOG(INFO) << Substitute("Detected one additional master provided: $0", symm_diff[0]);
     }
   }
 
@@ -1123,10 +1141,10 @@ Status SysCatalogTable::VisitTablets(TabletVisitor* visitor) {
 
 void SysCatalogTable::InitLocalRaftPeerPB() {
   local_peer_pb_.set_permanent_uuid(master_->fs_manager()->uuid());
-  Sockaddr addr = master_->first_rpc_address();
-  HostPort hp;
-  CHECK_OK(HostPortFromSockaddrReplaceWildcard(addr, &hp));
-  *local_peer_pb_.mutable_last_known_addr() = HostPortToPB(hp);
+  vector<HostPort> hps;
+  CHECK_OK(master_->rpc_server()->GetBoundHostPorts(&hps));
+  CHECK(!hps.empty());
+  *local_peer_pb_.mutable_last_known_addr() = HostPortToPB(hps[0]);
 }
 
 } // namespace master

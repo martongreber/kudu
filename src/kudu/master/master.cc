@@ -28,6 +28,7 @@
 #include <glog/logging.h>
 
 #include "kudu/cfile/block_cache.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/metadata.pb.h"
@@ -52,6 +53,7 @@
 #include "kudu/rpc/service_if.h"
 #include "kudu/security/token_signer.h"
 #include "kudu/server/rpc_server.h"
+#include "kudu/server/startup_path_handler.h"
 #include "kudu/server/webserver.h"
 #include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
@@ -63,6 +65,7 @@
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
 #include "kudu/util/threadpool.h"
+#include "kudu/util/timer.h"
 #include "kudu/util/version_info.h"
 
 DEFINE_int32(master_registration_rpc_timeout_ms, 1500,
@@ -190,10 +193,11 @@ Master::~Master() {
 Status Master::Init() {
   CHECK_EQ(kStopped, state_);
 
-  cfile::BlockCache::GetSingleton()->StartInstrumentation(metric_entity());
+  cfile::BlockCache::GetSingleton()->StartInstrumentation(
+      metric_entity(), opts_.block_cache_metrics_policy());
 
   RETURN_NOT_OK(ThreadPoolBuilder("init").set_max_threads(1).Build(&init_pool_));
-
+  startup_path_handler_->set_is_tablet_server(false);
   RETURN_NOT_OK(KuduServer::Init());
 
   if (web_server_) {
@@ -273,11 +277,13 @@ Status Master::StartAsync() {
 }
 
 void Master::InitCatalogManagerTask() {
+  startup_path_handler_->initialize_master_catalog_progress()->Start();
   Status s = InitCatalogManager();
   if (!s.ok()) {
     LOG(ERROR) << "Unable to init master catalog manager: " << s.ToString();
   }
   catalog_manager_init_status_.Set(s);
+  startup_path_handler_->initialize_master_catalog_progress()->Stop();
 }
 
 Status Master::InitCatalogManager() {
@@ -338,9 +344,9 @@ Status Master::InitTxnManager() {
   return Status::OK();
 }
 
-Status Master::WaitForTxnManagerInit(const MonoDelta& timeout) const {
-  if (timeout.Initialized()) {
-    const Status* s = txn_manager_init_status_.WaitFor(timeout);
+Status Master::WaitForTxnManagerInit(MonoTime deadline) const {
+  if (deadline.Initialized()) {
+    const Status* s = txn_manager_init_status_.WaitFor(deadline - MonoTime::Now());
     if (!s) {
       return Status::TimedOut("timed out waiting for TxnManager to initialize");
     }
@@ -379,10 +385,11 @@ Status Master::InitMasterRegistration() {
   CHECK(!registration_initialized_.load());
 
   ServerRegistrationPB reg;
-  vector<Sockaddr> rpc_addrs;
-  RETURN_NOT_OK_PREPEND(rpc_server()->GetAdvertisedAddresses(&rpc_addrs),
-                        "Couldn't get RPC addresses");
-  RETURN_NOT_OK(AddHostPortPBs(rpc_addrs, reg.mutable_rpc_addresses()));
+  vector<HostPort> hps;
+  RETURN_NOT_OK(rpc_server()->GetAdvertisedHostPorts(&hps));
+  for (const auto& hp : hps) {
+    *reg.add_rpc_addresses() = HostPortToPB(hp);
+  }
 
   if (web_server()) {
     vector<Sockaddr> http_addrs;
@@ -523,10 +530,10 @@ Status Master::AddMaster(const HostPort& hp, rpc::RpcContext* rpc) {
     const auto& config = consensus->CommittedConfig();
     DCHECK_EQ(1, config.peers_size());
     if (!config.peers(0).has_last_known_addr()) {
-      return Status::IllegalState("'last_known_addr' field in single master Raft configuration not "
-                                  "set. Please restart master with --master_addresses flag set "
-                                  "to the single master which will populate the 'last_known_addr' "
-                                  "field.");
+      return Status::InvalidArgument("'last_known_addr' field in single master Raft configuration "
+                                     "not set. Please restart master with --master_addresses flag "
+                                     "set to the single master which will populate the "
+                                     "'last_known_addr' field.");
     }
   }
 

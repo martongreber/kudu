@@ -92,6 +92,26 @@ void DnsResolver::ResolveAddressesAsync(const HostPort& hostport,
   }
 }
 
+void DnsResolver::RefreshAddressesAsync(const HostPort& hostport,
+                                        vector<Sockaddr>* addresses,
+                                        const StatusCallback& cb) {
+  if (PREDICT_TRUE(cache_)) {
+    cache_->Erase(hostport.host());
+  }
+  const auto s = pool_->Submit([=]() {
+    // Before performing the resolution, check if another task has already
+    // resolved it and cached a new entry.
+    if (this->GetCachedAddresses(hostport, addresses)) {
+      cb(Status::OK());
+      return;
+    }
+    this->DoResolutionCb(hostport, addresses, cb);
+  });
+  if (!s.ok()) {
+    cb(s);
+  }
+}
+
 Status DnsResolver::DoResolution(const HostPort& hostport,
                                  vector<Sockaddr>* addresses) {
   vector<Sockaddr> resolved_addresses;
@@ -105,7 +125,11 @@ Status DnsResolver::DoResolution(const HostPort& hostport,
         cached_addresses->capacity() > 0
         ? kudu_malloc_usable_size(cached_addresses->data()) : 0;
 #ifndef NDEBUG
-    // Clear the port number.
+    // The port numbers are not relevant when caching the results of DNS
+    // resolution. If it's a debug build, clear the port numbers: this is done
+    // to be able to spot regressions in the code which is responsible for
+    // setting appropriate port numbers when retrieving the cached addresses
+    // (see DnsResolver::GetCachedAddresses()).
     for (auto& addr : *cached_addresses) {
       addr.set_port(0);
     }
@@ -131,6 +155,10 @@ bool DnsResolver::GetCachedAddresses(const HostPort& hostport,
     auto handle = cache_->Get(hostport.host());
     if (handle) {
       if (addresses) {
+        // Copy the cached records and set the result port number as necessary:
+        // a cached port number is not relevant and stored in the cache as a
+        // by-product: HostRecordCache stores not just IPs address, but Sockaddr
+        // structures.
         vector<Sockaddr> result_addresses(handle.value());
         for (auto& addr : result_addresses) {
           addr.set_port(hostport.port());

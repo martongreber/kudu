@@ -29,9 +29,9 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/crypto.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/security-test-util.h"
 #include "kudu/security/test/test_certs.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -113,7 +113,7 @@ TEST_F(CertManagementTest, RequestGeneratorBasics) {
   ASSERT_OK(key.ToString(&key_str, DataFormat::PEM));
   // Check for non-supported number of bits for the key.
   Status s = GeneratePrivateKey(7, &key);
-  ASSERT_TRUE(s.IsRuntimeError());
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
 }
 
 // Check that CertSigner behaves in a predictable way if given non-matching

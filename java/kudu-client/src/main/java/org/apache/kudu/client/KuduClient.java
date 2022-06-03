@@ -536,6 +536,18 @@ public class KuduClient implements AutoCloseable {
     }
 
     /**
+     * Sets the default timeout used for connection negotiation.
+     * Optional.
+     * If not provided, defaults to 10s.
+     * @param timeoutMs a timeout in milliseconds
+     * @return this builder
+     */
+    public KuduClientBuilder connectionNegotiationTimeoutMs(long timeoutMs) {
+      clientBuilder.connectionNegotiationTimeoutMs(timeoutMs);
+      return this;
+    }
+
+    /**
      * Socket read timeouts are no longer used in the Java client and have no effect.
      * Setting this has no effect.
      * @param timeoutMs a timeout in milliseconds
@@ -619,6 +631,38 @@ public class KuduClient implements AutoCloseable {
      */
     public KuduClientBuilder saslProtocolName(String saslProtocolName) {
       clientBuilder.saslProtocolName(saslProtocolName);
+      return this;
+    }
+
+    /**
+     * Require authentication for the connection to a remote server.
+     *
+     * If it's set to true, the client will require mutual authentication between
+     * the server and the client. If the server doesn't support authentication,
+     * or it's disabled, the client will fail to connect.
+     */
+    public KuduClientBuilder requireAuthentication(boolean requireAuthentication) {
+      clientBuilder.requireAuthentication(requireAuthentication);
+      return this;
+    }
+
+    /**
+     * Require encryption for the connection to a remote server.
+     *
+     * If it's set to REQUIRED or REQUIRED_LOOPBACK, the client will
+     * require encrypting the traffic between the server and the client.
+     * If the server doesn't support encryption, or if it's disabled, the
+     * client will fail to connect.
+     *
+     * Loopback connections are encrypted only if 'encryption_policy' is
+     * set to REQUIRE_LOOPBACK, or if it's required by the server.
+     *
+     * The default value is OPTIONAL, which allows connecting to servers without
+     * encryption as well, but it will still attempt to use it if the server
+     * supports it.
+     */
+    public KuduClientBuilder encryptionPolicy(AsyncKuduClient.EncryptionPolicy encryptionPolicy) {
+      clientBuilder.encryptionPolicy(encryptionPolicy);
       return this;
     }
 

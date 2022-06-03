@@ -32,9 +32,9 @@
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus_meta_manager.h"
 #include "kudu/consensus/log.h"
 #include "kudu/consensus/log_anchor_registry.h"
@@ -106,7 +106,8 @@ using tablet::TabletReplica;
 using tablet::TabletSuperBlockPB;
 using tablet::WriteOpState;
 
-class TabletCopyTest : public KuduTabletTest {
+class TabletCopyTest : public KuduTabletTest,
+                       public ::testing::WithParamInterface<TabletCopyMode> {
  public:
   TabletCopyTest()
       : KuduTabletTest(Schema({ ColumnSchema("key", STRING),
@@ -189,7 +190,7 @@ class TabletCopyTest : public KuduTabletTest {
                                      prepare_pool_.get(),
                                      dns_resolver_.get()));
     ASSERT_OK(tablet_replica_->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10)));
-    ASSERT_OK(tablet_replica_->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
+    ASSERT_OK(tablet_replica_->consensus()->WaitUntilLeader(MonoDelta::FromSeconds(10)));
   }
 
   void TabletReplicaStateChangedCallback(const string& tablet_id, const string& reason) {
@@ -231,8 +232,14 @@ class TabletCopyTest : public KuduTabletTest {
   }
 
   void InitSession() {
-    session_.reset(new TabletCopySourceSession(tablet_replica_.get(), "TestSession", "FakeUUID",
-                   fs_manager(), nullptr /* no metrics */));
+    if (GetParam() == TabletCopyMode::REMOTE) {
+      session_.reset(new RemoteTabletCopySourceSession(
+          tablet_replica_.get(), "TestSession", "FakeUUID",
+          fs_manager(), nullptr /* no metrics */));
+    } else {
+      session_.reset(new LocalTabletCopySourceSession(
+          tablet_replica_->tablet_id(), fs_manager(), nullptr /* no metrics */));
+    }
     ASSERT_OK(session_->Init());
   }
 
@@ -252,6 +259,7 @@ class TabletCopyTest : public KuduTabletTest {
 
     // Write the file to a temporary location.
     WritableFileOptions opts;
+    opts.is_sensitive = true;
     string path_template = GetTestPath(Substitute("test_block_$0$1.XXXXXX",
                                                   block_id.ToString(),
                                                   kTmpInfix));
@@ -260,7 +268,9 @@ class TabletCopyTest : public KuduTabletTest {
     CHECK_OK(writable_file->Append(Slice(data.data(), data.size())));
     CHECK_OK(writable_file->Close());
 
-    CHECK_OK(Env::Default()->NewSequentialFile(*path, file));
+    SequentialFileOptions seq_opts;
+    seq_opts.is_sensitive = true;
+    CHECK_OK(Env::Default()->NewSequentialFile(seq_opts, *path, file));
   }
 
   MetricRegistry metric_registry_;
@@ -273,9 +283,13 @@ class TabletCopyTest : public KuduTabletTest {
   scoped_refptr<TabletCopySourceSession> session_;
 };
 
+INSTANTIATE_TEST_SUITE_P(TabletCopyTestModes, TabletCopyTest,
+                         testing::Values(TabletCopyMode::REMOTE,
+                                         TabletCopyMode::LOCAL));
+
 // Ensure that the serialized SuperBlock included in the TabletCopySourceSession is
 // equal to the serialized live superblock (on a quiesced tablet).
-TEST_F(TabletCopyTest, TestSuperBlocksEqual) {
+TEST_P(TabletCopyTest, TestSuperBlocksEqual) {
   // Compare content of superblocks.
   faststring session_buf;
   faststring tablet_buf;
@@ -304,7 +318,7 @@ TEST_F(TabletCopyTest, TestSuperBlocksEqual) {
 
 // Test fetching all files from tablet server, ensure the checksums for each
 // chunk and the total file sizes match.
-TEST_F(TabletCopyTest, TestBlocksEqual) {
+TEST_P(TabletCopyTest, TestBlocksEqual) {
   TabletSuperBlockPB tablet_superblock;
   ASSERT_OK(tablet()->metadata()->ToSuperBlock(&tablet_superblock));
   for (int i = 0; i < tablet_superblock.rowsets_size(); i++) {
@@ -334,13 +348,13 @@ TEST_F(TabletCopyTest, TestBlocksEqual) {
       buf.resize(tablet_block_size);
       Slice data2(buf.data(), tablet_block_size);
       ASSERT_OK(tablet_block->Read(0, data2));
-      uint32_t tablet_crc = crc::Crc32c(data.data(), data.size());
+      uint32_t tablet_crc = crc::Crc32c(data2.data(), data2.size());
       LOG(INFO) << "tablet block file has size of " << tablet_block_size
                 << " and CRC32C of " << tablet_crc
                 << ": " << block_id;
 
       // Compare the blocks.
-      ASSERT_EQ(tablet_block_size, session_block_size);
+      ASSERT_EQ(tablet_block_size, session_block_size - Env::Default()->GetEncryptionHeaderSize());
       ASSERT_EQ(tablet_crc, session_crc);
     }
   }
@@ -348,7 +362,7 @@ TEST_F(TabletCopyTest, TestBlocksEqual) {
 
 // Ensure that blocks are still readable through the open session even
 // after they've been deleted.
-TEST_F(TabletCopyTest, TestBlocksAreFetchableAfterBeingDeleted) {
+TEST_P(TabletCopyTest, TestBlocksAreFetchableAfterBeingDeleted) {
   TabletSuperBlockPB tablet_superblock;
   ASSERT_OK(tablet()->metadata()->ToSuperBlock(&tablet_superblock));
 

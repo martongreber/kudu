@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <ostream>
+#include <type_traits>
 #include <utility>
 
 #include <boost/range/adaptor/reversed.hpp>
@@ -142,17 +143,15 @@ DEFINE_double(log_inject_io_error_on_preallocate_fraction, 0.0,
 TAG_FLAG(log_inject_io_error_on_preallocate_fraction, unsafe);
 TAG_FLAG(log_inject_io_error_on_preallocate_fraction, runtime);
 
+DEFINE_int32(log_segment_size_bytes_for_tests, 0,
+             "The size for log segments, in bytes. This takes precedence over "
+             "--log_segment_size_mb in cases where significantly smaller segments are desired. "
+             "If non-positive, --log_segment_size_mb is honored.");
+TAG_FLAG(log_segment_size_bytes_for_tests, unsafe);
+
 // Other flags.
 // -----------------------------
-DEFINE_int64(fs_wal_dir_reserved_bytes, -1,
-             "Number of bytes to reserve on the log directory filesystem for "
-             "non-Kudu usage. The default, which is represented by -1, is that "
-             "1% of the disk space on each disk will be reserved. Any other "
-             "value specified represents the number of bytes reserved and must "
-             "be greater than or equal to 0. Explicit percentages to reserve "
-             "are not currently supported");
-DEFINE_validator(fs_wal_dir_reserved_bytes, [](const char* /*n*/, int64_t v) { return v >= -1; });
-TAG_FLAG(fs_wal_dir_reserved_bytes, runtime);
+DECLARE_int64(fs_wal_dir_reserved_bytes);
 
 DEFINE_bool(fs_wal_use_file_cache, true,
             "Whether to use the server-wide file cache for WAL segments and "
@@ -435,7 +434,10 @@ SegmentAllocator::SegmentAllocator(const LogOptions* opts,
                                    uint32_t schema_version)
     : opts_(opts),
       ctx_(ctx),
-      max_segment_size_(opts_->segment_size_mb * 1024 * 1024),
+      max_segment_size_(
+          FLAGS_log_segment_size_bytes_for_tests > 0
+              ? FLAGS_log_segment_size_bytes_for_tests
+              : opts_->segment_size_mb * 1024 * 1024),
       schema_(std::move(schema)),
       schema_version_(schema_version),
       sync_disabled_(false) {}
@@ -637,8 +639,10 @@ Status SegmentAllocator::AllocateNewSegment() {
   VLOG_WITH_PREFIX(2) << "Creating temp. file for place holder segment, template: " << path_tmpl;
   unique_ptr<RWFile> segment_file;
   Env* env = ctx_->fs_manager->env();
+  RWFileOptions opts;
+  opts.is_sensitive = true;
   RETURN_NOT_OK_PREPEND(env->NewTempRWFile(
-      RWFileOptions(), path_tmpl, &next_segment_path_, &segment_file),
+      opts, path_tmpl, &next_segment_path_, &segment_file),
                         "could not create next WAL segment");
   next_segment_file_.reset(segment_file.release());
   VLOG_WITH_PREFIX(1) << "Created next WAL segment, placeholder path: " << next_segment_path_;

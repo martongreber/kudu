@@ -226,7 +226,7 @@ Status DiskRowSetWriter::AppendBlock(const RowBlock &block, int live_row_count) 
     }
 
 #ifndef NDEBUG
-    CHECK(prev_key.size() == 0 || Slice(prev_key).compare(enc_key) < 0)
+    CHECK(prev_key.size() == 0 || Slice(prev_key) < enc_key)
       << KUDU_REDACT(enc_key.ToDebugString()) << " appended to file not > previous key "
       << KUDU_REDACT(Slice(prev_key).ToDebugString());
 #endif
@@ -260,8 +260,9 @@ Status DiskRowSetWriter::FinishAndReleaseBlocks(BlockCreationTransaction* transa
       key_index_writer()->GetMetaValueOrDie(DiskRowSet::kMinKeyMetaEntryName);
   Slice first_enc_slice(first_encoded_key);
 
-  CHECK_LE(first_enc_slice.compare(last_enc_slice), 0)
-      << "First Key not <= Last key: first_key=" << KUDU_REDACT(first_enc_slice.ToDebugString())
+  CHECK(first_enc_slice <= last_enc_slice)
+      << "First Key not <= Last key: first_key="
+      << KUDU_REDACT(first_enc_slice.ToDebugString())
       << "   last_key=" << KUDU_REDACT(last_enc_slice.ToDebugString());
   key_index_writer()->AddMetadataPair(DiskRowSet::kMaxKeyMetaEntryName, last_enc_slice);
   if (FLAGS_rowset_metadata_store_keys) {
@@ -629,10 +630,10 @@ Status DiskRowSet::NewMajorDeltaCompaction(const vector<ColumnId>& col_ids,
   DCHECK(open_);
   shared_lock<rw_spinlock> l(component_lock_);
 
-  const Schema* schema = &rowset_metadata_->tablet_schema();
+  const SchemaPtr schema_ptr = rowset_metadata_->tablet_schema();
 
   RowIteratorOptions opts;
-  opts.projection = schema;
+  opts.projection = schema_ptr.get();
   opts.io_context = io_context;
   vector<shared_ptr<DeltaStore>> included_stores;
   unique_ptr<DeltaIterator> delta_iter;
@@ -640,7 +641,7 @@ Status DiskRowSet::NewMajorDeltaCompaction(const vector<ColumnId>& col_ids,
       opts, REDO, &included_stores, &delta_iter));
 
   out->reset(new MajorDeltaCompaction(rowset_metadata_->fs_manager(),
-                                      *schema,
+                                      *schema_ptr,
                                       base_data_.get(),
                                       std::move(delta_iter),
                                       std::move(included_stores),
@@ -909,7 +910,7 @@ Status DiskRowSet::DebugDump(vector<string> *lines) {
   // Using CompactionInput to dump our data is an easy way of seeing all the
   // rows and deltas.
   unique_ptr<CompactionInput> input;
-  RETURN_NOT_OK(NewCompactionInput(&rowset_metadata_->tablet_schema(),
+  RETURN_NOT_OK(NewCompactionInput(rowset_metadata_->tablet_schema().get(),
                                    MvccSnapshot::CreateSnapshotIncludingAllOps(),
                                    nullptr, &input));
   return DebugDumpCompactionInput(input.get(), lines);

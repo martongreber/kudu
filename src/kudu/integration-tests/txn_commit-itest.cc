@@ -170,7 +170,7 @@ class TxnCommitITest : public KuduTest {
     table_name_ = w.table_name();
     initial_row_count_ = w.rows_inserted();
 
-    // Since the test table uses the hash partitioning scheme, every tablet gets
+    // Since the test table uses hash partitioning, every tablet gets
     // at least one write operation when inserting several rows into the test
     // table. So, for every transaction inserting several rows into the test
     // table, it's easy to build the list of transaction participants.
@@ -676,7 +676,7 @@ TEST_F(TxnCommitITest, TestCommitAfterParticipantAbort) {
   op_pb.set_txn_id(0);
   op_pb.set_type(ParticipantOpPB::ABORT_TXN);
   ASSERT_OK(txn_client_->ParticipateInTransaction(
-      participant_ids_[0], op_pb, MonoDelta::FromSeconds(3)));
+      participant_ids_[0], op_pb, MonoTime::Now() + MonoDelta::FromSeconds(3)));
 
   // When we try to commit, we should end up not completing.
   ASSERT_OK(txn->StartCommit());

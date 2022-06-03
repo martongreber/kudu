@@ -101,7 +101,8 @@ class WebserverTest : public KuduTest {
     MaybeSetupSpnego(&opts);
     server_.reset(new Webserver(opts));
 
-    AddDefaultPathHandlers(server_.get());
+    AddPreInitializedDefaultPathHandlers(server_.get());
+    AddPostInitializedDefaultPathHandlers(server_.get());
     if (!use_htpasswd() || !FIPS_mode()) {
       ASSERT_OK(server_->Start());
 
@@ -110,7 +111,10 @@ class WebserverTest : public KuduTest {
       ASSERT_EQ(addrs.size(), 1);
       ASSERT_TRUE(addrs[0].IsWildcard());
       ASSERT_OK(addr_.ParseString("127.0.0.1", addrs[0].port()));
-      url_ = Substitute("http://$0", addr_.ToString());
+      url_ = Substitute(use_ssl() ? "https://$0/" : "http://$0", addr_.ToString());
+      // For testing purposes, we assume the server has been initialized. Typically this
+      // is set to true after the rpc server is started in the server startup process.
+      server_->SetStartupComplete(true);
     }
   }
 
@@ -173,7 +177,7 @@ TEST_F(PasswdWebserverTest, TestCrashInFIPSMode) {
   }
 
   Status s = server_->Start();
-  ASSERT_TRUE(s.IsIllegalState());
+  ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "Digest authentication in FIPS approved mode");
 }
 
@@ -410,7 +414,7 @@ TEST_F(SslWebserverTest, TestSSL) {
   // We use a self-signed cert, so we need to disable cert verification in curl.
   curl_.set_verify_peer(false);
 
-  ASSERT_OK(curl_.FetchURL(Substitute("https://$0/", addr_.ToString()), &buf_));
+  ASSERT_OK(curl_.FetchURL(url_, &buf_));
   // Should have expected title.
   ASSERT_STR_CONTAINS(buf_.ToString(), "Kudu");
 }
@@ -427,6 +431,14 @@ TEST_F(WebserverTest, TestDefaultPaths) {
   // Test varz -- check for one of the built-in gflags flags.
   ASSERT_OK(curl_.FetchURL(Substitute("$0/varz?raw=1", url_), &buf_));
   ASSERT_STR_CONTAINS(buf_.ToString(), "--v=");
+
+  // Test version -- check for version information
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/version", url_), &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "version_info");
+
+  // Test healthz -- check for OK
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/healthz", url_), &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "OK");
 }
 
 TEST_F(WebserverTest, TestRedactFlagsDump) {

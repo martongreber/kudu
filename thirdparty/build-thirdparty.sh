@@ -105,6 +105,9 @@ else
       "postgres")     F_POSTGRES=1 ;;
       "psql-jdbc")    F_POSTGRES_JDBC=1 ;;
       "ranger")       F_RANGER=1 ;;
+      "oatpp")        F_OATPP=1 ;;
+      "oatpp-swagger") F_OATPP_SWAGGER=1 ;;
+      "jwt-cpp")      F_JWT_CPP=1;;
       *)              echo "Unknown module: $arg"; exit 1 ;;
     esac
   done
@@ -393,6 +396,18 @@ if [ -n "$F_UNINSTRUMENTED" -o -n "$F_GUMBO_QUERY" ]; then
   build_gumbo_query
 fi
 
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_OATPP" ]; then
+  build_oatpp
+fi
+
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_OATPP_SWAGGER" ]; then
+  build_oatpp_swagger
+fi
+
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_JWT_CPP" ]; then
+  build_jwt_cpp
+fi
+
 restore_env
 
 # If we're on macOS best to exit here, otherwise single dependency builds will try to
@@ -450,12 +465,12 @@ EXTRA_CFLAGS="-fsanitize=thread $EXTRA_CFLAGS"
 EXTRA_CFLAGS="-g $EXTRA_CFLAGS"
 EXTRA_CXXFLAGS="-g $EXTRA_CXXFLAGS"
 
-if [ -n "$OS_LINUX" ] && [ -n "$F_TSAN" -o -n "$F_LIBUNWIND" ]; then
-  build_libunwind
-fi
-
 if [ -n "$F_TSAN" -o -n "$F_ZLIB" ]; then
   build_zlib
+fi
+
+if [ -n "$OS_LINUX" ] && [ -n "$F_TSAN" -o -n "$F_LIBUNWIND" ]; then
+  build_libunwind
 fi
 
 if [ -n "$F_TSAN" -o -n "$F_LZ4" ]; then
@@ -580,6 +595,18 @@ fi
 
 if [ -n "$F_TSAN" -o -n "$F_GUMBO_QUERY" ]; then
   build_gumbo_query
+fi
+
+if [ -n "$F_TSAN" -o -n "$F_OATPP" ]; then
+  build_oatpp
+fi
+
+if [ -n "$F_TSAN" -o -n "$F_OATPP_SWAGGER" ]; then
+  build_oatpp_swagger
+fi
+
+if [ -n "$F_TSAN" -o -n "$F_JWT_CPP" ]; then
+  build_jwt_cpp
 fi
 
 restore_env

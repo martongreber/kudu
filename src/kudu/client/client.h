@@ -53,8 +53,10 @@
 
 namespace kudu {
 
+class AlterTableTest;
 class AuthzTokenTest;
 class ClientStressTest_TestUniqueClientIds_Test;
+class MetaCacheLookupStressTest_PerfSynthetic_Test;
 class DisableWriteWhenExceedingQuotaTest;
 class KuduPartialRow;
 class MonoDelta;
@@ -81,6 +83,8 @@ class TxnSystemClient;
 namespace tools {
 class LeaderMasterProxy;
 class RemoteKsckCluster;
+class TableAlter;
+class TableLister;
 } // namespace tools
 
 namespace client {
@@ -118,6 +122,7 @@ class RemoteTabletServer;
 class ReplicaController;
 class RetrieveAuthzTokenRpc;
 class ScanBatchDataInterface;
+class TabletInfoProvider;
 class WriteRpc;
 template <class ReqClass, class RespClass>
 class AsyncLeaderMasterRpc; // IWYU pragma: keep
@@ -230,6 +235,18 @@ class KUDU_EXPORT KuduClientBuilder {
   KuduClientBuilder();
   ~KuduClientBuilder();
 
+  /// Policy for on-the-wire encryption
+  enum EncryptionPolicy {
+    OPTIONAL,        ///< Optional, it uses encrypted connection if the server supports
+                     ///< it, but it can connect to insecure servers too.
+
+    REQUIRED_REMOTE, ///< Only connects to remote servers that support encryption, fails
+                     ///< otherwise. It can connect to insecure servers only locally.
+
+    REQUIRED         ///< Only connects to any server, including on the loopback interface,
+                     ///< that support encryption, fails otherwise.
+  };
+
   /// Clear the set of master addresses.
   ///
   /// @return Reference to the updated object.
@@ -318,6 +335,36 @@ class KUDU_EXPORT KuduClientBuilder {
   ///   SASL protocol name.
   /// @return Reference to the updated object.
   KuduClientBuilder& sasl_protocol_name(const std::string& sasl_protocol_name);
+
+  /// Require authentication for the connection to a remote server.
+  ///
+  /// If it's set to true, the client will require mutual authentication between
+  /// the server and the client. If the server doesn't support authentication,
+  /// or it's disabled, the client will fail to connect.
+  ///
+  /// @param [in] require_authentication
+  ///   Whether to require authentication.
+  /// @return Reference to the updated object.
+  KuduClientBuilder& require_authentication(bool require_authentication);
+
+  /// Require encryption for the connection to a remote server.
+  ///
+  /// If it's set to REQUIRED_REMOTE or REQUIRED, the client will
+  /// require encrypting the traffic between the server and the client.
+  /// If the server doesn't support encryption, or if it's disabled, the
+  /// client will fail to connect.
+  ///
+  /// Loopback connections are encrypted only if 'encryption_policy' is
+  /// set to REQUIRED, or if it's required by the server.
+  ///
+  /// The default value is OPTIONAL, which allows connecting to servers without
+  /// encryption as well, but it will still attempt to use it if the server
+  /// supports it.
+  ///
+  /// @param [in] encryption_policy
+  ///   Which encryption policy to use.
+  /// @return Reference to the updated object.
+  KuduClientBuilder& encryption_policy(EncryptionPolicy encryption_policy);
 
   /// Create a client object.
   ///
@@ -520,6 +567,7 @@ class KUDU_EXPORT KuduTransaction :
    private:
     friend class KuduTransaction;
     class KUDU_NO_EXPORT Data;
+
     Data* data_; // Owned.
 
     DISALLOW_COPY_AND_ASSIGN(SerializationOptions);
@@ -939,6 +987,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class internal::RemoteTablet;
   friend class internal::RemoteTabletServer;
   friend class internal::RetrieveAuthzTokenRpc;
+  friend class internal::TabletInfoProvider;
   friend class internal::WriteRpc;
   friend class kudu::AuthzTokenTest;
   friend class kudu::DisableWriteWhenExceedingQuotaTest;
@@ -948,8 +997,10 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class transactions::TxnSystemClient;
   friend class tools::LeaderMasterProxy;
   friend class tools::RemoteKsckCluster;
+  friend class tools::TableLister;
 
   FRIEND_TEST(kudu::ClientStressTest, TestUniqueClientIds);
+  FRIEND_TEST(kudu::MetaCacheLookupStressTest, PerfSynthetic);
   FRIEND_TEST(ClientTest, ClearCacheAndConcurrentWorkload);
   FRIEND_TEST(ClientTest, ConnectionNegotiationTimeout);
   FRIEND_TEST(ClientTest, TestBasicIdBasedLookup);
@@ -971,6 +1022,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   FRIEND_TEST(ClientTest, TestScanTimeout);
   FRIEND_TEST(ClientTest, TestWriteWithDeadMaster);
   FRIEND_TEST(MasterFailoverTest, TestPauseAfterCreateTableIssued);
+  FRIEND_TEST(MultiTServerClientTest, TestSetReplicationFactor);
 
   KuduClient();
 
@@ -1145,7 +1197,8 @@ class KUDU_EXPORT KuduTableCreator {
   ///   Hash: seed for mapping rows to hash buckets.
   /// @return Reference to the modified table creator.
   KuduTableCreator& add_hash_partitions(const std::vector<std::string>& columns,
-                                        int32_t num_buckets, int32_t seed);
+                                        int32_t num_buckets,
+                                        int32_t seed);
 
   /// Set the columns on which the table will be range-partitioned.
   ///
@@ -1167,7 +1220,68 @@ class KUDU_EXPORT KuduTableCreator {
     INCLUSIVE_BOUND, ///< An inclusive bound.
   };
 
-  /// Add a range partition to the table.
+  /// A helper class to represent a Kudu range partition with a custom hash
+  /// bucket schema. The hash sub-partitioning for a range partition might be
+  /// different from the default table-wide hash bucket schema specified during
+  /// the creation of a table (see KuduTableCreator::add_hash_partitions()).
+  /// Correspondingly, this class provides a means to specify a custom hash
+  /// bucket structure for the data in a range partition.
+  class KuduRangePartition {
+   public:
+    /// Create an object representing the range defined by the given parameters.
+    ///
+    /// @param [in] lower_bound
+    ///   The lower bound for the range.
+    ///   The KuduRangePartition object takes ownership of the parameter.
+    /// @param [in] upper_bound
+    ///   The upper bound for the range.
+    ///   The KuduRangePartition object takes ownership of the parameter.
+    /// @param [in] lower_bound_type
+    ///   The type of the lower_bound: inclusive or exclusive; inclusive if the
+    ///   parameter is omitted.
+    /// @param [in] upper_bound_type
+    ///   The type of the upper_bound: inclusive or exclusive; exclusive if the
+    ///   parameter is omitted.
+    KuduRangePartition(KuduPartialRow* lower_bound,
+                       KuduPartialRow* upper_bound,
+                       RangePartitionBound lower_bound_type = INCLUSIVE_BOUND,
+                       RangePartitionBound upper_bound_type = EXCLUSIVE_BOUND);
+
+    ~KuduRangePartition();
+
+    /// Add a level of hash sub-partitioning for this range partition.
+    ///
+    /// The hash schema for the range partition is defined by the whole set of
+    /// its hash sub-partitioning levels. A range partition can have multiple
+    /// levels of hash sub-partitioning: this method can be called multiple
+    /// times to define a multi-dimensional hash bucketing structure for the
+    /// range. Alternatively, a range partition can have zero levels of hash
+    /// sub-partitioning: simply don't call this method on a newly created
+    /// @c KuduRangePartition object to have no hash sub-partitioning for the
+    /// range represented by the object.
+    ///
+    /// @param [in] columns
+    ///   Names of columns to use for partitioning.
+    /// @param [in] num_buckets
+    ///   Number of buckets for the hashing.
+    /// @param [in] seed
+    ///   Hash seed for mapping rows to hash buckets.
+    /// @return Operation result status.
+    Status add_hash_partitions(const std::vector<std::string>& columns,
+                               int32_t num_buckets,
+                               int32_t seed = 0);
+   private:
+    class KUDU_NO_EXPORT Data;
+
+    friend class KuduTableCreator;
+
+    // Owned.
+    Data* data_;
+
+    DISALLOW_COPY_AND_ASSIGN(KuduRangePartition);
+  };
+
+  /// Add a range partition with table-wide hash bucket schema.
   ///
   /// Multiple range partitions may be added, but they must not overlap. All
   /// range splits specified by @c add_range_partition_split must fall in a
@@ -1199,6 +1313,26 @@ class KUDU_EXPORT KuduTableCreator {
                                         KuduPartialRow* upper_bound,
                                         RangePartitionBound lower_bound_type = INCLUSIVE_BOUND,
                                         RangePartitionBound upper_bound_type = EXCLUSIVE_BOUND);
+
+  /// Add a range partition with a custom hash bucket schema.
+  ///
+  /// This method allows adding a range partition which has hash partitioning
+  /// schema different from the table-wide one.
+  ///
+  /// @li When called with a @c KuduRangePartition for which
+  ///   @c KuduRangePartition::add_hash_partitions() hasn't been called,
+  ///   a range with no hash sub-partitioning is created.
+  /// @li To create a range with the table-wide hash schema, use
+  ///   @c KuduTableCreator::add_range_partition() instead.
+  ///
+  /// @warning This functionality isn't fully implemented yet.
+  ///
+  /// @param [in] partition
+  ///   Range partition with custom hash bucket schema.
+  ///   The KuduTableCreator object takes ownership of the parameter.
+  /// @return Reference to the modified table creator.
+  KuduTableCreator& add_custom_range_partition(
+      KuduRangePartition* partition);
 
   /// Add a range partition split at the provided row.
   ///
@@ -1635,6 +1769,7 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   friend class KuduClient;
   friend class KuduPartitioner;
   friend class KuduScanToken;
+  friend class KuduScanner;
 
   KuduTable(const sp::shared_ptr<KuduClient>& client,
             const std::string& name,
@@ -1916,6 +2051,10 @@ class KUDU_EXPORT KuduTableAlterer {
   class KUDU_NO_EXPORT Data;
 
   friend class KuduClient;
+  friend class tools::TableAlter;
+  friend class kudu::AlterTableTest;
+
+  FRIEND_TEST(MultiTServerClientTest, TestSetReplicationFactor);
 
   KuduTableAlterer(KuduClient* client,
                    const std::string& name);
@@ -2426,6 +2565,9 @@ class KUDU_EXPORT KuduSession : public sp::enable_shared_from_this<KuduSession> 
 
   /// @return Client for the session: pointer to the associated client object.
   KuduClient* client() const;
+
+  /// @return Cumulative write operation metrics since the beginning of the session.
+  const ResourceMetrics& GetWriteOpMetrics() const;
 
  private:
   class KUDU_NO_EXPORT Data;
@@ -3217,6 +3359,8 @@ class KUDU_EXPORT KuduPartitioner {
 
   explicit KuduPartitioner(Data* data);
   Data* data_; // Owned.
+
+  DISALLOW_COPY_AND_ASSIGN(KuduPartitioner);
 };
 
 

@@ -42,6 +42,7 @@ struct ClusterRawInfo {
   std::vector<cluster_summary::ServerHealthSummary> tserver_summaries;
   std::vector<cluster_summary::TableSummary> table_summaries;
   std::vector<cluster_summary::TabletSummary> tablet_summaries;
+  std::unordered_set<std::string> tservers_in_maintenance_mode;
 };
 
 // A class implementing logic for Kudu cluster rebalancing.
@@ -66,7 +67,10 @@ class Rebalancer {
            bool run_policy_fixer = true,
            bool run_cross_location_rebalancing = true,
            bool run_intra_location_rebalancing = true,
-           double load_imbalance_threshold = kLoadImbalanceThreshold);
+           double load_imbalance_threshold = kLoadImbalanceThreshold,
+           bool force_rebalance_replicas_on_maintenance_tservers = false,
+           size_t intra_location_rebalancing_concurrency = 0,
+           bool enable_range_rebalancing = false);
 
     // UUIDs of ignored servers. If empty, run the rebalancing on
     // all tablet servers in the cluster only when all tablet servers
@@ -132,6 +136,15 @@ class Rebalancer {
     // The per-table location load imbalance threshold for the cross-location
     // balancing algorithm.
     double load_imbalance_threshold;
+
+    bool force_rebalance_replicas_on_maintenance_tservers;
+
+    // The maximum number of intra-location rebalancing sessions that can be run
+    // in parallel. Value of 0 means 'the number of CPU cores at the node'.
+    size_t intra_location_rebalancing_concurrency;
+
+    // Whether to rebalance ranges of a table.
+    bool enable_range_rebalancing;
   };
 
   // Represents a concrete move of a replica from one tablet server to another.
@@ -171,9 +184,9 @@ class Rebalancer {
   // of the 'tablet_ids' container and tablet server UUIDs TableReplicaMove::from
   // and TableReplica::to correspondingly. If no suitable tablet replicas are found,
   // 'tablet_ids' will be empty.
-  static void FindReplicas(const TableReplicaMove& move,
-                           const ClusterRawInfo& raw_info,
-                           std::vector<std::string>* tablet_ids);
+  void FindReplicas(const TableReplicaMove& move,
+                    const ClusterRawInfo& raw_info,
+                    std::vector<std::string>* tablet_ids);
 
   // Convert the 'raw' information about the cluster into information suitable
   // for the input of the high-level rebalancing algorithm.
@@ -188,6 +201,20 @@ class Rebalancer {
   Status BuildClusterInfo(const ClusterRawInfo& raw_info,
                           const MovesInProgress& moves_in_progress,
                           ClusterInfo* info) const;
+
+  struct TabletInfo {
+    std::string tablet_id;
+    boost::optional<int64_t> config_idx;  // For CAS-like change of Raft configs.
+  };
+
+  // Mapping tserver UUID to tablets on it.
+  typedef std::unordered_map<std::string, std::vector<TabletInfo>> TServersToEmptyMap;
+  void GetTServersToEmpty(const ClusterRawInfo& raw_info,
+                          std::unordered_set<std::string>* tservers_to_empty) const;
+  static void BuildTServersToEmptyInfo(const ClusterRawInfo& raw_info,
+                                       const MovesInProgress& moves_in_progress,
+                                       const std::unordered_set<std::string>& tservers_to_empty,
+                                       TServersToEmptyMap* tservers_to_empty_map);
 
  protected:
   // Helper class to find and schedule next available rebalancing move operation

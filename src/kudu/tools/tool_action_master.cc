@@ -89,8 +89,6 @@ DEFINE_string(kudu_abs_path, "", "Absolute file path of the 'kudu' executable us
 
 using kudu::master::AddMasterRequestPB;
 using kudu::master::AddMasterResponsePB;
-using kudu::master::ConnectToMasterRequestPB;
-using kudu::master::ConnectToMasterResponsePB;
 using kudu::master::ListMastersRequestPB;
 using kudu::master::ListMastersResponsePB;
 using kudu::master::Master;
@@ -114,10 +112,10 @@ namespace kudu {
 namespace tools {
 namespace {
 
-const char* const kTabletServerAddressArg = "tserver_address";
-const char* const kTabletServerAddressDesc = "Address of a Kudu tablet server "
-    "of form 'hostname:port'. Port may be omitted if the tablet server is "
-    "bound to the default port.";
+const char* const kTabletServerAddressArg = "tserver_addresses";
+const char* const kTabletServerAddressDesc = "Address list of Kudu tablet servers"
+    " of form 'hostname-0:port-0 hostname-1:port-1 ... hostname-n:port-n'. Port may"
+    " be omitted if the tablet server is bound to the default port.";
 const char* const kFlagArg = "flag";
 const char* const kValueArg = "value";
 
@@ -143,6 +141,56 @@ Status MasterSetFlag(const RunnerContext& context) {
   const string& flag = FindOrDie(context.required_args, kFlagArg);
   const string& value = FindOrDie(context.required_args, kValueArg);
   return SetServerFlag(address, Master::kDefaultPort, flag, value);
+}
+
+Status MasterSetAllMasterFlag(const RunnerContext& context) {
+  LeaderMasterProxy proxy;
+  RETURN_NOT_OK(proxy.Init(context));
+
+  ListMastersRequestPB req;
+  ListMastersResponsePB resp;
+
+  RETURN_NOT_OK((proxy.SyncRpc<ListMastersRequestPB, ListMastersResponsePB>(
+      req, &resp, "ListMasters", &MasterServiceProxy::ListMastersAsync)));
+
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  const auto hostport_to_string = [] (const HostPortPB& hostport) {
+    return Substitute("$0:$1", hostport.host(), hostport.port());
+  };
+
+  vector<ServerEntryPB> masters;
+  std::copy_if(resp.masters().begin(), resp.masters().end(), std::back_inserter(masters),
+               [](const ServerEntryPB& master) {
+                 if (master.has_error()) {
+                   LOG(WARNING) << "Failed to retrieve info for master: "
+                                << StatusFromPB(master.error()).ToString();
+                   return false;
+                 }
+                 return true;
+               });
+  vector<string> master_addresses;
+  for (const auto& master : masters) {
+    master_addresses.push_back(JoinMapped(master.registration().rpc_addresses(),
+                     hostport_to_string, ","));
+  }
+  const string& flag = FindOrDie(context.required_args, kFlagArg);
+  const string& value = FindOrDie(context.required_args, kValueArg);
+  bool set_failed_flag = false;
+  for (const auto& addr : master_addresses) {
+      Status s = SetServerFlag(addr, Master::kDefaultPort, flag, value);
+      if (!s.ok()) {
+        set_failed_flag = true;
+        LOG(WARNING) << Substitute("Set config {$0:$1} for $2 failed, error message: $3",
+                                   flag, value, addr, s.ToString());
+      }
+  }
+  if (set_failed_flag) {
+    return Status::RuntimeError("Some Masters set flag failed!");
+  }
+  return Status::OK();
 }
 
 Status MasterStatus(const RunnerContext& context) {
@@ -403,6 +451,7 @@ Status AddMaster(const RunnerContext& context) {
     const auto& flag = name_flag_pair.second;
     new_master_flags.emplace_back(Substitute("--$0=$1", flag.name, flag.current_value));
   }
+  new_master_flags.emplace_back("--master_auto_join_cluster=false");
 
   // Bring up the new master that includes master addresses of the cluster and itself.
   // It's possible this is a retry in which case the new master is already part of
@@ -604,67 +653,6 @@ Status MasterDumpMemTrackers(const RunnerContext& context) {
   return DumpMemTrackers(address, Master::kDefaultPort);
 }
 
-// Make sure the list of master addresses specified in 'master_addresses'
-// corresponds to the actual list of masters addresses in the cluster,
-// as reported in ConnectToMasterResponsePB::master_addrs.
-Status VerifyMasterAddressList(const vector<string>& master_addresses) {
-  map<string, set<string>> addresses_per_master;
-  for (const auto& address : master_addresses) {
-    unique_ptr<MasterServiceProxy> proxy;
-    RETURN_NOT_OK(BuildProxy(address, Master::kDefaultPort, &proxy));
-
-    RpcController ctl;
-    ctl.set_timeout(MonoDelta::FromMilliseconds(FLAGS_timeout_ms));
-    ConnectToMasterRequestPB req;
-    ConnectToMasterResponsePB resp;
-    RETURN_NOT_OK(proxy->ConnectToMaster(req, &resp, &ctl));
-    const auto& resp_master_addrs = resp.master_addrs();
-    if (resp_master_addrs.size() != master_addresses.size()) {
-      const auto addresses_provided = JoinStrings(master_addresses, ",");
-      const auto addresses_cluster_config = JoinMapped(
-          resp_master_addrs,
-          [](const HostPortPB& pb) {
-            return Substitute("$0:$1", pb.host(), pb.port());
-          }, ",");
-      return Status::InvalidArgument(Substitute(
-          "list of master addresses provided ($0) "
-          "does not match the actual cluster configuration ($1) ",
-          addresses_provided, addresses_cluster_config));
-    }
-    set<string> addr_set;
-    for (const auto& hp : resp_master_addrs) {
-      addr_set.emplace(Substitute("$0:$1", hp.host(), hp.port()));
-    }
-    addresses_per_master.emplace(address, std::move(addr_set));
-  }
-
-  bool mismatch = false;
-  if (addresses_per_master.size() > 1) {
-    const auto it_0 = addresses_per_master.cbegin();
-    auto it_1 = addresses_per_master.begin();
-    ++it_1;
-    for (auto it = it_1; it != addresses_per_master.end(); ++it) {
-      if (it->second != it_0->second) {
-        mismatch = true;
-        break;
-      }
-    }
-  }
-
-  if (mismatch) {
-    string err_msg = Substitute("specified: ($0);",
-                                JoinStrings(master_addresses, ","));
-    for (const auto& e : addresses_per_master) {
-      err_msg += Substitute(" from master $0: ($1);",
-                            e.first, JoinStrings(e.second, ","));
-    }
-    return Status::ConfigurationError(
-        Substitute("master address lists mismatch: $0", err_msg));
-  }
-
-  return Status::OK();
-}
-
 Status PrintRebuildReport(const RebuildReport& rebuild_report) {
   cout << "Rebuild Report" << endl;
   cout << "Tablet Servers" << endl;
@@ -832,6 +820,16 @@ unique_ptr<Mode> BuildMasterMode() {
     builder.AddAction(std::move(set_flag));
   }
   {
+    unique_ptr<Action> set_flag_for_all =
+        ClusterActionBuilder("set_flag_for_all", &MasterSetAllMasterFlag)
+        .Description("Change a gflag value for all Kudu Masters in the cluster")
+        .AddRequiredParameter({ kFlagArg, "Name of the gflag" })
+        .AddRequiredParameter({ kValueArg, "New value for the gflag" })
+        .AddOptionalParameter("force")
+        .Build();
+    builder.AddAction(std::move(set_flag_for_all));
+  }
+  {
     unique_ptr<Action> status =
         MasterActionBuilder("status", &MasterStatus)
         .Description("Get the status of a Kudu Master")
@@ -853,7 +851,7 @@ unique_ptr<Mode> BuildMasterMode() {
             "columns",
             string("uuid,rpc-addresses,role"),
             string("Comma-separated list of master info fields to "
-                   "include in output.\nPossible values: uuid, cluster_id"
+                   "include in output.\nPossible values: uuid, cluster_id, "
                    "rpc-addresses, http-addresses, version, seqno, "
                    "start_time, role and member_type"))
         .AddOptionalParameter("format")
@@ -937,10 +935,11 @@ unique_ptr<Mode> BuildMasterMode() {
         .Description("Rebuild a Kudu master from tablet server metadata")
         .ExtraDescription(rebuild_extra_description)
         .AddRequiredVariadicParameter({ kTabletServerAddressArg, kTabletServerAddressDesc })
+        .AddOptionalParameter("default_num_replicas")
+        .AddOptionalParameter("default_schema_version")
         .AddOptionalParameter("fs_data_dirs")
         .AddOptionalParameter("fs_metadata_dir")
         .AddOptionalParameter("fs_wal_dir")
-        .AddOptionalParameter("default_num_replicas")
         .Build();
     builder.AddAction(std::move(unsafe_rebuild));
   }

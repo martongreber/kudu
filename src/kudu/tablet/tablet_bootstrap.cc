@@ -38,6 +38,7 @@
 #include "kudu/clock/hybrid_clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
@@ -141,6 +142,7 @@ using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::unordered_map;
+using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
@@ -176,7 +178,7 @@ class FlushedStoresSnapshot {
   bool IsMemStoreActive(const MemStoreTargetPB& target) const;
 
  private:
-  int64_t last_durable_mrs_id_;
+  int64_t last_durable_mrs_id_ = 0;
   unordered_map<int64_t, int64_t> flushed_dms_by_drs_id_;
 
   DISALLOW_COPY_AND_ASSIGN(FlushedStoresSnapshot);
@@ -209,9 +211,20 @@ class FlushedStoresSnapshot {
 // is handled by the 'TabletCopy' classes, which copy blocks and metadata locally
 // before invoking this local bootstrap functionality to start the tablet.
 //
-// TODO Because the table that is being rebuilt is never flushed/compacted, consensus
-// is only set on the tablet after bootstrap, when we get to flushes/compactions though
-// we need to set it before replay or we won't be able to re-rebuild.
+// When rebuilding an existing WAL, we first move the WAL segments into a
+// separate "recovery" directory to serve as the original copy. New WAL entries
+// with new commit messages are added to a new WAL in the original WAL
+// directory. Entire segments may be skipped (e.g. if the mem-stores were
+// flushed prior to shutting down), so the resulting WAL may be shorter than
+// the original. Once the bootstrap is complete, the recovery directory is
+// deleted, leaving only the new WAL. Since recovery directories contain the
+// original WALs, following a crash during bootstrapping, subsequent bootstraps
+// should attempt to replay segments out of the recovery directory.
+//
+// TODO(dralves): Because the tablet that is being rebuilt is never
+// flushed/compacted, consensus is only set on the tablet after bootstrap, when
+// we get to flushes/compactions though we need to set it before replay or we
+// won't be able to re-rebuild.
 class TabletBootstrap {
  public:
   TabletBootstrap(scoped_refptr<TabletMetadata> tablet_meta,
@@ -393,12 +406,15 @@ class TabletBootstrap {
   Status UpdateClock(uint64_t timestamp);
 
   // Return a log prefix string in the standard "T xxx P yyy" format.
-  string LogPrefix() const;
+  const string& LogPrefix() const {
+    return log_prefix_;
+  }
 
   // Log a status message and set the TabletReplica's status as well.
-  void SetStatusMessage(const string& status);
+  void SetStatusMessage(string status);
 
   const scoped_refptr<TabletMetadata> tablet_meta_;
+  const string log_prefix_;
   const RaftConfigPB committed_raft_config_;
   Clock* clock_;
   shared_ptr<MemTracker> mem_tracker_;
@@ -409,7 +425,7 @@ class TabletBootstrap {
   unique_ptr<tablet::Tablet> tablet_;
   const scoped_refptr<log::LogAnchorRegistry> log_anchor_registry_;
   scoped_refptr<log::Log> log_;
-  std::shared_ptr<log::LogReader> log_reader_;
+  shared_ptr<log::LogReader> log_reader_;
 
   // Statistics on the replay of entries in the log.
   struct Stats {
@@ -463,18 +479,20 @@ class TabletBootstrap {
 
   // Transactions that were persisted as being in-flight (neither finalized or
   // aborted) and completed prior to restart.
-  std::unordered_set<int64_t> in_flight_txn_ids_;
-  std::unordered_set<int64_t> terminal_txn_ids_;
+  unordered_set<int64_t> in_flight_txn_ids_;
+  unordered_set<int64_t> terminal_txn_ids_;
 
   // Transactions (committed or not) that have active MemRowSets.
-  std::unordered_set<int64_t> mrs_txn_ids_;
+  unordered_set<int64_t> mrs_txn_ids_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletBootstrap);
 };
 
-void TabletBootstrap::SetStatusMessage(const string& status) {
+void TabletBootstrap::SetStatusMessage(string status) {
   LOG_WITH_PREFIX(INFO) << status;
-  if (tablet_replica_) tablet_replica_->SetStatusMessage(status);
+  if (tablet_replica_) {
+    tablet_replica_->SetStatusMessage(std::move(status));
+  }
 }
 
 Status BootstrapTablet(scoped_refptr<TabletMetadata> tablet_meta,
@@ -538,6 +556,9 @@ TabletBootstrap::TabletBootstrap(
     scoped_refptr<TabletReplica> tablet_replica,
     scoped_refptr<LogAnchorRegistry> log_anchor_registry)
     : tablet_meta_(std::move(tablet_meta)),
+      log_prefix_(Substitute("T $0 P $1: ",
+                             tablet_meta_->tablet_id(),
+                             tablet_meta_->fs_manager()->uuid())),
       committed_raft_config_(std::move(committed_raft_config)),
       clock_(clock),
       mem_tracker_(std::move(mem_tracker)),
@@ -630,7 +651,7 @@ Status TabletBootstrap::RunBootstrap(shared_ptr<Tablet>* rebuilt_tablet,
 
   // This is a new tablet, nothing left to do.
   if (!has_blocks && !needs_recovery) {
-    LOG_WITH_PREFIX(INFO) << "No blocks or log segments found. Creating new log.";
+    LOG_WITH_PREFIX(INFO) << "Neither blocks nor log segments found. Creating new log.";
     RETURN_NOT_OK_PREPEND(OpenNewLog(), "Failed to open new log");
     RETURN_NOT_OK(FinishBootstrap("No bootstrap required, opened a new log",
                                   rebuilt_log, rebuilt_tablet));
@@ -795,7 +816,7 @@ struct ReplayState {
 
   // Return true if 'b' is allowed to immediately follow 'a' in the log.
   static bool IsValidSequence(const OpId& a, const OpId& b) {
-    if (a.term() == 0 && a.index() == 0) {
+    if (PREDICT_FALSE(a.term() == 0 && a.index() == 0)) {
       // Not initialized - can start with any opid.
       return true;
     }
@@ -810,7 +831,7 @@ struct ReplayState {
     return true;
   }
 
-  // Return a Corruption status if 'id' seems to be out-of-sequence in the log.
+  // Return a Corruption status if 'msg' seems to be out-of-sequence in the log.
   Status CheckSequentialReplicateId(const ReplicateMsg& msg) {
     DCHECK(msg.has_id());
     if (PREDICT_FALSE(!IsValidSequence(prev_op_id, msg.id()))) {
@@ -840,7 +861,7 @@ struct ReplayState {
     }
   }
 
-  void DumpReplayStateToStrings(vector<string>* strings)  const {
+  void DumpReplayStateToStrings(vector<string>* strings) const {
     strings->push_back(Substitute("ReplayState: Previous OpId: $0, Committed OpId: $1, "
         "Pending Replicates: $2, Pending Commits: $3", OpIdToString(prev_op_id),
         OpIdToString(committed_op_id), pending_replicates.size(), pending_commits.size()));
@@ -931,6 +952,7 @@ Status TabletBootstrap::HandleReplicateMessage(ReplayState* state,
   const ReplicateMsg& replicate = entry->replicate();
   RETURN_NOT_OK(state->CheckSequentialReplicateId(replicate));
   DCHECK(replicate.has_timestamp());
+  // TODO(yingchun): Should we try to update clock by batch?
   CHECK_OK(UpdateClock(replicate.timestamp()));
 
   // Append the replicate message to the log as is
@@ -938,7 +960,7 @@ Status TabletBootstrap::HandleReplicateMessage(ReplayState* state,
 
   const int64_t index = replicate.id().index();
   const auto existing_entry_iter = state->pending_replicates.find(index);
-  if (existing_entry_iter != state->pending_replicates.end()) {
+  if (PREDICT_FALSE(existing_entry_iter != state->pending_replicates.end())) {
     // If there was a entry with the same index we're overwriting then we need
     // to delete that entry and all entries with higher indexes.
     const auto& existing_entry = existing_entry_iter->second;
@@ -984,8 +1006,8 @@ Status TabletBootstrap::HandleCommitMessage(const IOContext* io_context, ReplayS
 
   // If there are no pending replicates, or if this commit's index is lower than the
   // the first pending replicate on record this is likely an orphaned commit.
-  if (state->pending_replicates.empty() ||
-      (*state->pending_replicates.begin()).first > committed_op_id.index()) {
+  if (PREDICT_FALSE(state->pending_replicates.empty() ||
+      (*state->pending_replicates.begin()).first > committed_op_id.index())) {
     VLOG_WITH_PREFIX(2) << "Found orphaned commit for " << committed_op_id;
     RETURN_NOT_OK(CheckOrphanedCommitDoesntNeedReplay(entry->commit()));
     stats_.orphaned_commits++;
@@ -1028,21 +1050,17 @@ Status TabletBootstrap::HandleCommitMessage(const IOContext* io_context, ReplayS
 
 TabletBootstrap::ActiveStores TabletBootstrap::AnalyzeActiveStores(const CommitMsg& commit) {
   bool has_mutated_stores = false;
-  bool has_active_stores = false;
 
   for (const OperationResultPB& op_result : commit.result().ops()) {
     for (const MemStoreTargetPB& mutated_store : op_result.mutated_stores()) {
       has_mutated_stores = true;
       if (flushed_stores_.IsMemStoreActive(mutated_store)) {
-        has_active_stores = true;
+        return SOME_STORES_ACTIVE;
       }
     }
   }
 
-  if (!has_mutated_stores) {
-    return NO_MUTATED_STORES;
-  }
-  return has_active_stores ? SOME_STORES_ACTIVE : NO_STORES_ACTIVE;
+  return has_mutated_stores ? NO_STORES_ACTIVE : NO_MUTATED_STORES;
 }
 
 Status TabletBootstrap::CheckOrphanedCommitDoesntNeedReplay(const CommitMsg& commit) {
@@ -1068,11 +1086,10 @@ Status TabletBootstrap::ApplyCommitMessage(const IOContext* io_context,
   // deleted log segment though).
   unique_ptr<LogEntryPB> pending_replicate_entry(EraseKeyReturnValuePtr(
       &state->pending_replicates, committed_op_id.index()));
-  if (pending_replicate_entry) {
-    // We found a replicate with the same index, make sure it also has the same
-    // term.
+  if (PREDICT_TRUE(pending_replicate_entry)) {
+    // We found a replicate with the same index, make sure it also has the same term.
     const auto& replicate = pending_replicate_entry->replicate();
-    if (!OpIdEquals(committed_op_id, replicate.id())) {
+    if (PREDICT_FALSE(!OpIdEquals(committed_op_id, replicate.id()))) {
       string error_msg = Substitute("Committed operation's OpId: $0 didn't match the"
           "commit message's committed OpId: $1. Pending operation: $2, Commit message: $3",
           SecureShortDebugString(replicate.id()),
@@ -1099,8 +1116,8 @@ Status TabletBootstrap::HandleEntryPair(const IOContext* io_context, LogEntryPB*
 
 #define RETURN_NOT_OK_REPLAY(ReplayMethodName, io_context, replicate, commit)       \
   RETURN_NOT_OK_PREPEND(ReplayMethodName(io_context, replicate, commit),            \
-                        Substitute(error_fmt, OperationType_Name(op_type), \
-                                   SecureShortDebugString(*(replicate)), \
+                        Substitute(error_fmt, OperationType_Name(op_type),          \
+                                   SecureShortDebugString(*(replicate)),            \
                                    SecureShortDebugString(commit)))
 
   ReplicateMsg* replicate = replicate_entry->mutable_replicate();
@@ -1135,6 +1152,7 @@ Status TabletBootstrap::HandleEntryPair(const IOContext* io_context, LogEntryPB*
 
 #undef RETURN_NOT_OK_REPLAY
 
+  // TODO(yingchun): We should try to avoid update MVCC's safe time for every entry?
   // We should only advance MVCC's safe time based on a specific set of
   // operations: those whose timestamps are guaranteed to be monotonically
   // increasing with respect to their entries in the write-ahead log.
@@ -1251,7 +1269,7 @@ Status TabletBootstrap::PlaySegments(const IOContext* io_context,
 
         string entry_debug_info;
         s = HandleEntry(io_context, &state, std::move(entry), &entry_debug_info);
-        if (!s.ok()) {
+        if (PREDICT_FALSE(!s.ok())) {
           DumpReplayStateToLog(state);
           RETURN_NOT_OK_PREPEND(s, DebugInfo(tablet_->tablet_id(),
                                              segment->header().sequence_number(),
@@ -1282,22 +1300,20 @@ Status TabletBootstrap::PlaySegments(const IOContext* io_context,
 
   // If we have non-applied commits they all must belong to pending operations and
   // they should only pertain to stores which are still active.
-  if (!state.pending_commits.empty()) {
-    for (const OpIndexToEntryMap::value_type& entry : state.pending_commits) {
-      if (!ContainsKey(state.pending_replicates, entry.first)) {
-        DumpReplayStateToLog(state);
-        return Status::Corruption("Had orphaned commits at the end of replay.");
-      }
+  for (const auto& entry : state.pending_commits) {
+    if (!ContainsKey(state.pending_replicates, entry.first)) {
+      DumpReplayStateToLog(state);
+      return Status::Corruption("Had orphaned commits at the end of replay.");
+    }
 
-      if (entry.second->commit().op_type() == WRITE_OP &&
-          AnalyzeActiveStores(entry.second->commit()) == NO_STORES_ACTIVE) {
-        DumpReplayStateToLog(state);
-        TabletSuperBlockPB super;
-        WARN_NOT_OK(tablet_meta_->ToSuperBlock(&super), "Couldn't build TabletSuperBlockPB.");
-        return Status::Corruption(Substitute("CommitMsg was pending but it did not refer "
-            "to any active memory stores. Commit: $0. TabletMetadata: $1",
-            SecureShortDebugString(entry.second->commit()), SecureShortDebugString(super)));
-      }
+    if (entry.second->commit().op_type() == WRITE_OP &&
+        AnalyzeActiveStores(entry.second->commit()) == NO_STORES_ACTIVE) {
+      DumpReplayStateToLog(state);
+      TabletSuperBlockPB super;
+      WARN_NOT_OK(tablet_meta_->ToSuperBlock(&super), "Couldn't build TabletSuperBlockPB.");
+      return Status::Corruption(Substitute("CommitMsg was pending but it did not refer "
+          "to any active memory stores. Commit: $0. TabletMetadata: $1",
+          SecureShortDebugString(entry.second->commit()), SecureShortDebugString(super)));
     }
   }
 
@@ -1345,8 +1361,8 @@ Status TabletBootstrap::PlaySegments(const IOContext* io_context,
   }
 
   // Set up the ConsensusBootstrapInfo structure for the caller.
-  for (OpIndexToEntryMap::value_type& e : state.pending_replicates) {
-    consensus_info->orphaned_replicates.push_back(e.second->release_replicate());
+  for (auto& entry : state.pending_replicates) {
+    consensus_info->orphaned_replicates.push_back(entry.second->release_replicate());
   }
   consensus_info->last_id = state.prev_op_id;
   consensus_info->last_committed_id = state.committed_op_id;
@@ -1519,11 +1535,11 @@ Status TabletBootstrap::PlayAlterSchemaRequest(const IOContext* /*io_context*/,
   AlterSchemaRequestPB* alter_schema = replicate_msg->mutable_alter_schema_request();
 
   // Decode schema
-  Schema schema;
-  RETURN_NOT_OK(SchemaFromPB(alter_schema->schema(), &schema));
+  SchemaPtr schema_ptr = std::make_shared<Schema>();
+  RETURN_NOT_OK(SchemaFromPB(alter_schema->schema(), schema_ptr.get()));
 
   AlterSchemaOpState op_state(nullptr, alter_schema, nullptr);
-  RETURN_NOT_OK(tablet_->CreatePreparedAlterSchema(&op_state, &schema));
+  RETURN_NOT_OK(tablet_->CreatePreparedAlterSchema(&op_state, schema_ptr));
 
   // Apply the alter schema to the tablet
   RETURN_NOT_OK_PREPEND(tablet_->AlterSchema(&op_state), "Failed to AlterSchema:");
@@ -1531,7 +1547,7 @@ Status TabletBootstrap::PlayAlterSchemaRequest(const IOContext* /*io_context*/,
   if (!op_state.error()) {
     // If the alter completed successfully, update the log segment header. Note
     // that our new log isn't hooked up to the tablet yet.
-    log_->SetSchemaForNextLogSegment(std::move(schema), op_state.schema_version());
+    log_->SetSchemaForNextLogSegment(*schema_ptr, op_state.schema_version());
   }
 
   return AppendCommitMsg(commit_msg);
@@ -1784,10 +1800,6 @@ Status TabletBootstrap::FilterOperation(const OperationResultPB& op_result,
 
 Status TabletBootstrap::UpdateClock(uint64_t timestamp) {
   return clock_->Update(Timestamp(timestamp));
-}
-
-string TabletBootstrap::LogPrefix() const {
-  return Substitute("T $0 P $1: ", tablet_meta_->tablet_id(), tablet_meta_->fs_manager()->uuid());
 }
 
 Status FlushedStoresSnapshot::InitFrom(const TabletMetadata& tablet_meta) {

@@ -36,12 +36,14 @@
 #include <google/protobuf/util/json_util.h>
 #include <rapidjson/document.h>
 
+#include "kudu/client/client-internal.h"
 #include "kudu/client/client.h"
 #include "kudu/client/replica_controller-internal.h"
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/scan_predicate.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
+#include "kudu/client/table_alterer-internal.h"
 #include "kudu/client/value.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
@@ -56,7 +58,9 @@
 #include "kudu/tools/tool.pb.h"
 #include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
+#include "kudu/util/flag_validators.h"
 #include "kudu/util/jsonreader.h"
+#include "kudu/util/jsonwriter.h"
 #include "kudu/util/status.h"
 #include "kudu/util/string_case.h"
 
@@ -102,6 +106,9 @@ DEFINE_string(dst_table, "",
               "If the empty string, use the same name as the source table.");
 DEFINE_bool(list_tablets, false,
             "Include tablet and replica UUIDs in the output");
+DEFINE_bool(show_table_info, false,
+            "Include extra information such as number of tablets, replicas, "
+            "and live row count for a table in the output");
 DEFINE_bool(modify_external_catalogs, true,
             "Whether to modify external catalogs, such as the Hive Metastore, "
             "when renaming or dropping a table.");
@@ -114,9 +121,44 @@ DEFINE_string(lower_bound_type, "INCLUSIVE_BOUND",
 DEFINE_string(upper_bound_type, "EXCLUSIVE_BOUND",
               "The type of the upper bound, either inclusive or exclusive. "
               "Defaults to exclusive. This flag is case-insensitive.");
+DEFINE_int32(scan_batch_size, -1,
+             "The size for scan results batches, in bytes. A negative value "
+             "means the server-side default is used, where the server-side "
+             "default is controlled by the tablet server's "
+             "--scanner_default_batch_size_bytes flag.");
+DEFINE_bool(show_avro_format_schema, false,
+            "Display the table schema in avro format. When enabled it only outputs the "
+            "table schema in Avro format without any other information like "
+            "partition/owner/comments. It cannot be used in conjunction with other flags");
+
+DECLARE_bool(create_table);
+DECLARE_int32(create_table_replication_factor);
+DECLARE_bool(row_count_only);
+DECLARE_bool(show_scanner_stats);
+
+DEFINE_string(encoding_type, "AUTO_ENCODING",
+              "Type of encoding for the column including AUTO_ENCODING, PLAIN_ENCODING, "
+              "PREFIX_ENCODING, RLE, DICT_ENCODING, BIT_SHUFFLE, GROUP_VARINT");
+DEFINE_string(compression_type, "DEFAULT_COMPRESSION",
+              "Type of compression for the column including DEFAULT_COMPRESSION, "
+              "NO_COMPRESSION, SNAPPY, LZ4, ZLIB");
+DEFINE_string(default_value, "", "Default value for this column.");
+DEFINE_string(comment, "", "Comment for this column.");
 
 DECLARE_bool(show_values);
+DECLARE_string(replica_selection);
 DECLARE_string(tables);
+
+bool ValidateCreateTable() {
+  if (!FLAGS_create_table && FLAGS_create_table_replication_factor != -1) {
+    LOG(ERROR) << Substitute("--create_table_replication_factor is meaningless "
+                             "when --create_table=false");
+    return false;
+  }
+  return true;
+}
+
+GROUP_FLAG_VALIDATOR(create_table, ValidateCreateTable);
 
 namespace kudu {
 namespace tools {
@@ -130,13 +172,21 @@ class TableLister {
     RETURN_NOT_OK(CreateKuduClient(master_addresses,
                                    &client,
                                    true /* can_see_all_replicas */));
-    vector<string> table_names;
-    RETURN_NOT_OK(client->ListTables(&table_names));
+    vector<kudu::client::KuduClient::Data::TableInfo> tables_info;
+    RETURN_NOT_OK(client->data_->ListTablesWithInfo(
+        client.get(), &tables_info, "" /* filter */));
 
     vector<string> table_filters = Split(FLAGS_tables, ",", strings::SkipEmpty());
-    for (const auto& tname : table_names) {
+    for (const auto& tinfo : tables_info) {
+      const auto& tname = tinfo.table_name;
       if (!MatchesAnyPattern(table_filters, tname)) continue;
-      cout << tname << endl;
+      if (FLAGS_show_table_info) {
+        cout << tname << " " << "num_tablets:" << tinfo.num_tablets
+             << " num_replicas:" << tinfo.num_replicas
+             << " live_row_count:" << tinfo.live_row_count << endl;
+      } else {
+        cout << tname << endl;
+      }
       if (!FLAGS_list_tablets) {
         continue;
       }
@@ -164,6 +214,20 @@ class TableLister {
   }
 };
 
+// This class only exists so that it can easily be friended by KuduTableAlterer.
+class TableAlter {
+ public:
+  static Status SetReplicationFactor(const vector<string>& master_addresses,
+                                     const string& table_name,
+                                     int32_t replication_factor) {
+    client::sp::shared_ptr<KuduClient> client;
+    RETURN_NOT_OK(CreateKuduClient(master_addresses, &client));
+    unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
+    alterer->data_->set_replication_factor_to_ = replication_factor;
+    return alterer->Alter();
+  }
+};
+
 namespace {
 
 const char* const kNewTableNameArg = "new_table_name";
@@ -181,11 +245,114 @@ const char* const kEncodingTypeArg = "encoding_type";
 const char* const kBlockSizeArg = "block_size";
 const char* const kColumnCommentArg = "column_comment";
 const char* const kCreateTableJSONArg = "create_table_json";
+const char* const kReplicationFactorArg = "replication_factor";
+const char* const kDataTypeArg = "data_type";
 
 enum PartitionAction {
   ADD,
   DROP,
 };
+
+Status AddLogicalType(JsonWriter* writer, const string& type, const string& logical_type,
+                      const ColumnSchema& col_schema) {
+  writer->StartArray();
+  writer->StartObject();
+  writer->String("type");
+  writer->String(type);
+  writer->String("logicalType");
+  writer->String(logical_type);
+  writer->EndObject();
+  writer->EndArray();
+  if (col_schema.has_read_default()) {
+    writer->String("default");
+    writer->String(col_schema.Stringify(col_schema.read_default_value()));
+  }
+  return Status::OK();
+}
+
+Status AddPrimitiveType(const ColumnSchema& col_schema, const string& type, JsonWriter* writer) {
+  if (col_schema.is_nullable()) {
+    writer->StartArray();
+    writer->String("null");
+    writer->String(type);
+    writer->EndArray();
+  } else {
+    writer->String(type);
+  }
+  if (col_schema.has_read_default()) {
+    writer->String("default");
+    writer->String(col_schema.Stringify(col_schema.read_default_value()));
+  }
+  return Status::OK();
+}
+
+Status PopulateAvroSchema(const string& table_name,
+                          const string& cluster_id,
+                          const KuduSchema& kudu_schema) {
+  std::ostringstream out;
+  JsonWriter writer(&out, JsonWriter::Mode::PRETTY);
+  // Start writing in Json format
+  writer.StartObject();
+  vector<string> json_attributes = {"type", "table", "name", table_name,
+                                    "namespace", "kudu.cluster." + cluster_id, "fields"};
+  for (const string& json: json_attributes) {
+    writer.String(json);
+  }
+  writer.StartArray();
+  const Schema schema = kudu::client::KuduSchema::ToSchema(kudu_schema);
+  // Each column type is a nested field
+  for (int i = 0; i < schema.num_columns(); i++) {
+    writer.StartObject();
+    writer.String("name");
+    writer.String(kudu_schema.Column(i).name());
+    writer.String("type");
+    switch (kudu_schema.Column(i).type()) {
+      case kudu::client::KuduColumnSchema::INT8:
+      case kudu::client::KuduColumnSchema::INT16:
+      case kudu::client::KuduColumnSchema::INT32:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "int", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::INT64:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "long", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::STRING:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "string", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::BOOL:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "bool", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::FLOAT:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "float", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::DOUBLE:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "double", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::BINARY:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "bytes", &writer));
+        break;
+      case kudu::client::KuduColumnSchema::VARCHAR:
+        RETURN_NOT_OK(AddPrimitiveType(schema.column(i), "string", &writer));
+        break;
+      // Each logical type in avro schema has sub-nested fields
+      case kudu::client::KuduColumnSchema::UNIXTIME_MICROS:
+        RETURN_NOT_OK(AddLogicalType(&writer, "long", "time-micros", schema.column(i)));
+        break;
+      case kudu::client::KuduColumnSchema::DATE:
+        RETURN_NOT_OK(AddLogicalType(&writer, "int", "date", schema.column(i)));
+        break;
+      case kudu::client::KuduColumnSchema::DECIMAL:
+        RETURN_NOT_OK(AddLogicalType(&writer, "bytes", "decimal", schema.column(i)));
+        break;
+      default:
+        LOG(DFATAL) << kudu_schema.Column(i).name() << ": Invalid column type";
+    }
+    writer.EndObject();
+  }
+  writer.EndArray();
+  writer.EndObject();
+  cout << out.str() << endl;
+  return Status::OK();
+}
 
 Status DeleteTable(const RunnerContext& context) {
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
@@ -204,8 +371,11 @@ Status DescribeTable(const RunnerContext& context) {
 
   // The schema.
   const KuduSchema& schema = table->schema();
+  if (FLAGS_show_avro_format_schema) {
+    return PopulateAvroSchema(FindOrDie(context.required_args, kTableNameArg),
+                                         client->cluster_id(), schema);
+  }
   cout << "TABLE " << table_name << " " << schema.ToString() << endl;
-
   // The partition schema with current range partitions.
   vector<Partition> partitions;
   RETURN_NOT_OK_PREPEND(table->ListPartitions(&partitions),
@@ -222,8 +392,8 @@ Status DescribeTable(const RunnerContext& context) {
       continue;
     }
     auto range_partition_str =
-        partition_schema.RangePartitionDebugString(partition.range_key_start(),
-                                                   partition.range_key_end(),
+        partition_schema.RangePartitionDebugString(partition.begin().range_key(),
+                                                   partition.end().range_key(),
                                                    schema_internal);
     partition_strs.emplace_back(std::move(range_partition_str));
   }
@@ -238,7 +408,6 @@ Status DescribeTable(const RunnerContext& context) {
 
   // The comment.
   cout << "COMMENT " << table->comment() << endl;
-
   return Status::OK();
 }
 
@@ -482,9 +651,16 @@ Status ScanTable(const RunnerContext &context) {
 
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
 
-  FLAGS_show_values = true;
+  if (!FLAGS_row_count_only) {
+    FLAGS_show_values = true;
+  }
   TableScanner scanner(client, table_name);
   scanner.SetOutput(&cout);
+  scanner.SetScanBatchSize(FLAGS_scan_batch_size);
+  const auto& replica_selection_str = FLAGS_replica_selection;
+  if (!replica_selection_str.empty()) {
+    RETURN_NOT_OK(scanner.SetReplicaSelection(replica_selection_str));
+  }
   return scanner.StartScan();
 }
 
@@ -805,7 +981,7 @@ Status ParseValueOfType(const string& default_value,
     case KuduColumnSchema::DataType::DECIMAL:
     default:
       return Status::NotSupported(Substitute(
-        "$0 columns are not supported for setting default value by this tool,"
+        "$0 columns are not supported for setting default value by this tool, "
         "is this tool out of date?",
         KuduColumnSchema::DataTypeToString(type)));
   }
@@ -900,6 +1076,26 @@ Status ColumnSetBlockSize(const RunnerContext& context) {
   return alterer->Alter();
 }
 
+Status ClearComment(const RunnerContext& context) {
+  const string& table_name = FindOrDie(context.required_args, kTableNameArg);
+  client::sp::shared_ptr<KuduClient> client;
+  RETURN_NOT_OK(CreateKuduClient(context, &client));
+  unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
+  alterer->SetComment("");
+  return alterer->Alter();
+}
+
+Status SetComment(const RunnerContext& context) {
+  const string& table_name = FindOrDie(context.required_args, kTableNameArg);
+  const string& table_comment = FindOrDie(context.required_args, kColumnCommentArg);
+
+  client::sp::shared_ptr<KuduClient> client;
+  RETURN_NOT_OK(CreateKuduClient(context, &client));
+  unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
+  alterer->SetComment(table_comment);
+  return alterer->Alter();
+}
+
 Status ColumnSetComment(const RunnerContext& context) {
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
   const string& column_name = FindOrDie(context.required_args, kColumnNameArg);
@@ -912,6 +1108,47 @@ Status ColumnSetComment(const RunnerContext& context) {
   return alterer->Alter();
 }
 
+Status AddColumn(const RunnerContext& context) {
+  const string& table_name = FindOrDie(context.required_args, kTableNameArg);
+  const string& column_name = FindOrDie(context.required_args, kColumnNameArg);
+  const string& data_type_name = FindOrDie(context.required_args, kDataTypeArg);
+
+  client::sp::shared_ptr<KuduClient> client;
+  RETURN_NOT_OK(CreateKuduClient(context, &client));
+  unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
+  KuduColumnSpec* column_spec = alterer->AddColumn(column_name);
+
+  KuduColumnSchema::DataType data_type;
+  RETURN_NOT_OK(KuduColumnSchema::StringToDataType(data_type_name, &data_type));
+  column_spec->Type(data_type);
+
+  if (!FLAGS_default_value.empty()) {
+    KuduValue* value = nullptr;
+    RETURN_NOT_OK(ParseValueOfType(FLAGS_default_value, data_type, &value));
+    column_spec->Default(value);
+  }
+
+  if (!FLAGS_encoding_type.empty()) {
+    KuduColumnStorageAttributes::EncodingType encoding_type;
+    RETURN_NOT_OK(KuduColumnStorageAttributes::StringToEncodingType(FLAGS_encoding_type,
+                                                                    &encoding_type));
+    column_spec->Encoding(encoding_type);
+  }
+
+  if (!FLAGS_compression_type.empty()) {
+    KuduColumnStorageAttributes::CompressionType compress_type;
+    RETURN_NOT_OK(KuduColumnStorageAttributes::StringToCompressionType(FLAGS_compression_type,
+                                                                       &compress_type));
+    column_spec->Compression(compress_type);
+  }
+
+  if (!FLAGS_comment.empty()) {
+    column_spec->Comment(FLAGS_comment);
+  }
+
+  return alterer->Alter();
+}
+
 Status DeleteColumn(const RunnerContext& context) {
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
   const string& column_name = FindOrDie(context.required_args, kColumnNameArg);
@@ -921,6 +1158,21 @@ Status DeleteColumn(const RunnerContext& context) {
   unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
   alterer->DropColumn(column_name);
   return alterer->Alter();
+}
+
+Status SetReplicationFactor(const RunnerContext& context) {
+  vector<string> master_addresses;
+  RETURN_NOT_OK(ParseMasterAddresses(context, &master_addresses));
+  const string& table_name = FindOrDie(context.required_args, kTableNameArg);
+  const string& str_replication_factor = FindOrDie(context.required_args, kReplicationFactorArg);
+
+  int32_t replication_factor;
+  if (!safe_strto32(str_replication_factor, &replication_factor)) {
+    return Status::InvalidArgument(Substitute(
+        "Unable to parse replication factor value: $0.", str_replication_factor));
+  }
+
+  return TableAlter::SetReplicationFactor(master_addresses, table_name, replication_factor);
 }
 
 Status GetTableStatistics(const RunnerContext& context) {
@@ -1244,6 +1496,7 @@ unique_ptr<Mode> BuildTableMode() {
       .Description("Describe a table")
       .AddRequiredParameter({ kTableNameArg, "Name of the table to describe" })
       .AddOptionalParameter("show_attributes")
+      .AddOptionalParameter("show_avro_format_schema")
       .Build();
 
   unique_ptr<Action> list_tables =
@@ -1251,6 +1504,7 @@ unique_ptr<Mode> BuildTableMode() {
       .Description("List tables")
       .AddOptionalParameter("tables")
       .AddOptionalParameter("list_tablets")
+      .AddOptionalParameter("show_table_info")
       .Build();
 
   unique_ptr<Action> locate_row =
@@ -1292,10 +1546,14 @@ unique_ptr<Mode> BuildTableMode() {
                         "for the --predicates flag on how predicates can be specified.")
       .AddRequiredParameter({ kTableNameArg, "Name of the table to scan"})
       .AddOptionalParameter("columns")
+      .AddOptionalParameter("row_count_only")
+      .AddOptionalParameter("report_scanner_stats")
+      .AddOptionalParameter("scan_batch_size")
       .AddOptionalParameter("fill_cache")
       .AddOptionalParameter("num_threads")
       .AddOptionalParameter("predicates")
       .AddOptionalParameter("tablets")
+      .AddOptionalParameter("replica_selection")
       .Build();
 
   unique_ptr<Action> copy_table =
@@ -1309,6 +1567,7 @@ unique_ptr<Mode> BuildTableMode() {
       .AddRequiredParameter({ kTableNameArg, "Name of the source table" })
       .AddRequiredParameter({ kDestMasterAddressesArg, kDestMasterAddressesArgDesc })
       .AddOptionalParameter("create_table")
+      .AddOptionalParameter("create_table_replication_factor")
       .AddOptionalParameter("dst_table")
       .AddOptionalParameter("num_threads")
       .AddOptionalParameter("predicates")
@@ -1413,6 +1672,22 @@ unique_ptr<Mode> BuildTableMode() {
       .AddRequiredParameter({ kColumnCommentArg, "Comment of the column" })
       .Build();
 
+  unique_ptr<Action> add_column =
+      ActionBuilder("add_column", &AddColumn)
+      .Description("Add a column")
+      .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
+      .AddRequiredParameter({ kTableNameArg, "Name of the table to alter" })
+      .AddRequiredParameter({ kColumnNameArg, "Name of the table column to add" })
+      .AddRequiredParameter({ kDataTypeArg, "Data Type, eg: INT8, INT16, INT32, INT64, STRING,"
+                            " BOOL, FLOAT, DOUBLE, BINARY, UNIXTIME_MICROS, DECIMAL, VARCHAR,"
+                            " TIMESTAMP, DATE"})
+      .AddOptionalParameter(kEncodingTypeArg)
+      .AddOptionalParameter(kCompressionTypeArg)
+      .AddOptionalParameter(kDefaultValueArg)
+      .AddOptionalParameter("comment")
+      .Build();
+
+
   unique_ptr<Action> delete_column =
       ClusterActionBuilder("delete_column", &DeleteColumn)
       .Description("Delete a column")
@@ -1420,6 +1695,25 @@ unique_ptr<Mode> BuildTableMode() {
       .AddRequiredParameter({ kColumnNameArg, "Name of the table column to delete" })
       .Build();
 
+  unique_ptr<Action> set_comment =
+      ClusterActionBuilder("set_comment", &SetComment)
+      .Description("Set the comment for a table")
+      .AddRequiredParameter({ kTableNameArg, "Name of the table to alter" })
+      .AddRequiredParameter({ kColumnCommentArg, "Comment of the table" })
+      .Build();
+
+  unique_ptr<Action> clear_comment =
+      ClusterActionBuilder("clear_comment", &ClearComment)
+      .Description("Clear the comment for a table")
+      .AddRequiredParameter({ kTableNameArg, "Name of the table to alter" })
+      .Build();
+
+  unique_ptr<Action> set_replication_factor =
+      ClusterActionBuilder("set_replication_factor", &SetReplicationFactor)
+      .Description("Change a table's replication factor")
+      .AddRequiredParameter({ kTableNameArg, "Name of the table to alter" })
+      .AddRequiredParameter({ kReplicationFactorArg, "New replication factor of the table" })
+      .Build();
 
   unique_ptr<Action> statistics =
       ClusterActionBuilder("statistics", &GetTableStatistics)
@@ -1450,7 +1744,9 @@ unique_ptr<Mode> BuildTableMode() {
   return ModeBuilder("table")
       .Description("Operate on Kudu tables")
       .AddMode(BuildSetTableLimitMode())
+      .AddAction(std::move(add_column))
       .AddAction(std::move(add_range_partition))
+      .AddAction(std::move(clear_comment))
       .AddAction(std::move(column_remove_default))
       .AddAction(std::move(column_set_block_size))
       .AddAction(std::move(column_set_compression))
@@ -1469,7 +1765,9 @@ unique_ptr<Mode> BuildTableMode() {
       .AddAction(std::move(rename_column))
       .AddAction(std::move(rename_table))
       .AddAction(std::move(scan_table))
+      .AddAction(std::move(set_comment))
       .AddAction(std::move(set_extra_config))
+      .AddAction(std::move(set_replication_factor))
       .AddAction(std::move(statistics))
       .Build();
 }

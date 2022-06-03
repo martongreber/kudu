@@ -41,7 +41,7 @@ static const int kNumLogRolls = 2;
 
 class TabletCopyTest : public TabletServerTestBase {
  public:
-  virtual void SetUp() OVERRIDE {
+  void SetUp() override {
     NO_FATALS(TabletServerTestBase::SetUp());
     // Create a tablet server with multiple data dirs. In most cases, this is
     // unimportant, but in some cases can be helpful to test multi-disk
@@ -56,7 +56,7 @@ class TabletCopyTest : public TabletServerTestBase {
     NO_FATALS(GenerateTestData());
   }
 
-  virtual void TearDown() OVERRIDE {
+  void TearDown() override {
     if (tablet_replica_) {
       ASSERT_OK(tablet_replica_->log_anchor_registry()->Unregister(&anchor_));
     }
@@ -126,8 +126,8 @@ class TabletCopyTest : public TabletServerTestBase {
     return tablet_replica_->permanent_uuid();
   }
 
-  const std::string& GetTabletId() const {
-    return tablet_replica_->tablet()->tablet_id();
+  virtual const std::string& GetTabletId() const {
+    return tablet_replica_->tablet_id();
   }
 
   // Read a block file from the file system fully into memory and return a

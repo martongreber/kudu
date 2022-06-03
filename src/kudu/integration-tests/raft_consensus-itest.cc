@@ -36,6 +36,7 @@
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/wire_protocol-test-util.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
@@ -92,6 +93,7 @@ DECLARE_int32(num_client_threads);
 DECLARE_int32(num_replicas);
 DECLARE_int32(num_tablet_servers);
 DECLARE_int32(rpc_timeout);
+DECLARE_bool(encrypt_data_at_rest);
 
 METRIC_DECLARE_entity(server);
 METRIC_DECLARE_entity(tablet);
@@ -791,14 +793,21 @@ TEST_F(RaftConsensusITest, TestInsertOnNonLeader) {
   NO_FATALS(AssertAllReplicasAgree(0));
 }
 
+class RaftConsensusParamEncryptionITest :
+    public RaftConsensusITest,
+    public ::testing::WithParamInterface<bool> {
+};
+INSTANTIATE_TEST_SUITE_P(EncryptionEnabled, RaftConsensusParamEncryptionITest,
+                         ::testing::Values(false, true));
+
 // Test that when a follower is stopped for a long time, the log cache
 // properly evicts operations, but still allows the follower to catch
 // up when it comes back.
 //
 // Also asserts that the other replicas retain logs for the stopped
 // follower to catch up from.
-TEST_F(RaftConsensusITest, TestCatchupAfterOpsEvicted) {
-  const vector<string> kTsFlags = {
+TEST_P(RaftConsensusParamEncryptionITest, TestCatchupAfterOpsEvicted) {
+  vector<string> kTsFlags = {
     "--log_cache_size_limit_mb=1",
     "--consensus_max_batch_size_bytes=500000",
     // Use short and synchronous rolls so that we can test log segment retention.
@@ -813,6 +822,14 @@ TEST_F(RaftConsensusITest, TestCatchupAfterOpsEvicted) {
     // And disable WAL compression so the 128KB cells don't get compressed away.
     "--log_compression_codec=no_compression"
   };
+
+  if (GetParam()) {
+    // We need to enable encryption both in the mini-cluster and in the current
+    // process, as both of them access encrypted files.
+    SetEncryptionFlags(true);
+    kTsFlags.emplace_back("--encrypt_data_at_rest=true");
+    kTsFlags.emplace_back("--test_server_key=" + GetEncryptionKey());
+  }
 
   NO_FATALS(BuildAndStart(kTsFlags));
   TServerDetails* replica = (*tablet_replicas_.begin()).second;
@@ -870,11 +887,17 @@ TEST_F(RaftConsensusITest, TestCatchupAfterOpsEvicted) {
 // itself.
 //
 // This is a regression test for KUDU-775 and KUDU-562.
-TEST_F(RaftConsensusITest, TestFollowerFallsBehindLeaderGC) {
+TEST_P(RaftConsensusParamEncryptionITest, TestFollowerFallsBehindLeaderGC) {
   vector<string> ts_flags = {
     // Disable follower eviction to maintain the original intent of this test.
     "--evict_failed_followers=false",
   };
+  if (GetParam()) {
+    // We need to enable encryption both in the mini-cluster and in the current
+    // process, as both of them access encrypted files.
+    ts_flags.emplace_back("--encrypt_data_at_rest=true");
+    FLAGS_encrypt_data_at_rest = true;
+  }
   AddFlagsForLogRolls(&ts_flags); // For CauseFollowerToFallBehindLogGC().
   NO_FATALS(BuildAndStart(ts_flags));
 
@@ -1912,7 +1935,7 @@ TEST_F(RaftConsensusITest, TestEarlyCommitDespiteMemoryPressure) {
   Status s = replica_ts->consensus_proxy->UpdateConsensus(req, &resp, &rpc);
 
   // Our memory limit was truly tiny, so we should be over it by now...
-  ASSERT_TRUE(s.IsRemoteError());
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "Soft memory limit exceeded");
 
   // ...but despite rejecting the request, we should have committed the
@@ -2267,7 +2290,17 @@ TEST_F(RaftConsensusITest, TestCommitIndexFarBehindAfterLeaderElection) {
 TEST_F(RaftConsensusITest, TestSlowFollower) {
   SKIP_IF_SLOW_NOT_ALLOWED();
 
-  NO_FATALS(BuildAndStart());
+  // Leaving the default --missed_heartbeats_before_rejecting_snapshot_scans=1.5
+  // makes the scenario prone to flakiness with the default setting of
+  // --raft_heartbeat_interval_ms=500 because the injected WAL latency of 1000ms
+  // is above of 750 ms (500 * 1.5 = 750). We don't want too many scan requests
+  // to be rejected because the follower replica hasn't heard from the leader
+  // when the safe time has already been advanced beyond the timestamp of the
+  // snapshot scan request. The customized setting for the
+  // --missed_heartbeats_before_rejecting_snapshot_scans flag helps making the
+  // scenario more stable.
+  NO_FATALS(BuildAndStart(
+      {"--missed_heartbeats_before_rejecting_snapshot_scans=3"}));
 
   TServerDetails* leader;
   ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &leader));
@@ -2275,9 +2308,9 @@ TEST_F(RaftConsensusITest, TestSlowFollower) {
   for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
     ExternalTabletServer* ts = cluster_->tablet_server(i);
     if (ts->instance_id().permanent_uuid() != leader->uuid()) {
-      TServerDetails* follower;
-      follower = GetReplicaWithUuidOrNull(tablet_id_, ts->instance_id().permanent_uuid());
-      ASSERT_TRUE(follower);
+      TServerDetails* follower =
+          GetReplicaWithUuidOrNull(tablet_id_, ts->instance_id().permanent_uuid());
+      ASSERT_NE(nullptr, follower);
       NO_FATALS(EnableLogLatency(follower->generic_proxy.get()));
       num_reconfigured++;
       break;
@@ -2560,7 +2593,7 @@ TEST_P(RaftConsensusParamReplicationModesITest, Test_KUDU_1735) {
     auto* ts = cluster_->tablet_server_by_uuid(server_uuid);
     auto s = ts->WaitForInjectedCrash(MonoDelta::FromSeconds(5));
     if (server_uuid == evicted_tserver->uuid() && is_3_4_3 && !s.ok()) {
-      ASSERT_TRUE(s.IsTimedOut());
+      ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
       continue;
     }
     ASSERT_TRUE(s.ok()) << s.ToString();

@@ -193,12 +193,13 @@ fetch_and_patch \
  $GFLAGS_SOURCE \
  $GFLAGS_PATCHLEVEL
 
-GPERFTOOLS_PATCHLEVEL=2
+GPERFTOOLS_PATCHLEVEL=3
 fetch_and_patch \
  gperftools-${GPERFTOOLS_VERSION}.tar.gz \
  $GPERFTOOLS_SOURCE \
  $GPERFTOOLS_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/gperftools-Replace-namespace-base-with-namespace-tcmalloc.patch" \
+ "patch -p1 < $TP_DIR/patches/gperftools-tcmalloc-osx-fix.patch" \
  "autoreconf -fvi"
 
 # NOTE: creating an empty 'third_party/googletest/m4' subdir is a recipe from
@@ -328,14 +329,17 @@ fetch_and_patch \
  $PYTHON_SOURCE \
  $PYTHON_PATCHLEVEL
 
-LLVM_PATCHLEVEL=3
+LLVM_PATCHLEVEL=5
 fetch_and_patch \
  llvm-${LLVM_VERSION}-iwyu-${IWYU_VERSION}.src.tar.gz \
  $LLVM_SOURCE \
  $LLVM_PATCHLEVEL \
   "patch -p1 < $TP_DIR/patches/llvm-add-iwyu.patch" \
   "patch -p1 < $TP_DIR/patches/llvm-iwyu-include-picker.patch" \
-  "patch -d projects -p1 < $TP_DIR/patches/llvm-947f9692440836dcb8d88b74b69dd379d85974ce.patch"
+  "patch -p1 < $TP_DIR/patches/llvm-MicrosoftDemangleNodes-e0402b5c9813a2458b8dd3f640883110db280395.patch" \
+  "patch -d projects -p1 < $TP_DIR/patches/llvm-947f9692440836dcb8d88b74b69dd379d85974ce.patch" \
+  "patch -d projects -p1 < $TP_DIR/patches/llvm-remove-cyclades-inclusion-in-sanitizer.patch" \
+  "patch -p2 < $TP_DIR/patches/llvm-fix-missing-include.patch"
 
 LZ4_PATCHLEVEL=0
 fetch_and_patch \
@@ -361,13 +365,14 @@ fetch_and_patch \
  $BOOST_SOURCE \
  $BOOST_PATCHLEVEL
 
-BREAKPAD_PATCHLEVEL=2
+BREAKPAD_PATCHLEVEL=3
 fetch_and_patch \
  breakpad-${BREAKPAD_VERSION}.tar.gz \
  $BREAKPAD_SOURCE \
  $BREAKPAD_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/breakpad-add-basic-support-for-dwz-dwarf-extension.patch" \
- "patch -p1 < $TP_DIR/patches/breakpad-syscall-rsp-clobber-fix.patch"
+ "patch -p1 < $TP_DIR/patches/breakpad-syscall-rsp-clobber-fix.patch" \
+ "patch -p0 < $TP_DIR/patches/breakpad-SIGSTKSZ-error.patch"
 
 SPARSEHASH_PATCHLEVEL=3
 fetch_and_patch \
@@ -472,6 +477,26 @@ fetch_and_patch \
  $RANGER_SOURCE \
  $RANGER_PATCHLEVEL \
  "patch -p0 < $TP_DIR/patches/ranger-fixscripts.patch"
+
+OATPP_PATCHLEVEL=1
+fetch_and_patch \
+ $OATPP_NAME.tar.gz \
+ $OATPP_SOURCE \
+ $OATPP_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/oatpp-remove-version-from-path.patch"
+
+OATPP_SWAGGER_PATCHLEVEL=1
+fetch_and_patch \
+ $OATPP_SWAGGER_NAME.tar.gz \
+ $OATPP_SWAGGER_SOURCE \
+ $OATPP_SWAGGER_PATCHLEVEL \
+"patch -p1 < $TP_DIR/patches/oatpp-swagger-remove-version-from-path.patch"
+
+JWT_CPP_PATCHLEVEL=0
+fetch_and_patch \
+  $JWT_CPP_NAME.tar.gz \
+  $JWT_CPP_SOURCE \
+  $JWT_CPP_PATCHLEVEL
 
 echo "---------------"
 echo "Thirdparty dependencies downloaded successfully"

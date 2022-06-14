@@ -106,9 +106,9 @@ class TabletCopyServiceTest : public TabletCopyTest {
   }
 
   Status DoBeginValidTabletCopySession(string* session_id,
-                                            tablet::TabletSuperBlockPB* superblock = nullptr,
-                                            uint64_t* idle_timeout_millis = nullptr,
-                                            vector<uint64_t>* sequence_numbers = nullptr) {
+                                       tablet::TabletSuperBlockPB* superblock = nullptr,
+                                       uint64_t* idle_timeout_millis = nullptr,
+                                       vector<uint64_t>* sequence_numbers = nullptr) {
     BeginTabletCopySessionResponsePB resp;
     RpcController controller;
     RETURN_NOT_OK(DoBeginTabletCopySession(GetTabletId(), GetLocalUUID(), &resp, &controller));
@@ -218,9 +218,9 @@ TEST_F(TabletCopyServiceTest, TestSimpleBeginEndSession) {
   uint64_t idle_timeout_millis;
   vector<uint64_t> segment_seqnos;
   ASSERT_OK(DoBeginValidTabletCopySession(&session_id,
-                                               &superblock,
-                                               &idle_timeout_millis,
-                                               &segment_seqnos));
+                                          &superblock,
+                                          &idle_timeout_millis,
+                                          &segment_seqnos));
   // Basic validation of returned params.
   ASSERT_FALSE(session_id.empty());
   ASSERT_EQ(FLAGS_tablet_copy_idle_timeout_sec * 1000, idle_timeout_millis);
@@ -391,7 +391,8 @@ TEST_F(TabletCopyServiceTest, TestFetchInvalidBlockOffset) {
   FetchDataResponsePB resp;
   RpcController controller;
   // Impossible offset.
-  uint64_t offset = std::numeric_limits<uint64_t>::max();
+  uint64_t offset = std::numeric_limits<uint64_t>::max() -
+      mini_server_->server()->fs_manager()->env()->GetEncryptionHeaderSize();
   Status status = DoFetchData(session_id, AsDataTypeId(FirstColumnBlockId(superblock)),
                               &offset, nullptr, &resp, &controller);
   NO_FATALS(AssertRemoteError(status, controller.error_response(),
@@ -482,10 +483,11 @@ TEST_F(TabletCopyServiceTest, TestFetchLog) {
       << " and " << first_seg_seqno;
   const scoped_refptr<ReadableLogSegment>& segment = local_segments[0];
   faststring scratch;
-  int64_t size = segment->file_size();
+  auto file = segment->file();
+  int64_t size = segment->file_size() - file->GetEncryptionHeaderSize();
   scratch.resize(size);
   Slice slice(scratch.data(), size);
-  ASSERT_OK(segment->file()->Read(0, slice));
+  ASSERT_OK(file->Read(file->GetEncryptionHeaderSize(), slice));
 
   AssertDataEqual(slice.data(), slice.size(), resp.chunk());
 }

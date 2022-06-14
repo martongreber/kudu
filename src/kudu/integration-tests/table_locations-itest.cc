@@ -39,6 +39,7 @@
 #include "kudu/client/schema.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/partition.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
@@ -154,19 +155,20 @@ class TableLocationsTest : public KuduTest {
 
   virtual void SetUpConfig() {}
 
-  struct HashBucketSchema {
+  struct HashDimension {
     vector<string> columns;
     int32_t num_buckets;
     uint32_t seed;
   };
+  typedef vector<HashDimension> HashSchema;
 
-  Status CreateTable(const string& table_name,
-                     const Schema& schema,
-                     const vector<KuduPartialRow>& split_rows,
-                     const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
-                     const vector<vector<HashBucketSchema>>& range_hash_schema,
-                     const vector<HashBucketSchema>& table_hash_schema);
-
+  Status CreateTable(
+      const string& table_name,
+      const Schema& schema,
+      const vector<KuduPartialRow>& split_rows = {},
+      const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds = {},
+      const vector<HashSchema>& range_hash_schemas = {},
+      const HashSchema& table_hash_schema = {});
 
   void CreateTable(const string& table_name, int num_splits);
 
@@ -178,55 +180,79 @@ class TableLocationsTest : public KuduTest {
   unique_ptr<MasterServiceProxy> proxy_;
 };
 
-Status TableLocationsTest::CreateTable(const string& table_name,
-                                       const Schema& schema,
-                                       const vector<KuduPartialRow>& split_rows = {},
-                                       const vector<pair<KuduPartialRow,
-                                                         KuduPartialRow>>& bounds = {},
-                                       const vector<vector<HashBucketSchema>>&
-                                           range_hash_schema = {},
-                                       const vector<HashBucketSchema>& table_hash_schema = {}) {
+Status TableLocationsTest::CreateTable(
+    const string& table_name,
+    const Schema& schema,
+    const vector<KuduPartialRow>& split_rows,
+    const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
+    const vector<HashSchema>& range_hash_schemas,
+    const HashSchema& table_hash_schema) {
+
+  if (!range_hash_schemas.empty() && range_hash_schemas.size() != bounds.size()) {
+    return Status::InvalidArgument(
+        "'bounds' and 'range_hash_schemas' must be of the same size");
+  }
 
   CreateTableRequestPB req;
-  CreateTableResponsePB resp;
-  RpcController controller;
-
   req.set_name(table_name);
   RETURN_NOT_OK(SchemaToPB(schema, req.mutable_schema()));
-  RowOperationsPBEncoder encoder(req.mutable_split_rows_range_bounds());
+  RowOperationsPBEncoder splits_encoder(req.mutable_split_rows_range_bounds());
   for (const KuduPartialRow& row : split_rows) {
-    encoder.Add(RowOperationsPB::SPLIT_ROW, row);
+    splits_encoder.Add(RowOperationsPB::SPLIT_ROW, row);
   }
   for (const auto& bound : bounds) {
-    encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, bound.first);
-    encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, bound.second);
+    splits_encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, bound.first);
+    splits_encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, bound.second);
   }
 
-  for (const auto& hash_schemas : range_hash_schema) {
-    auto* range_hash_schemas_pb = req.add_range_hash_schemas();
-    for (const auto& hash_schema : hash_schemas) {
-      auto* hash_schema_pb = range_hash_schemas_pb->add_hash_schemas();
-      for (const string& col_name : hash_schema.columns) {
-        hash_schema_pb->add_columns()->set_name(col_name);
+  auto* ps_pb = req.mutable_partition_schema();
+  for (size_t i = 0; i < range_hash_schemas.size(); ++i) {
+    const auto& bound = bounds[i];
+    const auto& hash_schema = range_hash_schemas[i];
+    auto* range = ps_pb->add_custom_hash_schema_ranges();
+    RowOperationsPBEncoder encoder(range->mutable_range_bounds());
+    encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, bound.first);
+    encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, bound.second);
+    for (const auto& hash_dimension : hash_schema) {
+      auto* hash_dimension_pb = range->add_hash_schema();
+      for (const string& col_name : hash_dimension.columns) {
+        hash_dimension_pb->add_columns()->set_name(col_name);
       }
-      hash_schema_pb->set_num_buckets(hash_schema.num_buckets);
-      hash_schema_pb->set_seed(hash_schema.seed);
+      hash_dimension_pb->set_num_buckets(hash_dimension.num_buckets);
+      hash_dimension_pb->set_seed(hash_dimension.seed);
     }
   }
 
   if (!table_hash_schema.empty()) {
-    auto* partition_schema_pb = req.mutable_partition_schema();
-    for (const auto& hash_schema : table_hash_schema) {
-      auto* hash_schema_pb = partition_schema_pb->add_hash_bucket_schemas();
-      for (const string& col_name : hash_schema.columns) {
+    for (const auto& hash_dimension : table_hash_schema) {
+      auto* hash_schema_pb = ps_pb->add_hash_schema();
+      for (const string& col_name : hash_dimension.columns) {
         hash_schema_pb->add_columns()->set_name(col_name);
       }
-      hash_schema_pb->set_num_buckets(hash_schema.num_buckets);
-      hash_schema_pb->set_seed(hash_schema.seed);
+      hash_schema_pb->set_num_buckets(hash_dimension.num_buckets);
+      hash_schema_pb->set_seed(hash_dimension.seed);
     }
   }
 
-  return proxy_->CreateTable(req, &resp, &controller);
+  CreateTableResponsePB resp;
+  RpcController controller;
+  RETURN_NOT_OK(proxy_->CreateTable(req, &resp, &controller));
+  if (resp.has_error()) {
+    RETURN_NOT_OK(StatusFromPB(resp.error().status()));
+  }
+  return Status::OK();
+}
+
+void TableLocationsTest::CreateTable(const string& table_name, int num_splits) {
+  Schema schema({ ColumnSchema("key", INT32) }, 1);
+  KuduPartialRow row(&schema);
+  vector<KuduPartialRow> splits(num_splits, row);
+  for (int i = 0; i < num_splits; i++) {
+    ASSERT_OK(splits[i].SetInt32(0, i*1000));
+  }
+
+  ASSERT_OK(CreateTable(table_name, schema, splits));
+  NO_FATALS(CheckMasterTableCreation(table_name, num_splits + 1));
 }
 
 void TableLocationsTest::CheckMasterTableCreation(const string &table_name,
@@ -254,18 +280,6 @@ void TableLocationsTest::CheckMasterTableCreation(const string &table_name,
       break;
     }
   }
-}
-
-void TableLocationsTest::CreateTable(const string& table_name, int num_splits) {
-  Schema schema({ ColumnSchema("key", INT32) }, 1);
-  KuduPartialRow row(&schema);
-  vector<KuduPartialRow> splits(num_splits, row);
-  for (int i = 0; i < num_splits; i++) {
-    ASSERT_OK(splits[i].SetInt32(0, i*1000));
-  }
-
-  ASSERT_OK(CreateTable(table_name, schema, splits));
-  NO_FATALS(CheckMasterTableCreation(table_name, num_splits + 1));
 }
 
 // Test the tablet server location is properly set in the master GetTableLocations RPC.
@@ -454,73 +468,125 @@ TEST_F(TableLocationsTest, TestGetTableLocations) {
   }
 }
 
-TEST_F(TableLocationsTest, TestRangeSpecificHashing) {
+TEST_F(TableLocationsTest, RangeSpecificHashingSameDimensions) {
+  const string table_name = CURRENT_TEST_NAME();
+  Schema schema({
+                  ColumnSchema("str_0", STRING),
+                  ColumnSchema("int_1", INT32),
+                  ColumnSchema("str_2", STRING),
+                }, 3);
+  KuduPartialRow row(&schema);
+
+  FLAGS_enable_per_range_hash_schemas = true; // enable for testing.
+
+  // Use back-to-back and sparse range placement.
+  vector<pair<KuduPartialRow, KuduPartialRow>> bounds(5, { row, row });
+  ASSERT_OK(bounds[0].first.SetStringNoCopy(0, "a"));
+  ASSERT_OK(bounds[0].second.SetStringNoCopy(0, "b"));
+  ASSERT_OK(bounds[1].first.SetStringNoCopy(0, "b"));
+  ASSERT_OK(bounds[1].second.SetStringNoCopy(0, "c"));
+  ASSERT_OK(bounds[2].first.SetStringNoCopy(0, "c"));
+  ASSERT_OK(bounds[2].second.SetStringNoCopy(0, "d"));
+  ASSERT_OK(bounds[3].first.SetStringNoCopy(0, "e"));
+  ASSERT_OK(bounds[3].second.SetStringNoCopy(0, "f"));
+  ASSERT_OK(bounds[4].first.SetStringNoCopy(0, "g"));
+  ASSERT_OK(bounds[4].second.SetStringNoCopy(0, "h"));
+
+  vector<HashSchema> range_hash_schemas;
+  HashSchema hash_schema_5 = { { { "str_0", "int_1" }, 5, 0 } };
+  range_hash_schemas.emplace_back(hash_schema_5);
+  HashSchema hash_schema_4 = { { { "str_0" }, 4, 1 } };
+  range_hash_schemas.emplace_back(hash_schema_4);
+  HashSchema hash_schema_3 = { { { "int_1" }, 3, 2 } };
+  range_hash_schemas.emplace_back(hash_schema_3);
+  HashSchema hash_schema_6 = { { { "str_2", "str_0" }, 6, 3 } };
+  range_hash_schemas.emplace_back(hash_schema_6);
+
+  // Use 2 bucket hash schema as the table-wide one.
+  HashSchema table_hash_schema_2 = { { { "str_2" }, 2, 4 } };
+  // Apply table-wide hash schema applied to this range.
+  range_hash_schemas.emplace_back(table_hash_schema_2);
+
+  ASSERT_OK(CreateTable(
+      table_name, schema, {}, bounds, range_hash_schemas, table_hash_schema_2));
+  NO_FATALS(CheckMasterTableCreation(table_name, 20));
+
+  // The default setting for GetTableLocationsRequestPB::max_returned_locations
+  // is 10 , but here it's necessary to fetch all the existing tablets.
+  GetTableLocationsRequestPB req;
+  req.mutable_table()->set_table_name(table_name);
+  req.clear_max_returned_locations();
+  GetTableLocationsResponsePB resp;
+  RpcController controller;
+  ASSERT_OK(proxy_->GetTableLocations(req, &resp, &controller));
+  SCOPED_TRACE(SecureDebugString(resp));
+  ASSERT_FALSE(resp.has_error());
+  ASSERT_EQ(20, resp.tablet_locations().size());
+
+  vector<PartitionKey> partition_keys_ref =  {
+      { string("\0\0\0\0", 4), string("a" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\1", 4), string("a" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\2", 4), string("a" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\3", 4), string("a" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\4", 4), string("a" "\0\0\0\0\0\0", 7) },
+
+      { string("\0\0\0\0", 4), string("b" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\1", 4), string("b" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\2", 4), string("b" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\3", 4), string("b" "\0\0\0\0\0\0", 7) },
+
+      { string("\0\0\0\0", 4), string("c" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\1", 4), string("c" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\2", 4), string("c" "\0\0\0\0\0\0", 7) },
+
+      { string("\0\0\0\0", 4), string("e" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\1", 4), string("e" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\2", 4), string("e" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\3", 4), string("e" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\4", 4), string("e" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\5", 4), string("e" "\0\0\0\0\0\0", 7) },
+
+      { string("\0\0\0\0", 4), string("g" "\0\0\0\0\0\0", 7) },
+      { string("\0\0\0\1", 4), string("g" "\0\0\0\0\0\0", 7) },
+  };
+  // Sorting partition keys to match the tablets that are returned in sorted order.
+  sort(partition_keys_ref.begin(), partition_keys_ref.end());
+  ASSERT_EQ(partition_keys_ref.size(), resp.tablet_locations_size());
+  for (auto i = 0; i < resp.tablet_locations_size(); ++i) {
+    EXPECT_EQ(partition_keys_ref[i].ToString(),
+              resp.tablet_locations(i).partition().partition_key_start());
+  }
+}
+
+// TODO(aserbin): update this scenario once varying hash dimensions per range
+//                are supported
+TEST_F(TableLocationsTest, RangeSpecificHashingVaryingDimensions) {
   const string table_name = "test";
   Schema schema({ ColumnSchema("key", STRING), ColumnSchema("val", STRING) }, 2);
   KuduPartialRow row(&schema);
 
   FLAGS_enable_per_range_hash_schemas = true; // enable for testing.
 
-  vector<pair<KuduPartialRow, KuduPartialRow>> bounds(3, { row, row });
+  vector<pair<KuduPartialRow, KuduPartialRow>> bounds(2, { row, row });
   ASSERT_OK(bounds[0].first.SetStringNoCopy(0, "a"));
   ASSERT_OK(bounds[0].second.SetStringNoCopy(0, "b"));
   ASSERT_OK(bounds[1].first.SetStringNoCopy(0, "c"));
   ASSERT_OK(bounds[1].second.SetStringNoCopy(0, "d"));
-  ASSERT_OK(bounds[2].first.SetStringNoCopy(0, "e"));
-  ASSERT_OK(bounds[2].second.SetStringNoCopy(0, "f"));
 
-  vector<vector<HashBucketSchema>> range_hash_schema;
-  vector<HashBucketSchema> hash_schema_4_by_2 = { { { "key" }, 4, 0 }, { { "val" }, 2, 0} };
-  range_hash_schema.emplace_back(hash_schema_4_by_2);
-  vector<HashBucketSchema> hash_schema_6 = { { { "key" }, 6, 2 } };
-  range_hash_schema.emplace_back(hash_schema_6);
+  vector<HashSchema> range_hash_schemas;
+  HashSchema hash_schema_3_by_2 = { { { "key" }, 3, 0 }, { { "val" }, 2, 1 } };
+  range_hash_schemas.emplace_back(hash_schema_3_by_2);
 
-  // Table-wide hash schema, applied to range by default if no per-range schema is specified.
-  vector<HashBucketSchema> table_hash_schema_5 = { { { "val" }, 5, 4 } };
-  range_hash_schema.emplace_back(vector<HashBucketSchema>());
+  // Use 4 bucket hash schema as the table-wide one.
+  HashSchema table_hash_schema_4 = { { { "val" }, 4, 2 } };
+  // Apply table-wide hash schema applied to this range.
+  range_hash_schemas.emplace_back(table_hash_schema_4);
 
-  ASSERT_OK(CreateTable(table_name, schema, {}, bounds, range_hash_schema, table_hash_schema_5));
-  NO_FATALS(CheckMasterTableCreation(table_name, 19));
-
-  GetTableLocationsRequestPB req;
-  GetTableLocationsResponsePB resp;
-  RpcController controller;
-  req.mutable_table()->set_table_name(table_name);
-  req.set_max_returned_locations(19);
-  ASSERT_OK(proxy_->GetTableLocations(req, &resp, &controller));
-  SCOPED_TRACE(SecureDebugString(resp));
-
-  ASSERT_FALSE(resp.has_error());
-  ASSERT_EQ(19, resp.tablet_locations().size());
-
-  vector<string> partition_key_starts =  {
-      string("\0\0\0\0" "\0\0\0\0" "a" "\0\0", 11),
-      string("\0\0\0\0" "\0\0\0\1" "a" "\0\0", 11),
-      string("\0\0\0\1" "\0\0\0\0" "a" "\0\0", 11),
-      string("\0\0\0\1" "\0\0\0\1" "a" "\0\0", 11),
-      string("\0\0\0\2" "\0\0\0\0" "a" "\0\0", 11),
-      string("\0\0\0\2" "\0\0\0\1" "a" "\0\0", 11),
-      string("\0\0\0\3" "\0\0\0\0" "a" "\0\0", 11),
-      string("\0\0\0\3" "\0\0\0\1" "a" "\0\0", 11),
-      string("\0\0\0\0" "c" "\0\0", 7),
-      string("\0\0\0\1" "c" "\0\0", 7),
-      string("\0\0\0\2" "c" "\0\0", 7),
-      string("\0\0\0\3" "c" "\0\0", 7),
-      string("\0\0\0\4" "c" "\0\0", 7),
-      string("\0\0\0\5" "c" "\0\0", 7),
-      string("\0\0\0\0" "e" "\0\0", 7),
-      string("\0\0\0\1" "e" "\0\0", 7),
-      string("\0\0\0\2" "e" "\0\0", 7),
-      string("\0\0\0\3" "e" "\0\0", 7),
-      string("\0\0\0\4" "e" "\0\0", 7)
-  };
-  // Sorting partition keys to match the tablets that are returned in sorted order.
-  sort(partition_key_starts.begin(), partition_key_starts.end());
-  ASSERT_EQ(partition_key_starts.size(), resp.tablet_locations_size());
-  for (int i = 0; i < resp.tablet_locations_size(); i++) {
-    EXPECT_EQ(partition_key_starts[i],
-              resp.tablet_locations(i).partition().partition_key_start());
-  }
+  const auto s = CreateTable(
+      table_name, schema, {}, bounds, range_hash_schemas, table_hash_schema_4);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(),
+      "varying number of hash dimensions per range is not yet supported");
 }
 
 TEST_F(TableLocationsWithTSLocationTest, TestGetTSLocation) {
@@ -1267,18 +1333,15 @@ TEST_F(TableLocationsCacheMultiMasterTest, ResetCache) {
 
   int leader_master_idx = -1;
   ASSERT_EVENTUALLY([&] {
-    // Induce a change in master leadership (maybe, even few of them, up to the
-    // number of masters in the cluster).
-    for (auto idx = 0; idx < cluster_->num_masters(); ++idx) {
-      ASSERT_OK(cluster_->master(idx)->Pause());
-      // Make one master to stop sending heartbeats, and give the rest about
-      // three heartbeat periods to elect a new leader in case if the stopped
-      // master was a leader.
-      SleepFor(MonoDelta::FromMilliseconds(
-          2 * kRaftHeartbeatIntervalMs * kMaxMissedHeartbeatPeriods +
-          3 * kRaftHeartbeatIntervalMs));
-      ASSERT_OK(cluster_->master(idx)->Resume());
-    }
+    // Induce a change of the masters' leadership.
+    ASSERT_OK(cluster_->master(former_leader_master_idx)->Pause());
+    // Make one master stop sending heartbeats, and give the rest about three
+    // heartbeat periods to elect a new leader (include an extra margin to keep
+    // the scenario stable).
+    SleepFor(MonoDelta::FromMilliseconds(
+        2 * (kRaftHeartbeatIntervalMs * kMaxMissedHeartbeatPeriods +
+             kRaftHeartbeatIntervalMs * 3)));
+    ASSERT_OK(cluster_->master(former_leader_master_idx)->Resume());
     ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_master_idx));
     ASSERT_NE(former_leader_master_idx, leader_master_idx);
   });

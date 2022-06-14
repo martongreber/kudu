@@ -25,6 +25,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <gflags/gflags_declare.h>
@@ -87,7 +88,9 @@ using kudu::client::sp::shared_ptr;
 using kudu::cluster::ExternalMiniCluster;
 using kudu::cluster::ExternalMiniClusterOptions;
 using kudu::rpc::Messenger;
+using std::get;
 using std::string;
+using std::tuple;
 using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
@@ -102,6 +105,7 @@ class SecurityITest : public KuduTest {
  public:
   SecurityITest() {
     cluster_opts_.enable_kerberos = true;
+    cluster_opts_.enable_encryption = true;
     cluster_opts_.num_tablet_servers = 3;
     cluster_opts_.extra_master_flags.emplace_back("--rpc_trace_negotiation");
     cluster_opts_.extra_tserver_flags.emplace_back("--rpc_trace_negotiation");
@@ -599,7 +603,7 @@ TEST_F(SecurityITest, TestNonDefaultPrincipal) {
       builder.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
     }
     const auto s = builder.Build(&client);
-    ASSERT_TRUE(s.IsNotAuthorized());
+    ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "not found in Kerberos database");
 
     // Create a client with the matching SASL proto name and verify it's able to
@@ -618,8 +622,8 @@ TEST_F(SecurityITest, TestNonDefaultPrincipal) {
 TEST_F(SecurityITest, TestNonExistentPrincipal) {
   cluster_opts_.extra_master_flags.emplace_back("--principal=oryx");
   cluster_opts_.extra_tserver_flags.emplace_back("--principal=oryx");
-  Status s = StartCluster();
-  ASSERT_TRUE(s.IsRuntimeError());
+  auto s = StartCluster();
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "failed to start masters");
 }
 
@@ -636,7 +640,77 @@ TEST_F(SecurityITest, TestMismatchingPrincipals) {
   }
   cluster_->Shutdown();
   Status s = cluster_->Restart();
-  ASSERT_TRUE(s.IsTimedOut());
+  ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
+}
+
+TEST_F(SecurityITest, TestRequireAuthenticationInsecureCluster) {
+  cluster_opts_.enable_kerberos = false;
+  ASSERT_OK(StartCluster());
+
+  shared_ptr<KuduClient> client;
+  KuduClientBuilder b;
+  b.require_authentication(true);
+  Status s = cluster_->CreateClient(&b, &client);
+  ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(),
+                      "client requires authentication, but server does not have Kerberos enabled");
+}
+
+TEST_F(SecurityITest, TestRequireEncryptionInsecureCluster) {
+  cluster_opts_.enable_kerberos = false;
+  cluster_opts_.extra_master_flags.emplace_back("--rpc_encryption=disabled");
+  cluster_opts_.extra_tserver_flags.emplace_back("--rpc_encryption=disabled");
+  cluster_opts_.extra_master_flags.emplace_back("--rpc_authentication=disabled");
+  cluster_opts_.extra_tserver_flags.emplace_back("--rpc_authentication=disabled");
+  ASSERT_OK(StartCluster());
+
+  shared_ptr<KuduClient> client;
+  KuduClientBuilder b;
+  b.encryption_policy(client::KuduClientBuilder::REQUIRED);
+  Status s = cluster_->CreateClient(&b, &client);
+  ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "server does not support required TLS encryption");
+}
+
+TEST_F(SecurityITest, TestRequireAuthenticationSecureCluster) {
+  ASSERT_OK(StartCluster());
+
+  shared_ptr<KuduClient> client;
+  KuduClientBuilder b;
+  b.require_authentication(true);
+  ASSERT_OK(cluster_->CreateClient(&b, &client));
+  SmokeTestCluster(client, /* transactional */ false);
+}
+
+class EncryptionPolicyTest :
+    public SecurityITest,
+    public ::testing::WithParamInterface<tuple<
+        KuduClientBuilder::EncryptionPolicy, bool>> {
+};
+
+INSTANTIATE_TEST_SUITE_P(,
+    EncryptionPolicyTest,
+    ::testing::Combine(
+        ::testing::Values(
+            KuduClientBuilder::EncryptionPolicy::OPTIONAL,
+            KuduClientBuilder::EncryptionPolicy::REQUIRED,
+            KuduClientBuilder::EncryptionPolicy::REQUIRED_REMOTE),
+        ::testing::Values(true, false)));
+
+TEST_P(EncryptionPolicyTest, TestEncryptionPolicy) {
+  const auto& params = GetParam();
+  if (!get<1>(params)) {
+    cluster_opts_.enable_kerberos = false;
+    cluster_opts_.extra_master_flags.emplace_back("--rpc_authentication=disabled");
+    cluster_opts_.extra_tserver_flags.emplace_back("--rpc_authentication=disabled");
+  }
+  ASSERT_OK(StartCluster());
+
+  shared_ptr<KuduClient> client;
+  KuduClientBuilder b;
+  b.encryption_policy(get<0>(params));
+  ASSERT_OK(cluster_->CreateClient(&b, &client));
+  SmokeTestCluster(client, /* transactional */ false);
 }
 
 Status AssignIPToClient(bool external) {
@@ -924,4 +998,4 @@ TEST_P(ConnectToFollowerMasterTest, AuthnTokenVerifierHaveKeys) {
   }
 }
 
-} // namespace kudu
+}  // namespace kudu

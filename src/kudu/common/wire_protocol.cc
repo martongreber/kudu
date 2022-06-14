@@ -24,6 +24,7 @@
 #include <cstring>
 #include <ostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -41,6 +42,7 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/fixedarray.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/fastmem.h"
 #include "kudu/gutil/strings/numbers.h"
@@ -56,6 +58,7 @@
 #include "kudu/util/pb_util.h"
 #include "kudu/util/safe_math.h"
 #include "kudu/util/slice.h"
+#include "kudu/util/string_case.h"
 
 namespace kudu {
 class BlockBloomFilterPB;
@@ -67,6 +70,7 @@ using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using std::map;
 using std::string;
+using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
@@ -647,8 +651,6 @@ Status ColumnPredicateFromPB(const Schema& schema,
   return Status::OK();
 }
 
-const char kTableHistoryMaxAgeSec[] = "kudu.table.history_max_age_sec";
-const char kTableMaintenancePriority[] = "kudu.table.maintenance_priority";
 Status ExtraConfigPBToMap(const TableExtraConfigPB& pb, map<string, string>* configs) {
   Map<string, string> tmp;
   RETURN_NOT_OK(ExtraConfigPBToPBMap(pb, &tmp));
@@ -665,11 +667,34 @@ Status ParseInt32Config(const string& name, const string& value, int32_t* result
   return Status::OK();
 }
 
+Status ParseBoolConfig(const string& name, const string& value, bool* result) {
+  CHECK(result);
+  bool true_flag = iequals(value, "TRUE");
+  bool false_flag = iequals(value, "FALSE");
+  if (!(true_flag || false_flag)) {
+    return Status::InvalidArgument(Substitute("unable to parse $0", name), value);
+  }
+  *result = true_flag;
+  return Status::OK();
+}
+
+static const std::string kTableHistoryMaxAgeSec = "kudu.table.history_max_age_sec";
+static const std::string kTableMaintenancePriority = "kudu.table.maintenance_priority";
+static const std::string kTableDisableCompaction = "kudu.table.disable_compaction";
+
 Status ExtraConfigPBFromPBMap(const Map<string, string>& configs, TableExtraConfigPB* pb) {
+  static const unordered_set<string> kSupportedConfigs({kTableHistoryMaxAgeSec,
+                                                        kTableMaintenancePriority,
+                                                        kTableDisableCompaction});
   TableExtraConfigPB result;
   for (const auto& config : configs) {
     const string& name = config.first;
     const string& value = config.second;
+    if (!ContainsKey(kSupportedConfigs, name)) {
+      return Status::InvalidArgument(
+          Substitute("invalid extra configuration property: $0", name));
+    }
+
     if (name == kTableHistoryMaxAgeSec) {
       if (!value.empty()) {
         int32_t history_max_age_sec;
@@ -682,8 +707,14 @@ Status ExtraConfigPBFromPBMap(const Map<string, string>& configs, TableExtraConf
         RETURN_NOT_OK(ParseInt32Config(name, value, &maintenance_priority));
         result.set_maintenance_priority(maintenance_priority);
       }
+    } else if (name == kTableDisableCompaction) {
+      if (!value.empty()) {
+        bool disable_compaction = false;
+        RETURN_NOT_OK(ParseBoolConfig(name, value, &disable_compaction));
+        result.set_disable_compaction(disable_compaction);
+      }
     } else {
-      LOG(WARNING) << "Unknown extra configuration property: " << name;
+      LOG(FATAL) << "Unknown extra configuration property: " << name;
     }
   }
   *pb = std::move(result);
@@ -697,6 +728,9 @@ Status ExtraConfigPBToPBMap(const TableExtraConfigPB& pb, Map<string, string>* c
   }
   if (pb.has_maintenance_priority()) {
     result[kTableMaintenancePriority] = std::to_string(pb.maintenance_priority());
+  }
+  if (pb.has_disable_compaction()) {
+    result[kTableDisableCompaction] = std::to_string(pb.disable_compaction());
   }
   *configs = std::move(result);
   return Status::OK();

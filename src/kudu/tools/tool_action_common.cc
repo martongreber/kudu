@@ -23,8 +23,10 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <numeric>
+#include <set>
 #include <stack>
 #include <string>
 #include <unordered_map>
@@ -51,8 +53,10 @@
 #include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
+#include "kudu/fs/fs.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
@@ -60,6 +64,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
 #include "kudu/master/master.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h" // IWYU pragma: keep
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/response_callback.h"
@@ -71,6 +76,7 @@
 #include "kudu/tools/tool.pb.h" // IWYU pragma: keep
 #include "kudu/tools/tool_action.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/tserver/tserver_admin.proxy.h"   // IWYU pragma: keep
 #include "kudu/tserver/tserver_service.proxy.h" // IWYU pragma: keep
 #include "kudu/util/async_util.h"
@@ -129,8 +135,7 @@ DEFINE_string(memtracker_output, "table",
               "the memtracker hierarchy.");
 
 DEFINE_int32(num_threads, 2,
-             "Number of threads to run. Each thread runs its own "
-             "KuduSession.");
+             "Number of threads to run.");
 static bool ValidateNumThreads(const char* flag_name, int32_t flag_value) {
   if (flag_value <= 0) {
     LOG(ERROR) << strings::Substitute("'$0' flag should have a positive value",
@@ -151,6 +156,15 @@ DEFINE_string(sasl_protocol_name,
               "servers' service principal name base (e.g. if it's \"kudu/_HOST\", then "
               "sasl_protocol_name must be \"kudu\" to be able to connect.");
 
+DEFINE_bool(row_count_only, false,
+            "Whether to only count rows instead of reading row cells: yields "
+            "an empty projection for the table");
+
+DECLARE_bool(show_values);
+
+DEFINE_string(instance_file, "",
+              "Path to the instance file containing the encrypted encryption key.");
+
 bool ValidateTimeoutSettings() {
   if (FLAGS_timeout_ms < FLAGS_negotiation_timeout_ms) {
     LOG(ERROR) << strings::Substitute(
@@ -164,6 +178,23 @@ bool ValidateTimeoutSettings() {
 }
 GROUP_FLAG_VALIDATOR(timeout_flags, ValidateTimeoutSettings);
 
+bool ValidateSchemaProjectionFlags() {
+  if (FLAGS_row_count_only && !FLAGS_columns.empty()) {
+    LOG(ERROR) <<
+        "--row_count_only and --columns flags are conflicting: "
+        "either remove/unset --columns or remove/unset --row_count_only";
+    return false;
+  }
+  if (FLAGS_row_count_only && FLAGS_show_values) {
+    LOG(ERROR) <<
+        "--row_count_only and --show_values flags are conflicting: either "
+        "remove/unset --show_values or remove/unset --row_count_only";
+    return false;
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(schema_projection_flags, ValidateSchemaProjectionFlags);
+
 using kudu::client::KuduClient;
 using kudu::client::KuduClientBuilder;
 using kudu::client::internal::AsyncLeaderMasterRpc;
@@ -173,6 +204,8 @@ using kudu::consensus::ReplicateMsg;
 using kudu::log::LogEntryPB;
 using kudu::log::LogEntryReader;
 using kudu::log::ReadableLogSegment;
+using kudu::master::ConnectToMasterRequestPB;
+using kudu::master::ConnectToMasterResponsePB;
 using kudu::master::MasterServiceProxy;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
@@ -199,13 +232,16 @@ using kudu::tserver::TabletServerServiceProxy; // NOLINT
 using kudu::tserver::WriteRequestPB;
 using std::cout;
 using std::endl;
+using std::map;
 using std::ostream;
+using std::set;
 using std::setfill;
 using std::setw;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+using strings::a2b_hex;
 using strings::Split;
 using strings::Substitute;
 
@@ -315,7 +351,7 @@ Status PrintDecodedWriteRequestPB(const string& indent,
   return Status::OK();
 }
 
-Status PrintDecoded(const LogEntryPB& entry, const Schema& tablet_schema) {
+Status PrintDecoded(const LogEntryPB& entry, Schema* tablet_schema) {
   PrintIdOnly(entry);
 
   const string indent = "\t";
@@ -326,9 +362,16 @@ Status PrintDecoded(const LogEntryPB& entry, const Schema& tablet_schema) {
     if (replicate.op_type() == consensus::WRITE_OP) {
       RETURN_NOT_OK(PrintDecodedWriteRequestPB(
           indent,
-          tablet_schema,
+          *tablet_schema,
           replicate.write_request(),
           replicate.has_request_id() ? &replicate.request_id() : nullptr));
+    } else if (replicate.op_type() == consensus::ALTER_SCHEMA_OP) {
+      if (!replicate.has_alter_schema_request()) {
+        LOG(ERROR) << "read an ALTER_SCHEMA_OP log entry, but has no alter_schema_request";
+        return Status::RuntimeError("ALTER_SCHEMA_OP log entry has no alter_schema_request");
+      }
+      RETURN_NOT_OK(SchemaFromPB(replicate.alter_schema_request().schema(), tablet_schema));
+      cout << indent << SecureShortDebugString(replicate) << endl;
     } else {
       cout << indent << SecureShortDebugString(replicate) << endl;
     }
@@ -485,6 +528,7 @@ Status GetServerStatus(const string& address, uint16_t default_port,
 Status GetReplicas(TabletServerServiceProxy* proxy,
                    vector<ListTabletsResponsePB::StatusAndSchemaPB>* replicas) {
   ListTabletsRequestPB req;
+  req.set_need_schema_info(true);
   ListTabletsResponsePB resp;
   RpcController rpc;
   rpc.set_timeout(MonoDelta::FromMilliseconds(FLAGS_timeout_ms));
@@ -524,7 +568,7 @@ Status PrintSegment(const scoped_refptr<ReadableLogSegment>& segment) {
 
         cout << "Entry:\n" << SecureDebugString(*entry);
       } else if (print_type == PRINT_DECODED) {
-        RETURN_NOT_OK(PrintDecoded(*entry, tablet_schema));
+        RETURN_NOT_OK(PrintDecoded(*entry, &tablet_schema));
       } else if (print_type == PRINT_ID) {
         PrintIdOnly(*entry);
       }
@@ -720,6 +764,61 @@ Status MasterAddressesToSet(
   return Status::OK();
 }
 
+Status VerifyMasterAddressList(const vector<string>& master_addresses) {
+  map<string, set<string>> addresses_per_master;
+  for (const auto& address : master_addresses) {
+    unique_ptr<MasterServiceProxy> proxy;
+    RETURN_NOT_OK(BuildProxy(address, master::Master::kDefaultPort, &proxy));
+
+    RpcController ctl;
+    ctl.set_timeout(MonoDelta::FromMilliseconds(FLAGS_timeout_ms));
+    ConnectToMasterRequestPB req;
+    ConnectToMasterResponsePB resp;
+    RETURN_NOT_OK(proxy->ConnectToMaster(req, &resp, &ctl));
+    const auto& resp_master_addrs = resp.master_addrs();
+    if (resp_master_addrs.size() != master_addresses.size()) {
+      const auto addresses_provided = JoinStrings(master_addresses, ",");
+      const auto addresses_cluster_config =
+          JoinMapped(resp_master_addrs,
+                     [](const HostPortPB& pb) { return Substitute("$0:$1", pb.host(), pb.port()); },
+                     ",");
+      return Status::InvalidArgument(
+          Substitute("list of master addresses provided ($0) "
+                     "does not match the actual cluster configuration ($1) ",
+                     addresses_provided,
+                     addresses_cluster_config));
+    }
+    set<string> addr_set;
+    for (const auto& hp : resp_master_addrs) {
+      addr_set.emplace(Substitute("$0:$1", hp.host(), hp.port()));
+    }
+    addresses_per_master.emplace(address, std::move(addr_set));
+  }
+
+  bool mismatch = false;
+  if (addresses_per_master.size() > 1) {
+    const auto it_0 = addresses_per_master.cbegin();
+    auto it_1 = addresses_per_master.begin();
+    ++it_1;
+    for (auto it = it_1; it != addresses_per_master.end(); ++it) {
+      if (it->second != it_0->second) {
+        mismatch = true;
+        break;
+      }
+    }
+  }
+
+  if (mismatch) {
+    string err_msg = Substitute("specified: ($0);", JoinStrings(master_addresses, ","));
+    for (const auto& e : addresses_per_master) {
+      err_msg += Substitute(" from master $0: ($1);", e.first, JoinStrings(e.second, ","));
+    }
+    return Status::ConfigurationError(Substitute("master address lists mismatch: $0", err_msg));
+  }
+
+  return Status::OK();
+}
+
 Status PrintServerStatus(const string& address, uint16_t default_port) {
   ServerStatusPB status;
   RETURN_NOT_OK(GetServerStatus(address, default_port, &status));
@@ -797,6 +896,25 @@ Status GetKuduToolAbsolutePathSafe(string* path) {
         "$0 binary not found at $1", kKuduCtlFileName, tool_abs_path));
   }
   *path = std::move(tool_abs_path);
+  return Status::OK();
+}
+
+Status SetServerKey() {
+  if (FLAGS_instance_file.empty()) {
+    return Status::OK();
+  }
+
+  InstanceMetadataPB instance;
+  RETURN_NOT_OK_PREPEND(pb_util::ReadPBContainerFromPath(Env::Default(), FLAGS_instance_file,
+                                                         &instance, pb_util::NOT_SENSITIVE),
+                        "Could not open instance file");
+
+  if (string key = instance.server_key();
+      !key.empty()) {
+    Env::Default()->SetEncryptionKey(key.length() * 4,
+                                     reinterpret_cast<const uint8_t*>(a2b_hex(key).c_str()));
+  }
+
   return Status::OK();
 }
 
@@ -959,6 +1077,7 @@ Status LeaderMasterProxy::Init(const vector<string>& master_addrs,
       .default_rpc_timeout(timeout)
       .default_admin_operation_timeout(timeout)
       .connection_negotiation_timeout(connection_negotiation_timeout)
+      .sasl_protocol_name(FLAGS_sasl_protocol_name)
       .Build(&client_);
 }
 

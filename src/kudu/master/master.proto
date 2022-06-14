@@ -73,7 +73,8 @@ message MasterErrorPB {
     // The number of replicas requested is even.
     EVEN_REPLICATION_FACTOR = 10;
 
-    // The number of replicas requested is illegal (eg non-positive).
+    // The number of replicas requested is illegal, i.e. either non-positive
+    // or not allowed per system policies.
     ILLEGAL_REPLICATION_FACTOR = 11;
 
     // The callee detected that its replica management scheme is incompatible
@@ -150,6 +151,9 @@ message SysTabletsEntryPB {
   // The dimension label for the tablet. Used for dimension-specific
   // placement of the tablet's replicas.
   optional string dimension_label = 8;
+
+  // The delete time of the tablet, in seconds since the epoch.
+  optional int64 delete_timestamp = 9;
 }
 
 // The on-disk entry in the sys.catalog table ("metadata" column) for
@@ -179,7 +183,7 @@ message SysTablesEntryPB {
   // This is the schema provided to the user on client->GetSchema(tableName).
   optional SchemaPB fully_applied_schema = 4;
 
-  // The table's partitioning schema.
+  // The table's partition schema.
   optional PartitionSchemaPB partition_schema = 9;
 
   // The next column ID to assign to newly added columns in this table.
@@ -214,6 +218,9 @@ message SysTablesEntryPB {
 
   // The comment on the table.
   optional string comment = 17;
+
+  // The delete time of the table, in seconds since the epoch.
+  optional int64 delete_timestamp = 18;
 }
 
 // The on-disk entry in the sys.catalog table ("metadata" column) to represent
@@ -508,17 +515,20 @@ message CreateTableRequestPB {
   required SchemaPB schema = 2;
   // repeated bytes pre_split_keys = 3;
   // repeated PartialRowPB split_rows = 5;
+
   // Holds either the split rows or the range bounds (or both) of the table.
   optional RowOperationsPB split_rows_range_bounds = 6;
-  // Holds the table's partition schema, the partition schema's hash bucket schemas
-  // are the default for any range where 'range_hash_schemas' is empty.
+
+  // Holds the table's partition schema, table-wide hash bucket schema, and,
+  // optionally, custom hash bucket schemas for each range. The latter is
+  // populated only when the 'split_rows_range_bounds' field above specifies
+  // range bounds, and must not be present if any split rows are specified.
   optional PartitionSchemaPB partition_schema = 7;
-  // Holds the hash bucket schemas for each range during table creation.
-  // Only populated when 'split_rows_range_bounds' specifies range bounds, must be empty if any
-  // split rows are specified. If this field is set, its size must match the number of ranges
-  // specified by range bounds and they must be in the same order. If this field is empty,
-  // 'partition_schema' is assumed for every range bound.
-  repeated PartitionSchemaPB.PerRangeHashBucketSchemasPB range_hash_schemas = 12;
+
+  // repeated PartitionSchemaPB.PerRangeHashBucketSchemasPB range_hash_schemas = 12;
+
+  // Number of replicas for a partition/tablet, a.k.a. table's replication
+  // factor. All tablets of the same table has same replication factor.
   optional int32 num_replicas = 4;
 
   // If set, uses the provided value as the table owner when creating the table.
@@ -590,6 +600,9 @@ message ListTablesResponsePB {
   message TableInfo {
     required bytes id = 1;
     required string name = 2;
+    optional uint64 live_row_count = 3;
+    optional int32 num_tablets = 4;
+    optional int32 num_replicas = 5;
   }
 
   repeated TableInfo tables = 2;
@@ -612,10 +625,24 @@ message GetTableStatisticsResponsePB {
   optional int64 row_count_limit = 5;
 }
 
+// This data structure is used to specify a table's partition key.
+// That's used to find partitions (i.e. tablets) that cover the key range span
+// between two partition keys.
+message PartitionKeyPB {
+  // The range part of the encoded key.
+  optional bytes range_key = 1 [(kudu.REDACT) = true];
+
+  // The hash part of the encoded key.
+  optional bytes hash_key = 2;
+}
+
 message GetTableLocationsRequestPB {
   required TableIdentifierPB table = 1;
 
-  // Partition-key range.
+  // These two fields are used to specify key range span if the table
+  // has a table-wide hash schema. Otherwise, neither of these two fields
+  // should not be present: use 'key_start' and 'key_end' fields below
+  // to specify key range information instead.
   optional bytes partition_key_start = 3 [(kudu.REDACT) = true];
   optional bytes partition_key_end = 4 [(kudu.REDACT) = true];
 
@@ -627,6 +654,17 @@ message GetTableLocationsRequestPB {
 
   // Whether the response should use the 'interned_replicas' field.
   optional bool intern_ts_infos_in_response = 7 [ default = false ];
+
+  // Partition key range, start and end: these fields make the
+  // 'partition_key_start' and 'partition_key_end' fields above obsolete.
+  // It's crucial to specify these (or at least one of these if the range is
+  // unbounded) when the table has custom hash schemas per range, otherwise
+  // the catalog manager responds back with an error. Even in case of
+  // table-wide hash schema the clients compiled with this proto specification
+  // are encouraged to use these fields instead of legacy 'partition_key_start'
+  // and 'partition_key_end'.
+  optional PartitionKeyPB key_start = 8;
+  optional PartitionKeyPB key_end = 9;
 }
 
 // The response to a GetTableLocations RPC. The master guarantees that:
@@ -694,6 +732,9 @@ message AlterTableRequestPB {
     // The dimension label for the tablet. Used for dimension-specific placement
     // of the tablet's replicas.
     optional string dimension_label = 2;
+
+    // The custom hash partition schema for the range if specified.
+    repeated PartitionSchemaPB.HashBucketSchemaPB custom_hash_schema = 3;
   }
   message DropRangePartition {
     // A set of row operations containing the lower and upper range bound for
@@ -733,6 +774,7 @@ message AlterTableRequestPB {
   optional int64 row_count_limit = 9;
 
   optional string new_table_comment = 10;
+  optional int32 num_replicas = 11;
 }
 
 message AlterTableResponsePB {
@@ -1037,6 +1079,22 @@ message RefreshAuthzCacheResponsePB {
   optional MasterErrorPB error = 1;
 }
 
+// RemoveTabletServerRequest/Response: remove a tablet server from master's
+// in-memory map and persisted catalog.
+message UnregisterTServerRequestPB {
+  // The tserver UUID to be unregistered.
+  optional string uuid = 1;
+
+  // Whether to return an error in case the tserver is not presumed to be dead,
+  // per --tserver_unresponsive_timeout_ms.
+  // Disable this by default to make sure the tserver has been brought down.
+  optional bool force_unregister_live_tserver = 2 [default = false];
+}
+
+message UnregisterTServerResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
 enum MasterFeatures {
   UNKNOWN_FEATURE = 0;
   // The master supports creating tables with non-covering range partitions.
@@ -1140,11 +1198,18 @@ service MasterService {
 
   // Add a new master to the existing cluster.
   rpc AddMaster(AddMasterRequestPB) returns (AddMasterResponsePB) {
-    option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
+    // NOTE: the master service may send this RPC as a part of its automated
+    // addition of masters to existing clusters, hence the inclusion of the
+    // service user.
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
   }
 
   // Remove a master from the existing cluster.
   rpc RemoveMaster(RemoveMasterRequestPB) returns (RemoveMasterResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
+  }
+
+  rpc UnregisterTServer(UnregisterTServerRequestPB) returns (UnregisterTServerResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
   }
 

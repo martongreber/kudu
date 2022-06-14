@@ -55,6 +55,10 @@ class Status;
 
 extern const char* kInvalidPath;
 
+class KuduTestEventListener : public ::testing::EmptyTestEventListener {
+  void OnTestIterationStart(const testing::UnitTest& unit_test, int iteration) override;
+};
+
 class KuduTest : public ::testing::Test {
  public:
   KuduTest();
@@ -69,6 +73,9 @@ class KuduTest : public ::testing::Test {
   // variables so that we don't pick up the user's credentials.
   static void OverrideKrb5Environment();
 
+  // Returns the encryption key used by the test.
+  static const std::string GetEncryptionKey();
+
  protected:
   // Returns absolute path based on a unit test-specific work directory, given
   // a relative path. Useful for writing test files that should be deleted after
@@ -81,6 +88,9 @@ class KuduTest : public ::testing::Test {
   // (and the flags reset) before test_dir_ is deleted.
   std::unique_ptr<google::FlagSaver> flag_saver_;
 
+  // Sets the flags to enable encryption if 'enable_encryption' is true.
+  void SetEncryptionFlags(bool enable_encryption);
+
   std::string test_dir_;
 };
 
@@ -90,6 +100,8 @@ bool AllowSlowTests();
 // Returns true if the KUDU_USE_LARGE_KEYS_IN_TESTS environment variable is set
 // to true. This is required to pass certain tests in FIPS approved mode.
 bool UseLargeKeys();
+
+bool EnableEncryption();
 
 // Override the given gflag to the new value, only in the case that
 // slow tests are enabled and the user hasn't otherwise overridden

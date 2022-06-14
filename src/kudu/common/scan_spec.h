@@ -25,15 +25,13 @@
 #include <glog/logging.h>
 
 #include "kudu/common/column_predicate.h" // IWYU pragma: keep
-#include "kudu/util/slice.h"
+#include "kudu/common/partition.h"
 
 namespace kudu {
 
 class Arena;
 class ColumnSchema;
 class EncodedKey;
-class Partition;
-class PartitionSchema;
 class Schema;
 
 class ScanSpec {
@@ -73,22 +71,21 @@ class ScanSpec {
                     Arena* arena,
                     bool remove_pushed_predicates);
 
-  // Filter in-list predicate values with given hash partition schema.
-  // If range partition is introduced when creating table, in-list predicate
-  // can also benefit from this pruning.
+  // Filter in-list predicate values with given a partition schema.
   //
-  // Only supports pruning for single-column hash schemas or single-column range schema.
-  // Now support hash prune on:
-  //     hash(onekey), # support.
-  //     range(onekey), # support.
-  //     hash(onekey), hash(anotherkey) # support either.
-  //     hash(onekey), range(anotherkey) # support either.
-  //     hash(key_one, key_two), hash(anotherkey) # only support prune on anotherkey.
-  //     range(key_one, key_two) # not support.
+  // Supports pruning only for single-column hash and range schemas. The pruning
+  // of IN list predicate's values is enabled for the following partitioning
+  // patterns:
   //
-  // TODO(ningw) For IN list predicate on hash/range(key_one, key_two) or more columns,
-  // if one predicate is IN list, and the rest predicate(s) are EQUAL, could
-  // have IN list predicate values prune as well.
+  //   hash(onekey),                            # pruning on 'onekey'
+  //   range(onekey),                           # pruning on 'onekey'
+  //   hash(onekey), hash(anotherkey)           # pruning on either key
+  //   hash(onekey), range(anotherkey)          # pruning on either key
+  //   hash(key_one, key_two), hash(anotherkey) # pruning on 'anotherkey'
+  //
+  // TODO(ningw) For IN list predicate on hash/range(key_one, key_two) or more
+  //             columns, if one predicate is IN list, and the rest predicate(s)
+  //             are EQUAL, could have IN list predicate values prune as well.
   void PruneInlistValuesIfPossible(const Schema& schema,
                                    const Partition& partition,
                                    const PartitionSchema& partition_schema);
@@ -108,17 +105,13 @@ class ScanSpec {
 
   // Sets the lower bound (inclusive) partition key for the scan.
   //
-  // The scan spec makes a copy of 'slice'; the caller may free it afterward.
-  //
   // Only used in the client.
-  void SetLowerBoundPartitionKey(const Slice& slice);
+  void SetLowerBoundPartitionKey(const PartitionKey& partition_key);
 
   // Sets the upper bound (exclusive) partition key for the scan.
   //
-  // The scan spec makes a copy of 'slice'; the caller may free it afterward.
-  //
   // Only used in the client.
-  void SetExclusiveUpperBoundPartitionKey(const Slice& slice);
+  void SetExclusiveUpperBoundPartitionKey(const PartitionKey& partition_key);
 
   // Returns the scan predicates.
   const std::unordered_map<std::string, ColumnPredicate>& predicates() const {
@@ -133,10 +126,10 @@ class ScanSpec {
     return exclusive_upper_bound_key_;
   }
 
-  const std::string& lower_bound_partition_key() const {
+  const PartitionKey& lower_bound_partition_key() const {
     return lower_bound_partition_key_;
   }
-  const std::string& exclusive_upper_bound_partition_key() const {
+  const PartitionKey& exclusive_upper_bound_partition_key() const {
     return exclusive_upper_bound_partition_key_;
   }
 
@@ -187,8 +180,8 @@ class ScanSpec {
   std::unordered_map<std::string, ColumnPredicate> predicates_;
   const EncodedKey* lower_bound_key_;
   const EncodedKey* exclusive_upper_bound_key_;
-  std::string lower_bound_partition_key_;
-  std::string exclusive_upper_bound_partition_key_;
+  PartitionKey lower_bound_partition_key_;
+  PartitionKey exclusive_upper_bound_partition_key_;
   bool cache_blocks_;
   boost::optional<int64_t> limit_;
 };

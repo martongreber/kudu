@@ -48,6 +48,7 @@
 #include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/proxy.h"
 #include "kudu/rpc/reactor.h"
+#include "kudu/rpc/result_tracker.h"
 #include "kudu/rpc/rpc-test-base.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
@@ -207,7 +208,7 @@ TEST_P(TestRpc, TestNegotiationDeadlock) {
 
   Proxy p(messenger, server_addr, kRemoteHostName,
           GenericCalculatorService::static_service_name());
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
 }
 
 // Test making successful RPC calls.
@@ -227,7 +228,7 @@ TEST_P(TestRpc, TestCall) {
                                                expected_remote_str(server_addr)));
 
   for (int i = 0; i < 10; i++) {
-    ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+    ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
   }
 }
 
@@ -259,7 +260,7 @@ TEST_P(TestRpc, TestCallWithChainCertAndChainCA) {
                                                             "{remote=$0, user_credentials=",
                                                         expected_remote_str(server_addr)));
 
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
 }
 
 // Test for KUDU-2041.
@@ -290,7 +291,7 @@ TEST_P(TestRpc, TestCallWithChainCertAndRootCA) {
                                                             "{remote=$0, user_credentials=",
                                                         expected_remote_str(server_addr)));
 
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
 }
 
 // Test making successful RPC calls while using a TLS certificate with a password protected
@@ -326,7 +327,7 @@ TEST_P(TestRpc, TestCallWithPasswordProtectedKey) {
                                                             "{remote=$0, user_credentials=",
                                                         expected_remote_str(server_addr)));
 
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
 }
 
 // Test that using a TLS certificate with a password protected private key and providing
@@ -352,7 +353,7 @@ TEST_P(TestRpc, TestCallWithBadPasswordProtectedKey) {
   Sockaddr server_addr = bind_addr();
   Status s = StartTestServer(&server_addr, enable_ssl(), rpc_certificate_file, rpc_private_key_file,
       rpc_ca_certificate_file, rpc_private_key_password_cmd);
-  ASSERT_TRUE(s.IsRuntimeError());
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "failed to load private key file");
 }
 
@@ -368,7 +369,7 @@ TEST_P(TestRpc, TestCallToBadServer) {
   // Loop a few calls to make sure that we properly set up and tear down
   // the connections.
   for (int i = 0; i < 5; i++) {
-    Status s = DoTestSyncCall(p, GenericCalculatorService::kAddMethodName);
+    Status s = DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName);
     LOG(INFO) << "Status: " << s.ToString();
     ASSERT_TRUE(s.IsNetworkError()) << "unexpected status: " << s.ToString();
   }
@@ -388,7 +389,7 @@ TEST_P(TestRpc, TestInvalidMethodCall) {
           GenericCalculatorService::static_service_name());
 
   // Call the method which fails.
-  Status s = DoTestSyncCall(p, "ThisMethodDoesNotExist");
+  Status s = DoTestSyncCall(&p, "ThisMethodDoesNotExist");
   ASSERT_TRUE(s.IsRemoteError()) << "unexpected status: " << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "bad method");
 }
@@ -406,7 +407,7 @@ TEST_P(TestRpc, TestWrongService) {
   Proxy p(client_messenger, server_addr, "localhost", "WrongServiceName");
 
   // Call the method which fails.
-  Status s = DoTestSyncCall(p, "ThisMethodDoesNotExist");
+  Status s = DoTestSyncCall(&p, "ThisMethodDoesNotExist");
   ASSERT_TRUE(s.IsRemoteError()) << "unexpected status: " << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(),
                       "Service unavailable: service WrongServiceName "
@@ -415,7 +416,7 @@ TEST_P(TestRpc, TestWrongService) {
   // If the server has been marked as having registered all services, we should
   // expect a "not found" error instead.
   server_messenger_->SetServicesRegistered();
-  s = DoTestSyncCall(p, "ThisMethodDoesNotExist");
+  s = DoTestSyncCall(&p, "ThisMethodDoesNotExist");
   ASSERT_TRUE(s.IsRemoteError()) << "unexpected status: " << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(),
                       "Not found: service WrongServiceName "
@@ -449,7 +450,7 @@ TEST_P(TestRpc, TestHighFDs) {
   ASSERT_OK(CreateMessenger("Client", &client_messenger, 1, enable_ssl()));
   Proxy p(client_messenger, server_addr, kRemoteHostName,
           GenericCalculatorService::static_service_name());
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
 }
 
 // Test that connections are kept alive between calls.
@@ -470,7 +471,7 @@ TEST_P(TestRpc, TestConnectionKeepalive) {
   Proxy p(client_messenger, server_addr, kRemoteHostName,
           GenericCalculatorService::static_service_name());
 
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
 
   SleepFor(MonoDelta::FromMilliseconds(5));
 
@@ -514,7 +515,7 @@ TEST_P(TestRpc, TestConnectionAlwaysKeepalive) {
   Proxy p(client_messenger, server_addr, kRemoteHostName,
           GenericCalculatorService::static_service_name());
 
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
 
   ReactorMetrics metrics;
   ASSERT_OK(server_messenger_->reactors_[0]->GetMetrics(&metrics));
@@ -651,7 +652,7 @@ TEST_P(TestRpc, TestReopenOutboundConnections) {
 
   // Run several iterations, just in case.
   for (int i = 0; i < 32; ++i) {
-    ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+    ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
     ASSERT_OK(server_messenger_->reactors_[0]->GetMetrics(&metrics));
     ASSERT_EQ(0, metrics.total_client_connections_);
     ASSERT_EQ(i + 1, metrics.total_server_connections_);
@@ -692,7 +693,7 @@ TEST_P(TestRpc, TestCredentialsPolicy) {
   ASSERT_EQ(0, metrics.total_server_connections_);
 
   // Make an RPC call with ANY_CREDENTIALS policy.
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
   ASSERT_OK(server_messenger_->reactors_[0]->GetMetrics(&metrics));
   ASSERT_EQ(0, metrics.total_client_connections_);
   ASSERT_EQ(1, metrics.total_server_connections_);
@@ -708,7 +709,7 @@ TEST_P(TestRpc, TestCredentialsPolicy) {
   // Make an RPC call with PRIMARY_CREDENTIALS policy. Currently open connection
   // with ANY_CREDENTIALS policy should be closed and a new one established
   // with PRIMARY_CREDENTIALS policy.
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName,
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName,
                            CredentialsPolicy::PRIMARY_CREDENTIALS));
   ASSERT_OK(server_messenger_->reactors_[0]->GetMetrics(&metrics));
   ASSERT_EQ(0, metrics.total_client_connections_);
@@ -723,7 +724,7 @@ TEST_P(TestRpc, TestCredentialsPolicy) {
   // connection with PRIMARY_CREDENTIALS policy should be re-used because
   // the ANY_CREDENTIALS policy satisfies the PRIMARY_CREDENTIALS policy which
   // the currently open connection has been established with.
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
   ASSERT_OK(server_messenger_->reactors_[0]->GetMetrics(&metrics));
   ASSERT_EQ(0, metrics.total_client_connections_);
   ASSERT_EQ(2, metrics.total_server_connections_);
@@ -769,7 +770,7 @@ TEST_P(TestRpc, TestConnectionNetworkPlane) {
   ASSERT_EQ(0, metrics.num_client_connections_);
 
   // Make an RPC call with the default network plane.
-  ASSERT_OK(DoTestSyncCall(p1, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p1, GenericCalculatorService::kAddMethodName));
   ASSERT_OK(server_messenger_->reactors_[0]->GetMetrics(&metrics));
   ASSERT_EQ(0, metrics.total_client_connections_);
   ASSERT_EQ(1, metrics.total_server_connections_);
@@ -780,7 +781,7 @@ TEST_P(TestRpc, TestConnectionNetworkPlane) {
   ASSERT_EQ(1, metrics.num_client_connections_);
 
   // Make an RPC call with the non-default network plane.
-  ASSERT_OK(DoTestSyncCall(p2, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p2, GenericCalculatorService::kAddMethodName));
   ASSERT_OK(server_messenger_->reactors_[0]->GetMetrics(&metrics));
   ASSERT_EQ(0, metrics.total_client_connections_);
   ASSERT_EQ(2, metrics.total_server_connections_);
@@ -792,7 +793,7 @@ TEST_P(TestRpc, TestConnectionNetworkPlane) {
 
   // Make an RPC call with the default network plane again and verify that
   // there are no new connections.
-  ASSERT_OK(DoTestSyncCall(p1, GenericCalculatorService::kAddMethodName));
+  ASSERT_OK(DoTestSyncCall(&p1, GenericCalculatorService::kAddMethodName));
   ASSERT_OK(server_messenger_->reactors_[0]->GetMetrics(&metrics));
   ASSERT_EQ(0, metrics.total_client_connections_);
   ASSERT_EQ(2, metrics.total_server_connections_);
@@ -870,18 +871,18 @@ TEST_P(TestRpc, TestRpcSidecar) {
           GenericCalculatorService::static_service_name());
 
   // Test a zero-length sidecar
-  DoTestSidecar(p, 0, 0);
+  DoTestSidecar(&p, 0, 0);
 
   // Test some small sidecars
-  DoTestSidecar(p, 123, 456);
+  DoTestSidecar(&p, 123, 456);
 
   // Test some larger sidecars to verify that we properly handle the case where
   // we can't write the whole response to the socket in a single call.
-  DoTestSidecar(p, 3000 * 1024, 2000 * 1024);
+  DoTestSidecar(&p, 3000 * 1024, 2000 * 1024);
 
-  DoTestOutgoingSidecarExpectOK(p, 0, 0);
-  DoTestOutgoingSidecarExpectOK(p, 123, 456);
-  DoTestOutgoingSidecarExpectOK(p, 3000 * 1024, 2000 * 1024);
+  DoTestOutgoingSidecarExpectOK(&p, 0, 0);
+  DoTestOutgoingSidecarExpectOK(&p, 123, 456);
+  DoTestOutgoingSidecarExpectOK(&p, 3000 * 1024, 2000 * 1024);
 }
 
 // Test sending the maximum number of sidecars, each of them being a single
@@ -903,7 +904,7 @@ TEST_P(TestRpc, TestMaxSmallSidecars) {
   for (auto& s : strings) {
     s = RandomString(2, &rng);
   }
-  ASSERT_OK(DoTestOutgoingSidecar(p, strings));
+  ASSERT_OK(DoTestOutgoingSidecar(&p, strings));
 }
 
 TEST_P(TestRpc, TestRpcSidecarLimits) {
@@ -1008,15 +1009,15 @@ TEST_P(TestRpc, TestCallTimeout) {
   // Test a very short timeout - we expect this will time out while the
   // call is still trying to connect, or in the send queue. This was triggering ASAN failures
   // before.
-  NO_FATALS(DoTestExpectTimeout(p, MonoDelta::FromNanoseconds(1)));
+  NO_FATALS(DoTestExpectTimeout(&p, MonoDelta::FromNanoseconds(1)));
 
   // Test a longer timeout - expect this will time out after we send the request,
   // but shorter than our threshold for two-stage timeout handling.
-  NO_FATALS(DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(200)));
+  NO_FATALS(DoTestExpectTimeout(&p, MonoDelta::FromMilliseconds(200)));
 
   // Test a longer timeout - expect this will trigger the "two-stage timeout"
   // code path.
-  NO_FATALS(DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(1500)));
+  NO_FATALS(DoTestExpectTimeout(&p, MonoDelta::FromMilliseconds(1500)));
 }
 
 // Inject 500ms delay in negotiation, and send a call with a short timeout, followed by
@@ -1035,8 +1036,8 @@ TEST_P(TestRpc, TestCallTimeoutDoesntAffectNegotiation) {
           GenericCalculatorService::static_service_name());
 
   FLAGS_rpc_negotiation_inject_delay_ms = 500;
-  NO_FATALS(DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(50)));
-  ASSERT_OK(DoTestSyncCall(p, GenericCalculatorService::kAddMethodName));
+  NO_FATALS(DoTestExpectTimeout(&p, MonoDelta::FromMilliseconds(50)));
+  ASSERT_OK(DoTestSyncCall(&p, GenericCalculatorService::kAddMethodName));
 
   // Only the second call should have been received by the server, because we
   // don't bother sending an already-timed-out call.
@@ -1059,6 +1060,15 @@ static void AcceptAndReadForever(Socket* listen_sock) {
   }
 }
 
+// Basic test for methods_by_name(). At the time of writing, this isn't used by
+// Kudu, but is used in other projects like Apache Impala.
+TEST_F(TestRpc, TestMethodsByName) {
+  std::unique_ptr<CalculatorService> service(
+      new CalculatorService(metric_entity_, result_tracker_));
+  const auto& methods = service->methods_by_name();
+  ASSERT_EQ(8, methods.size());
+}
+
 // Starts a fake listening socket which never actually negotiates.
 // Ensures that the client gets a reasonable status code in this case.
 TEST_F(TestRpc, TestNegotiationTimeout) {
@@ -1079,7 +1089,7 @@ TEST_F(TestRpc, TestNegotiationTimeout) {
 
   bool is_negotiation_error = false;
   NO_FATALS(DoTestExpectTimeout(
-      p, MonoDelta::FromMilliseconds(100), false, &is_negotiation_error));
+      &p, MonoDelta::FromMilliseconds(100), false, &is_negotiation_error));
   EXPECT_TRUE(is_negotiation_error);
 }
 
@@ -1267,7 +1277,7 @@ TEST_P(TestRpc, TestRpcContextClientDeadline) {
   SleepResponsePB resp;
   RpcController controller;
   Status s = p.SyncRequest("Sleep", req, &resp, &controller);
-  ASSERT_TRUE(s.IsRemoteError());
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "Missing required timeout");
 
   controller.Reset();
@@ -1311,7 +1321,7 @@ TEST_P(TestRpc, TestApplicationFeatureFlag) {
     controller.RequireServerFeature(99);
     Status s = p.SyncRequest("Add", req, &resp, &controller);
     SCOPED_TRACE(strings::Substitute("unsupported response: $0", s.ToString()));
-    ASSERT_TRUE(s.IsRemoteError());
+    ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
   }
 }
 
@@ -1339,7 +1349,7 @@ TEST_P(TestRpc, TestApplicationFeatureFlagUnsupportedServer) {
     controller.RequireServerFeature(FeatureFlags::FOO);
     Status s = p.SyncRequest("Add", req, &resp, &controller);
     SCOPED_TRACE(strings::Substitute("supported response: $0", s.ToString()));
-    ASSERT_TRUE(s.IsNotSupported());
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
   }
 
   { // No required flag
@@ -1374,14 +1384,14 @@ TEST_P(TestRpc, TestCancellation) {
       case OutboundCall::ON_OUTBOUND_QUEUE:
       case OutboundCall::SENDING:
       case OutboundCall::SENT:
-        ASSERT_TRUE(DoTestOutgoingSidecar(p, 0, 0).IsAborted());
-        ASSERT_TRUE(DoTestOutgoingSidecar(p, 123, 456).IsAborted());
-        ASSERT_TRUE(DoTestOutgoingSidecar(p, 3000 * 1024, 2000 * 1024).IsAborted());
-        DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(timeout_ms), true);
+        ASSERT_TRUE(DoTestOutgoingSidecar(&p, 0, 0).IsAborted());
+        ASSERT_TRUE(DoTestOutgoingSidecar(&p, 123, 456).IsAborted());
+        ASSERT_TRUE(DoTestOutgoingSidecar(&p, 3000 * 1024, 2000 * 1024).IsAborted());
+        DoTestExpectTimeout(&p, MonoDelta::FromMilliseconds(timeout_ms), true);
         break;
       case OutboundCall::NEGOTIATION_TIMED_OUT:
       case OutboundCall::TIMED_OUT:
-        DoTestExpectTimeout(p, MonoDelta::FromMilliseconds(1000));
+        DoTestExpectTimeout(&p, MonoDelta::FromMilliseconds(1000));
         break;
       case OutboundCall::CANCELLED:
         break;
@@ -1395,13 +1405,13 @@ TEST_P(TestRpc, TestCancellation) {
         controller.RequireServerFeature(FeatureFlags::FOO);
         controller.RequireServerFeature(99);
         Status s = p.SyncRequest("Add", req, &resp, &controller);
-        ASSERT_TRUE(s.IsRemoteError());
+        ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
         break;
       }
       case OutboundCall::FINISHED_SUCCESS:
-        DoTestOutgoingSidecarExpectOK(p, 0, 0);
-        DoTestOutgoingSidecarExpectOK(p, 123, 456);
-        DoTestOutgoingSidecarExpectOK(p, 3000 * 1024, 2000 * 1024);
+        DoTestOutgoingSidecarExpectOK(&p, 0, 0);
+        DoTestOutgoingSidecarExpectOK(&p, 123, 456);
+        DoTestOutgoingSidecarExpectOK(&p, 3000 * 1024, 2000 * 1024);
         break;
     }
   }
@@ -1568,7 +1578,7 @@ TEST_P(TestRpc, TestPerformanceBySocketType) {
     Stopwatch sw(Stopwatch::ALL_THREADS);
     sw.start();
     for (int i = 0; i < kNumMb / kMbPerRpc; i++) {
-      DoTestOutgoingSidecar(p, sidecars);
+      DoTestOutgoingSidecar(&p, sidecars);
     }
     sw.stop();
     LOG(INFO) << strings::Substitute(
@@ -1580,6 +1590,32 @@ TEST_P(TestRpc, TestPerformanceBySocketType) {
   }
 }
 
+// Test that call_id is returned in call response and accessible through RpcController.
+TEST_P(TestRpc, TestCallId) {
+  // Set up server.
+  Sockaddr server_addr = bind_addr();
+  ASSERT_OK(StartTestServer(&server_addr, enable_ssl()));
+
+  // Set up client.
+  shared_ptr<Messenger> client_messenger;
+  ASSERT_OK(CreateMessenger("Client", &client_messenger, 1, enable_ssl()));
+  Proxy p(client_messenger, server_addr, kRemoteHostName,
+          GenericCalculatorService::static_service_name());
+
+  for (int i = 0; i < 10; i++) {
+    AddRequestPB req;
+    req.set_x(rand());
+    req.set_y(rand());
+    RpcController controller;
+    controller.set_timeout(MonoDelta::FromMilliseconds(10000));
+
+    AddResponsePB resp;
+    ASSERT_OK(p.SyncRequest(GenericCalculatorService::kAddMethodName,
+      req, &resp, &controller));
+    ASSERT_EQ(req.x() + req.y(), resp.result());
+    ASSERT_EQ(i, controller.call_id());
+  }
+}
 
 } // namespace rpc
 } // namespace kudu

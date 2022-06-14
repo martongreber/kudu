@@ -36,6 +36,7 @@ import org.apache.kudu.test.RandomUtils
 import org.apache.kudu.spark.kudu.SparkListenerUtil.withJobTaskCounter
 import org.apache.kudu.test.KuduTestHarness.EnableKerberos
 import org.apache.kudu.test.KuduTestHarness.MasterServerConfig
+import org.apache.kudu.test.KuduTestHarness.TabletServerConfig
 import org.junit.Before
 import org.junit.Test
 import org.scalatest.matchers.should.Matchers
@@ -62,6 +63,86 @@ class DefaultSourceTest extends KuduTestSuite with Matchers {
       .format("kudu")
       .load()
       .createOrReplaceTempView(tableName)
+  }
+
+  /**
+   * A simple test to delete rows from an empty table.
+   * First delete ignore rows from the empty table.
+   * Next, insert data to the kudu table and delete all of them afterwards.
+   * Finally, delete again from the empty table through deleteIngoreRows.
+   */
+  @Test
+  def testDeleteRowsFromEmptyTable(): Unit = {
+    val origDf = sqlContext.read.options(kuduOptions).format("kudu").load
+    val tableName = "testEmptyTable"
+    if (kuduContext.tableExists(tableName)) {
+      kuduContext.deleteTable(tableName)
+    }
+    kuduContext.createTable(
+      tableName,
+      origDf.schema,
+      Seq("key"),
+      new CreateTableOptions()
+        .addHashPartitions(List("key").asJava, harness.getTabletServers.size() * 3))
+    val df = sqlContext.read.options(kuduOptions).format("kudu").load
+    // delete rows from the empty table.
+    kuduContext.deleteIgnoreRows(df, tableName)
+    // insert rows.
+    val newKuduTableOptions =
+      Map("kudu.table" -> tableName, "kudu.master" -> harness.getMasterAddressesAsString)
+    val insertsBefore = kuduContext.numInserts.value.get(tableName)
+    kuduContext.insertRows(df, tableName)
+    assertEquals(insertsBefore + df.count(), kuduContext.numInserts.value.get(tableName))
+    // delete all of the newly inserted rows.
+    kuduContext.deleteRows(df, tableName)
+    val newDf = sqlContext.read.options(newKuduTableOptions).format("kudu").load()
+    assertEquals(newDf.collectAsList().size(), 0)
+    // delete all of rows again, which is no hurt.
+    kuduContext.deleteIgnoreRows(df, tableName)
+  }
+
+  /**
+   * A simple test with two threads to delete the data from the same table.
+   * After applying deleteIgnoreRows, there should be no errors even though
+   * half of the delete operations will be applied on non-existing rows.
+   */
+  @Test
+  def testDuplicateDelete(): Unit = {
+    val totalRows = 10000
+    val origDf = sqlContext.read.options(kuduOptions).format("kudu").load
+    insertRows(table, totalRows, rowCount)
+    val tableName = "testDuplicateDelete"
+    if (kuduContext.tableExists(tableName)) {
+      kuduContext.deleteTable(tableName)
+    }
+    kuduContext.createTable(
+      tableName,
+      origDf.schema,
+      Seq("key"),
+      new CreateTableOptions()
+        .addHashPartitions(List("key").asJava, harness.getTabletServers.size() * 3)
+        .setNumReplicas(3))
+    val newKuduTableOptions =
+      Map("kudu.table" -> tableName, "kudu.master" -> harness.getMasterAddressesAsString)
+    kuduContext.insertRows(origDf, tableName)
+    val df = sqlContext.read.options(newKuduTableOptions).format("kudu").load()
+    assertEquals(df.collectAsList().size(), totalRows + rowCount)
+    val deleteThread1 = new Thread {
+      override def run: Unit = {
+        kuduContext.deleteIgnoreRows(df, tableName)
+      }
+    }
+    val deleteThread2 = new Thread {
+      override def run: Unit = {
+        kuduContext.deleteIgnoreRows(df, tableName)
+      }
+    }
+    deleteThread1.start()
+    deleteThread2.start()
+    deleteThread1.join(3000)
+    deleteThread2.join(3000)
+    val newDf = sqlContext.read.options(newKuduTableOptions).format("kudu").load()
+    assertEquals(newDf.collectAsList().size(), 0)
   }
 
   /**
@@ -896,5 +977,65 @@ class DefaultSourceTest extends KuduTestSuite with Matchers {
 
     val df = sqlContext.read.options(kuduOptions).format("kudu").load
     assertEquals(rowCount, df.count())
+  }
+
+  @Test
+  def testKuduRequireAuthenticationInsecureCluster(): Unit = {
+    KuduClientCache.clearCacheForTests()
+    kuduOptions = Map(
+      "kudu.table" -> tableName,
+      "kudu.master" -> harness.getMasterAddressesAsString,
+      "kudu.requireAuthentication" -> "true"
+    )
+    val exception = intercept[Exception] {
+      val df = sqlContext.read.options(kuduOptions).format("kudu").load
+      df.count
+    }
+    assertTrue(
+      exception.getCause.getMessage
+        .contains("client requires authentication, but server does not have Kerberos enabled"))
+  }
+
+  @Test
+  @MasterServerConfig(flags = Array("--rpc_encryption=disabled", "--rpc_authentication=disabled"))
+  @TabletServerConfig(flags = Array("--rpc_encryption=disabled", "--rpc_authentication=disabled"))
+  def testKuduRequireEncryptionInsecureCluster(): Unit = {
+    KuduClientCache.clearCacheForTests()
+    kuduOptions = Map(
+      "kudu.table" -> tableName,
+      "kudu.master" -> harness.getMasterAddressesAsString,
+      "kudu.encryptionPolicy" -> "required_remote"
+    )
+    val exception = intercept[Exception] {
+      val df = sqlContext.read.options(kuduOptions).format("kudu").load
+      df.count
+    }
+    assertTrue(
+      exception.getCause.getMessage.contains("server does not support required TLS encryption"))
+  }
+
+  @Test
+  @EnableKerberos
+  def testKuduRequireAuthenticationAndEncryptionSecureCluster(): Unit = {
+    KuduClientCache.clearCacheForTests()
+    kuduOptions = Map(
+      "kudu.table" -> tableName,
+      "kudu.master" -> harness.getMasterAddressesAsString,
+      "kudu.encryptionPolicy" -> "required",
+      "kudu.requireAuthentication" -> "true"
+    )
+
+    val df = sqlContext.read.options(kuduOptions).format("kudu").load
+    assertEquals(rowCount, df.count)
+  }
+
+  @Test
+  @MasterServerConfig(flags = Array("--rpc_encryption=disabled", "--rpc_authentication=disabled"))
+  @TabletServerConfig(flags = Array("--rpc_encryption=disabled", "--rpc_authentication=disabled"))
+  def testKuduInsecureCluster(): Unit = {
+    KuduClientCache.clearCacheForTests()
+
+    val df = sqlContext.read.options(kuduOptions).format("kudu").load
+    assertEquals(rowCount, df.count)
   }
 }

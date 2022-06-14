@@ -43,9 +43,7 @@ public:
   Status GenerateYamlReader(const string& content, unique_ptr<YamlReader>* result) {
     string fname = GetTestPath("YamlReaderTest.json");
     unique_ptr<WritableFile> writable_file;
-    RETURN_NOT_OK(env_->NewWritableFile(fname, &writable_file));
-    RETURN_NOT_OK(writable_file->Append(Slice(content)));
-    RETURN_NOT_OK(writable_file->Close());
+    RETURN_NOT_OK(WriteStringToFile(env_, content, fname));
     result->reset(new YamlReader(fname));
     return Status::OK();
   }
@@ -54,7 +52,7 @@ public:
 TEST_F(YamlReaderTest, FileNotExist) {
   YamlReader r("YamlReaderTest.NotExist");
   Status s = r.Init();
-  ASSERT_TRUE(s.IsCorruption());
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
   ASSERT_STR_CONTAINS(
       s.ToString(), "YAML::LoadFile error");
 }

@@ -422,6 +422,7 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         "#include \"kudu/rpc/result_tracker.h\"\n"
         "#include \"kudu/rpc/service_if.h\"\n"
         "#include \"kudu/util/metrics.h\"\n"
+        "#include \"kudu/util/net/dns_resolver.h\"\n"
         "\n");
 
     // Define metric prototypes for each method in the service.
@@ -575,6 +576,10 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
           "      std::shared_ptr<::kudu::rpc::Messenger> messenger,\n"
           "      const ::kudu::Sockaddr& sockaddr,\n"
           "      std::string hostname);\n"
+          "  $service_name$Proxy(\n"
+          "      std::shared_ptr<::kudu::rpc::Messenger> messenger,\n"
+          "      const ::kudu::HostPort& hp,\n"
+          "      ::kudu::DnsResolver* dns_resolver);\n"
           "  ~$service_name$Proxy();\n");
 
       for (int method_idx = 0; method_idx < service->method_count();
@@ -616,6 +621,7 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         "#include \"$path_no_extension$.proxy.h\"\n"
         "\n"
         "namespace kudu {\n"
+        "class DnsResolver;\n"
         "namespace rpc {\n"
         "class Messenger;\n"
         "class RpcController;\n"
@@ -639,6 +645,15 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
           "            std::move(hostname),\n"
           "            \"$full_service_name$\") {\n"
           "}\n"
+          "$service_name$Proxy::$service_name$Proxy(\n"
+          "    std::shared_ptr<::kudu::rpc::Messenger> messenger,\n"
+          "    const ::kudu::HostPort& hp,\n"
+          "    ::kudu::DnsResolver* dns_resolver)\n"
+          "    : Proxy(std::move(messenger),\n"
+          "            hp,\n"
+          "            dns_resolver,\n"
+          "            \"$full_service_name$\") {\n"
+          "}\n"
           "\n"
           "$service_name$Proxy::~$service_name$Proxy() {\n"
           "}\n");
@@ -652,7 +667,8 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
             "    const $request$& req,\n"
             "    $response$* resp,\n"
             "    ::kudu::rpc::RpcController* controller) {\n"
-            "  return SyncRequest(\"$rpc_name$\", req, resp, controller);\n"
+            "  static const std::string kRpcName = \"$rpc_name$\";\n"
+            "  return SyncRequest(kRpcName, req, resp, controller);\n"
             "}\n"
             "\n"
             "void $service_name$Proxy::$rpc_name$Async(\n"
@@ -660,7 +676,8 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
             "    $response$* resp,\n"
             "    ::kudu::rpc::RpcController* controller,\n"
             "    const ::kudu::rpc::ResponseCallback& callback) {\n"
-            "  AsyncRequest(\"$rpc_name$\", req, resp, controller, callback);\n"
+            "  static const std::string kRpcName = \"$rpc_name$\";\n"
+            "  AsyncRequest(kRpcName, req, resp, controller, callback);\n"
             "}\n");
         subs->Pop(); // method
       }

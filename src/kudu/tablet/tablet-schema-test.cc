@@ -129,7 +129,7 @@ TEST_F(TestTabletSchema, TestRead) {
   ASSERT_OK(tablet()->NewRowIterator(projection, &iter));
 
   Status s = iter->Init(nullptr);
-  ASSERT_TRUE(s.IsInvalidArgument());
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
   ASSERT_STR_CONTAINS(s.message().ToString(),
                       "Some columns are not present in the current schema: c2, c3");
 }
@@ -146,7 +146,7 @@ TEST_F(TestTabletSchema, TestWrite) {
   const int32_t c2_write_default = 5;
   const int32_t c2_read_default = 7;
 
-  SchemaBuilder builder(tablet()->metadata()->schema());
+  SchemaBuilder builder(*tablet()->metadata()->schema());
   ASSERT_OK(builder.AddColumn("c2", INT32, false, &c2_read_default, &c2_write_default));
   AlterSchema(builder.Build());
   Schema s2 = builder.BuildWithoutIds();
@@ -189,7 +189,7 @@ TEST_F(TestTabletSchema, TestReInsert) {
   const int32_t c2_write_default = 5;
   const int32_t c2_read_default = 7;
 
-  SchemaBuilder builder(tablet()->metadata()->schema());
+  SchemaBuilder builder(*tablet()->metadata()->schema());
   ASSERT_OK(builder.AddColumn("c2", INT32, false, &c2_read_default, &c2_write_default));
   AlterSchema(builder.Build());
   Schema s2 = builder.BuildWithoutIds();
@@ -219,7 +219,7 @@ TEST_F(TestTabletSchema, TestRenameProjection) {
   InsertRow(client_schema_, 1);
 
   // Switch schema to s2
-  SchemaBuilder builder(tablet()->metadata()->schema());
+  SchemaBuilder builder(*tablet()->metadata()->schema());
   ASSERT_OK(builder.RenameColumn("c1", "c1_renamed"));
   AlterSchema(builder.Build());
   Schema s2 = builder.BuildWithoutIds();
@@ -260,7 +260,7 @@ TEST_F(TestTabletSchema, TestDeleteAndReAddColumn) {
   VerifyTabletRows(client_schema_, keys);
 
   // Switch schema to s2
-  SchemaBuilder builder(tablet()->metadata()->schema());
+  SchemaBuilder builder(*tablet()->metadata()->schema());
   ASSERT_OK(builder.RemoveColumn("c1"));
   // NOTE this new 'c1' will have a different id from the previous one
   //      so the data added to the previous 'c1' will not be visible.
@@ -279,7 +279,7 @@ TEST_F(TestTabletSchema, TestModifyEmptyMemRowSet) {
   std::vector<std::pair<string, string> > keys;
 
   // Switch schema to s2
-  SchemaBuilder builder(tablet()->metadata()->schema());
+  SchemaBuilder builder(*tablet()->metadata()->schema());
   ASSERT_OK(builder.AddNullableColumn("c2", INT32));
   AlterSchema(builder.Build());
   Schema s2 = builder.BuildWithoutIds();

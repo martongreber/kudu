@@ -519,6 +519,7 @@ Status FileReadableBlock::Size(uint64_t* sz) const {
   DCHECK(!closed_.Load());
 
   RETURN_NOT_OK_HANDLE_ERROR(reader_->Size(sz));
+  *sz -= reader_->GetEncryptionHeaderSize();
   return Status::OK();
 }
 
@@ -529,7 +530,7 @@ Status FileReadableBlock::Read(uint64_t offset, Slice result) const {
 Status FileReadableBlock::ReadV(uint64_t offset, ArrayView<Slice> results) const {
   DCHECK(!closed_.Load());
 
-  RETURN_NOT_OK_HANDLE_ERROR(reader_->ReadV(offset, results));
+  RETURN_NOT_OK_HANDLE_ERROR(reader_->ReadV(offset + reader_->GetEncryptionHeaderSize(), results));
 
   if (block_manager_->metrics_) {
     // Calculate the read amount of data
@@ -715,7 +716,8 @@ FileBlockManager::FileBlockManager(Env* env,
 FileBlockManager::~FileBlockManager() {
 }
 
-Status FileBlockManager::Open(FsReport* report) {
+Status FileBlockManager::Open(FsReport* report, std::atomic<int>* containers_processed,
+                              std::atomic<int>* containers_total) {
   // Prepare the filesystem report and either return or log it.
   FsReport local_report;
   set<int> failed_dirs = dd_manager_->GetFailedDirs();
@@ -787,6 +789,7 @@ Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
         error_manager_->RunErrorNotificationCb(ErrorHandlerType::DISK_ERROR, dir));
     WritableFileOptions wr_opts;
     wr_opts.mode = Env::MUST_CREATE;
+    wr_opts.is_sensitive = true;
     s = env_util::OpenFileForWrite(wr_opts, env_, path, &writer);
   } while (PREDICT_FALSE(s.IsAlreadyPresent()));
   if (s.ok()) {
@@ -833,7 +836,9 @@ Status FileBlockManager::OpenBlock(const BlockId& block_id,
         path, &reader));
   } else {
     unique_ptr<RandomAccessFile> r;
-    RETURN_NOT_OK_FBM_DISK_FAILURE(env_->NewRandomAccessFile(path, &r));
+    RandomAccessFileOptions opts;
+    opts.is_sensitive = true;
+    RETURN_NOT_OK_FBM_DISK_FAILURE(env_->NewRandomAccessFile(opts, path, &r));
     reader.reset(r.release());
   }
   block->reset(new internal::FileReadableBlock(this, block_id, reader));
@@ -949,9 +954,7 @@ Status FileBlockManager::GetAllBlockIds(vector<BlockId>* block_ids) {
       GetAllBlockIdsForDir(this->env_, dd, bid_vec, s);
     });
   }
-  for (const auto& dd : dd_manager_->dirs()) {
-    dd->WaitOnClosures();
-  }
+  dd_manager_->WaitOnClosures();
 
   // A failure on any data directory is fatal.
   for (const auto& s : statuses) {

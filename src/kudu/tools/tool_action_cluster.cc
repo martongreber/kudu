@@ -91,6 +91,15 @@ DEFINE_uint32(max_staleness_interval_sec, 300,
               "cluster or when some unexpected concurrent activity is "
               "present (such as automatic recovery of failed replicas, etc.)");
 
+DEFINE_uint32(intra_location_rebalancing_concurrency, 0,
+              "How many independent intra-location rebalancing sessions can be "
+              "run in parallel. Since the location assignment naturally provides "
+              "non-intersecting sets of servers, it's possible to "
+              "independently move tablet replicas within different locations "
+              "in parallel. Value of 0 means 'the number of CPU cores'. "
+              "The actual number of concurrent sessions is the minimum of two "
+              "values: this setting and the number of locations in a cluster.");
+
 DEFINE_int64(max_run_time_sec, 0,
              "Maximum time to run the rebalancing, in seconds. Specifying 0 "
              "means not imposing any limit on the rebalancing run time.");
@@ -129,6 +138,9 @@ DEFINE_bool(disable_intra_location_rebalancing, false,
             "replica distribution within each location. "
             "This setting is applicable to multi-location clusters only.");
 
+DEFINE_bool(enable_range_rebalancing, false,
+            "Whether to enable table range rebalancing");
+
 DEFINE_bool(move_replicas_from_ignored_tservers, false,
             "Whether to move replicas from the specified 'ignored_tservers' to other "
             "servers when the source tablet server is healthy. "
@@ -152,6 +164,15 @@ DEFINE_double(load_imbalance_threshold,
               "(greater threshold value). The default value is empirically "
               "proven to be a good choice between 'ideal' and 'good enough' "
               "replica distributions.");
+
+DEFINE_bool(force_rebalance_replicas_on_maintenance_tservers, false,
+            "This flag only takes effect in the case that some tservers are set maintenance "
+            "mode but not specified in 'ignored_tservers'. If set true, the tool would rebalance "
+            "all known replicas among all known tservers. The side effect of this is new "
+            "replicas may be moved to maintenance tservers which are likely to be restarted or "
+            "decommissioned soon. It is generally more recommended to specify all maintenance "
+            "tservers in 'ignored_tservers', so that the rebalancer tool would ignore these "
+            "tservers' states and replicas on them when planning replica moves.");
 
 static bool ValidateMoveSingleReplicas(const char* flag_name,
                                        const string& flag_value) {
@@ -302,6 +323,12 @@ Status RunRebalance(const RunnerContext& context) {
   const vector<string> table_filters =
       Split(FLAGS_tables, ",", strings::SkipEmpty());
 
+  if (FLAGS_enable_range_rebalancing && table_filters.size() != 1) {
+    return Status::NotSupported(
+        "range rebalancing is currently implemented for a single table only: "
+        "use '--tables' to specify a table for range rebalancing");
+  }
+
   // Evaluate --move_single_replicas flag: decide whether enable to disable
   // moving of single-replica tablets based on the reported version of the
   // Kudu components.
@@ -321,7 +348,10 @@ Status RunRebalance(const RunnerContext& context) {
       !FLAGS_disable_policy_fixer,
       !FLAGS_disable_cross_location_rebalancing,
       !FLAGS_disable_intra_location_rebalancing,
-      FLAGS_load_imbalance_threshold));
+      FLAGS_load_imbalance_threshold,
+      FLAGS_force_rebalance_replicas_on_maintenance_tservers,
+      FLAGS_intra_location_rebalancing_concurrency,
+      FLAGS_enable_range_rebalancing));
 
   // Print info on pre-rebalance distribution of replicas.
   RETURN_NOT_OK(rebalancer.PrintStats(cout));
@@ -413,7 +443,9 @@ unique_ptr<Mode> BuildClusterMode() {
         .AddOptionalParameter("disable_intra_location_rebalancing")
         .AddOptionalParameter("disable_policy_fixer")
         .AddOptionalParameter("fetch_info_concurrency")
+        .AddOptionalParameter("force_rebalance_replicas_on_maintenance_tservers")
         .AddOptionalParameter("ignored_tservers")
+        .AddOptionalParameter("intra_location_rebalancing_concurrency")
         .AddOptionalParameter("load_imbalance_threshold")
         .AddOptionalParameter("max_moves_per_server")
         .AddOptionalParameter("max_run_time_sec")
@@ -421,6 +453,7 @@ unique_ptr<Mode> BuildClusterMode() {
         .AddOptionalParameter("move_replicas_from_ignored_tservers")
         .AddOptionalParameter("move_single_replicas")
         .AddOptionalParameter("output_replica_distribution_details")
+        .AddOptionalParameter("enable_range_rebalancing")
         .AddOptionalParameter("report_only")
         .AddOptionalParameter("tables")
         .Build();
@@ -432,4 +465,3 @@ unique_ptr<Mode> BuildClusterMode() {
 
 } // namespace tools
 } // namespace kudu
-

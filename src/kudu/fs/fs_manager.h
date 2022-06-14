@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
@@ -46,6 +47,7 @@ class BlockId;
 class FileCache;
 class InstanceMetadataPB;
 class MemTracker;
+class Timer;
 
 namespace fs {
 
@@ -181,14 +183,30 @@ class FsManager {
   // If the filesystem has not been initialized, returns NotFound. In that
   // case, CreateInitialFileSystemLayout() may be used to initialize the
   // on-disk and in-memory structures.
-  Status Open(fs::FsReport* report = nullptr);
+  //
+  // If 'read_instance_metadata_files' and 'read_data_directories' are not nullptr,
+  // they will be populated with time spent reading the instance metadata files
+  // and time spent reading data directories respectively.
+  //
+  // If 'containers_processed' and 'containers_total' are not nullptr, they will
+  // be populated with total containers attempted to be opened/processed and
+  // total containers present respectively in the subsequent calls made to
+  // the block manager.
+  Status Open(fs::FsReport* report = nullptr,
+              Timer* read_instance_metadata_files = nullptr,
+              Timer* read_data_directories = nullptr,
+              std::atomic<int>* containers_processed = nullptr,
+              std::atomic<int>* containers_total = nullptr );
 
   // Create the initial filesystem layout. If 'uuid' is provided, uses it as
-  // uuid of the filesystem. Otherwise generates one at random.
+  // uuid of the filesystem. Otherwise generates one at random. If 'server_key'
+  // is provided, it is used as the server key of the filesystem. Otherwise, if
+  // encryption is enabled, generates one at random.
   //
   // Returns an error if the file system is already initialized.
   Status CreateInitialFileSystemLayout(
-      boost::optional<std::string> uuid = boost::none);
+      boost::optional<std::string> uuid = boost::none,
+      boost::optional<std::string> server_key = boost::none);
 
   // ==========================================================================
   //  Error handling helpers
@@ -218,8 +236,6 @@ class FsManager {
 
   Status OpenBlock(const BlockId& block_id,
                    std::unique_ptr<fs::ReadableBlock>* block);
-
-  Status DeleteBlock(const BlockId& block_id);
 
   bool BlockExists(const BlockId& block_id) const;
 
@@ -275,6 +291,12 @@ class FsManager {
   // Open() have not been called, this will crash.
   const std::string& uuid() const;
 
+  // Return the server key persisted on the local filesystem. After the server
+  // key is decrypted, it can be used to encrypt/decrypt file keys on the
+  // filesystem.  If PartialOpen() or Open() have not been called, this will
+  // crash. If the file system is not encrypted, it returns an empty string.
+  const std::string& server_key() const;
+
   // ==========================================================================
   //  file-system helpers
   // ==========================================================================
@@ -297,6 +319,10 @@ class FsManager {
 
   // Prints the file system trees under the file system roots.
   void DumpFileSystemTree(std::ostream& out);
+
+  bool meta_on_xfs() const {
+    return meta_on_xfs_;
+  }
 
  private:
   FRIEND_TEST(fs::FsManagerTestBase, TestDuplicatePaths);
@@ -331,6 +357,7 @@ class FsManager {
 
   // Create a new InstanceMetadataPB.
   Status CreateInstanceMetadata(boost::optional<std::string> uuid,
+                                boost::optional<std::string> server_key,
                                 InstanceMetadataPB* metadata);
 
   // Save a InstanceMetadataPB to the filesystem.
@@ -366,8 +393,6 @@ class FsManager {
   static const char *kTabletMetadataDirName;
   static const char *kWalDirName;
   static const char *kInstanceMetadataFileName;
-  static const char *kInstanceMetadataMagicNumber;
-  static const char *kTabletSuperBlockMagicNumber;
   static const char *kConsensusMetadataDirName;
 
   // The environment to be used for all filesystem operations.
@@ -395,6 +420,9 @@ class FsManager {
   ObjectIdGenerator oid_generator_;
 
   bool initted_;
+
+  // Cache whether or not the metadata directory is on an XFS directory.
+  bool meta_on_xfs_;
 
   DISALLOW_COPY_AND_ASSIGN(FsManager);
 };

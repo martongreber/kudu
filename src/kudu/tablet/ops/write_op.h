@@ -29,7 +29,8 @@
 #include <google/protobuf/stubs/port.h>
 
 #include "kudu/common/row_operations.h"
-#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/common/row_operations.pb.h"
+#include "kudu/common/schema.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
@@ -44,7 +45,6 @@
 
 namespace kudu {
 
-class Schema;
 class rw_semaphore;
 
 namespace rpc {
@@ -193,9 +193,10 @@ class WriteOpState : public OpState {
 
   void ReleaseMvccTxn(Op::OpResult result);
 
-  void set_schema_at_decode_time(const Schema* schema) {
+  void set_schema_at_decode_time(const SchemaPtr& schema) {
     std::lock_guard<simple_spinlock> l(op_state_lock_);
-    schema_at_decode_time_ = schema;
+    schema_ptr_at_decode_time_ = schema;
+    schema_at_decode_time_ = schema.get();
   }
 
   const Schema* schema_at_decode_time() const {
@@ -260,6 +261,11 @@ class WriteOpState : public OpState {
   // the partition lock.
   void TransferOrReleasePartitionLock();
 
+  // Copy metrics from 'op_metrics_' into the response's 'resource_metrics'.
+  // Should only be called before FinishApplyingOrAbort() to make sure that 'response_'
+  // has not been released.
+  void FillResponseMetrics(consensus::DriverType type);
+
  private:
   // Releases all the row locks acquired by this op.
   void ReleaseRowLocks();
@@ -319,6 +325,8 @@ class WriteOpState : public OpState {
   // at APPLY time to ensure we don't have races against schema change.
   // Protected by op_state_lock_.
   const Schema* schema_at_decode_time_;
+  // protect schema_at_decode_time_
+  SchemaPtr schema_ptr_at_decode_time_;
 
   // Lock that protects access to various fields of WriteOpState.
   mutable simple_spinlock op_state_lock_;
@@ -385,7 +393,10 @@ class WriteOp : public Op {
   std::string ToString() const override;
 
  private:
-  void UpdatePerRowErrors();
+  // For each row of this write operation, update corresponding metrics or set
+  // corresponding error information in the response. The former is for
+  // successfully written rows, the latter is for failed ones.
+  void UpdatePerRowMetricsAndErrors();
 
   // this op's start time
   MonoTime start_time_;

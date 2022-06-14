@@ -25,6 +25,7 @@
 #include <ostream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -39,18 +40,22 @@
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
+#include "kudu/client/table_alterer-internal.h"
 #include "kudu/client/value.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/integration-tests/cluster_itest_util.h"
+#include "kudu/integration-tests/test_workload.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
@@ -64,20 +69,28 @@
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/util/maintenance_manager.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/random.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+METRIC_DECLARE_histogram(log_gc_duration);
+METRIC_DECLARE_entity(tablet);
+
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_bool(log_inject_latency);
 DECLARE_bool(scanner_allow_snapshot_scans_with_logical_timestamps);
 DECLARE_bool(use_hybrid_clock);
 DECLARE_int32(flush_threshold_mb);
+DECLARE_int32(flush_threshold_secs);
 DECLARE_int32(heartbeat_interval_ms);
 DECLARE_int32(log_inject_latency_ms_mean);
+DECLARE_int32(log_segment_size_mb);
+DECLARE_int32(tablet_copy_download_file_inject_latency_ms);
 
 using kudu::client::CountTableRows;
 using kudu::client::KuduClient;
@@ -100,6 +113,8 @@ using kudu::client::KuduValue;
 using kudu::client::sp::shared_ptr;
 using kudu::cluster::InternalMiniCluster;
 using kudu::cluster::InternalMiniClusterOptions;
+using kudu::itest::TabletServerMap;
+using kudu::itest::TServerDetails;
 using kudu::master::AlterTableRequestPB;
 using kudu::master::AlterTableResponsePB;
 using kudu::tablet::TabletReplica;
@@ -138,7 +153,7 @@ class AlterTableTest : public KuduTest {
     KuduTest::SetUp();
 
     InternalMiniClusterOptions opts;
-    opts.num_tablet_servers = num_replicas();
+    opts.num_tablet_servers = num_tservers();
     cluster_.reset(new InternalMiniCluster(env_, opts));
     ASSERT_OK(cluster_->Start());
 
@@ -155,9 +170,9 @@ class AlterTableTest : public KuduTest {
              .num_replicas(num_replicas())
              .Create());
 
-    if (num_replicas() == 1) {
-      tablet_replica_ = LookupTabletReplica();
-      ASSERT_OK(tablet_replica_->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
+    if (num_replicas() > 0) {
+      tablet_replica_ = LookupLeaderTabletReplica();
+      CHECK(tablet_replica_);
     }
     LOG(INFO) << "Tablet successfully located";
   }
@@ -167,11 +182,34 @@ class AlterTableTest : public KuduTest {
     cluster_->Shutdown();
   }
 
-  scoped_refptr<TabletReplica> LookupTabletReplica() {
-    vector<scoped_refptr<TabletReplica> > replicas;
-    cluster_->mini_tablet_server(0)->server()->tablet_manager()->GetTabletReplicas(&replicas);
-    CHECK_EQ(1, replicas.size());
-    return replicas[0];
+  scoped_refptr<TabletReplica> LookupLeaderTabletReplica() {
+    static const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+    for (int i = 0; i < num_tservers(); ++i) {
+      vector<scoped_refptr<TabletReplica>> replicas;
+      cluster_->mini_tablet_server(i)->server()->tablet_manager()->GetTabletReplicas(&replicas);
+      if (replicas.empty()) {
+        continue;
+      }
+
+      TabletServerMap tablet_servers;
+      ValueDeleter deleter(&tablet_servers);
+      CHECK_OK(CreateTabletServerMap(
+          cluster_->master_proxy(), cluster_->messenger(), &tablet_servers));
+
+      TServerDetails* leader = nullptr;
+      std::string tablet_id = replicas[0]->tablet_id();
+      CHECK_OK(FindTabletLeader(tablet_servers, tablet_id, kTimeout, &leader));
+      replicas.clear();
+      cluster_->mini_tablet_server_by_uuid(leader->uuid())->
+          server()->tablet_manager()->GetTabletReplicas(&replicas);
+      for (const auto& replica : replicas) {
+        if (replica->tablet_id() == tablet_id) {
+          return replica;
+        }
+      }
+      CHECK(false) << "leader tablet replica must has been found in prev steps.";
+    }
+    return nullptr;
   }
 
   void ShutdownTS() {
@@ -196,7 +234,7 @@ class AlterTableTest : public KuduTest {
 
     ASSERT_OK(cluster_->mini_tablet_server(idx)->WaitStarted());
     if (idx == 0) {
-      tablet_replica_ = LookupTabletReplica();
+      tablet_replica_ = LookupLeaderTabletReplica();
     }
   }
 
@@ -231,6 +269,56 @@ class AlterTableTest : public KuduTest {
     table_alterer->AddColumn(column_name)->Type(KuduColumnSchema::INT32)->
         NotNull()->Default(KuduValue::FromInt(default_value));
     return table_alterer->timeout(timeout)->Alter();
+  }
+
+  Status SetReplicationFactor(const string& table_name,
+                              int32_t replication_factor) {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(table_name));
+    table_alterer->data_->set_replication_factor_to_ = replication_factor;
+    return table_alterer->timeout(MonoDelta::FromSeconds(60))->Alter();
+  }
+
+  enum class VerifyRowCount {
+    kEnable = 0,
+    kDisable
+  };
+  void VerifyTabletReplicaCount(int32_t replication_factor, VerifyRowCount verify_row_count) {
+    ASSERT_EVENTUALLY([&] {
+      ASSERT_EQ(replication_factor, tablet_replica_->consensus()->CommittedConfig().peers().size());
+
+      scoped_refptr<TabletReplica> first_node_replica;
+      uint64_t first_count = 0;
+      int actual_replica_count = 0;
+      for (int i = 0; i < num_tservers(); i++) {
+        vector<scoped_refptr<TabletReplica>> cur_node_replicas;
+        cluster_->mini_tablet_server(i)->server()->
+          tablet_manager()->GetTabletReplicas(&cur_node_replicas);
+        if (cur_node_replicas.empty()) continue;
+        ASSERT_EQ(1, cur_node_replicas.size());
+        const auto& cur_node_replica = cur_node_replicas[0];
+        if (!cur_node_replica->tablet()) continue;
+
+        ASSERT_OK(cur_node_replica->CheckRunning());
+        if (!first_node_replica) {
+          first_node_replica = cur_node_replica;
+          if (verify_row_count == VerifyRowCount::kEnable) {
+            ASSERT_OK(first_node_replica->CountLiveRows(&first_count));
+          }
+        } else {
+          ASSERT_EQ(first_node_replica->tablet()->tablet_id(),
+            cur_node_replica->tablet()->tablet_id());
+          ASSERT_EQ(*(first_node_replica->tablet()->schema()),
+                    *(cur_node_replica->tablet()->schema()));
+          if (verify_row_count == VerifyRowCount::kEnable) {
+            uint64_t cur_count = 0;
+            ASSERT_OK(cur_node_replica->CountLiveRows(&cur_count));
+            ASSERT_EQ(first_count, cur_count);
+          }
+        }
+        ++actual_replica_count;
+      }
+      ASSERT_EQ(replication_factor, actual_replica_count);
+    });
   }
 
   enum VerifyPattern {
@@ -288,8 +376,13 @@ class AlterTableTest : public KuduTest {
     }
   }
 
+  void CheckDisableCompaction(const bool& disable_compaction) {
+    ASSERT_EQ(tablet_replica_->tablet()->disable_compaction(), disable_compaction);
+  }
+
  protected:
   virtual int num_replicas() const { return 1; }
+  virtual int num_tservers() const { return 1; }
 
   static const char* const kTableName;
 
@@ -313,7 +406,8 @@ class AlterTableTest : public KuduTest {
 // Subclass which creates three servers and a replicated cluster.
 class ReplicatedAlterTableTest : public AlterTableTest {
  protected:
-  virtual int num_replicas() const OVERRIDE { return 3; }
+  int num_replicas() const override { return 3; }
+  int num_tservers() const override { return num_replicas() + 1; }
 };
 
 const char* const AlterTableTest::kTableName = "fake-table";
@@ -333,7 +427,7 @@ TEST_F(AlterTableTest, TestAddExistingColumn) {
 
   {
     Status s = AddNewI32Column(kTableName, "c1", 0);
-    ASSERT_TRUE(s.IsAlreadyPresent());
+    ASSERT_TRUE(s.IsAlreadyPresent()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "The column already exists: c1");
   }
 
@@ -363,7 +457,7 @@ TEST_F(AlterTableTest, TestAddNotNullableColumnWithoutDefaults) {
     master::CatalogManager::ScopedLeaderSharedLock l(catalog);
     ASSERT_OK(l.first_failed_status());
     Status s = catalog->AlterTableRpc(req, &resp, /*rpc=*/nullptr);
-    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "column `c2`: NOT NULL columns must have a default");
   }
 
@@ -549,7 +643,7 @@ TEST_F(AlterTableTest, TestAlterOnTSRestart) {
   {
     Status s = AddNewI32Column(kTableName, "new-32", 10,
                                MonoDelta::FromMilliseconds(500));
-    ASSERT_TRUE(s.IsTimedOut());
+    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
   }
 
   // Verify that the Schema is the old one
@@ -576,7 +670,7 @@ TEST_F(AlterTableTest, TestShutdownWithPendingTasks) {
   {
     Status s = AddNewI32Column(kTableName, "new-i32", 10,
                                MonoDelta::FromMilliseconds(500));
-    ASSERT_TRUE(s.IsTimedOut());
+    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
   }
 }
 
@@ -592,7 +686,7 @@ TEST_F(AlterTableTest, TestRestartTSDuringAlter) {
 
   Status s = AddNewI32Column(kTableName, "new-i32", 10,
                              MonoDelta::FromMilliseconds(1));
-  ASSERT_TRUE(s.IsTimedOut());
+  ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
 
   // Restart the TS while alter is running
   for (int i = 0; i < 3; i++) {
@@ -2147,6 +2241,221 @@ TEST_F(ReplicatedAlterTableTest, AlterTableAndDropTablet) {
   ASSERT_OK(client_->DeleteTable(kTableName));
 }
 
+TEST_F(ReplicatedAlterTableTest, AlterReplicationFactor) {
+  // 1. The default replication factor is 3.
+  ASSERT_EQ(0, tablet_replica_->tablet()->metadata()->schema_version());
+  NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+
+  // 2. Set replication factor to 1.
+  ASSERT_OK(SetReplicationFactor(kTableName, 1));
+  NO_FATALS(VerifyTabletReplicaCount(1, VerifyRowCount::kEnable));
+  ASSERT_EQ(1, tablet_replica_->tablet()->metadata()->schema_version());
+
+  // 3. Set replication factor to 3.
+  ASSERT_OK(SetReplicationFactor(kTableName, 3));
+  NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+  ASSERT_EQ(2, tablet_replica_->tablet()->metadata()->schema_version());
+
+  // 4. Set replication factor to 3 again.
+  ASSERT_OK(SetReplicationFactor(kTableName, 3));
+  NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+  ASSERT_EQ(2, tablet_replica_->tablet()->metadata()->schema_version());
+
+  // 5. Set replication factor to 5, while there are only 4 tservers in the cluster.
+  auto s = SetReplicationFactor(kTableName, 5);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "not enough live tablet servers to alter a table with the"
+                                    " requested replication factor 5; 4 tablet servers are alive");
+  NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+  ASSERT_EQ(2, tablet_replica_->tablet()->metadata()->schema_version());
+
+  // 6. Set replication factor to -1, it will fail.
+  s = SetReplicationFactor(kTableName, -1);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "illegal replication factor -1: minimum allowed replication"
+                                    " factor is 1 (controlled by --min_num_replicas)");
+  NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+  ASSERT_EQ(2, tablet_replica_->tablet()->metadata()->schema_version());
+
+  // 7. Set replication factor to 2, it will fail.
+  s = SetReplicationFactor(kTableName, 2);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "illegal replication factor 2: replication factor must be odd");
+  NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+  ASSERT_EQ(2, tablet_replica_->tablet()->metadata()->schema_version());
+
+  // 8. Set replication factor to 9, it will fail.
+  s = SetReplicationFactor(kTableName, 9);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "illegal replication factor 9: maximum allowed replication "
+                                    "factor is 7 (controlled by --max_num_replicas)");
+  NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+  ASSERT_EQ(2, tablet_replica_->tablet()->metadata()->schema_version());
+
+  ASSERT_OK(client_->DeleteTable(kTableName));
+}
+
+TEST_F(ReplicatedAlterTableTest, AlterReplicationFactorWhileScanning) {
+  // Delete table at first, and create table by TestWorkload later.
+  ASSERT_OK(client_->DeleteTable(kTableName));
+
+  // Write some data for scan later.
+  {
+    TestWorkload workload(cluster_.get());
+    workload.set_table_name(kTableName);
+    workload.set_num_tablets(1);
+    workload.set_num_replicas(1);
+    workload.set_num_write_threads(10);
+    workload.Setup();
+    workload.Start();
+    ASSERT_EVENTUALLY([&]() {
+      ASSERT_GE(workload.rows_inserted(), 30000);
+    });
+    workload.StopAndJoin();
+  }
+
+  // Keep scaning the table.
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_num_write_threads(0);
+  workload.set_num_read_threads(10);
+  workload.set_read_errors_allowed(false);
+  workload.Setup();
+  workload.Start();
+
+  // Set replication factor to 3.
+  ASSERT_OK(SetReplicationFactor(kTableName, 3));
+  ASSERT_EVENTUALLY([&] {
+    tablet_replica_ = LookupLeaderTabletReplica();
+    NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+    ASSERT_EQ(1, tablet_replica_->tablet()->metadata()->schema_version());
+  });
+
+  // Set replication factor to 1.
+  ASSERT_OK(SetReplicationFactor(kTableName, 1));
+  ASSERT_EVENTUALLY([&] {
+    tablet_replica_ = LookupLeaderTabletReplica();
+    NO_FATALS(VerifyTabletReplicaCount(1, VerifyRowCount::kEnable));
+    ASSERT_EQ(2, tablet_replica_->tablet()->metadata()->schema_version());
+  });
+
+  workload.StopAndJoin();
+}
+
+TEST_F(ReplicatedAlterTableTest, AlterReplicationFactorWhileWriting) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  // Additionally, make the WAL segments smaller to encourage more frequent
+  // roll-over onto WAL segments.
+  FLAGS_flush_threshold_secs = 0;
+  FLAGS_log_segment_size_mb = 1;
+
+  // Make tablet replica copying slow, to make it easier to spot violations.
+  FLAGS_tablet_copy_download_file_inject_latency_ms = 2000;
+
+  // Delete table at first, and create table by TestWorkload later.
+  ASSERT_OK(client_->DeleteTable(kTableName));
+
+  // Keep writing the table.
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_num_tablets(1);
+  workload.set_num_replicas(1);
+  workload.set_num_write_threads(10);
+  workload.set_payload_bytes(1024);
+  workload.set_write_timeout_millis(5 * 1000);
+  workload.set_timeout_allowed(false);
+  workload.set_network_error_allowed(false);
+  workload.set_remote_error_allowed(false);
+  workload.Setup();
+  workload.Start();
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_GE(workload.rows_inserted(), 200000);
+  });
+
+  // Set replication factor to 3.
+  ASSERT_OK(SetReplicationFactor(kTableName, 3));
+  ASSERT_EVENTUALLY([&] {
+    tablet_replica_ = LookupLeaderTabletReplica();
+    // Not verify row count while table is being written.
+    NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kDisable));
+    ASSERT_EQ(1, tablet_replica_->tablet()->metadata()->schema_version());
+  });
+
+  // Stop writing and verify again.
+  workload.StopAndJoin();
+  ASSERT_EVENTUALLY([&] {
+    tablet_replica_ = LookupLeaderTabletReplica();
+    NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+    ASSERT_EQ(1, tablet_replica_->tablet()->metadata()->schema_version());
+  });
+
+  // Set replication factor to 1.
+  workload.Start();
+  ASSERT_OK(SetReplicationFactor(kTableName, 1));
+  ASSERT_EVENTUALLY([&] {
+    tablet_replica_ = LookupLeaderTabletReplica();
+    NO_FATALS(VerifyTabletReplicaCount(1, VerifyRowCount::kEnable));
+    ASSERT_EQ(2, tablet_replica_->tablet()->metadata()->schema_version());
+  });
+
+  workload.StopAndJoin();
+}
+
+TEST_F(ReplicatedAlterTableTest, AlterReplicationFactorAfterWALGCed) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  // Additionally, make the WAL segments smaller to encourage more frequent
+  // roll-over onto WAL segments.
+  FLAGS_flush_threshold_secs = 0;
+  FLAGS_log_segment_size_mb = 1;
+
+  ASSERT_OK(client_->DeleteTable(kTableName));
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_num_tablets(1);
+  workload.set_num_replicas(1);
+  workload.set_num_write_threads(10);
+  workload.Setup();
+  workload.Start();
+
+  // Function to fetch the GC count of all tablet's WAL.
+  auto get_tablet_wal_gc_count = [&] (int tserver_idx) {
+    int64_t tablet_wal_gc_count = 0;
+    itest::GetInt64Metric(
+        HostPort(cluster_->mini_tablet_server(tserver_idx)->bound_http_addr()),
+        &METRIC_ENTITY_tablet,
+        "*",
+        &METRIC_log_gc_duration,
+        "total_count",
+        &tablet_wal_gc_count);
+    return tablet_wal_gc_count;
+  };
+
+  vector<int64_t> orig_gc_count(num_tservers());
+  for (int tserver_idx = 0; tserver_idx < num_tservers(); tserver_idx++) {
+    orig_gc_count[tserver_idx] = get_tablet_wal_gc_count(tserver_idx);
+  }
+
+  // Wait util some WALs have been GCed.
+  ASSERT_EVENTUALLY([&] {
+    int num_tserver_gc_updated = 0;
+    for (int tserver_idx = 0; tserver_idx < num_tservers(); tserver_idx++) {
+      if (get_tablet_wal_gc_count(tserver_idx) > orig_gc_count[tserver_idx]) {
+        num_tserver_gc_updated++;
+      }
+    }
+    ASSERT_GE(num_tserver_gc_updated, 1);
+  });
+  workload.StopAndJoin();
+
+  // Set replication factor to 3.
+  ASSERT_OK(SetReplicationFactor(kTableName, 3));
+  tablet_replica_ = LookupLeaderTabletReplica();
+  NO_FATALS(VerifyTabletReplicaCount(3, VerifyRowCount::kEnable));
+  ASSERT_EQ(1, tablet_replica_->tablet()->metadata()->schema_version());
+}
+
 TEST_F(AlterTableTest, TestRenameStillCreatingTable) {
   const string kNewTableName = "foo";
 
@@ -2206,6 +2515,32 @@ TEST_F(AlterTableTest, TestMaintenancePriorityAlter) {
   // Reset to default priority level.
   ASSERT_OK(table_alterer->AlterExtraConfig({{"kudu.table.maintenance_priority", "0"}})->Alter());
   NO_FATALS(CheckMaintenancePriority(0));
+}
+
+TEST_F(AlterTableTest, TestDisableCompactAlter) {
+  // Default disable_compaction.
+  NO_FATALS(CheckDisableCompaction(false));
+
+  // Set disable_compaction true.
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  ASSERT_OK(table_alterer->AlterExtraConfig(
+                           {{"kudu.table.disable_compaction", "true"}})->Alter());
+  NO_FATALS(CheckDisableCompaction(true));
+
+  // Reset to default disable_compaction.
+  ASSERT_OK(table_alterer->AlterExtraConfig(
+                           {{"kudu.table.disable_compaction", ""}})->Alter());
+  NO_FATALS(CheckDisableCompaction(false));
+
+  // Set disable_compaction false.
+  ASSERT_OK(table_alterer->AlterExtraConfig(
+                           {{"kudu.table.disable_compaction", "false"}})->Alter());
+  NO_FATALS(CheckDisableCompaction(false));
+
+  // Set to invalid string.
+  Status s = table_alterer->AlterExtraConfig(
+                           {{"kudu.table.disable_compaction", "ok"}})->Alter();
+  ASSERT_TRUE(s.IsInvalidArgument());
 }
 
 } // namespace kudu

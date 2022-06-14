@@ -65,10 +65,21 @@ are several different ways to determine whether an ext4 mountpoint is backed by 
 ext3, or ext4 formatted device; see link:https://unix.stackexchange.com/q/60723[this Stack
 Exchange post] for details.
 
-link:administration.html#change_dir_config[Changing Directory Configurations] documentation.
-
 Without hole punching support, the log block manager is unsafe to use. It won't
 ever delete blocks, and will consume ever more space on disk.
+
+You can run the following sequence of commands on a mounted file system to
+check whether it supports hole punching (the originally allocated 10MiB
+turns into 5MiB after punching a 5MiB hole in the file at 1MiB offset):
+
+----
+$ dd if=/dev/zero of=hole_punch bs=1M count=10 2>/dev/null
+$ du -h hole_punch
+10M     hole_punch
+$ fallocate -p -o 1M -l 5M hole_punch
+$ du -h hole_punch
+5.0M    hole_punch
+----
 
 If you can't use hole punching in your environment, you can still
 try Kudu. Enable the file block manager instead of the log block manager by
@@ -337,7 +348,7 @@ $ ntpq -nc opeers
 TIP: Both `lpeers` and `opeers` may be helpful as `lpeers` lists refid and
 jitter, while `opeers` lists clock dispersion.
 
-
+[[chronyd]]
 ===== Installing And Running `chronyd`
 Kudu has been tested and is supported on machines whose local clock is
 synchronized with NTP using `chronyd` version 3.2 and newer.
@@ -503,6 +514,36 @@ Total valid RX  : 50
 For troubleshooting tips on clock synchronisation with chronyd see
 link:https://chrony.tuxfamily.org/faq.html#_computer_is_not_synchronising[this
 useful guide].
+
+===== Notes on running `chronyd` in local reference mode
+When running Kudu cluster in an isolated network, it's possible to synchronize
+the clocks on all nodes with one another, but not necessarily to true time.
+The local clock of one dedicated server can be kept vaguely in line with true
+time by manual input, and other nodes will synchronize with that one. The
+`chronyd` at the dedicated server runs in
+link:https://chrony.tuxfamily.org/doc/3.4/chrony.conf.html#local[local reference mode],
+and `chronyd` at other nodes synchronize with it as with a regular true time
+reference.
+
+If using such a setup, it's not recommended to run any Kudu servers at the
+node where `chronyd` is running with local reference mode (at least for
+`chronyd` of version 3.4 and below). Otherwise, the following might happen:
+
+ - `chronyc tracking` reports that all is well, `Leap Status` is `Normal`
+ - `ntptime` reports that the local clock is out of sync
+ - `ntp_gettime() returns code 5 (ERROR)`
+ - `ntp_adjtime() returns code 5 (ERROR)` with `status 0x40 (UNSYNC)`
+
+With that, `kudu-master` and `kudu-tserver` fail to start, reporting an
+errors like below:
+
+----
+E0321 09:47:04.076095  2558 master_main.cc:40] Service unavailable: RunMasterServer() failed: Cannot initialize clock: timed out waiting for clock synchronisation: Error reading clock. Clock considered unsynchronized
+----
+
+----
+E0321 09:50:03.023491  2853 tablet_server_main.cc:40] Service unavailable: RunTabletServer() failed: Cannot initialize clock: timed out waiting for clock synchronisation: Error reading clock. Clock considered unsynchronized
+----
 
 ==== NTP Configuration Best Practices
 In order to provide stable time synchronization with low maximum error, follow

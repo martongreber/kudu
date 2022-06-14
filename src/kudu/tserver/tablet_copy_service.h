@@ -20,7 +20,6 @@
 #include <string>
 #include <unordered_map>
 
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/tserver/tablet_copy.pb.h"
 #include "kudu/tserver/tablet_copy.service.h"
@@ -63,29 +62,33 @@ class TabletCopyServiceImpl : public TabletCopyServiceIf {
                             google::protobuf::Message* resp,
                             rpc::RpcContext* rpc) override;
 
-  virtual void BeginTabletCopySession(const BeginTabletCopySessionRequestPB* req,
-                                           BeginTabletCopySessionResponsePB* resp,
-                                           rpc::RpcContext* context) OVERRIDE;
+  void BeginTabletCopySession(const BeginTabletCopySessionRequestPB* req,
+                              BeginTabletCopySessionResponsePB* resp,
+                              rpc::RpcContext* context) override;
 
-  virtual void CheckSessionActive(const CheckTabletCopySessionActiveRequestPB* req,
-                                  CheckTabletCopySessionActiveResponsePB* resp,
-                                  rpc::RpcContext* context) OVERRIDE;
+  void CheckSessionActive(const CheckTabletCopySessionActiveRequestPB* req,
+                          CheckTabletCopySessionActiveResponsePB* resp,
+                          rpc::RpcContext* context) override;
 
-  virtual void FetchData(const FetchDataRequestPB* req,
-                         FetchDataResponsePB* resp,
-                         rpc::RpcContext* context) OVERRIDE;
+  void FetchData(const FetchDataRequestPB* req,
+                 FetchDataResponsePB* resp,
+                 rpc::RpcContext* context) override;
 
-  virtual void EndTabletCopySession(const EndTabletCopySessionRequestPB* req,
-                                         EndTabletCopySessionResponsePB* resp,
-                                         rpc::RpcContext* context) OVERRIDE;
+  void EndTabletCopySession(const EndTabletCopySessionRequestPB* req,
+                            EndTabletCopySessionResponsePB* resp,
+                            rpc::RpcContext* context) override;
 
-  virtual void Shutdown() OVERRIDE;
+  void Shutdown() override;
+
+  // Validate the data identifier in a FetchData request.
+  static Status ValidateFetchRequestDataId(const DataIdPB& data_id,
+                                           TabletCopyErrorPB::Code* app_error);
 
  private:
   struct SessionEntry {
-    explicit SessionEntry(scoped_refptr<TabletCopySourceSession> session_in);
+    explicit SessionEntry(scoped_refptr<RemoteTabletCopySourceSession> session_in);
 
-    scoped_refptr<TabletCopySourceSession> session;
+    scoped_refptr<RemoteTabletCopySourceSession> session;
     MonoTime last_accessed_time; // Time this session was last accessed.
     MonoDelta expire_timeout;
   };
@@ -95,12 +98,7 @@ class TabletCopyServiceImpl : public TabletCopyServiceIf {
   // Look up session in session map.
   Status FindSessionUnlocked(const std::string& session_id,
                              TabletCopyErrorPB::Code* app_error,
-                             scoped_refptr<TabletCopySourceSession>* session) const;
-
-  // Validate the data identifier in a FetchData request.
-  Status ValidateFetchRequestDataId(const DataIdPB& data_id,
-                                    TabletCopyErrorPB::Code* app_error,
-                                    const scoped_refptr<TabletCopySourceSession>& session) const;
+                             scoped_refptr<RemoteTabletCopySourceSession>* session) const;
 
   // Take note of session activity; Re-update the session timeout deadline.
   void ResetSessionExpirationUnlocked(const std::string& session_id);

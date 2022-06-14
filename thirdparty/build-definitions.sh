@@ -419,7 +419,8 @@ build_libunwind() {
   pushd $LIBUNWIND_BDIR
   # Disable minidebuginfo, which depends on liblzma, until/unless we decide to
   # add liblzma to thirdparty.
-  $LIBUNWIND_SOURCE/configure \
+  CFLAGS="$EXTRA_CFLAGS" \
+    $LIBUNWIND_SOURCE/configure \
     --disable-minidebuginfo \
     --with-pic \
     --prefix=$PREFIX
@@ -575,7 +576,7 @@ build_lz4() {
     -DBUILD_STATIC_LIBS=On \
     -DCMAKE_INSTALL_PREFIX:PATH=$PREFIX \
     $EXTRA_CMAKE_FLAGS \
-    $LZ4_SOURCE/contrib/cmake_unofficial
+    $LZ4_SOURCE/build/cmake
   ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }
@@ -738,6 +739,7 @@ build_curl() {
     --disable-smtp \
     --disable-telnet \
     --disable-tftp \
+    --without-brotli \
     --without-libidn2 \
     --without-libpsl \
     --without-librtmp \
@@ -1087,5 +1089,53 @@ build_postgres() {
     --without-zlib
 
   make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  popd
+}
+
+build_oatpp(){
+  OATPP_BUILD_DIR=$TP_BUILD_DIR/$OATPP_NAME$MODE_SUFFIX
+  mkdir -p $OATPP_BUILD_DIR
+  pushd $OATPP_BUILD_DIR
+  cmake \
+    -DCMAKE_BUILD_TYPE=release \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DOATPP_DISABLE_ENV_OBJECT_COUNTERS=ON \
+    -DOATPP_BUILD_TESTS=OFF \
+    $OATPP_SOURCE
+  make -j$PARALLEL install
+  popd
+}
+
+build_oatpp_swagger(){
+  OATPP_SWAGGER_BUILD_DIR=$TP_BUILD_DIR/$OATPP_SWAGGER_NAME$MODE_SUFFIX
+  mkdir -p $OATPP_SWAGGER_BUILD_DIR
+  pushd $OATPP_SWAGGER_BUILD_DIR
+  cmake \
+    -DCMAKE_BUILD_TYPE=release \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DOATPP_BUILD_TESTS=OFF \
+    -DOATPP_INSTALL=ON \
+    $OATPP_SWAGGER_SOURCE
+  make -j$PARALLEL install
+  popd
+}
+
+build_jwt_cpp() {
+  JWT_CPP_BUILD_DIR=$TP_BUILD_DIR/$JWT_CPP_NAME$MODE_SUFFIX
+  mkdir -p $JWT_CPP_BUILD_DIR
+  pushd $JWT_CPP_BUILD_DIR
+  CFLAGS="$EXTRA_CFLAGS" \
+    CXXFLAGS="$EXTRA_CXXFLAGS $OPENSSL_CFLAGS" \
+    LDFLAGS="$EXTRA_LDFLAGS $OPENSSL_LDFLAGS" \
+    cmake \
+    -DCMAKE_BUILD_TYPE=release \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DJWT_BUILD_EXAMPLES=OFF \
+    $JWT_CPP_SOURCE
+  make -j$PARALLEL install
   popd
 }

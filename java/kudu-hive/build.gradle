@@ -24,6 +24,7 @@ dependencies {
   // Transitively required through hive-metastore,
   // which has marked it as an optional dependency.
   provided libs.hadoopCommon
+  provided libs.hadoopHdfs
   provided libs.hadoopMRClientCommon
 
   testCompile project(path: ":kudu-test-utils", configuration: "shadow")

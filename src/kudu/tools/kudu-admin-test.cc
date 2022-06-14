@@ -1906,6 +1906,138 @@ TEST_F(AdminCliTest, TestDescribeTable) {
       ")\n"
       "OWNER alice\n"
       "REPLICAS 1");
+
+  s = RunKuduTool({
+                      "table",
+                      "describe",
+                      cluster_->master()->bound_rpc_addr().ToString(),
+                      kAnotherTableId,
+                      "-show_avro_format_schema"
+                  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+
+  ASSERT_STR_CONTAINS(
+      stdout,
+      Substitute(
+          "{\n"
+          "    \"type\": \"table\",\n"
+          "    \"name\": \"TestAnotherTable\",\n"
+          "    \"namespace\": \"kudu.cluster.$0\",\n"
+          "    \"fields\": [\n"
+          "        {\n"
+          "            \"name\": \"key_hash0\",\n"
+          "            \"type\": \"int\"\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"key_hash1\",\n"
+          "            \"type\": \"int\"\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"key_hash2\",\n"
+          "            \"type\": \"int\"\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"key_range\",\n"
+          "            \"type\": \"int\"\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"int8_val\",\n"
+          "            \"type\": [\n"
+          "                \"null\",\n"
+          "                \"int\"\n"
+          "            ]\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"int16_val\",\n"
+          "            \"type\": [\n"
+          "                \"null\",\n"
+          "                \"int\"\n"
+          "            ]\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"int32_val\",\n"
+          "            \"type\": [\n"
+          "                \"null\",\n"
+          "                \"int\"\n"
+          "            ]\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"int64_val\",\n"
+          "            \"type\": [\n"
+          "                \"null\",\n"
+          "                \"long\"\n"
+          "            ],\n"
+          "            \"default\": \"123\"\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"timestamp_val\",\n"
+          "            \"type\": [\n"
+          "                {\n"
+          "                    \"type\": \"long\",\n"
+          "                    \"logicalType\": \"time-micros\"\n"
+          "                }\n"
+          "            ]\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"date_val\",\n"
+          "            \"type\": [\n"
+          "                {\n"
+          "                    \"type\": \"int\",\n"
+          "                    \"logicalType\": \"date\"\n"
+          "                }\n"
+          "            ]\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"string_val\",\n"
+          "            \"type\": [\n"
+          "                \"null\",\n"
+          "                \"string\"\n"
+          "            ],\n"
+          "            \"default\": \"\\\"hello\\\"\"\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"bool_val\",\n"
+          "            \"type\": [\n"
+          "                \"null\",\n"
+          "                \"bool\"\n"
+          "            ],\n"
+          "            \"default\": \"false\"\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"float_val\",\n"
+          "            \"type\": [\n"
+          "                \"null\",\n"
+          "                \"float\"\n"
+          "            ]\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"double_val\",\n"
+          "            \"type\": [\n"
+          "                \"null\",\n"
+          "                \"double\"\n"
+          "            ],\n"
+          "            \"default\": \"123.4\"\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"binary_val\",\n"
+          "            \"type\": [\n"
+          "                \"null\",\n"
+          "                \"bytes\"\n"
+          "            ]\n"
+          "        },\n"
+          "        {\n"
+          "            \"name\": \"decimal_val\",\n"
+          "            \"type\": [\n"
+          "                {\n"
+          "                    \"type\": \"bytes\",\n"
+          "                    \"logicalType\": \"decimal\"\n"
+          "                }\n"
+          "            ]\n"
+          "        }\n"
+          "    ]\n"
+          "}\n",
+      client_->cluster_id())
+  );
 }
 
 TEST_F(AdminCliTest, TestDescribeTableNoOwner) {
@@ -2902,9 +3034,13 @@ TEST_F(AdminCliTest, TestAddAndDropRangePartitionForMultipleRangeColumnsTable) {
 }
 
 namespace {
+constexpr const char* kPrincipal = "oryx";
 
 vector<string> RebuildMasterCmd(const ExternalMiniCluster& cluster,
-                                bool log_to_stderr = false) {
+                                int tserver_num,
+                                bool is_secure, bool log_to_stderr = false) {
+  CHECK_GT(tserver_num, 0);
+  CHECK_LE(tserver_num, cluster.num_tablet_servers());
   vector<string> command = {
     "master",
     "unsafe_rebuild",
@@ -2916,7 +3052,10 @@ vector<string> RebuildMasterCmd(const ExternalMiniCluster& cluster,
   if (log_to_stderr) {
     command.emplace_back("--logtostderr");
   }
-  for (int i = 0; i < cluster.num_tablet_servers(); i++) {
+  if (is_secure) {
+    command.emplace_back(Substitute("--sasl_protocol_name=$0", kPrincipal));
+  }
+  for (int i = 0; i < tserver_num; i++) {
     auto* ts = cluster.tablet_server(i);
     command.emplace_back(ts->bound_rpc_hostport().ToString());
   }
@@ -2949,7 +3088,8 @@ TEST_F(AdminCliTest, TestRebuildMasterWhenNonEmpty) {
   NO_FATALS(cluster_->master()->Shutdown());
   string stdout;
   string stderr;
-  Status s = RunKuduTool(RebuildMasterCmd(*cluster_, /*log_to_stderr*/true),
+  Status s = RunKuduTool(RebuildMasterCmd(*cluster_, FLAGS_num_tablet_servers,
+                                          /*is_secure*/false, /*log_to_stderr*/true),
                          &stdout, &stderr);
   ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
   ASSERT_STR_CONTAINS(stderr, "must be empty");
@@ -2957,7 +3097,8 @@ TEST_F(AdminCliTest, TestRebuildMasterWhenNonEmpty) {
   // Delete the contents of the old master from disk. This should allow the
   // tool to run.
   ASSERT_OK(cluster_->master()->DeleteFromDisk());
-  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, /*log_to_stderr*/true),
+  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, FLAGS_num_tablet_servers,
+                                         /*is_secure*/false, /*log_to_stderr*/true),
                         &stdout, &stderr));
   ASSERT_STR_NOT_CONTAINS(stderr, "must be empty");
   ASSERT_STR_CONTAINS(stdout,
@@ -3000,7 +3141,8 @@ TEST_F(AdminCliTest, TestRebuildMasterWithTombstones) {
   ASSERT_OK(cluster_->master()->DeleteFromDisk());
   string stdout;
   string stderr;
-  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, /*log_to_stderr*/true),
+  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, FLAGS_num_tablet_servers,
+                                         /*is_secure*/false, /*log_to_stderr*/true),
                                          &stdout, &stderr));
   ASSERT_STR_CONTAINS(stderr, Substitute("Skipping replica of tablet $0 of table $1",
                                          tablet_id, kTable));
@@ -3029,6 +3171,111 @@ TEST_F(AdminCliTest, TestRebuildMasterWithTombstones) {
   NO_FATALS(cv.CheckCluster());
 }
 
+TEST_F(AdminCliTest, TestAddColumnsAndRebuildMaster) {
+  FLAGS_num_tablet_servers = 3;
+  FLAGS_num_replicas = 3;
+
+  NO_FATALS(BuildAndStart());
+
+  // Add a column and shutdown a tserver, the tserver holds a schema with a lower version.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableId));
+    table_alterer->AddColumn("old_column_0")->Type(KuduColumnSchema::INT32);
+    ASSERT_OK(table_alterer->Alter());
+  }
+  NO_FATALS(cluster_->tablet_server(0)->Shutdown());
+
+  // Add another column, the latest schema has a higher version.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableId));
+    table_alterer->AddColumn("old_column_1")->Type(KuduColumnSchema::INT32);
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  // Shut down the master and wipe out its data.
+  NO_FATALS(cluster_->master()->Shutdown());
+  ASSERT_OK(cluster_->master()->DeleteFromDisk());
+
+  // Restart the shutdown tserver, which holds a lower version schema.
+  ASSERT_OK(cluster_->tablet_server(0)->Restart());
+
+  // Rebuild the master with the tool.
+  // The tool will firstly use schema on tserver-0 which holds an outdated schema, then
+  // use the newer schema on tserver-1 to rebuild master.
+  string stdout;
+  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, 2, /*is_secure*/false, /*log_to_stderr*/true),
+                        &stdout));
+  ASSERT_STR_CONTAINS(stdout, "Rebuilt from 2 tablet servers, of which 0 had errors");
+  ASSERT_STR_CONTAINS(stdout, "Rebuilt from 2 replicas, of which 0 had errors");
+
+  // Restart the master and the tablet servers.
+  // The tablet servers must be restarted so they accept the new master's certs.
+  for (int i = 0; i < FLAGS_num_tablet_servers; i++) {
+    cluster_->tablet_server(i)->Shutdown();
+  }
+  ASSERT_OK(cluster_->Restart());
+  WaitForTSAndReplicas();
+
+  // Wait the cluster to become healthy.
+  string master_address = cluster_->master()->bound_rpc_addr().ToString();
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_OK(RunKuduTool({"cluster", "ksck", master_address}, nullptr, nullptr));
+  });
+
+  // The client has to be rebuilt since there's a new master.
+  KuduClientBuilder builder;
+  ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+
+  // Make sure we can add columns to the table we rebuilt.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableId));
+    table_alterer->AddColumn("new_column_0")->Type(KuduColumnSchema::INT32);
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  // Check master and all tservers have the latest schema.
+  ASSERT_OK(RunKuduTool({"table", "describe", master_address, kTableId}, &stdout));
+  ASSERT_STR_MATCHES(stdout, "old_column_0.*old_column_1.*new_column_0");
+  for (int i = 0; i < FLAGS_num_tablet_servers; i++) {
+    const string& ts_addr = cluster_->tablet_server(i)->bound_rpc_addr().ToString();
+    ASSERT_OK(RunKuduTool({"remote_replica", "list", ts_addr, "-include_schema"}, &stdout));
+    ASSERT_STR_MATCHES(stdout, "old_column_0.*old_column_1.*new_column_0");
+  }
+
+  // Check the altered table schema in client view, and check it is writable and readable.
+  {
+    KuduSchema schema;
+    ASSERT_OK(client_->GetTableSchema(kTableId, &schema));
+    ASSERT_EQ(6, schema.num_columns());
+    // Here we use the first column to initialize an object of KuduColumnSchema
+    // for there is no default constructor for it.
+    KuduColumnSchema col_schema = schema.Column(0);
+    ASSERT_TRUE(schema.HasColumn("old_column_0", &col_schema));
+    ASSERT_TRUE(schema.HasColumn("old_column_1", &col_schema));
+    ASSERT_TRUE(schema.HasColumn("new_column_0", &col_schema));
+
+    client::sp::shared_ptr<KuduTable> table;
+    ASSERT_OK(client_->OpenTable(kTableId, &table));
+
+    TestWorkload workload(cluster_.get());
+    workload.set_table_name(kTableId);
+    workload.set_num_write_threads(1);
+    workload.set_schema(table->schema());
+    workload.Setup();
+    workload.Start();
+    while (workload.rows_inserted() < 1000) {
+      SleepFor(MonoDelta::FromMilliseconds(10));
+    }
+    workload.StopAndJoin();
+
+    vector<string> rows;
+    ScanTableToStrings(table.get(), &rows);
+    for (const auto& row : rows) {
+      ASSERT_STR_MATCHES(row, "old_column_0.*old_column_1.*new_column_0");
+    }
+  }
+}
+
 class SecureClusterAdminCliTest : public KuduTest {
  public:
   void SetUpCluster(bool is_secure) {
@@ -3036,10 +3283,12 @@ class SecureClusterAdminCliTest : public KuduTest {
     opts.num_tablet_servers = 3;
     if (is_secure) {
       opts.enable_kerberos = true;
+      opts.principal = "oryx";
     }
     cluster_.reset(new ExternalMiniCluster(std::move(opts)));
     ASSERT_OK(cluster_->Start());
     KuduClientBuilder builder;
+    builder.sasl_protocol_name(kPrincipal);
     ASSERT_OK(cluster_->CreateClient(&builder, &client_));
   }
 
@@ -3051,6 +3300,13 @@ class SecureClusterAdminCliTest : public KuduTest {
   client::sp::shared_ptr<KuduClient> client_;
 };
 
+TEST_F(SecureClusterAdminCliTest, TestNonDefaultPrincipal) {
+  ASSERT_OK(RunKuduTool({"master",
+                         "list",
+                         Substitute("--sasl_protocol_name=$0", kPrincipal),
+                         HostPort::ToCommaSeparatedString(cluster_->master_rpc_addrs())}));
+}
+
 class SecureClusterAdminCliParamTest : public SecureClusterAdminCliTest,
                                        public ::testing::WithParamInterface<bool> {
  public:
@@ -3061,6 +3317,7 @@ class SecureClusterAdminCliParamTest : public SecureClusterAdminCliTest,
 
 // Basic test that the master rebuilder works in the happy case.
 TEST_P(SecureClusterAdminCliParamTest, TestRebuildMaster) {
+  bool is_secure = GetParam();
   constexpr const char* kPreRebuildTableName = "pre_rebuild";
   constexpr const char* kPostRebuildTableName = "post_rebuild";
   constexpr int kNumRows = 10000;
@@ -3085,7 +3342,8 @@ TEST_P(SecureClusterAdminCliParamTest, TestRebuildMaster) {
 
   // Rebuild the master with the tool.
   string stdout;
-  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_), &stdout));
+  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, FLAGS_num_tablet_servers, is_secure),
+                        &stdout));
   ASSERT_STR_CONTAINS(stdout,
                       "Rebuilt from 3 tablet servers, of which 0 had errors");
   ASSERT_STR_CONTAINS(stdout, "Rebuilt from 3 replicas, of which 0 had errors");
@@ -3113,6 +3371,7 @@ TEST_P(SecureClusterAdminCliParamTest, TestRebuildMaster) {
                                             << " of " << rows.size();
   }
   // The cluster should still be considered healthy.
+  FLAGS_sasl_protocol_name = kPrincipal;
   ClusterVerifier cv(cluster_.get());
   NO_FATALS(cv.CheckCluster());
 
@@ -3132,7 +3391,7 @@ TEST_P(SecureClusterAdminCliParamTest, TestRebuildMasterAndAddColumns) {
   FLAGS_num_tablet_servers = 3;
   FLAGS_num_replicas = 3;
 
-  // Create a table and insert some rows
+  // Create a table and insert some rows.
   NO_FATALS(MakeTestTable(kTableName, kNumRows, /*num_replicas*/3, cluster_.get()));
 
   // Shut down the master and wipe out its data.
@@ -3141,7 +3400,8 @@ TEST_P(SecureClusterAdminCliParamTest, TestRebuildMasterAndAddColumns) {
 
   // Rebuild the master with the tool.
   string stdout;
-  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, is_secure), &stdout));
+  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, FLAGS_num_tablet_servers, is_secure),
+                        &stdout));
   ASSERT_STR_CONTAINS(stdout,
                       "Rebuilt from 3 tablet servers, of which 0 had errors");
   ASSERT_STR_CONTAINS(stdout, "Rebuilt from 3 replicas, of which 0 had errors");
@@ -3180,6 +3440,7 @@ TEST_P(SecureClusterAdminCliParamTest, TestRebuildMasterAndAddColumns) {
 
 INSTANTIATE_TEST_SUITE_P(IsSecure, SecureClusterAdminCliParamTest,
                          ::testing::Bool());
+
 
 } // namespace tools
 } // namespace kudu

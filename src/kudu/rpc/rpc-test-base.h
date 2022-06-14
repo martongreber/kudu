@@ -91,12 +91,12 @@ namespace rpc {
 class GenericCalculatorService : public ServiceIf {
  public:
   static const std::string kFullServiceName;
-  static const char *kAddMethodName;
-  static const char *kSleepMethodName;
-  static const char *kSleepWithSidecarMethodName;
-  static const char *kPushStringsMethodName;
-  static const char *kSendTwoStringsMethodName;
-  static const char *kAddExactlyOnce;
+  static const std::string kAddMethodName;
+  static const std::string kSleepMethodName;
+  static const std::string kSleepWithSidecarMethodName;
+  static const std::string kPushStringsMethodName;
+  static const std::string kSendTwoStringsMethodName;
+  static const std::string kAddExactlyOnce;
 
   static const char* kFirstString;
   static const char* kSecondString;
@@ -261,6 +261,7 @@ class CalculatorService : public CalculatorServiceIf {
 
   void Add(const AddRequestPB *req, AddResponsePB *resp, RpcContext *context) override {
     CHECK_GT(context->GetTransferSize(), 0);
+    CHECK_GE(context->call_id(), 0);
     resp->set_result(req->x() + req->y());
     context->RespondSuccess();
   }
@@ -399,13 +400,14 @@ class CalculatorService : public CalculatorServiceIf {
 
 };
 
-const std::string GenericCalculatorService::kFullServiceName = "kudu.rpc.GenericCalculatorService";
-const char *GenericCalculatorService::kAddMethodName = "Add";
-const char *GenericCalculatorService::kSleepMethodName = "Sleep";
-const char *GenericCalculatorService::kSleepWithSidecarMethodName = "SleepWithSidecar";
-const char *GenericCalculatorService::kPushStringsMethodName = "PushStrings";
-const char *GenericCalculatorService::kSendTwoStringsMethodName = "SendTwoStrings";
-const char *GenericCalculatorService::kAddExactlyOnce = "AddExactlyOnce";
+const std::string GenericCalculatorService::kFullServiceName =
+    "kudu.rpc.GenericCalculatorService";
+const std::string GenericCalculatorService::kAddMethodName = "Add";
+const std::string GenericCalculatorService::kSleepMethodName = "Sleep";
+const std::string GenericCalculatorService::kSleepWithSidecarMethodName = "SleepWithSidecar";
+const std::string GenericCalculatorService::kPushStringsMethodName = "PushStrings";
+const std::string GenericCalculatorService::kSendTwoStringsMethodName = "SendTwoStrings";
+const std::string GenericCalculatorService::kAddExactlyOnce = "AddExactlyOnce";
 
 const char *GenericCalculatorService::kFirstString =
     "1111111111111111111111111111111111111111111111111111111111";
@@ -467,8 +469,8 @@ class RpcTestBase : public KuduTest {
     return bld.Build(messenger);
   }
 
-  Status DoTestSyncCall(const Proxy &p, const char *method,
-                        CredentialsPolicy policy = CredentialsPolicy::ANY_CREDENTIALS) {
+  static Status DoTestSyncCall(Proxy* p, const std::string& method,
+                               CredentialsPolicy policy = CredentialsPolicy::ANY_CREDENTIALS) {
     AddRequestPB req;
     req.set_x(rand());
     req.set_y(rand());
@@ -476,13 +478,13 @@ class RpcTestBase : public KuduTest {
     RpcController controller;
     controller.set_timeout(MonoDelta::FromMilliseconds(10000));
     controller.set_credentials_policy(policy);
-    RETURN_NOT_OK(p.SyncRequest(method, req, &resp, &controller));
+    RETURN_NOT_OK(p->SyncRequest(method, req, &resp, &controller));
 
     CHECK_EQ(req.x() + req.y(), resp.result());
     return Status::OK();
   }
 
-  void DoTestSidecar(const Proxy &p, int size1, int size2) {
+static void DoTestSidecar(Proxy* p, int size1, int size2) {
     const uint32_t kSeed = 12345;
 
     SendTwoStringsRequestPB req;
@@ -493,8 +495,8 @@ class RpcTestBase : public KuduTest {
     SendTwoStringsResponsePB resp;
     RpcController controller;
     controller.set_timeout(MonoDelta::FromMilliseconds(10000));
-    CHECK_OK(p.SyncRequest(GenericCalculatorService::kSendTwoStringsMethodName,
-                           req, &resp, &controller));
+    CHECK_OK(p->SyncRequest(GenericCalculatorService::kSendTwoStringsMethodName,
+                            req, &resp, &controller));
 
     Slice first = GetSidecarPointer(controller, resp.sidecar1(), size1);
     Slice second = GetSidecarPointer(controller, resp.sidecar2(), size2);
@@ -503,18 +505,18 @@ class RpcTestBase : public KuduTest {
 
     expected.resize(size1);
     RandomString(expected.data(), size1, &rng);
-    CHECK_EQ(0, first.compare(Slice(expected)));
+    CHECK_EQ(Slice(expected), first);
 
     expected.resize(size2);
     RandomString(expected.data(), size2, &rng);
-    CHECK_EQ(0, second.compare(Slice(expected)));
+    CHECK_EQ(Slice(expected), second);
   }
 
-  static Status DoTestOutgoingSidecar(const Proxy &p, int size1, int size2) {
+  static Status DoTestOutgoingSidecar(Proxy* p, int size1, int size2) {
     return DoTestOutgoingSidecar(p, {std::string(size1, 'a'), std::string(size2, 'b')});
   }
 
-  static Status DoTestOutgoingSidecar(const Proxy& p, const std::vector<std::string>& strings) {
+  static Status DoTestOutgoingSidecar(Proxy* p, const std::vector<std::string>& strings) {
     PushStringsRequestPB request;
     RpcController controller;
 
@@ -525,8 +527,8 @@ class RpcTestBase : public KuduTest {
     }
 
     PushStringsResponsePB resp;
-    KUDU_RETURN_NOT_OK(p.SyncRequest(GenericCalculatorService::kPushStringsMethodName,
-                                     request, &resp, &controller));
+    KUDU_RETURN_NOT_OK(p->SyncRequest(GenericCalculatorService::kPushStringsMethodName,
+                                      request, &resp, &controller));
     for (int i = 0; i < strings.size(); i++) {
       CHECK_EQ(strings[i].size(), resp.sizes(i));
       CHECK_EQ(crc::Crc32c(strings[i].data(), strings[i].size()),
@@ -536,11 +538,11 @@ class RpcTestBase : public KuduTest {
     return Status::OK();
   }
 
-  void DoTestOutgoingSidecarExpectOK(const Proxy &p, int size1, int size2) {
+  static void DoTestOutgoingSidecarExpectOK(Proxy* p, int size1, int size2) {
     CHECK_OK(DoTestOutgoingSidecar(p, size1, size2));
   }
 
-  static void DoTestExpectTimeout(const Proxy& p,
+  static void DoTestExpectTimeout(Proxy* p,
                                   const MonoDelta& timeout,
                                   bool will_be_cancelled = false,
                                   bool* is_negotiaton_error = nullptr) {
@@ -554,7 +556,7 @@ class RpcTestBase : public KuduTest {
     c.set_timeout(timeout);
     Stopwatch sw;
     sw.start();
-    Status s = p.SyncRequest(GenericCalculatorService::kSleepMethodName, req, &resp, &c);
+    Status s = p->SyncRequest(GenericCalculatorService::kSleepMethodName, req, &resp, &c);
     sw.stop();
     ASSERT_FALSE(s.ok());
     if (is_negotiaton_error != nullptr) {

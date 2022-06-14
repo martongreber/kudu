@@ -30,6 +30,8 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include "kudu/util/version_info.h"
+#include "kudu/util/version_info.pb.h"
 
 #ifdef TCMALLOC_ENABLED
 #include <boost/algorithm/string/replace.hpp>
@@ -210,6 +212,22 @@ static void StacksHandler(const Webserver::WebRequest& /*req*/,
     });
 }
 
+// Registered to handle "/version"
+//
+// Prints out the current version info
+static void VersionInfoHandler(const Webserver::WebRequest& /*req*/,
+                               Webserver::PrerenderedWebResponse* resp) {
+  JsonWriter writer(&resp->output, JsonWriter::PRETTY);
+  writer.StartObject();
+  writer.String("version_info");
+
+  kudu::VersionInfoPB version_info;
+  VersionInfo::GetVersionInfoPB(&version_info);
+
+  writer.Protobuf(version_info);
+  writer.EndObject();
+}
+
 // Registered to handle "/memz", and prints out memory allocation statistics.
 static void MemUsageHandler(const Webserver::WebRequest& req,
                             Webserver::PrerenderedWebResponse* resp) {
@@ -289,6 +307,12 @@ static void MemTrackersHandler(const Webserver::WebRequest& /*req*/,
                             peak_consumption_str);
   }
   *output << "</tbody></table>\n";
+}
+
+static void HealthHandler(const Webserver::WebRequest& /*req*/,
+                          Webserver::PrerenderedWebResponse* resp) {
+  resp->output << "OK";
+  resp->status_code = HttpStatusCode::Ok;
 }
 
 static const char* const kName = "name";
@@ -387,9 +411,17 @@ static void FillTimeSourceConfigs(EasyJson* output) {
         "Effective list of NTP servers used by the built-in NTP client. "
         "Configurable via --builtin_ntp_servers. If Kudu is configured with "
         "--time_source=auto and the Effective Time Source is auto-selected "
-        "to be 'builtin', Kudu uses dedicated NTP servers provided by the "
-        "hosting environment, overriding the list of NTP servers configured "
-        "via --builtin_ntp_servers.";
+        "to be 'builtin', Kudu tries to use dedicated NTP servers provided by "
+        "the hosting environment known to Kudu, overriding the list of servers "
+        "configured via --builtin_ntp_servers. If Kudu cannot recognize the "
+        "hosting environment it runs with --time_source=auto, the Effective "
+        "Time Source is auto-selected to be 'builtin' with the set of "
+        "reference servers configured per --builtin_ntp_servers flag's value, "
+        "unless it's empty or otherwise unparsable. The last resort for a "
+        "cluster-wide synchronized clock is to auto-select the 'system' Time "
+        "Source if the platform supports get_ntptime() API. The catch-all case "
+        "is 'system_unsync' Time Source which is for development-only "
+        "platforms or single-node-runs-it-all proof-of-concept Kudu clusters.";
   }
 }
 
@@ -399,19 +431,27 @@ static void ConfigurationHandler(const Webserver::WebRequest& /* req */,
   FillSecurityConfigs(output);
   FillTimeSourceConfigs(output);
 }
-
-void AddDefaultPathHandlers(Webserver* webserver) {
+void AddPreInitializedDefaultPathHandlers(Webserver* webserver) {
   bool styled = true;
   bool on_nav_bar = true;
   webserver->RegisterPathHandler("/logs", "Logs", LogsHandler, styled, on_nav_bar);
   webserver->RegisterPrerenderedPathHandler("/varz", "Flags", FlagsHandler, styled, on_nav_bar);
+  webserver->RegisterPathHandler("/config", "Configuration", ConfigurationHandler,
+                                 styled, on_nav_bar);
   webserver->RegisterPrerenderedPathHandler("/memz", "Memory (total)", MemUsageHandler,
                                             styled, on_nav_bar);
   webserver->RegisterPrerenderedPathHandler("/mem-trackers", "Memory (detail)", MemTrackersHandler,
                                             styled, on_nav_bar);
-  webserver->RegisterPathHandler("/config", "Configuration", ConfigurationHandler,
-                                  styled, on_nav_bar);
+}
+
+void AddPostInitializedDefaultPathHandlers(Webserver* webserver) {
   webserver->RegisterPrerenderedPathHandler("/stacks", "Stacks", StacksHandler,
+                                            /*is_styled=*/false,
+                                            /*is_on_nav_bar=*/true);
+  webserver->RegisterPrerenderedPathHandler("/version", "VersionInfo", VersionInfoHandler,
+                                            /*is_styled=*/false,
+                                            /*is_on_nav_bar*/false);
+  webserver->RegisterPrerenderedPathHandler("/healthz", "Health", HealthHandler,
                                             /*is_styled=*/false,
                                             /*is_on_nav_bar=*/true);
   AddPprofPathHandlers(webserver);

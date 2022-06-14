@@ -25,10 +25,12 @@
 #include <string>
 #include <vector>
 
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
@@ -36,8 +38,12 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+DECLARE_bool(fail_dns_resolution);
+DECLARE_string(fail_dns_resolution_hostports);
+
 using std::string;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 
@@ -128,6 +134,39 @@ TEST_F(NetUtilTest, TestParseAddressesWithScheme) {
   ASSERT_STR_CONTAINS(s.ToString(), "invalid scheme format");
 }
 
+TEST_F(NetUtilTest, TestInjectFailureToResolveAddresses) {
+  HostPort hp1("localhost", 12345);
+  HostPort hp2("localhost", 12346);
+  FLAGS_fail_dns_resolution_hostports = hp1.ToString();
+  FLAGS_fail_dns_resolution = true;
+
+  // With a list of bad hostports specified, check that resolution fails as
+  // expected.
+  vector<Sockaddr> addrs;
+  Status s = hp1.ResolveAddresses(&addrs);
+  ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+
+  // Addresses not in the list should resolve fine.
+  ASSERT_TRUE(addrs.empty());
+  ASSERT_OK(hp2.ResolveAddresses(&addrs));
+  ASSERT_FALSE(addrs.empty());
+
+  // With both in the list, resolution should fail.
+  FLAGS_fail_dns_resolution_hostports = Substitute("$0,$1", hp1.ToString(), hp2.ToString());
+  addrs.clear();
+  s = hp1.ResolveAddresses(&addrs);
+  ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+  s = hp2.ResolveAddresses(&addrs);
+  ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+
+  // When a list isn't specified, all resolution fails.
+  FLAGS_fail_dns_resolution_hostports = "";
+  s = hp1.ResolveAddresses(&addrs);
+  ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+  s = hp2.ResolveAddresses(&addrs);
+  ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
+}
+
 TEST_F(NetUtilTest, TestResolveAddresses) {
   HostPort hp("localhost", 12345);
   vector<Sockaddr> addrs;
@@ -173,18 +212,19 @@ TEST_F(NetUtilTest, TestWithinNetwork) {
 TEST_F(NetUtilTest, TestReverseLookup) {
   string host;
   Sockaddr addr;
-  HostPort hp;
+  vector<HostPort> hps;
   ASSERT_OK(addr.ParseString("0.0.0.0:12345", 0));
   EXPECT_EQ(12345, addr.port());
-  ASSERT_OK(HostPortFromSockaddrReplaceWildcard(addr, &hp));
-  EXPECT_NE("0.0.0.0", hp.host());
-  EXPECT_NE("", hp.host());
-  EXPECT_EQ(12345, hp.port());
+  ASSERT_OK(HostPortsFromAddrs({ addr }, &hps));
+  EXPECT_NE("0.0.0.0", hps[0].host());
+  EXPECT_NE("", hps[0].host());
+  EXPECT_EQ(12345, hps[0].port());
 
+  hps.clear();
   ASSERT_OK(addr.ParseString("127.0.0.1:12345", 0));
-  ASSERT_OK(HostPortFromSockaddrReplaceWildcard(addr, &hp));
-  EXPECT_EQ("127.0.0.1", hp.host());
-  EXPECT_EQ(12345, hp.port());
+  ASSERT_OK(HostPortsFromAddrs({ addr }, &hps));
+  EXPECT_EQ("127.0.0.1", hps[0].host());
+  EXPECT_EQ(12345, hps[0].port());
 }
 
 TEST_F(NetUtilTest, TestLsof) {

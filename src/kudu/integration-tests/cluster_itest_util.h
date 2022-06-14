@@ -110,15 +110,16 @@ Status CreateTabletServerMap(const std::shared_ptr<master::MasterServiceProxy>& 
 
 // Gets a vector containing the latest OpId for each of the given replicas.
 // Returns a bad Status if any replica cannot be reached.
-Status GetLastOpIdForEachReplica(const std::string& tablet_id,
-                                 const std::vector<TServerDetails*>& replicas,
-                                 consensus::OpIdType opid_type,
-                                 const MonoDelta& timeout,
-                                 std::vector<consensus::OpId>* op_ids);
+Status GetLastOpIdForEachReplica(
+    const std::string& tablet_id,
+    const std::vector<const TServerDetails*>& replicas,
+    consensus::OpIdType opid_type,
+    const MonoDelta& timeout,
+    std::vector<consensus::OpId>* op_ids);
 
 // Like the above, but for a single replica.
 Status GetLastOpIdForReplica(const std::string& tablet_id,
-                             TServerDetails* replica,
+                             const TServerDetails* replica,
                              consensus::OpIdType opid_type,
                              const MonoDelta& timeout,
                              consensus::OpId* op_id);
@@ -143,14 +144,6 @@ Status WaitForServersToAgree(
     const std::string& tablet_id,
     int64_t minimum_index,
     consensus::OpIdType op_id_type = consensus::RECEIVED_OPID);
-
-// Wait until all specified replicas have logged at least the given index.
-// Unlike WaitForServersToAgree(), the servers do not actually have to converge
-// or quiesce. They only need to progress to or past the given index.
-Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
-                                  const std::string& tablet_id,
-                                  const std::vector<TServerDetails*>& replicas,
-                                  const MonoDelta& timeout);
 
 // Get the consensus state from the given replica.
 Status GetConsensusState(const TServerDetails* replica,
@@ -445,7 +438,7 @@ Status BeginTabletCopySession(const TServerDetails* ts,
 // histogram, it might be 'total_count' or 'mean'.
 //
 // 'entity_id' may be NULL, in which case the first entity of the same type
-// as 'entity_proto' will be matched.
+// as 'entity_proto' will be matched, and also it can be a pattern.
 Status GetInt64Metric(const HostPort& http_hp,
                       const MetricEntityPrototype* entity_proto,
                       const char* entity_id,

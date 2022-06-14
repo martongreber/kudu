@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdint.h>
-#include <stdlib.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <ostream>
@@ -38,11 +38,11 @@
 #include "kudu/common/common.pb.h"
 #include "kudu/common/encoded_key.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
 #include "kudu/common/wire_protocol-test-util.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
@@ -52,7 +52,6 @@
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/security/crypto.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/security/token_signer.h"
 #include "kudu/security/token_verifier.h"
@@ -67,6 +66,7 @@
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"

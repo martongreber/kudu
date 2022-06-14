@@ -42,13 +42,13 @@
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/server_negotiation.h"
 #include "kudu/rpc/service_if.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/token_verifier.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/thread_restrictions.h"
 #include "kudu/util/threadpool.h"
@@ -76,6 +76,7 @@ MessengerBuilder::MessengerBuilder(string name)
       sasl_proto_name_("kudu"),
       rpc_authentication_("optional"),
       rpc_encryption_("optional"),
+      rpc_loopback_encryption_(false),
       rpc_tls_ciphers_(kudu::security::SecurityDefaults::kDefaultTlsCiphers),
       rpc_tls_ciphersuites_(kudu::security::SecurityDefaults::kDefaultTlsCipherSuites),
       rpc_tls_min_protocol_(kudu::security::SecurityDefaults::kDefaultTlsMinVersion),
@@ -98,6 +99,7 @@ Status MessengerBuilder::Build(shared_ptr<Messenger>* msgr) {
   RETURN_NOT_OK(ParseTriState("--rpc_encryption",
                               rpc_encryption_,
                               &new_msgr->encryption_));
+  new_msgr->loopback_encryption_ = rpc_loopback_encryption_;
   RETURN_NOT_OK(new_msgr->Init());
   if (new_msgr->encryption_ != RpcEncryption::DISABLED && enable_inbound_tls_) {
     auto* tls_context = new_msgr->mutable_tls_context();

@@ -90,8 +90,12 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake_modules")
 include(CMakeParseArguments)
 
 set(BUILD_SUPPORT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build-support)
-set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty)
-set(THIRDPARTY_TOOLCHAIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/clang-toolchain)
+if ("$ENV{THIRDPARTY_DIR}" STREQUAL "")
+  set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty)
+else()
+  set(THIRDPARTY_DIR $ENV{THIRDPARTY_DIR})
+endif()
+set(THIRDPARTY_TOOLCHAIN_DIR ${THIRDPARTY_DIR}/clang-toolchain)
 set(THIRDPARTY_INSTALL_DIR ${THIRDPARTY_DIR}/installed)
 set(THIRDPARTY_INSTALL_COMMON_DIR ${THIRDPARTY_INSTALL_DIR}/common)
 set(THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR ${THIRDPARTY_INSTALL_DIR}/uninstrumented)
@@ -1077,6 +1081,22 @@ find_package(Mustache REQUIRED)
 include_directories(SYSTEM ${MUSTACHE_INCLUDE_DIR})
 ADD_THIRDPARTY_LIB(mustache
   STATIC_LIB "${MUSTACHE_STATIC_LIB}")
+
+## Oatpp
+find_package(Oatpp REQUIRED)
+include_directories(SYSTEM ${OATPP_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(oatpp
+  STATIC_LIB "${OATPP_STATIC_LIB}")
+
+## Oatpp-swagger
+find_package(OatppSwagger REQUIRED)
+include_directories(SYSTEM ${OATPP_SWAGGER_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(oatpp-swagger
+  STATIC_LIB "${OATPP_SWAGGER_STATIC_LIB}")
+
+## jwt-cpp
+find_package(JwtCpp REQUIRED)
+include_directories(${JWT_CPP_INCLUDE_DIR})
 
 ## OpenSSL
 ##

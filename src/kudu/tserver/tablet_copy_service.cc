@@ -34,6 +34,7 @@
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/server/server_base.h"
@@ -115,7 +116,8 @@ TabletCopyServiceImpl::TabletCopyServiceImpl(
                           &session_expiration_thread_));
 }
 
-TabletCopyServiceImpl::SessionEntry::SessionEntry(scoped_refptr<TabletCopySourceSession> session_in)
+TabletCopyServiceImpl::SessionEntry::SessionEntry(
+    scoped_refptr<RemoteTabletCopySourceSession> session_in)
     : session(std::move(session_in)),
       last_accessed_time(MonoTime::Now()),
       expire_timeout(MonoDelta::FromSeconds(FLAGS_tablet_copy_idle_timeout_sec)) {
@@ -148,7 +150,7 @@ void TabletCopyServiceImpl::BeginTabletCopySession(
                     Substitute("Unable to find specified tablet: $0", tablet_id),
                     context);
 
-  scoped_refptr<TabletCopySourceSession> session;
+  scoped_refptr<RemoteTabletCopySourceSession> session;
   bool new_session;
   {
     MutexLock l(sessions_lock_);
@@ -159,9 +161,9 @@ void TabletCopyServiceImpl::BeginTabletCopySession(
           "Beginning new tablet copy session on tablet $0 from peer $1"
           " at $2: session id = $3",
           tablet_id, requestor_uuid, context->requestor_string(), session_id);
-      session.reset(new TabletCopySourceSession(tablet_replica, session_id,
-                                                requestor_uuid, fs_manager_,
-                                                &tablet_copy_metrics_));
+      session.reset(new RemoteTabletCopySourceSession(tablet_replica, session_id,
+                                                      requestor_uuid, fs_manager_,
+                                                      &tablet_copy_metrics_));
       InsertOrDie(&sessions_, session_id, SessionEntry(session));
     } else {
       session = session_entry->session;
@@ -232,7 +234,7 @@ void TabletCopyServiceImpl::CheckSessionActive(
   const string& session_id = req->session_id();
 
   // Look up and validate tablet copy session.
-  scoped_refptr<TabletCopySourceSession> session;
+  scoped_refptr<RemoteTabletCopySourceSession> session;
   MutexLock l(sessions_lock_);
   TabletCopyErrorPB::Code app_error;
   Status status = FindSessionUnlocked(session_id, &app_error, &session);
@@ -260,10 +262,10 @@ void TabletCopyServiceImpl::FetchData(const FetchDataRequestPB* req,
   const string& session_id = req->session_id();
 
   // Look up and validate tablet copy session.
-  scoped_refptr<TabletCopySourceSession> session;
+  scoped_refptr<RemoteTabletCopySourceSession> session;
   {
     MutexLock l(sessions_lock_);
-    TabletCopyErrorPB::Code app_error;
+    TabletCopyErrorPB::Code app_error = TabletCopyErrorPB::UNKNOWN_ERROR;
     RPC_RETURN_NOT_OK(FindSessionUnlocked(session_id, &app_error, &session),
                       app_error, "No such session", context);
     ResetSessionExpirationUnlocked(session_id);
@@ -285,7 +287,7 @@ void TabletCopyServiceImpl::FetchData(const FetchDataRequestPB* req,
 
   const DataIdPB& data_id = req->data_id();
   TabletCopyErrorPB::Code error_code = TabletCopyErrorPB::UNKNOWN_ERROR;
-  RPC_RETURN_NOT_OK(ValidateFetchRequestDataId(data_id, &error_code, session),
+  RPC_RETURN_NOT_OK(ValidateFetchRequestDataId(data_id, &error_code),
                     error_code, "Invalid DataId", context);
 
   DataChunkPB* data_chunk = resp->mutable_chunk();
@@ -323,7 +325,7 @@ void TabletCopyServiceImpl::EndTabletCopySession(
         rpc::RpcContext* context) {
   {
     MutexLock l(sessions_lock_);
-    TabletCopyErrorPB::Code app_error;
+    TabletCopyErrorPB::Code app_error = TabletCopyErrorPB::UNKNOWN_ERROR;
     LOG_WITH_PREFIX(INFO) << "Request end of tablet copy session " << req->session_id()
                           << " received from " << context->requestor_string();
     RPC_RETURN_NOT_OK(DoEndTabletCopySessionUnlocked(req->session_id(), &app_error),
@@ -355,7 +357,7 @@ void TabletCopyServiceImpl::Shutdown() {
 Status TabletCopyServiceImpl::FindSessionUnlocked(
         const string& session_id,
         TabletCopyErrorPB::Code* app_error,
-        scoped_refptr<TabletCopySourceSession>* session) const {
+        scoped_refptr<RemoteTabletCopySourceSession>* session) const {
   const SessionEntry* session_entry = FindOrNull(sessions_, session_id);
   if (!session_entry) {
     *app_error = TabletCopyErrorPB::NO_SESSION;
@@ -368,8 +370,7 @@ Status TabletCopyServiceImpl::FindSessionUnlocked(
 
 Status TabletCopyServiceImpl::ValidateFetchRequestDataId(
         const DataIdPB& data_id,
-        TabletCopyErrorPB::Code* app_error,
-        const scoped_refptr<TabletCopySourceSession>& session) const {
+        TabletCopyErrorPB::Code* app_error) {
   if (PREDICT_FALSE(data_id.has_block_id() && data_id.has_wal_segment_seqno())) {
     *app_error = TabletCopyErrorPB::INVALID_TABLET_COPY_REQUEST;
     return Status::InvalidArgument(
@@ -408,7 +409,7 @@ Status TabletCopyServiceImpl::DoEndTabletCopySessionUnlocked(
         const std::string& session_id,
         TabletCopyErrorPB::Code* app_error) {
   sessions_lock_.AssertAcquired();
-  scoped_refptr<TabletCopySourceSession> session;
+  scoped_refptr<RemoteTabletCopySourceSession> session;
   RETURN_NOT_OK(FindSessionUnlocked(session_id, app_error, &session));
   // Remove the session from the map.
   // It will get destroyed once there are no outstanding refs.

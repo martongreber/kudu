@@ -74,10 +74,13 @@
 
 DECLARE_bool(never_fsync);
 DECLARE_bool(crash_on_eio);
+DECLARE_bool(encrypt_data_at_rest);
 DECLARE_double(env_inject_eio);
 DECLARE_int32(env_inject_short_read_bytes);
 DECLARE_int32(env_inject_short_write_bytes);
+DECLARE_int32(encryption_key_length);
 DECLARE_string(env_inject_eio_globs);
+DECLARE_string(encryption_server_key);
 
 namespace kudu {
 
@@ -271,7 +274,7 @@ TEST_F(TestEnv, TestPreallocate) {
   // the writable file size should now report 1 MB
   ASSERT_EQ(file->Size(), kOneMb);
   ASSERT_OK(file->Close());
-  // and the real size for the file on disk should match ony the
+  // and the real size for the file on disk should match only the
   // written size
   ASSERT_OK(env_->GetFileSize(test_path, &size));
   ASSERT_EQ(kOneMb, size);
@@ -459,8 +462,8 @@ TEST_F(TestEnv, TestTruncate) {
 
 // Write 'size' bytes of data to a file, with a simple pattern stored in it.
 static void WriteTestFile(Env* env, const string& path, size_t size) {
-  shared_ptr<WritableFile> wf;
-  ASSERT_OK(env_util::OpenFileForWrite(env, path, &wf));
+  unique_ptr<WritableFile> wf;
+  ASSERT_OK(env->NewWritableFile(path, &wf));
   faststring data;
   data.resize(size);
   for (int i = 0; i < data.size(); i++) {
@@ -567,7 +570,7 @@ TEST_F(TestEnv, TestIOVMax) {
   FLAGS_env_inject_short_read_bytes = 3;
 
   // Verify all the data is read
-  ASSERT_OK(file->ReadV(0, results));
+  ASSERT_OK(file->ReadV(file->GetEncryptionHeaderSize(), results));
   VerifyTestData(Slice(scratch, data_size), 0);
 }
 
@@ -600,7 +603,7 @@ TEST_F(TestEnv, TestOpenEmptyRandomAccessFile) {
   ASSERT_OK(env->NewRandomAccessFile(test_file, &readable_file));
   uint64_t size;
   ASSERT_OK(readable_file->Size(&size));
-  ASSERT_EQ(0, size);
+  ASSERT_EQ(readable_file->GetEncryptionHeaderSize(), size);
 }
 
 TEST_F(TestEnv, TestOverwrite) {
@@ -629,8 +632,7 @@ TEST_F(TestEnv, TestReopen) {
 
   // Create the file and write to it.
   shared_ptr<WritableFile> writer;
-  ASSERT_OK(env_util::OpenFileForWrite(WritableFileOptions(),
-                                       env_, test_path, &writer));
+  ASSERT_OK(env_util::OpenFileForWrite(env_, test_path, &writer));
   ASSERT_OK(writer->Append(first));
   ASSERT_EQ(first.length(), writer->Size());
   ASSERT_OK(writer->Close());
@@ -683,14 +685,14 @@ INSTANTIATE_TEST_SUITE_P(ResourceLimitTypes,
 TEST_P(ResourceLimitTypeTest, TestIncreaseLimit) {
   // Increase the resource limit. It should either increase or remain the same.
   Env::ResourceLimitType t = GetParam();
-  int64_t limit_before = env_->GetResourceLimit(t);
+  uint64_t limit_before = env_->GetResourceLimit(t);
   env_->IncreaseResourceLimit(t);
-  int64_t limit_after = env_->GetResourceLimit(t);
+  uint64_t limit_after = env_->GetResourceLimit(t);
   ASSERT_GE(limit_after, limit_before);
 
   // Try again. It should definitely be the same now.
   env_->IncreaseResourceLimit(t);
-  int64_t limit_after_again = env_->GetResourceLimit(t);
+  uint64_t limit_after_again = env_->GetResourceLimit(t);
   ASSERT_EQ(limit_after, limit_after_again);
 }
 
@@ -1004,7 +1006,7 @@ TEST_F(TestEnv, TestCopyFile) {
   ASSERT_OK(env_util::CopyFile(env, orig_path, copy_path, WritableFileOptions()));
   unique_ptr<RandomAccessFile> copy;
   ASSERT_OK(env->NewRandomAccessFile(copy_path, &copy));
-  NO_FATALS(ReadAndVerifyTestData(copy.get(), 0, kFileSize));
+  NO_FATALS(ReadAndVerifyTestData(copy.get(), copy->GetEncryptionHeaderSize(), kFileSize));
 }
 
 // Simple regression test for NewTempRWFile().
@@ -1120,6 +1122,7 @@ TEST_F(TestEnv, TestGetExtentMap) {
 
   // Punch out a hole and split the extent.
   s = f->PunchHole(found_offset, fs_block_size);
+  LOG(INFO) << Substitute("Punched a $0 byte sized hole at offset $1", fs_block_size, found_offset);
   if (s.IsNotSupported()) {
     LOG(INFO) << "PunchHole() not supported, skipping this part of the test";
     return;
@@ -1247,6 +1250,127 @@ TEST_F(TestEnv, TestCreateFifo) {
   // Until our fifo gets deleted.
   ASSERT_OK(env_->DeleteFile(kFifo));
   ASSERT_OK(env_->NewFifo(kFifo, &fifo));
+}
+
+class TestEncryptedEnv : public TestEnv, public ::testing::WithParamInterface<int> {
+ public:
+  void SetUp() override {
+    SetEncryptionFlags(true);
+    FLAGS_encryption_key_length = GetParam();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(TestEncryption, TestEncryptedEnv, ::testing::Values(128, 192, 256));
+
+TEST_P(TestEncryptedEnv, TestEncryption) {
+  const string kFile = JoinPathSegments(test_dir_, "encrypted_file");
+  unique_ptr<RWFile> rw;
+  RWFileOptions opts;
+  opts.is_sensitive = true;
+  ASSERT_OK(env_->NewRWFile(opts, kFile, &rw));
+
+  string kTestData =
+      "Hello world! This text is slightly longer than usual to make sure multiple blocks are "
+      "encrypted and we can read at unaligned offsets correctly. Lorem ipsum dolor sit amet, "
+      "consectetur adipiscing elit.";
+
+  string kTestData2 =
+      "We also need to append to this file to make sure initialization vectors are calculated "
+      "correctly.";
+
+  ASSERT_OK(rw->Write(env_->GetEncryptionHeaderSize(), kTestData));
+  ASSERT_OK(rw->Write(env_->GetEncryptionHeaderSize() + kTestData.length(), kTestData2));
+
+  // Setup read parameters
+  constexpr size_t size1 = 9;
+  uint8_t scratch1[size1];
+  Slice result1(scratch1, size1);
+  constexpr size_t size2 = 19;
+  uint8_t scratch2[size2];
+  Slice result2(scratch2, size2);
+  vector<Slice> results = { result1, result2 };
+
+  // Reading back from the RWFile should succeed
+  ASSERT_OK(rw->ReadV(env_->GetEncryptionHeaderSize() + 13, results));
+  ASSERT_EQ(result1, "This text");
+  ASSERT_EQ(result2, " is slightly longer");
+
+  ASSERT_OK(rw->Close());
+
+  unique_ptr<RandomAccessFile> unencrpyted;
+  RandomAccessFileOptions unencrpyted_opts;
+  unencrpyted_opts.is_sensitive = false;
+  ASSERT_OK(env_->NewRandomAccessFile(unencrpyted_opts, kFile, &unencrpyted));
+
+  // Treating it as an unencrypted file should yield garbage and not contain the
+  // cleartext written to the file.
+  string unencrypted_string;
+  ASSERT_OK(unencrpyted->Read(env_->GetEncryptionHeaderSize(), unencrypted_string));
+  ASSERT_EQ(string::npos, unencrypted_string.find("This text is slightly longer"));
+
+  // Check if the file can be read into a SequentialFile.
+  unique_ptr<SequentialFile> seq_file;
+  SequentialFileOptions seq_opts;
+  seq_opts.is_sensitive = true;
+  ASSERT_OK(env_->NewSequentialFile(seq_opts, kFile, &seq_file));
+
+  ASSERT_OK(seq_file->Read(&result1));
+  ASSERT_OK(seq_file->Read(&result2));
+  ASSERT_EQ(result1, "Hello wor");
+  ASSERT_EQ(result2, "ld! This text is sl");
+
+  // Check if the file can be read into a RandomAccessFile if treated properly
+  // as an encrypted file.
+  unique_ptr<RandomAccessFile> random;
+  RandomAccessFileOptions random_opts;
+  random_opts.is_sensitive = true;
+  ASSERT_OK(env_->NewRandomAccessFile(random_opts, kFile, &random));
+  size_t size = kTestData.length() + kTestData2.length();
+  uint8_t scratch[size];
+  Slice result(scratch, size);
+  ASSERT_OK(random->Read(env_->GetEncryptionHeaderSize(), result));
+  ASSERT_EQ(kTestData + kTestData2, result);
+
+  // Read a SequentialFile until EOF.
+  ASSERT_OK(env_->NewSequentialFile(seq_opts, kFile, &seq_file));
+  uint8_t scratch3[size + 10];
+  Slice result3(scratch3, size + 10);
+  ASSERT_OK(seq_file->Read(&result3));
+  ASSERT_EQ(kTestData + kTestData2, result3);
+}
+
+TEST_P(TestEncryptedEnv, TestPreallocatedReadEncryptedFile) {
+  const string kFile = JoinPathSegments(test_dir_, "encrypted_file");
+  unique_ptr<RWFile> rw;
+  RWFileOptions opts;
+  opts.is_sensitive = true;
+  ASSERT_OK(env_->NewRWFile(opts, kFile, &rw));
+
+  ASSERT_OK(rw->PreAllocate(0, 1024, RWFile::CHANGE_FILE_SIZE));
+
+  size_t size = 10;
+  uint8_t scratch[size];
+  Slice result(scratch, size);
+  vector<Slice> results = {result};
+  ASSERT_OK(rw->ReadV(env_->GetEncryptionHeaderSize(), results));
+  ASSERT_TRUE(IsAllZeros(result));
+}
+
+TEST_P(TestEncryptedEnv, TestEncryptionMultipleSlices) {
+  const string kFile = JoinPathSegments(test_dir_, "encrypted_file");
+  unique_ptr<RWFile> rw;
+  RWFileOptions opts;
+  opts.is_sensitive = true;
+  ASSERT_OK(env_->NewRWFile(opts, kFile, &rw));
+
+  vector<Slice> data = {"foo", "bar", "hello", "world"};
+
+  ASSERT_OK(rw->WriteV(env_->GetEncryptionHeaderSize(), data));
+
+  uint8_t scratch[16];
+  Slice result(scratch, 16);
+  ASSERT_OK(rw->Read(env_->GetEncryptionHeaderSize(), result));
+  ASSERT_EQ("foobarhelloworld", result);
 }
 
 }  // namespace kudu

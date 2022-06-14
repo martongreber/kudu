@@ -50,6 +50,7 @@ set(CLIENT_SRCS
   scanner-internal.cc
   replica-internal.cc
   replica_controller-internal.cc
+  tablet_info_provider-internal.cc
   resource_metrics.cc
   schema.cc
   session-internal.cc
@@ -139,9 +140,11 @@ set(CLIENT_VERSION_PATCH 0)
 
 if(NOT APPLE)
   # Localize thirdparty symbols using a linker version script. This hides them
-  # from the client application. The OS X linker does not support the
-  # version-script option.
+  # from the client application. Also, completely remove libprotobuf symbols
+  # (see KUDU-3334 for details). The --version-script and --exclude-libs
+  # GNU ld linker's options are not supported by the OS X linker.
   set(LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/symbols.map")
+  set(LINK_FLAGS "${LINK_FLAGS} -Wl,--exclude-libs=libprotobuf")
 endif()
 
 set_target_properties(kudu_client_exported
@@ -275,5 +278,6 @@ SET_KUDU_TEST_LINK_LIBS(
 ADD_KUDU_TEST(client-test NUM_SHARDS 8 PROCESSORS 2
                           DATA_FILES ../scripts/first_argument.sh)
 ADD_KUDU_TEST(client-unittest)
+ADD_KUDU_TEST(flex_partitioning_client-test)
 ADD_KUDU_TEST(predicate-test NUM_SHARDS 4)
 ADD_KUDU_TEST(scan_token-test PROCESSORS 2)

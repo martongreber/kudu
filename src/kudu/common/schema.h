@@ -14,8 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_COMMON_SCHEMA_H
-#define KUDU_COMMON_SCHEMA_H
+
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -48,14 +48,15 @@
 
 namespace kudu {
 class Schema;
+typedef std::shared_ptr<Schema> SchemaPtr;
 }  // namespace kudu
 
-// Check that two schemas are equal, yielding a useful error message in the case that
-// they are not.
+// Check that two schemas are equal, yielding a useful error message
+// if they are not.
 #define DCHECK_SCHEMA_EQ(s1, s2) \
   do { \
-    DCHECK((s1).Equals((s2))) << "Schema " << (s1).ToString() \
-                              << " does not match " << (s2).ToString(); \
+    DCHECK((s1) == (s2)) << "Schema " << (s1).ToString() \
+                           << " does not match " << (s2).ToString(); \
   } while (0)
 
 #define DCHECK_KEY_PROJECTION_SCHEMA_EQ(s1, s2) \
@@ -82,8 +83,8 @@ struct ColumnId {
   operator const int32_t() const { return t_; } // NOLINT
   operator const strings::internal::SubstituteArg() const { return t_; } // NOLINT
   operator const AlphaNum() const { return t_; } // NOLINT
-  bool operator==(const ColumnId & rhs) const { return t_ == rhs.t_; }
-  bool operator<(const ColumnId & rhs) const { return t_ < rhs.t_; }
+  bool operator==(const ColumnId& rhs) const { return t_ == rhs.t_; }
+  bool operator<(const ColumnId& rhs) const { return t_ < rhs.t_; }
   friend std::ostream& operator<<(std::ostream& os, ColumnId column_id) {
     return os << column_id.t_;
   }
@@ -221,7 +222,9 @@ class ColumnSchema {
   //   ColumnSchema col_c("c", INT32, false, &default_i32);
   //   Slice default_str("Hello");
   //   ColumnSchema col_d("d", STRING, false, &default_str);
-  ColumnSchema(std::string name, DataType type, bool is_nullable = false,
+  ColumnSchema(std::string name,
+               DataType type,
+               bool is_nullable = false,
                const void* read_default = nullptr,
                const void* write_default = nullptr,
                ColumnStorageAttributes attributes = ColumnStorageAttributes(),
@@ -249,7 +252,7 @@ class ColumnSchema {
     return is_nullable_;
   }
 
-  const std::string &name() const {
+  const std::string& name() const {
     return name_;
   }
 
@@ -287,9 +290,9 @@ class ColumnSchema {
   // The returned value will be valid until the ColumnSchema will be destroyed.
   //
   // Example:
-  //    const uint32_t *vu32 = static_cast<const uint32_t *>(col_schema.read_default_value());
-  //    const Slice *vstr = static_cast<const Slice *>(col_schema.read_default_value());
-  const void *read_default_value() const {
+  //    const uint32_t* vu32 = static_cast<const uint32_t*>(col_schema.read_default_value());
+  //    const Slice* vstr = static_cast<const Slice*>(col_schema.read_default_value());
+  const void* read_default_value() const {
     if (read_default_ != nullptr) {
       return read_default_->value();
     }
@@ -306,9 +309,9 @@ class ColumnSchema {
   // The returned value will be valid until the ColumnSchema will be destroyed.
   //
   // Example:
-  //    const uint32_t *vu32 = static_cast<const uint32_t *>(col_schema.write_default_value());
-  //    const Slice *vstr = static_cast<const Slice *>(col_schema.write_default_value());
-  const void *write_default_value() const {
+  //    const uint32_t* vu32 = static_cast<const uint32_t*>(col_schema.write_default_value());
+  //    const Slice* vstr = static_cast<const Slice*>(col_schema.write_default_value());
+  const void* write_default_value() const {
     if (write_default_ != nullptr) {
       return write_default_->value();
     }
@@ -321,7 +324,7 @@ class ColumnSchema {
            type_info()->physical_type() == other.type_info()->physical_type();
   }
 
-  bool EqualsType(const ColumnSchema &other) const {
+  bool EqualsType(const ColumnSchema& other) const {
     if (this == &other) return true;
     return is_nullable_ == other.is_nullable_ &&
            type_info()->type() == other.type_info()->type() &&
@@ -338,7 +341,7 @@ class ColumnSchema {
     COMPARE_ALL = COMPARE_NAME | COMPARE_TYPE | COMPARE_OTHER
   };
 
-  bool Equals(const ColumnSchema &other,
+  bool Equals(const ColumnSchema& other,
               CompareFlags flags = COMPARE_ALL) const {
     if (this == &other) return true;
 
@@ -388,13 +391,13 @@ class ColumnSchema {
     return type_attributes_;
   }
 
-  int Compare(const void *lhs, const void *rhs) const {
+  int Compare(const void* lhs, const void* rhs) const {
     return type_info_->Compare(lhs, rhs);
   }
 
   // Stringify the given cell. This just stringifies the cell contents,
   // and doesn't include the column name or type.
-  std::string Stringify(const void *cell) const {
+  std::string Stringify(const void* cell) const {
     std::string ret;
     type_info_->AppendDebugStringForValue(cell, &ret);
     return ret;
@@ -431,7 +434,7 @@ class ColumnSchema {
   }
 
   std::string name_;
-  const TypeInfo *type_info_;
+  const TypeInfo* type_info_;
   bool is_nullable_;
   // use shared_ptr since the ColumnSchema is always copied around.
   std::shared_ptr<Variant> read_default_;
@@ -453,8 +456,7 @@ class ColumnSchema {
 // Schema::Reset() rather than returning by value.
 class Schema {
  public:
-
-  static const int kColumnNotFound;
+  static constexpr int kColumnNotFound = -1;
 
   Schema()
     : num_key_columns_(0),
@@ -558,7 +560,7 @@ class Schema {
   }
 
   // Return the ColumnSchema corresponding to the given column index.
-  const ColumnSchema &column(size_t idx) const {
+  const ColumnSchema& column(size_t idx) const {
     DCHECK_LT(idx, cols_.size());
     return cols_[idx];
   }
@@ -640,23 +642,22 @@ class Schema {
   // are off, incorrect data may result.
   //
   // This is mostly useful for tests at this point.
-  // TODO: consider removing it.
   template<DataType Type, class RowType>
-  const typename DataTypeTraits<Type>::cpp_type *
+  const typename DataTypeTraits<Type>::cpp_type*
   ExtractColumnFromRow(const RowType& row, size_t idx) const {
     DCHECK_SCHEMA_EQ(*this, *row.schema());
     const ColumnSchema& col_schema = cols_[idx];
     DCHECK_LT(idx, cols_.size());
     DCHECK_EQ(col_schema.type_info()->type(), Type);
 
-    const void *val;
+    const void* val;
     if (col_schema.is_nullable()) {
       val = row.nullable_cell_ptr(idx);
     } else {
       val = row.cell_ptr(idx);
     }
 
-    return reinterpret_cast<const typename DataTypeTraits<Type>::cpp_type *>(val);
+    return reinterpret_cast<const typename DataTypeTraits<Type>::cpp_type*>(val);
   }
 
   // Stringify the given row, which conforms to this schema,
@@ -762,7 +763,7 @@ class Schema {
   // contents.
   // Returns the encoded key.
   template <class RowType>
-  Slice EncodeComparableKey(const RowType& row, faststring *dst) const {
+  Slice EncodeComparableKey(const RowType& row, faststring* dst) const {
     DCHECK_KEY_PROJECTION_SCHEMA_EQ(*this, *row.schema());
 
     dst->clear();
@@ -787,40 +788,26 @@ class Schema {
   // so should only be used when necessary for output.
   std::string ToString(ToStringMode mode = ToStringMode::WITH_COLUMN_IDS) const;
 
-  // Compare column ids in Equals() method.
-  enum SchemaComparisonType {
-    COMPARE_COLUMNS = 1 << 0,
-    COMPARE_COLUMN_IDS = 1 << 1,
-
-    COMPARE_ALL = COMPARE_COLUMNS | COMPARE_COLUMN_IDS
-  };
-
-  // Return true if the schemas have exactly the same set of columns
-  // and respective types.
-  bool Equals(const Schema& other, SchemaComparisonType flags = COMPARE_COLUMNS) const {
-    if (this == &other) return true;
-
-    if (flags & COMPARE_COLUMNS) {
-      if (this->num_key_columns_ != other.num_key_columns_) return false;
-      if (this->num_columns() != other.num_columns()) return false;
-      for (size_t i = 0; i < other.num_columns(); i++) {
-        if (!this->cols_[i].Equals(other.cols_[i])) return false;
-      }
+  bool operator==(const Schema& other) const {
+    if (this == &other) {
+      return true;
     }
 
-    if (flags & COMPARE_COLUMN_IDS) {
-      if (this->has_column_ids() != other.has_column_ids()) return false;
-      if (this->has_column_ids()) {
-        if (this->col_ids_ != other.col_ids_) return false;
-        if (this->max_col_id() != other.max_col_id()) return false;
+    if (this->num_key_columns_ != other.num_key_columns_) {
+      return false;
+    }
+
+    const size_t num_columns = this->num_columns();
+    if (num_columns != other.num_columns()) {
+      return false;
+    }
+    for (size_t i = 0; i < num_columns; ++i) {
+      if (!this->cols_[i].Equals(other.cols_[i])) {
+        return false;
       }
     }
 
     return true;
-  }
-
-  bool operator==(const Schema& other) const {
-    return this->Equals(other);
   }
 
   bool operator!=(const Schema& other) const {
@@ -853,7 +840,7 @@ class Schema {
   // Returns the projection schema mapped on the current one
   // If the project is invalid, return a non-OK status.
   Status GetMappedReadProjection(const Schema& projection,
-                                 Schema *mapped_projection) const;
+                                 Schema* mapped_projection) const;
 
   // Loops through this schema (the projection) and calls the projector methods once for
   // each column.
@@ -878,7 +865,7 @@ class Schema {
   //
   // TODO(MAYBE): Pass the ColumnSchema and not only the column index?
   template <class Projector>
-  Status GetProjectionMapping(const Schema& base_schema, Projector *projector) const {
+  Status GetProjectionMapping(const Schema& base_schema, Projector* projector) const {
     const bool use_column_ids = base_schema.has_column_ids() && has_column_ids();
 
     int proj_idx = 0;
@@ -926,7 +913,7 @@ class Schema {
   int find_column_by_id(ColumnId id) const {
     DCHECK(cols_.empty() || has_column_ids());
     int ret = id_to_index_[id];
-    if (ret == -1) {
+    if (ret == IdMapping::kNoEntry) {
       return kColumnNotFound;
     }
     return ret;
@@ -967,6 +954,9 @@ class Schema {
 
   friend class SchemaBuilder;
 
+  // 'Deep' compare two schemas: this is used by Schema's unit tests.
+  friend bool EqualSchemas(const Schema&, const Schema&);
+
   std::vector<ColumnSchema> cols_;
   size_t num_key_columns_;
   std::vector<ColumnId> col_ids_;
@@ -1002,11 +992,10 @@ class Schema {
 // Helper used for schema creation/editing.
 //
 // Example:
-//   Status s;
 //   SchemaBuilder builder(base_schema);
-//   s = builder.RemoveColumn("value");
-//   s = builder.AddKeyColumn("key2", STRING);
-//   s = builder.AddColumn("new_c1", UINT32);
+//   RETURN_NOT_OK(builder.RemoveColumn("value"));
+//   RETURN_NOT_OK(builder.AddKeyColumn("key2", STRING));
+//   RETURN_NOT_OK(builder.AddColumn("new_c1", UINT32));
 //   ...
 //   Schema new_schema = builder.Build();
 class SchemaBuilder {
@@ -1017,7 +1006,7 @@ class SchemaBuilder {
   void Reset();
   void Reset(const Schema& schema);
 
-  bool is_valid() const { return cols_.size() > 0; }
+  bool is_valid() const { return !cols_.empty(); }
 
   // Set the next column ID to be assigned to columns added with
   // AddColumn.
@@ -1035,7 +1024,7 @@ class SchemaBuilder {
   // Return false if the column is not a key column, or if
   // the column is not in the builder.
   bool is_key_column(const StringPiece col_name) const {
-    for (int i = 0; i < num_key_columns_; i++) {
+    for (size_t i = 0; i < num_key_columns_; ++i) {
       if (cols_[i].name() == col_name) return true;
     }
     return false;
@@ -1059,8 +1048,8 @@ class SchemaBuilder {
   Status AddColumn(const std::string& name,
                    DataType type,
                    bool is_nullable,
-                   const void *read_default,
-                   const void *write_default);
+                   const void* read_default,
+                   const void* write_default);
 
   Status RemoveColumn(const std::string& name);
 
@@ -1089,5 +1078,3 @@ struct hash<kudu::ColumnId> {
   }
 };
 } // namespace std
-
-#endif

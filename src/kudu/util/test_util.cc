@@ -39,6 +39,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest-spi.h>
 
+#include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/strcat.h"
@@ -66,16 +67,25 @@ DEFINE_string(test_leave_files, "on_failure",
 DEFINE_int32(test_random_seed, 0, "Random seed to use for randomized tests");
 
 DECLARE_string(time_source);
+DECLARE_bool(encrypt_data_at_rest);
 
 using std::string;
 using std::vector;
 using strings::Substitute;
+
+namespace {
+int testIteration = 0;
+} // namespace
 
 namespace kudu {
 
 const char* kInvalidPath = "/dev/invalid-path-for-kudu-tests";
 static const char* const kSlowTestsEnvVar = "KUDU_ALLOW_SLOW_TESTS";
 static const char* const kLargeKeysEnvVar = "KUDU_USE_LARGE_KEYS_IN_TESTS";
+static const char* const kEncryptDataInTests = "KUDU_ENCRYPT_DATA_IN_TESTS";
+static const int kEncryptionKeySize = 16;
+static const uint8_t kEncryptionKey[kEncryptionKeySize] =
+  {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 42};
 
 static const uint64_t kTestBeganAtMicros = Env::Default()->NowMicros();
 
@@ -85,6 +95,11 @@ static const uint64_t kTestBeganAtMicros = Env::Default()->NowMicros();
 //
 // This can be checked using the 'IsGTest()' function from test_util_prod.cc.
 bool g_is_gtest = true;
+
+void KuduTestEventListener::OnTestIterationStart(const testing::UnitTest& /*unit_test*/,
+                                                 int iteration) {
+  testIteration = iteration;
+}
 
 ///////////////////////////////////////////////////
 // KuduTest
@@ -127,10 +142,15 @@ KuduTest::KuduTest()
     // reports an error since the flag is unknown to the gflags runtime.
     google::SetCommandLineOptionWithMode(e.first, e.second, google::SET_FLAGS_DEFAULT);
   }
+
+  if (EnableEncryption()) {
+    SetEncryptionFlags(true);
+  }
+
   // If the TEST_TMPDIR variable has been set, then glog will automatically use that
   // as its default log directory. We would prefer that the default log directory
   // instead be the test-case-specific subdirectory.
-  FLAGS_log_dir = GetTestDataDirectory();
+  FLAGS_log_dir = test_dir_;
 }
 
 KuduTest::~KuduTest() {
@@ -178,6 +198,22 @@ void KuduTest::OverrideKrb5Environment() {
   setenv("KRB5CCNAME", kInvalidPath, 1);
 }
 
+void KuduTest::SetEncryptionFlags(bool enable_encryption) {
+  FLAGS_encrypt_data_at_rest = enable_encryption;
+  if (enable_encryption) {
+    Env::Default()->SetEncryptionKey(kEncryptionKeySize * 8, kEncryptionKey);
+  }
+}
+
+const string KuduTest::GetEncryptionKey() {
+  if (FLAGS_encrypt_data_at_rest) {
+    string key;
+    strings::b2a_hex(kEncryptionKey, &key, kEncryptionKeySize);
+    return key;
+  }
+  return "";
+}
+
 ///////////////////////////////////////////////////
 // Test utility functions
 ///////////////////////////////////////////////////
@@ -185,6 +221,8 @@ void KuduTest::OverrideKrb5Environment() {
 bool AllowSlowTests() { return GetBooleanEnvironmentVariable(kSlowTestsEnvVar); }
 
 bool UseLargeKeys() { return GetBooleanEnvironmentVariable(kLargeKeysEnvVar); }
+
+bool EnableEncryption() { return GetBooleanEnvironmentVariable(kEncryptDataInTests); }
 
 void OverrideFlagForSlowTests(const std::string& flag_name,
                               const std::string& new_value) {
@@ -223,8 +261,9 @@ string GetTestDataDirectory() {
   // The directory name includes some strings for specific reasons:
   // - program name: identifies the directory to the test invoker
   // - timestamp and pid: disambiguates with prior runs of the same test
+  // - iteration: identifies the iteration when using --gtest_repeat
   //
-  // e.g. "env-test.TestEnv.TestReadFully.1409169025392361-23600"
+  // e.g. "env-test.TestEnv.TestReadFully.1409169025392361-23600-0"
   //
   // If the test is sharded, the shard index is also included so that the test
   // invoker can more easily identify all directories belonging to each shard.
@@ -233,13 +272,14 @@ string GetTestDataDirectory() {
   if (shard_index && shard_index[0] != '\0') {
     shard_index_infix = Substitute("$0.", shard_index);
   }
-  dir += Substitute("/$0.$1$2.$3.$4-$5",
+  dir += Substitute("/$0.$1$2.$3.$4-$5-$6",
     StringReplace(google::ProgramInvocationShortName(), "/", "_", true),
     shard_index_infix,
     StringReplace(test_info->test_case_name(), "/", "_", true),
     StringReplace(test_info->name(), "/", "_", true),
     kTestBeganAtMicros,
-    getpid());
+    getpid(),
+    testIteration);
   Status s = Env::Default()->CreateDir(dir);
   CHECK(s.IsAlreadyPresent() || s.ok())
     << "Could not create directory " << dir << ": " << s.ToString();

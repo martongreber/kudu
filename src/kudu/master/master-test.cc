@@ -18,6 +18,7 @@
 #include "kudu/master/master.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <ctime>
 #include <functional>
@@ -34,7 +35,7 @@
 #include <vector>
 
 #include <boost/optional/optional.hpp>
-#include <gflags/gflags_declare.h>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <rapidjson/document.h>
@@ -77,6 +78,7 @@
 #include "kudu/server/rpc_server.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/util/atomic.h"
+#include "kudu/util/cache.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/curl_util.h"
 #include "kudu/util/env.h"
@@ -118,13 +120,20 @@ using std::vector;
 using strings::Substitute;
 
 DECLARE_bool(catalog_manager_check_ts_count_for_create_table);
+DECLARE_bool(enable_metadata_cleanup_for_deleted_tables_and_tablets);
 DECLARE_bool(enable_per_range_hash_schemas);
 DECLARE_bool(master_client_location_assignment_enabled);
 DECLARE_bool(master_support_authz_tokens);
 DECLARE_bool(mock_table_metrics_for_testing);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_double(sys_catalog_fail_during_write);
+DECLARE_int32(catalog_manager_bg_task_wait_ms);
+DECLARE_int32(default_num_replicas);
+DECLARE_int32(metadata_for_deleted_table_and_tablet_reserved_secs);
 DECLARE_int32(diagnostics_log_stack_traces_interval_ms);
+DECLARE_int32(flush_threshold_mb);
+DECLARE_int32(flush_threshold_secs);
+DECLARE_int32(flush_upper_bound_ms);
 DECLARE_int32(master_inject_latency_on_tablet_lookups_ms);
 DECLARE_int32(max_table_comment_length);
 DECLARE_int32(rpc_service_queue_length);
@@ -166,31 +175,151 @@ class MasterTest : public KuduTest {
     KuduTest::TearDown();
   }
 
-  struct HashBucketSchema {
+  struct HashDimension {
     vector<string> columns;
     int32_t num_buckets;
     uint32_t seed;
   };
+  typedef vector<HashDimension> HashSchema;
 
   void DoListTables(const ListTablesRequestPB& req, ListTablesResponsePB* resp);
   void DoListAllTables(ListTablesResponsePB* resp);
-  Status CreateTable(const string& table_name,
+
+  Status CreateTable(const string& name,
                      const Schema& schema,
-                     const optional<TableTypePB>& table_type = boost::none);
-  Status CreateTable(const string& table_name,
+                     const optional<TableTypePB>& type = none,
+                     const optional<string>& owner = none,
+                     const optional<string>& comment = none);
+
+  Status CreateTable(const string& name,
                      const Schema& schema,
                      const vector<KuduPartialRow>& split_rows,
-                     const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
+                     const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds = {},
+                     const vector<HashSchema>& range_hash_schemas = {});
+
+  Status CreateTable(const string& name,
+                     const Schema& schema,
+                     const optional<TableTypePB>& type,
                      const optional<string>& owner,
-                     const optional<string>& comment = boost::none,
-                     const optional<TableTypePB>& table_type = boost::none,
-                     const vector<vector<HashBucketSchema>>& range_hash_schema = {});
+                     const optional<string>& comment,
+                     const vector<KuduPartialRow>& split_rows,
+                     const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
+                     const vector<HashSchema>& range_hash_schemas);
 
   shared_ptr<Messenger> client_messenger_;
   unique_ptr<MiniMaster> mini_master_;
   Master* master_;
   unique_ptr<MasterServiceProxy> proxy_;
 };
+
+Status MasterTest::CreateTable(const string& name,
+                               const Schema& schema,
+                               const optional<TableTypePB>& type,
+                               const optional<string>& owner,
+                               const optional<string>& comment) {
+  KuduPartialRow split1(&schema);
+  RETURN_NOT_OK(split1.SetInt32("key", 10));
+
+  KuduPartialRow split2(&schema);
+  RETURN_NOT_OK(split2.SetInt32("key", 20));
+
+  return CreateTable(
+      name, schema, type, owner, comment, { split1, split2 }, {}, {});
+}
+
+Status MasterTest::CreateTable(
+    const string& name,
+    const Schema& schema,
+    const vector<KuduPartialRow>& split_rows,
+    const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
+    const vector<HashSchema>& range_hash_schemas) {
+  return CreateTable(
+        name, schema, none, none, none, split_rows, bounds, range_hash_schemas);
+}
+
+Status MasterTest::CreateTable(
+    const string& name,
+    const Schema& schema,
+    const optional<TableTypePB>& type,
+    const optional<string>& owner,
+    const optional<string>& comment,
+    const vector<KuduPartialRow>& split_rows,
+    const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
+    const vector<HashSchema>& range_hash_schemas) {
+
+  if (!range_hash_schemas.empty() && range_hash_schemas.size() != bounds.size()) {
+    return Status::InvalidArgument(
+        "'bounds' and 'range_hash_schemas' must be of the same size");
+  }
+
+  CreateTableRequestPB req;
+  req.set_name(name);
+  if (type) {
+    req.set_table_type(*type);
+  }
+  RETURN_NOT_OK(SchemaToPB(schema, req.mutable_schema()));
+  RowOperationsPBEncoder splits_encoder(req.mutable_split_rows_range_bounds());
+  for (const KuduPartialRow& row : split_rows) {
+    splits_encoder.Add(RowOperationsPB::SPLIT_ROW, row);
+  }
+  for (const pair<KuduPartialRow, KuduPartialRow>& bound : bounds) {
+    splits_encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, bound.first);
+    splits_encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, bound.second);
+  }
+
+  auto* ps_pb = req.mutable_partition_schema();
+  for (size_t i = 0; i < range_hash_schemas.size(); ++i) {
+    auto* range = ps_pb->add_custom_hash_schema_ranges();
+    RowOperationsPBEncoder encoder(range->mutable_range_bounds());
+    const auto& bound = bounds[i];
+    encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, bound.first);
+    encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, bound.second);
+    const auto& range_hash_schema = range_hash_schemas[i];
+    for (const auto& hash_dimension : range_hash_schema) {
+      auto* hash_dimension_pb = range->add_hash_schema();
+      for (const string& col_name : hash_dimension.columns) {
+        hash_dimension_pb->add_columns()->set_name(col_name);
+      }
+      hash_dimension_pb->set_num_buckets(hash_dimension.num_buckets);
+      hash_dimension_pb->set_seed(hash_dimension.seed);
+    }
+  }
+
+  if (owner) {
+    req.set_owner(*owner);
+  }
+  if (comment) {
+    req.set_comment(*comment);
+  }
+  RpcController controller;
+  if (!bounds.empty()) {
+    controller.RequireServerFeature(MasterFeatures::RANGE_PARTITION_BOUNDS);
+  }
+
+  CreateTableResponsePB resp;
+  RETURN_NOT_OK(proxy_->CreateTable(req, &resp, &controller));
+  if (resp.has_error()) {
+    RETURN_NOT_OK(StatusFromPB(resp.error().status()));
+  }
+  return Status::OK();
+}
+
+void MasterTest::DoListTables(const ListTablesRequestPB& req, ListTablesResponsePB* resp) {
+  RpcController controller;
+  ASSERT_OK(proxy_->ListTables(req, resp, &controller));
+  SCOPED_TRACE(SecureDebugString(*resp));
+  ASSERT_FALSE(resp->has_error());
+}
+
+void MasterTest::DoListAllTables(ListTablesResponsePB* resp) {
+  ListTablesRequestPB req;
+  DoListTables(req, resp);
+}
+
+static void MakeHostPortPB(const string& host, uint32_t port, HostPortPB* pb) {
+  pb->set_host(host);
+  pb->set_port(port);
+}
 
 TEST_F(MasterTest, TestPingServer) {
   // Ping the server.
@@ -200,16 +329,95 @@ TEST_F(MasterTest, TestPingServer) {
   ASSERT_OK(proxy_->Ping(req, &resp, &controller));
 }
 
-static void MakeHostPortPB(const string& host, uint32_t port, HostPortPB* pb) {
-  pb->set_host(host);
-  pb->set_port(port);
-}
-
 // Test that shutting down a MiniMaster without starting it does not
 // SEGV.
 TEST_F(MasterTest, TestShutdownWithoutStart) {
   MiniMaster m("/xxxx", HostPort("127.0.0.1", 0));
   m.Shutdown();
+}
+
+// Test that ensures that, when specified, restarting a master from within the
+// same process can correctly instantiate proper block cache metrics.
+TEST_F(MasterTest, TestResetBlockCacheMetricsInSameProcess) {
+  mini_master_->Shutdown();
+  // Make sure we flush quickly so we start using the block cache ASAP.
+  FLAGS_flush_threshold_mb = 1;
+  FLAGS_flush_threshold_secs = 1;
+  FLAGS_flush_upper_bound_ms = 0;
+
+  // If implemented incorrectly, since the BlockCache is a singleton, we could
+  // end up with incorrect block cache metrics upon resetting the master
+  // because we register metrics twice. Ensure that's not the case when we
+  // supply the option to reset metrics.
+  mini_master_->mutable_options()->set_block_cache_metrics_policy(
+      Cache::ExistingMetricsPolicy::kReset);
+  ASSERT_OK(mini_master_->Restart());
+
+  // Keep on creating tables until we flush, at which point we'll use the block
+  // cache and increment metrics.
+  // NOTE: we could examine the master's metric_entity() directly, but that
+  // could itself interfere with the reported metrics, e.g. by calling
+  // FindOrCreateCount(). Going through the web UI is more organic anyway.
+  const Schema kTableSchema({ ColumnSchema("key", INT32), ColumnSchema("v", STRING) }, 1);
+  constexpr const char* kTablePrefix = "testtb";
+  EasyCurl c;
+  int i = 0;
+  ASSERT_EVENTUALLY([&] {
+      ASSERT_OK(CreateTable(Substitute("$0-$1", kTablePrefix, i++), kTableSchema));
+      faststring buf;
+      ASSERT_OK(c.FetchURL(
+          Substitute("http://$0/metrics?ids=kudu.master&metrics=block_cache_inserts",
+                     mini_master_->bound_http_addr().ToString()),
+          &buf));
+      string raw = buf.ToString();
+      // If instrumented correctly, the new master should eventually display
+      // non-zero metrics for the block cache.
+      ASSERT_STR_MATCHES(raw, ".*\"value\": [1-9].*");
+  });
+}
+
+TEST_F(MasterTest, TestStartupWebPage) {
+  EasyCurl c;
+  faststring buf;
+  string addr = mini_master_->bound_http_addr().ToString();
+  mini_master_->Shutdown();
+  std::atomic<bool> run_status_reader = false;
+  thread read_startup_page([&] {
+    EasyCurl thread_c;
+    faststring thread_buf;
+    while (!run_status_reader) {
+      SleepFor(MonoDelta::FromMilliseconds(10));
+      if (!(thread_c.FetchURL(strings::Substitute("http://$0/startup", addr), &thread_buf)).ok()) {
+        continue;
+      }
+      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"init_status\":(100|0)( |,)");
+      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"read_filesystem_status\":(100|0)( |,)");
+      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"read_instance_metadatafiles_status\""
+                                                    ":(100|0)( |,)");
+      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"read_data_directories_status\":"
+                                                    "([0-9]|[1-9][0-9]|100)( |,)");
+      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"initialize_master_catalog_status\":"
+                                                    "([0-9]|[1-9][0-9]|100)( |,)");
+      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"start_rpc_server_status\":(100|0)( |,)");
+    }
+  });
+  SCOPED_CLEANUP({
+    run_status_reader = true;
+    read_startup_page.join();
+  });
+
+  ASSERT_OK(mini_master_->Restart());
+  ASSERT_OK(mini_master_->WaitForCatalogManagerInit());
+  run_status_reader = true;
+
+  // After all the steps have been completed, ensure every startup step has 100 percent status
+  ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/startup", addr), &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"init_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"read_filesystem_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"read_instance_metadatafiles_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"read_data_directories_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"initialize_master_catalog_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"start_rpc_server_status\":100");
 }
 
 TEST_F(MasterTest, TestRegisterAndHeartbeat) {
@@ -463,7 +671,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     req.mutable_replica_management_info()->CopyFrom(rmi);
     req.mutable_registration()->mutable_rpc_addresses(0)->set_port(1001);
     Status s = proxy_->TSHeartbeat(req, &resp, &rpc);
-    ASSERT_TRUE(s.IsRemoteError());
+    ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
                         "Tablet server my-ts-uuid is attempting to re-register "
                         "with a different host/port.");
@@ -538,86 +746,6 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     ASSERT_FALSE(list_ts_resp.has_error());
     ASSERT_EQ(0, list_ts_resp.servers_size());
   }
-}
-
-Status MasterTest::CreateTable(const string& table_name,
-                               const Schema& schema,
-                               const optional<TableTypePB>& table_type) {
-  KuduPartialRow split1(&schema);
-  RETURN_NOT_OK(split1.SetInt32("key", 10));
-
-  KuduPartialRow split2(&schema);
-  RETURN_NOT_OK(split2.SetInt32("key", 20));
-
-  return CreateTable(
-      table_name, schema, { split1, split2 }, {}, boost::none, boost::none, table_type);
-}
-
-Status MasterTest::CreateTable(const string& table_name,
-                               const Schema& schema,
-                               const vector<KuduPartialRow>& split_rows,
-                               const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
-                               const optional<string>& owner,
-                               const optional<string>& comment,
-                               const optional<TableTypePB>& table_type,
-                               const vector<vector<HashBucketSchema>>& range_hash_schema) {
-  CreateTableRequestPB req;
-  CreateTableResponsePB resp;
-  RpcController controller;
-
-  req.set_name(table_name);
-  if (table_type) {
-    req.set_table_type(*table_type);
-  }
-  RETURN_NOT_OK(SchemaToPB(schema, req.mutable_schema()));
-  RowOperationsPBEncoder encoder(req.mutable_split_rows_range_bounds());
-  for (const KuduPartialRow& row : split_rows) {
-    encoder.Add(RowOperationsPB::SPLIT_ROW, row);
-  }
-  for (const pair<KuduPartialRow, KuduPartialRow>& bound : bounds) {
-    encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, bound.first);
-    encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, bound.second);
-  }
-
-  for (const auto& hash_schemas : range_hash_schema) {
-    auto* hash_schemas_pb = req.add_range_hash_schemas();
-    for (const auto& hash_schema : hash_schemas) {
-      auto* hash_bucket_schema_pb = hash_schemas_pb->add_hash_schemas();
-      for (const string& col_name : hash_schema.columns) {
-        hash_bucket_schema_pb->add_columns()->set_name(col_name);
-      }
-      hash_bucket_schema_pb->set_num_buckets(hash_schema.num_buckets);
-      hash_bucket_schema_pb->set_seed(hash_schema.seed);
-    }
-  }
-
-  if (owner) {
-    req.set_owner(*owner);
-  }
-  if (comment) {
-    req.set_comment(*comment);
-  }
-  if (!bounds.empty()) {
-    controller.RequireServerFeature(MasterFeatures::RANGE_PARTITION_BOUNDS);
-  }
-
-  RETURN_NOT_OK(proxy_->CreateTable(req, &resp, &controller));
-  if (resp.has_error()) {
-    RETURN_NOT_OK(StatusFromPB(resp.error().status()));
-  }
-  return Status::OK();
-}
-
-void MasterTest::DoListTables(const ListTablesRequestPB& req, ListTablesResponsePB* resp) {
-  RpcController controller;
-  ASSERT_OK(proxy_->ListTables(req, resp, &controller));
-  SCOPED_TRACE(SecureDebugString(*resp));
-  ASSERT_FALSE(resp->has_error());
-}
-
-void MasterTest::DoListAllTables(ListTablesResponsePB* resp) {
-  ListTablesRequestPB req;
-  DoListTables(req, resp);
 }
 
 TEST_F(MasterTest, TestCatalog) {
@@ -808,7 +936,7 @@ TEST_F(MasterTest, ListTablesWithTableFilter) {
 }
 
 TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
-  const char *kTableName = "testtb";
+  constexpr const char* const kTableName = "testtb";
   const Schema kTableSchema({ ColumnSchema("key", INT32), ColumnSchema("val", INT32) }, 1);
 
   // No duplicate split rows.
@@ -817,7 +945,7 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     ASSERT_OK(split1.SetInt32("key", 1));
     KuduPartialRow split2(&kTableSchema);
     ASSERT_OK(split2.SetInt32("key", 2));
-    Status s = CreateTable(kTableName, kTableSchema, { split1, split1, split2 }, {}, none);
+    Status s = CreateTable(kTableName, kTableSchema, { split1, split1, split2 });
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "duplicate split row");
   }
@@ -827,15 +955,16 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     KuduPartialRow split1(&kTableSchema);
     ASSERT_OK(split1.SetInt32("key", 1));
     KuduPartialRow split2(&kTableSchema);
-    Status s = CreateTable(kTableName, kTableSchema, { split1, split2 }, {}, none);
-    ASSERT_TRUE(s.IsInvalidArgument());
+    Status s = CreateTable(kTableName, kTableSchema, { split1, split2 });
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
-                        "Invalid argument: split rows must contain a value for at "
+                        "split rows must contain a value for at "
                         "least one range partition column");
   }
 
   // No split rows and range specific hashing concurrently.
   {
+    google::FlagSaver flag_saver;
     FLAGS_enable_per_range_hash_schemas = true; // enable for testing.
     KuduPartialRow split1(&kTableSchema);
     ASSERT_OK(split1.SetInt32("key", 1));
@@ -843,32 +972,16 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     KuduPartialRow a_upper(&kTableSchema);
     ASSERT_OK(a_lower.SetInt32("key", 0));
     ASSERT_OK(a_upper.SetInt32("key", 100));
-    vector<vector<HashBucketSchema>> range_hash_schema = { vector<HashBucketSchema>() };
-    Status s = CreateTable(kTableName, kTableSchema, { split1 }, { { a_lower, a_upper } },
-                           none, none, none, range_hash_schema);
-    ASSERT_TRUE(s.IsInvalidArgument());
+    vector<HashSchema> range_hash_schemas = {{}};
+    Status s = CreateTable(kTableName,
+                           kTableSchema,
+                           { split1 },
+                           { { a_lower, a_upper } },
+                           range_hash_schemas);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
                         "Both 'split_rows' and 'range_hash_schemas' cannot be "
                         "populated at the same time.");
-  }
-
-  // The number of range bounds must match the size of user defined hash schemas.
-  {
-    FLAGS_enable_per_range_hash_schemas = true; // enable for testing.
-    KuduPartialRow a_lower(&kTableSchema);
-    KuduPartialRow a_upper(&kTableSchema);
-    ASSERT_OK(a_lower.SetInt32("key", 0));
-    ASSERT_OK(a_upper.SetInt32("key", 100));
-    vector<HashBucketSchema> hash_schemas_4 = { { {"key"}, 4, 0 } };
-    vector<HashBucketSchema> hash_schemas_2 = { { {"val"}, 2, 0 } };
-    vector<vector<HashBucketSchema>> range_hash_schema = {std::move(hash_schemas_2),
-                                                          std::move(hash_schemas_4)};
-    Status s = CreateTable(kTableName, kTableSchema, { }, { { a_lower, a_upper } },
-                           none, none, none, range_hash_schema);
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(),
-                        "The number of range bounds does not match the number of per "
-                        "range hash schemas.");
   }
 
   // No non-range columns.
@@ -876,11 +989,11 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     KuduPartialRow split(&kTableSchema);
     ASSERT_OK(split.SetInt32("key", 1));
     ASSERT_OK(split.SetInt32("val", 1));
-    Status s = CreateTable(kTableName, kTableSchema, { split }, {}, none);
-    ASSERT_TRUE(s.IsInvalidArgument());
+    Status s = CreateTable(kTableName, kTableSchema, { split });
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
-                        "Invalid argument: split rows may only contain values "
-                        "for range partitioned columns: val");
+                        "split rows may only contain values for "
+                        "range partition columns: val");
   }
 
   { // Overlapping bounds.
@@ -892,10 +1005,12 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     ASSERT_OK(a_upper.SetInt32("key", 100));
     ASSERT_OK(b_lower.SetInt32("key", 50));
     ASSERT_OK(b_upper.SetInt32("key", 150));
-    Status s = CreateTable(kTableName, kTableSchema, { }, { { a_lower, a_upper },
-                                                            { b_lower, b_upper } }, none);
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: overlapping range partition");
+    Status s = CreateTable(kTableName,
+                           kTableSchema,
+                           {},
+                           { { a_lower, a_upper }, { b_lower, b_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "overlapping range partition");
   }
   { // Split row out of bounds (above).
     KuduPartialRow bound_lower(&kTableSchema);
@@ -906,10 +1021,10 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     KuduPartialRow split(&kTableSchema);
     ASSERT_OK(split.SetInt32("key", 200));
 
-    Status s = CreateTable(kTableName, kTableSchema, { split },
-                           { { bound_lower, bound_upper } }, none);
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: split out of bounds");
+    Status s = CreateTable(
+        kTableName, kTableSchema, { split }, { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "split out of bounds");
   }
   { // Split row out of bounds (below).
     KuduPartialRow bound_lower(&kTableSchema);
@@ -920,10 +1035,10 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     KuduPartialRow split(&kTableSchema);
     ASSERT_OK(split.SetInt32("key", -120));
 
-    Status s = CreateTable(kTableName, kTableSchema, { split },
-                           { { bound_lower, bound_upper } }, none);
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: split out of bounds");
+    Status s = CreateTable(
+        kTableName, kTableSchema, { split }, { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "split out of bounds");
   }
   { // Lower bound greater than upper bound.
     KuduPartialRow bound_lower(&kTableSchema);
@@ -931,11 +1046,13 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     ASSERT_OK(bound_lower.SetInt32("key", 150));
     ASSERT_OK(bound_upper.SetInt32("key", 0));
 
-    Status s = CreateTable(kTableName, kTableSchema, { }, { { bound_lower, bound_upper } }, none);
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(),
-                        "Invalid argument: range partition lower bound must be "
-                        "less than the upper bound");
+    Status s = CreateTable(
+        kTableName, kTableSchema, vector<KuduPartialRow>{},
+        { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(
+        s.ToString(),
+        "range partition lower bound must be less than the upper bound");
   }
   { // Lower bound equals upper bound.
     KuduPartialRow bound_lower(&kTableSchema);
@@ -943,11 +1060,13 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     ASSERT_OK(bound_lower.SetInt32("key", 0));
     ASSERT_OK(bound_upper.SetInt32("key", 0));
 
-    Status s = CreateTable(kTableName, kTableSchema, { }, { { bound_lower, bound_upper } }, none);
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(),
-                        "Invalid argument: range partition lower bound must be "
-                        "less than the upper bound");
+    Status s = CreateTable(
+        kTableName, kTableSchema,
+        vector<KuduPartialRow>{}, { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(
+        s.ToString(),
+        "range partition lower bound must be less than the upper bound");
   }
   { // Split equals lower bound
     KuduPartialRow bound_lower(&kTableSchema);
@@ -958,10 +1077,10 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     KuduPartialRow split(&kTableSchema);
     ASSERT_OK(split.SetInt32("key", 0));
 
-    Status s = CreateTable(kTableName, kTableSchema, { split }, { { bound_lower, bound_upper } },
-                           none);
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: split matches lower or upper bound");
+    Status s = CreateTable(
+        kTableName, kTableSchema, { split }, { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "split matches lower or upper bound");
   }
   { // Split equals upper bound
     KuduPartialRow bound_lower(&kTableSchema);
@@ -972,10 +1091,10 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     KuduPartialRow split(&kTableSchema);
     ASSERT_OK(split.SetInt32("key", 10));
 
-    Status s = CreateTable(kTableName, kTableSchema, { split }, { { bound_lower, bound_upper } },
-                           none);
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: split matches lower or upper bound");
+    Status s = CreateTable(
+        kTableName, kTableSchema, { split }, { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "split matches lower or upper bound");
   }
 }
 
@@ -985,7 +1104,7 @@ TEST_F(MasterTest, TestCreateTableInvalidKeyType) {
   const DataType types[] = { BOOL, FLOAT, DOUBLE };
   for (DataType type : types) {
     const Schema kTableSchema({ ColumnSchema("key", type) }, 1);
-    Status s = CreateTable(kTableName, kTableSchema, vector<KuduPartialRow>(), {}, none);
+    Status s = CreateTable(kTableName, kTableSchema, vector<KuduPartialRow>());
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
         "key column may not have type of BOOL, FLOAT, or DOUBLE");
@@ -993,12 +1112,15 @@ TEST_F(MasterTest, TestCreateTableInvalidKeyType) {
 }
 
 TEST_F(MasterTest, TestCreateTableOwnerNameTooLong) {
-  const char *kTableName = "testb";
-  const string kOwnerName = "abcdefghijklmnopqrstuvwxyz01234567899abcdefghijklmnopqrstuvw"
-    "xyz01234567899abcdefghijklmnopqrstuvwxyz01234567899abcdefghijklmnopqrstuvwxyz01234567899";
+  constexpr const char* const kTableName = "testb";
+  const string kOwnerName =
+      "abcdefghijklmnopqrstuvwxyz01234567899"
+      "abcdefghijklmnopqrstuvwxyz01234567899"
+      "abcdefghijklmnopqrstuvwxyz01234567899"
+      "abcdefghijklmnopqrstuvwxyz01234567899";
 
   const Schema kTableSchema({ ColumnSchema("key", INT32), ColumnSchema("val", INT32) }, 1);
-  Status s = CreateTable(kTableName, kTableSchema, {}, {}, kOwnerName);
+  Status s = CreateTable(kTableName, kTableSchema, none, kOwnerName);
   ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "invalid owner name");
 }
@@ -1007,7 +1129,7 @@ TEST_F(MasterTest, TestCreateTableCommentTooLong) {
   constexpr const char* const kTableName = "testb";
   const string kComment = string(FLAGS_max_table_comment_length + 1, 'x');
   const Schema kTableSchema({ ColumnSchema("key", INT32), ColumnSchema("val", INT32) }, 1);
-  Status s = CreateTable(kTableName, kTableSchema, {}, {}, none, kComment);
+  Status s = CreateTable(kTableName, kTableSchema, none, none, kComment);
   ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "invalid table comment");
 }
@@ -1086,6 +1208,31 @@ TEST_F(MasterTest, TestCreateTableMismatchedDefaults) {
   ASSERT_EQ("code: INVALID_ARGUMENT message: \"column \\'col\\' has "
             "mismatched read/write defaults\"",
             SecureShortDebugString(resp.error().status()));
+}
+
+// Non-PK columns cannot be used for per-range custom hash bucket schemas.
+TEST_F(MasterTest, NonPrimaryKeyColumnsForPerRangeCustomHashSchema) {
+  constexpr const char* const kTableName = "nicetry";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32), ColumnSchema("int32_val", INT32) }, 1);
+
+  // Explicitly enable support for per-range custom hash bucket schemas.
+  FLAGS_enable_per_range_hash_schemas = true;
+
+  // For simplicity, a single tablet replica is enough.
+  FLAGS_default_num_replicas = 1;
+
+  KuduPartialRow lower(&kTableSchema);
+  KuduPartialRow upper(&kTableSchema);
+  ASSERT_OK(lower.SetInt32("key", 0));
+  ASSERT_OK(upper.SetInt32("key", 100));
+  vector<HashSchema> range_hash_schemas{{{{"int32_val"}, 2, 0}}};
+  const auto s = CreateTable(
+      kTableName, kTableSchema, {}, { { lower, upper } }, range_hash_schemas);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(),
+                      "must specify only primary key columns for "
+                      "hash bucket partition components");
 }
 
 // Regression test for KUDU-253/KUDU-592: crash if the GetTableLocations RPC call is
@@ -1254,7 +1401,7 @@ TEST_F(MasterTest, TestGetTableSchemaIsAtomicWithCreateTable) {
       } else {
         Schema receivedSchema;
         CHECK_OK(SchemaFromPB(resp.schema(), &receivedSchema));
-        CHECK(kTableSchema.Equals(receivedSchema)) <<
+        CHECK(kTableSchema == receivedSchema) <<
             strings::Substitute("$0 not equal to $1",
                                 kTableSchema.ToString(), receivedSchema.ToString());
         CHECK_EQ(kTableName, resp.table_name());
@@ -1381,6 +1528,20 @@ TEST_P(ConcurrentGetTableSchemaTest, Rpc) {
   LOG(INFO) << Substitute(
       "GetTableSchema RPC: $0 req/sec (authz $1)",
       total / kRunInterval.ToSeconds(), supports_authz_ ? "enabled" : "disabled");
+}
+
+// Validate the hostname and the UUID of the server from the metrics webpage
+TEST_F(MasterTest, ServerAttributes) {
+  EasyCurl c;
+  faststring buf;
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics?ids=kudu.master",
+                                mini_master_->bound_http_addr().ToString()),
+                                &buf));
+  string raw = buf.ToString();
+  string server_hostname;
+  ASSERT_STR_CONTAINS(raw, "\"uuid\": \"" + mini_master_->permanent_uuid() + "\"");
+  ASSERT_OK(GetFQDN(&server_hostname));
+  ASSERT_STR_CONTAINS(raw, "\"hostname\": \"" + server_hostname + "\"");
 }
 
 // Run multiple threads calling GetTableSchema() directly to system catalog.
@@ -2239,7 +2400,7 @@ TEST_F(MasterTest, TestDuplicateRequest) {
   vector<scoped_refptr<TableInfo>> tables;
   {
     CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
-    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    master_->catalog_manager()->GetAllTables(&tables);
     ASSERT_EQ(1, tables.size());
   }
 
@@ -2314,7 +2475,7 @@ TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
   vector<scoped_refptr<TableInfo>> tables;
   {
     CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
-    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    master_->catalog_manager()->GetAllTables(&tables);
     ASSERT_EQ(1, tables.size());
   }
   vector<scoped_refptr<TabletInfo>> tablets;
@@ -2330,7 +2491,7 @@ TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
       old_stats.set_live_row_count(1);
       new_stats.set_live_row_count(1);
     }
-    tables[0]->UpdateMetrics(tablet->id(), old_stats, new_stats);
+    tables[0]->UpdateStatsMetrics(tablet->id(), old_stats, new_stats);
   };
 
   // Trigger to cause 'live_row_count' invisible.
@@ -2381,7 +2542,7 @@ TEST_F(MasterTest, TestTableStatisticsWithOldVersion) {
   vector<scoped_refptr<TableInfo>> tables;
   {
     CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
-    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    master_->catalog_manager()->GetAllTables(&tables);
     ASSERT_EQ(1, tables.size());
   }
   const auto& table = tables[0];
@@ -2399,11 +2560,118 @@ TEST_F(MasterTest, TestTableStatisticsWithOldVersion) {
     tablet::ReportedTabletStatsPB new_stats;
     new_stats.set_on_disk_size(1024);
     new_stats.set_live_row_count(1000);
-    table->UpdateMetrics(tablets.back()->id(), old_stats, new_stats);
+    table->UpdateStatsMetrics(tablets.back()->id(), old_stats, new_stats);
     ASSERT_TRUE(table->GetMetrics()->TableSupportsOnDiskSize());
     ASSERT_TRUE(table->GetMetrics()->TableSupportsLiveRowCount());
     ASSERT_EQ(1024, table->GetMetrics()->on_disk_size->value());
     ASSERT_EQ(1000, table->GetMetrics()->live_row_count->value());
+  }
+}
+
+TEST_F(MasterTest, TestDeletedTablesAndTabletsCleanup) {
+  FLAGS_enable_metadata_cleanup_for_deleted_tables_and_tablets = true;
+  FLAGS_metadata_for_deleted_table_and_tablet_reserved_secs = 1;
+  FLAGS_catalog_manager_bg_task_wait_ms = 10;
+
+  constexpr const char* const kTableName = "testtable";
+  const Schema kTableSchema({ColumnSchema("key", INT32)}, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  vector<scoped_refptr<TableInfo>> tables;
+  vector<scoped_refptr<TabletInfo>> tablets;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    master_->catalog_manager()->GetAllTables(&tables);
+    ASSERT_EQ(1, tables.size());
+    master_->catalog_manager()->GetAllTabletsForTests(&tablets);
+    ASSERT_EQ(3, tablets.size());
+  }
+
+  // Replace a tablet.
+  {
+    const string& tablet_id = tablets[0]->id();
+    ReplaceTabletRequestPB req;
+    ReplaceTabletResponsePB resp;
+    req.set_tablet_id(tablet_id);
+    RpcController controller;
+    ASSERT_OK(proxy_->ReplaceTablet(req, &resp, &controller));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // The replaced tablet should be cleaned up.
+  ASSERT_EVENTUALLY([&] {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    master_->catalog_manager()->GetAllTabletsForTests(&tablets);
+    ASSERT_EQ(3, tablets.size());
+  });
+
+  // Delete the table.
+  {
+    DeleteTableRequestPB req;
+    DeleteTableResponsePB resp;
+    RpcController controller;
+    req.mutable_table()->set_table_name(kTableName);
+    ASSERT_OK(proxy_->DeleteTable(req, &resp, &controller));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // The deleted table and tablets should be cleaned up.
+  ASSERT_EVENTUALLY([&] {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    master_->catalog_manager()->GetAllTables(&tables);
+    ASSERT_EQ(0, tables.size());
+    master_->catalog_manager()->GetAllTabletsForTests(&tablets);
+    ASSERT_EQ(0, tablets.size());
+  });
+}
+
+TEST_F(MasterTest, TestTableSchemaMetrics) {
+  const char* kTableName = "testtable";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  vector<scoped_refptr<TableInfo>> tables;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    master_->catalog_manager()->GetAllTables(&tables);
+    ASSERT_EQ(1, tables.size());
+  }
+  const auto& table = tables[0];
+
+  ASSERT_EQ(1, table->GetMetrics()->column_count->value());
+  ASSERT_EQ(0, table->GetMetrics()->schema_version->value());
+
+  {
+    AlterTableRequestPB req;
+    req.mutable_table()->set_table_name(kTableName);
+    AlterTableRequestPB::Step* step = req.add_alter_schema_steps();
+    step->set_type(AlterTableRequestPB::ADD_COLUMN);
+    ColumnSchemaToPB(ColumnSchema("c1", INT32, true),
+                     step->mutable_add_column()->mutable_schema());
+
+    AlterTableResponsePB resp;
+    RpcController controller;
+    ASSERT_OK(proxy_->AlterTable(req, &resp, &controller));
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_EQ(2, table->GetMetrics()->column_count->value());
+    ASSERT_EQ(1, table->GetMetrics()->schema_version->value());
+  }
+
+  {
+    AlterTableRequestPB req;
+    req.mutable_table()->set_table_name(kTableName);
+    AlterTableRequestPB::Step* step = req.add_alter_schema_steps();
+    step->set_type(AlterTableRequestPB::DROP_COLUMN);
+    step->mutable_drop_column()->set_name("c1");
+
+    AlterTableResponsePB resp;
+    RpcController controller;
+    ASSERT_OK(proxy_->AlterTable(req, &resp, &controller));
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_EQ(1, table->GetMetrics()->column_count->value());
+    ASSERT_EQ(2, table->GetMetrics()->schema_version->value());
   }
 }
 

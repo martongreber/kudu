@@ -82,6 +82,11 @@ class Messenger;
 class ResultTracker;
 } // namespace rpc
 
+namespace tools {
+struct RunnerContext;
+Status CopyFromLocal(const RunnerContext& context);
+} // namespace tools
+
 namespace tablet {
 class AlterSchemaOpState;
 class OpDriver;
@@ -229,14 +234,14 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
     return tablet_;
   }
 
-  const TabletStatePB state() const {
+  TabletStatePB state() const {
     std::lock_guard<simple_spinlock> lock(lock_);
     return state_;
   }
 
-  std::string StateName() const;
+  const std::string& StateName() const;
 
-  const TabletDataState data_state() const {
+  TabletDataState data_state() const {
     std::lock_guard<simple_spinlock> lock(lock_);
     return meta_->tablet_data_state();
   }
@@ -249,7 +254,7 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
 
   // Set a user-readable status message about the tablet. This may appear on
   // the Web UI, for example.
-  void SetStatusMessage(const std::string& status);
+  void SetStatusMessage(std::string status);
 
   // Retrieve the last human-readable status of this tablet replica.
   std::string last_status() const;
@@ -390,6 +395,7 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   void BeginTxnParticipantOp(int64_t txn_id, RegisteredTxnCallback began_txn_cb);
 
  private:
+  friend Status kudu::tools::CopyFromLocal(const kudu::tools::RunnerContext& context);
   friend class kudu::AlterTableTest;
   friend class RefCountedThreadSafe<TabletReplica>;
   friend class TabletReplicaTest;
@@ -399,6 +405,9 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   FRIEND_TEST(TabletReplicaTest, TestDMSAnchorPreventsLogGC);
   FRIEND_TEST(TabletReplicaTest, TestMRSAnchorPreventsLogGC);
   FRIEND_TEST(kudu::TxnOpDispatcherITest, LifecycleBasic);
+
+  // Only for CLI tools and tests.
+  TabletReplica();
 
   // A class to properly dispatch transactional write operations arriving
   // with TabletServerService::Write() RPC for the specified tablet replica.
@@ -513,7 +522,10 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   void TxnStatusReplicaStateChanged(const std::string& tablet_id,
                                     const std::string& reason);
 
-  std::string LogPrefix() const;
+  const std::string& LogPrefix() const {
+    return meta_->LogPrefix();
+  }
+
   // Transition to another state. Requires that the caller hold 'lock_' if the
   // object has already published to other threads. See tablet/metadata.proto
   // for state descriptions and legal state transitions.
@@ -628,7 +640,5 @@ class FlushInflightsToLogCallback : public RefCountedThreadSafe<FlushInflightsTo
   scoped_refptr<log::Log> log_;
 };
 
-
 }  // namespace tablet
 }  // namespace kudu
-

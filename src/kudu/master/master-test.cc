@@ -43,6 +43,7 @@
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/partition.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
@@ -183,6 +184,12 @@ class MasterTest : public KuduTest {
   };
   typedef vector<HashDimension> HashSchema;
 
+  struct RangeWithHashSchema {
+    KuduPartialRow lower;
+    KuduPartialRow upper;
+    HashSchema hash_schema;
+  };
+
   void DoListTables(const ListTablesRequestPB& req, ListTablesResponsePB* resp);
   void DoListAllTables(ListTablesResponsePB* resp);
 
@@ -196,7 +203,7 @@ class MasterTest : public KuduTest {
                      const Schema& schema,
                      const vector<KuduPartialRow>& split_rows,
                      const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds = {},
-                     const vector<HashSchema>& range_hash_schemas = {});
+                     const vector<RangeWithHashSchema>& ranges_with_hash_schemas = {});
 
 
   Status CreateTable(const string& name,
@@ -206,7 +213,7 @@ class MasterTest : public KuduTest {
                      const optional<string>& comment,
                      const vector<KuduPartialRow>& split_rows,
                      const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
-                     const vector<HashSchema>& range_hash_schemas,
+                     const vector<RangeWithHashSchema>& ranges_with_hash_schemas,
                      const HashSchema& table_wide_hash_schema,
                      CreateTableResponsePB* resp);
 
@@ -237,10 +244,10 @@ Status MasterTest::CreateTable(
     const Schema& schema,
     const vector<KuduPartialRow>& split_rows,
     const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
-    const vector<HashSchema>& range_hash_schemas) {
+    const vector<RangeWithHashSchema>& ranges_with_hash_schemas) {
   CreateTableResponsePB resp;
-  return CreateTable(
-        name, schema, none, none, none, split_rows, bounds, range_hash_schemas, {}, &resp);
+  return CreateTable(name, schema, none, none, none, split_rows, bounds,
+                     ranges_with_hash_schemas, {}, &resp);
 }
 
 Status MasterTest::CreateTable(
@@ -251,15 +258,9 @@ Status MasterTest::CreateTable(
     const optional<string>& comment,
     const vector<KuduPartialRow>& split_rows,
     const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds,
-    const vector<HashSchema>& range_hash_schemas,
+    const vector<RangeWithHashSchema>& ranges_with_hash_schemas,
     const HashSchema& table_wide_hash_schema,
     CreateTableResponsePB* resp) {
-
-  if (!range_hash_schemas.empty() && range_hash_schemas.size() != bounds.size()) {
-    return Status::InvalidArgument(
-        "'bounds' and 'range_hash_schemas' must be of the same size");
-  }
-
   CreateTableRequestPB req;
   req.set_name(name);
   if (type) {
@@ -276,7 +277,6 @@ Status MasterTest::CreateTable(
   }
 
   auto* ps_pb = req.mutable_partition_schema();
-
   for (const auto& hash_dimension : table_wide_hash_schema) {
     auto* hash_schema = ps_pb->add_hash_schema();
     for (const string& col_name : hash_dimension.columns) {
@@ -286,14 +286,12 @@ Status MasterTest::CreateTable(
     hash_schema->set_seed(hash_dimension.num_buckets);
   }
 
-  for (size_t i = 0; i < range_hash_schemas.size(); ++i) {
+  for (const auto& range_and_hs : ranges_with_hash_schemas) {
     auto* range = ps_pb->add_custom_hash_schema_ranges();
     RowOperationsPBEncoder encoder(range->mutable_range_bounds());
-    const auto& bound = bounds[i];
-    encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, bound.first);
-    encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, bound.second);
-    const auto& range_hash_schema = range_hash_schemas[i];
-    for (const auto& hash_dimension : range_hash_schema) {
+    encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, range_and_hs.lower);
+    encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, range_and_hs.upper);
+    for (const auto& hash_dimension : range_and_hs.hash_schema) {
       auto* hash_dimension_pb = range->add_hash_schema();
       for (const string& col_name : hash_dimension.columns) {
         hash_dimension_pb->add_columns()->set_name(col_name);
@@ -985,7 +983,7 @@ TEST_P(AlterTableWithRangeSpecificHashSchema, TestAlterTableWithDifferentHashDim
   ASSERT_EQ(2, tables.front()->num_tablets());
 
   // Submit the alter table request
-  proxy_->AlterTable(req, &resp, &controller);
+  ASSERT_OK(proxy_->AlterTable(req, &resp, &controller));
   if (has_different_dimensions_count) {
     ASSERT_TRUE(resp.has_error());
     ASSERT_STR_CONTAINS(resp.error().status().DebugString(),
@@ -1000,9 +998,141 @@ TEST_P(AlterTableWithRangeSpecificHashSchema, TestAlterTableWithDifferentHashDim
     ASSERT_EQ(5, tables.front()->num_tablets());
   }
 }
-
 INSTANTIATE_TEST_SUITE_P(AlterTableWithCustomHashSchema,
                          AlterTableWithRangeSpecificHashSchema, ::testing::Bool());
+
+TEST_F(MasterTest, AlterTableAddRangeWithSpecificHashSchema) {
+  constexpr const char* const kTableName = "alter_table_custom_hash_schema";
+  constexpr const char* const kCol0 = "c_int32";
+  constexpr const char* const kCol1 = "c_int64";
+  const Schema kTableSchema({ColumnSchema(kCol0, INT32),
+                             ColumnSchema(kCol1, INT64)}, 1);
+  FLAGS_enable_per_range_hash_schemas = true;
+  FLAGS_default_num_replicas = 1;
+
+  // Create a table with one range partition based in the table-wide hash schema.
+  CreateTableResponsePB create_table_resp;
+  {
+    KuduPartialRow lower(&kTableSchema);
+    ASSERT_OK(lower.SetInt32(kCol0, 0));
+    KuduPartialRow upper(&kTableSchema);
+    ASSERT_OK(upper.SetInt32(kCol0, 100));
+    ASSERT_OK(CreateTable(
+        kTableName, kTableSchema, none, none, none, {}, {{lower, upper}},
+        {}, {{{kCol0}, 2, 0}}, &create_table_resp));
+  }
+
+  const auto& table_id = create_table_resp.table_id();
+  const HashSchema custom_hash_schema{{{kCol0}, 5, 1}};
+
+  // Alter the table, adding a new range with custom hash schema.
+  {
+    AlterTableRequestPB req;
+    AlterTableResponsePB resp;
+    req.mutable_table()->set_table_name(kTableName);
+    req.mutable_table()->set_table_id(table_id);
+
+    // Add the required information on the table's schema:
+    // key and non-null columns must be present in the request.
+    {
+      ColumnSchemaPB* col0 = req.mutable_schema()->add_columns();
+      col0->set_name(kCol0);
+      col0->set_type(INT32);
+      col0->set_is_key(true);
+
+      ColumnSchemaPB* col1 = req.mutable_schema()->add_columns();
+      col1->set_name(kCol1);
+      col1->set_type(INT64);
+    }
+
+    AlterTableRequestPB::Step* step = req.add_alter_schema_steps();
+    step->set_type(AlterTableRequestPB::ADD_RANGE_PARTITION);
+    KuduPartialRow lower(&kTableSchema);
+    ASSERT_OK(lower.SetInt32(kCol0, 100));
+    KuduPartialRow upper(&kTableSchema);
+    ASSERT_OK(upper.SetInt32(kCol0, 200));
+    RowOperationsPBEncoder enc(
+        step->mutable_add_range_partition()->mutable_range_bounds());
+    enc.Add(RowOperationsPB::RANGE_LOWER_BOUND, lower);
+    enc.Add(RowOperationsPB::RANGE_UPPER_BOUND, upper);
+    for (const auto& hash_dimension: custom_hash_schema) {
+      auto* hash_dimension_pb =
+          step->mutable_add_range_partition()->add_custom_hash_schema();
+      for (const auto& col_name: hash_dimension.columns) {
+        hash_dimension_pb->add_columns()->set_name(col_name);
+      }
+      hash_dimension_pb->set_num_buckets(hash_dimension.num_buckets);
+      hash_dimension_pb->set_seed(hash_dimension.seed);
+    }
+
+    // Check the number of tablets in the table before ALTER TABLE.
+    {
+      CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+      std::vector<scoped_refptr<TableInfo>> tables;
+      master_->catalog_manager()->GetAllTables(&tables);
+      ASSERT_EQ(1, tables.size());
+      // 2 tablets (because of 2 hash buckets) for already existing range.
+      ASSERT_EQ(2, tables.front()->num_tablets());
+    }
+
+    RpcController ctl;
+    ASSERT_OK(proxy_->AlterTable(req, &resp, &ctl));
+    ASSERT_FALSE(resp.has_error())
+        << StatusFromPB(resp.error().status()).ToString();
+
+    // Check the number of tablets in the table after ALTER TABLE.
+    {
+      CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+      std::vector<scoped_refptr<TableInfo>> tables;
+      master_->catalog_manager()->GetAllTables(&tables);
+      ASSERT_EQ(1, tables.size());
+      // Extra 5 tablets (because of 5 hash buckets) for newly added range.
+      ASSERT_EQ(7, tables.front()->num_tablets());
+    }
+  }
+
+  // Now verify the table's schema: fetch the information on the altered
+  // table and make sure the schema contains information on the newly added
+  // range partition with the custom hash schema.
+  {
+    GetTableSchemaRequestPB req;
+    req.mutable_table()->set_table_name(kTableName);
+
+    RpcController ctl;
+    GetTableSchemaResponsePB resp;
+    ASSERT_OK(proxy_->GetTableSchema(req, &resp, &ctl));
+    ASSERT_FALSE(resp.has_error())
+        << StatusFromPB(resp.error().status()).ToString();
+
+    Schema received_schema;
+    ASSERT_TRUE(resp.has_schema());
+    ASSERT_OK(SchemaFromPB(resp.schema(), &received_schema));
+    ASSERT_TRUE(kTableSchema == received_schema) << Substitute(
+        "$0 not equal to $1", kTableSchema.ToString(), received_schema.ToString());
+
+    ASSERT_TRUE(resp.has_table_id());
+    ASSERT_EQ(table_id, resp.table_id());
+    ASSERT_TRUE(resp.has_table_name());
+    ASSERT_EQ(kTableName, resp.table_name());
+
+    ASSERT_TRUE(resp.has_partition_schema());
+    PartitionSchema ps;
+    ASSERT_OK(PartitionSchema::FromPB(
+        resp.partition_schema(), received_schema, &ps));
+    ASSERT_TRUE(ps.HasCustomHashSchemas());
+
+    const auto& table_wide_hash_schema = ps.hash_schema();
+    ASSERT_EQ(1, table_wide_hash_schema.size());
+    ASSERT_EQ(2, table_wide_hash_schema.front().num_buckets);
+
+    const auto& ranges_with_hash_schemas = ps.ranges_with_hash_schemas();
+    ASSERT_EQ(ranges_with_hash_schemas.size(), 1);
+    const auto& custom_hash_schema = ranges_with_hash_schemas.front().hash_schema;
+    ASSERT_EQ(1, custom_hash_schema.size());
+    ASSERT_EQ(5, custom_hash_schema.front().num_buckets);
+    ASSERT_EQ(1, custom_hash_schema.front().seed);
+  }
+}
 
 TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
   constexpr const char* const kTableName = "testtb";
@@ -1031,26 +1161,49 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
                         "least one range partition column");
   }
 
-  // No split rows and range specific hashing concurrently.
+  // In case of custom hash schemas per range, don't supply the information
+  // on split rows.
   {
     google::FlagSaver flag_saver;
-    FLAGS_enable_per_range_hash_schemas = true; // enable for testing.
+    FLAGS_enable_per_range_hash_schemas = true;
     KuduPartialRow split1(&kTableSchema);
     ASSERT_OK(split1.SetInt32("key", 1));
     KuduPartialRow a_lower(&kTableSchema);
     KuduPartialRow a_upper(&kTableSchema);
     ASSERT_OK(a_lower.SetInt32("key", 0));
     ASSERT_OK(a_upper.SetInt32("key", 100));
-    vector<HashSchema> range_hash_schemas = {{}};
-    Status s = CreateTable(kTableName,
-                           kTableSchema,
-                           { split1 },
-                           { { a_lower, a_upper } },
-                           range_hash_schemas);
+    const auto s = CreateTable(kTableName,
+                               kTableSchema,
+                               {split1},
+                               {},
+                               {{ a_lower, a_upper, {}}});
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
                         "both split rows and custom hash schema ranges "
-                        "cannot be populated at the same time");
+                        "must not be populated at the same time");
+  }
+
+  // In case of custom hash schemas per range, don't supply the information
+  // on the range partition boundaries via both the
+  // CreateTableRequestPB::split_rows_range_bounds and the
+  // CreateTableRequestPB::partition_schema::custom_hash_schema_ranges fields.
+  {
+    google::FlagSaver flag_saver;
+    FLAGS_enable_per_range_hash_schemas = true;
+    KuduPartialRow a_lower(&kTableSchema);
+    KuduPartialRow a_upper(&kTableSchema);
+    ASSERT_OK(a_lower.SetInt32("key", 0));
+    ASSERT_OK(a_upper.SetInt32("key", 100));
+    vector<HashSchema> range_hash_schemas = {{}};
+    const auto s = CreateTable(kTableName,
+                               kTableSchema,
+                               vector<KuduPartialRow>(),
+                               {{ a_lower, a_upper }},
+                               {{ a_lower, a_upper, {}}});
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "both range bounds and custom hash schema ranges "
+                        "must not be populated at the same time");
   }
 
   // No non-range columns.
@@ -1295,9 +1448,11 @@ TEST_F(MasterTest, NonPrimaryKeyColumnsForPerRangeCustomHashSchema) {
   KuduPartialRow upper(&kTableSchema);
   ASSERT_OK(lower.SetInt32("key", 0));
   ASSERT_OK(upper.SetInt32("key", 100));
-  vector<HashSchema> range_hash_schemas{{{{"int32_val"}, 2, 0}}};
-  const auto s = CreateTable(
-      kTableName, kTableSchema, {}, { { lower, upper } }, range_hash_schemas);
+  const auto s = CreateTable(kTableName,
+                             kTableSchema,
+                             {},
+                             {},
+                             {{ lower, upper, {{{"int32_val"}, 2, 0}}}});
   ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(),
                       "must specify only primary key columns for "

@@ -253,9 +253,9 @@ class FlexPartitioningTest : public KuduTest {
     }
     ASSERT_OK(scanner.Open());
 
-    KuduScanBatch batch;
     int64_t count = 0;
     while (scanner.HasMoreRows()) {
+      KuduScanBatch batch;
       ASSERT_OK(scanner.NextBatch(&batch));
       count += batch.NumRows();
     }
@@ -300,7 +300,7 @@ class FlexPartitioningTest : public KuduTest {
     ASSERT_OK(scanner.AddConjunctPredicate(table->NewComparisonPredicate(
         col_name, KuduPredicate::GREATER_EQUAL, KuduValue::FromInt(lower))));
     ASSERT_OK(scanner.AddConjunctPredicate(table->NewComparisonPredicate(
-        col_name, KuduPredicate::LESS_EQUAL, KuduValue::FromInt(upper))));
+        col_name, KuduPredicate::LESS, KuduValue::FromInt(upper))));
 
     ASSERT_OK(scanner.Open());
     KuduScanBatch batch;
@@ -444,19 +444,13 @@ TEST_F(FlexPartitioningCreateTableTest, DISABLED_SingleCustomRangeEmptyHashSchem
   // the partitions: first check the range of table-wide schema, then check
   // the ranges with custom hash schemas.
   ASSERT_OK(InsertTestRows(kTableName, -111, 0));
-  //NO_FATALS(CheckTableRowsNum(kTableName, 111));
+  NO_FATALS(CheckTableRowsNum(kTableName, 111));
   ASSERT_OK(InsertTestRows(kTableName, 111, 222));
-  // TODO(aserbin): uncomment the line below once PartitionPruner handles such
-  //                cases properly
-  //NO_FATALS(CheckTableRowsNum(kTableName, 222));
+  NO_FATALS(CheckTableRowsNum(kTableName, 222));
 }
 
 // Create a table with mixed set of range partitions, using both table-wide and
 // custom hash bucket schemas.
-//
-// TODO(aserbin): add verification based on PartitionSchema provided by
-//                KuduTable::partition_schema() once PartitionPruner
-//                recognizes custom hash bucket schema per range
 TEST_F(FlexPartitioningCreateTableTest, DefaultAndCustomHashSchemas) {
   // Create a table with the following partitions:
   //
@@ -991,8 +985,8 @@ TEST_F(FlexPartitioningCreateTableTest, ScansWithRangePredicates) {
   CheckScanWithColumnPredicate(kTableName, "key", 83, 3, 250, 333);
   CheckScanWithColumnPredicate(kTableName, "key", 1, 1, 0, 1);
   CheckScanWithColumnPredicate(kTableName, "key", 2, 6, 110, 112);
-  //CheckScanWithColumnPredicate(kTableName, "key", 0, 0, -10, -5);
-  //CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 350, 400);
+  CheckScanWithColumnPredicate(kTableName, "key", 0, 0, -10, -5);
+  CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 350, 400);
   CheckScanWithColumnPredicate(kTableName, "key", 1, 1, 332, 333);
   CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 333, 334);
   CheckScanWithColumnPredicate(kTableName, "key", 100, 2, lower_filler, 100);
@@ -1003,7 +997,7 @@ TEST_F(FlexPartitioningCreateTableTest, ScansWithRangePredicates) {
   CheckScanWithColumnPredicate(kTableName, "key", 233, 9, 100, upper_filler);
   CheckScanWithColumnPredicate(kTableName, "key", 133, 7, 200, upper_filler);
   CheckScanWithColumnPredicate(kTableName, "key", 83, 3, 250, upper_filler);
-  //CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 333, upper_filler);
+  CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 333, upper_filler);
 
   // Meanwhile, inserting into non-covered ranges should result in a proper
   // error status return to the client attempting such an operation.
@@ -1095,8 +1089,8 @@ TEST_F(FlexPartitioningCreateTableTest, ScansWithRangePredicatesWithSameHashBuck
   CheckScanWithColumnPredicate(kTableName, "key", 3, 6, 110, 113);
   CheckScanWithColumnPredicate(kTableName, "key", 1, 1, 332, 333);
   CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 333, 334);
-  //CheckScanWithColumnPredicate(kTableName, "key", 0, 0, -10, -5);
-  //CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 350, 400);
+  CheckScanWithColumnPredicate(kTableName, "key", 0, 0, -10, -5);
+  CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 350, 400);
   CheckScanWithColumnPredicate(kTableName, "key", 100, 3, lower_filler, 100);
   CheckScanWithColumnPredicate(kTableName, "key", 250, 9, lower_filler, 250);
   CheckScanWithColumnPredicate(kTableName, "key", 333, 9, lower_filler, 333);
@@ -1105,7 +1099,7 @@ TEST_F(FlexPartitioningCreateTableTest, ScansWithRangePredicatesWithSameHashBuck
   CheckScanWithColumnPredicate(kTableName, "key", 233, 9, 100, upper_filler);
   CheckScanWithColumnPredicate(kTableName, "key", 133, 6, 200, upper_filler);
   CheckScanWithColumnPredicate(kTableName, "key", 83, 3, 250, upper_filler);
-  //CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 333, upper_filler);
+  CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 333, upper_filler);
 
   // Meanwhile, inserting into non-covered ranges should result in a proper
   // error status return to the client attempting such an operation.
@@ -1190,8 +1184,8 @@ TEST_F(FlexPartitioningCreateTableTest, ScansWithNonCoveringRanges) {
   CheckScanWithColumnPredicate(kTableName, "key", 333, 9, -50, 600);
   CheckScanWithColumnPredicate(kTableName, "key", 222, 5, 150, 600);
   CheckScanWithColumnPredicate(kTableName, "key", 1, 1, 0, 1);
-  //CheckScanWithColumnPredicate(kTableName, "key", 0, 0, -10, -5);
-  //CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 600, 650);
+  CheckScanWithColumnPredicate(kTableName, "key", 0, 0, -10, -5);
+  CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 600, 650);
   CheckScanWithColumnPredicate(kTableName, "key", 1, 1, 554, 555);
   CheckScanWithColumnPredicate(kTableName, "key", 0, 0, 555, 556);
   CheckScanWithColumnPredicate(kTableName, "key", 111, 4, lower_filler, 150);
@@ -1538,10 +1532,8 @@ TEST_F(FlexPartitioningAlterTableTest, ReadAndWriteToCustomRangePartition) {
   ASSERT_OK(InsertTestRows(kTableName, 111, 444));
   NO_FATALS(CheckTableRowsNum(kTableName, 444));
 
-  // WIP: Scan the data present after rebasing on pruning patches
-  /*
-   NO_FATALS(CheckTableRowsNum(kTableName, kKeyColumn, 111, 222, 111));
-   NO_FATALS(CheckTableRowsNum(kTableName, kKeyColumn, 0, 444, 444));
+  NO_FATALS(CheckTableRowsNum(kTableName, kKeyColumn, 111, 222, 111));
+  NO_FATALS(CheckTableRowsNum(kTableName, kKeyColumn, 0, 444, 444));
   // Drop a partition and re-scan
   {
     unique_ptr<KuduTableAlterer> table_alterer_drop(client_->NewTableAlterer(kTableName));
@@ -1553,7 +1545,6 @@ TEST_F(FlexPartitioningAlterTableTest, ReadAndWriteToCustomRangePartition) {
     ASSERT_OK(table_alterer_drop->Alter());
   }
   NO_FATALS(CheckTableRowsNum(kTableName, kKeyColumn, 0, 444, 333));
-  */
 
   // Meanwhile, inserting into non-covered ranges should result in a proper
   // error status return to the client attempting such an operation.
@@ -1672,6 +1663,90 @@ TEST_F(FlexPartitioningAlterTableTest, UnsupportedRangeSpecificHashSchema) {
 
   // Dropping tables having ranges with custom hash schema should be fine
   // even if the server side has no RANGE_SPECIFIC_HASH_SCHEMA feature.
+  ASSERT_OK(client_->DeleteTable(kTableName));
+}
+
+// Make sure adding and dropping ranges with the table-wide hash schema works
+// as expected when --enable_per_range_hash_schemas=true.
+TEST_F(FlexPartitioningAlterTableTest, AddDropTableWideHashSchemaPartitions) {
+  FLAGS_enable_per_range_hash_schemas = true;
+
+  constexpr const char* const kTableName =
+      "AddDropTableWideHashSchemaPartitions";
+
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  table_creator->table_name(kTableName)
+      .schema(&schema_)
+      .num_replicas(1)
+      .add_hash_partitions({ kKeyColumn }, 2)
+      .set_range_partition_columns({ kKeyColumn });
+
+  // Add a range partition with the table-wide hash partitioning rules.
+  {
+    unique_ptr<KuduPartialRow> lower(schema_.NewRow());
+    ASSERT_OK(lower->SetInt32(kKeyColumn, 0));
+    unique_ptr<KuduPartialRow> upper(schema_.NewRow());
+    ASSERT_OK(upper->SetInt32(kKeyColumn, 111));
+    table_creator->add_range_partition(lower.release(), upper.release());
+  }
+
+  ASSERT_OK(table_creator->Create());
+
+  ASSERT_OK(InsertTestRows(kTableName, 0, 111));
+  NO_FATALS(CheckTableRowsNum(kTableName, 111));
+
+  // To have mix of ranges, add a single range with custom hash schema.
+  {
+    unique_ptr<KuduTableAlterer> alterer(client_->NewTableAlterer(kTableName));
+    auto p = CreateRangePartition(-111, 0);
+    ASSERT_OK(p->add_hash_partitions({ kKeyColumn }, 5, 1));
+    alterer->AddRangePartition(p.release());
+    ASSERT_OK(alterer->Alter());
+  }
+
+  ASSERT_OK(InsertTestRows(kTableName, -111, 0));
+  NO_FATALS(CheckTableRowsNum(kTableName, 222));
+
+  // Add one more range partition with the table-wide hash schema.
+  {
+    unique_ptr<KuduTableAlterer> alterer(client_->NewTableAlterer(kTableName));
+
+    unique_ptr<KuduPartialRow> lower(schema_.NewRow());
+    ASSERT_OK(lower->SetInt32(kKeyColumn, 111));
+    unique_ptr<KuduPartialRow> upper(schema_.NewRow());
+    ASSERT_OK(upper->SetInt32(kKeyColumn, 222));
+    alterer->AddRangePartition(lower.release(), upper.release());
+
+    ASSERT_OK(alterer->Alter());
+  }
+
+  ASSERT_OK(InsertTestRows(kTableName, 111, 222));
+  NO_FATALS(CheckTableRowsNum(kTableName, 333));
+
+  // Drop the ranges with the table-wide hash partitions.
+  {
+    unique_ptr<KuduTableAlterer> alterer(client_->NewTableAlterer(kTableName));
+
+    {
+      unique_ptr<KuduPartialRow> lower(schema_.NewRow());
+      ASSERT_OK(lower->SetInt32(kKeyColumn, 111));
+      unique_ptr<KuduPartialRow> upper(schema_.NewRow());
+      ASSERT_OK(upper->SetInt32(kKeyColumn, 222));
+      alterer->DropRangePartition(lower.release(), upper.release());
+    }
+    {
+      unique_ptr<KuduPartialRow> lower(schema_.NewRow());
+      ASSERT_OK(lower->SetInt32(kKeyColumn, 0));
+      unique_ptr<KuduPartialRow> upper(schema_.NewRow());
+      ASSERT_OK(upper->SetInt32(kKeyColumn, 111));
+      alterer->DropRangePartition(lower.release(), upper.release());
+    }
+
+    ASSERT_OK(alterer->Alter());
+  }
+
+  NO_FATALS(CheckTableRowsNum(kTableName, 111));
+
   ASSERT_OK(client_->DeleteTable(kTableName));
 }
 

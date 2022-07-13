@@ -17,8 +17,10 @@
 
 #include "kudu/client/table_alterer-internal.h"
 
+#include <memory>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include <glog/logging.h>
@@ -26,18 +28,19 @@
 
 #include "kudu/client/schema-internal.h"
 #include "kudu/client/schema.h"
+#include "kudu/client/table_creator-internal.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/master/master.pb.h"
 
+using kudu::master::AlterTableRequestPB;
 using std::string;
 
 namespace kudu {
 namespace client {
-
-using master::AlterTableRequestPB;
 
 KuduTableAlterer::Data::Data(KuduClient* client, string name)
     : client_(client),
@@ -57,13 +60,13 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
     return status_;
   }
 
-  if (!rename_to_.is_initialized() &&
+  if (!rename_to_ &&
       !new_extra_configs_ &&
-      !set_owner_to_.is_initialized() &&
-      !set_comment_to_.is_initialized() &&
+      !set_owner_to_ &&
+      !set_comment_to_ &&
       !disk_size_limit_ &&
       !row_count_limit_ &&
-      !set_replication_factor_to_.is_initialized() &&
+      !set_replication_factor_to_ &&
       steps_.empty()) {
     return Status::InvalidArgument("No alter steps provided");
   }
@@ -72,20 +75,20 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
   req->set_modify_external_catalogs(modify_external_catalogs_);
   req->mutable_table()->set_table_name(table_name_);
   if (rename_to_) {
-    req->set_new_table_name(rename_to_.get());
+    req->set_new_table_name(*rename_to_);
   }
   if (new_extra_configs_) {
     req->mutable_new_extra_configs()->insert(new_extra_configs_->begin(),
                                              new_extra_configs_->end());
   }
-  if (set_owner_to_.is_initialized()) {
-    req->set_new_table_owner(set_owner_to_.get());
+  if (set_owner_to_) {
+    req->set_new_table_owner(*set_owner_to_);
   }
-  if (set_comment_to_.is_initialized()) {
-    req->set_new_table_comment(set_comment_to_.get());
+  if (set_comment_to_) {
+    req->set_new_table_comment(*set_comment_to_);
   }
-  if (set_replication_factor_to_.is_initialized()) {
-    req->set_num_replicas(set_replication_factor_to_.get());
+  if (set_replication_factor_to_) {
+    req->set_num_replicas(*set_replication_factor_to_);
   }
 
   if (schema_ != nullptr) {
@@ -96,10 +99,10 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
   }
 
   if (disk_size_limit_) {
-    req->set_disk_size_limit(disk_size_limit_.get());
+    req->set_disk_size_limit(*disk_size_limit_);
   }
   if (row_count_limit_) {
-    req->set_row_count_limit(row_count_limit_.get());
+    req->set_row_count_limit(*row_count_limit_);
   }
 
   for (const Step& s : steps_) {
@@ -150,7 +153,7 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
             !s.spec->data_->comment) {
           pb_step->set_type(AlterTableRequestPB::RENAME_COLUMN);
           pb_step->mutable_rename_column()->set_old_name(s.spec->data_->name);
-          pb_step->mutable_rename_column()->set_new_name(s.spec->data_->rename_to.value());
+          pb_step->mutable_rename_column()->set_new_name(*(s.spec->data_->rename_to));
           break;
         }
         ColumnSchemaDelta col_delta(s.spec->data_->name);
@@ -164,21 +167,33 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
       {
         RowOperationsPBEncoder encoder(pb_step->mutable_add_range_partition()
                                               ->mutable_range_bounds());
+        auto* partition_data = s.range_partition->data_;
         RowOperationsPB_Type lower_bound_type =
-          s.lower_bound_type == KuduTableCreator::INCLUSIVE_BOUND ?
-          RowOperationsPB::RANGE_LOWER_BOUND :
-          RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND;
+            partition_data->lower_bound_type_ == KuduTableCreator::INCLUSIVE_BOUND ?
+            RowOperationsPB::RANGE_LOWER_BOUND :
+            RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND;
 
         RowOperationsPB_Type upper_bound_type =
-          s.upper_bound_type == KuduTableCreator::EXCLUSIVE_BOUND ?
-          RowOperationsPB::RANGE_UPPER_BOUND :
-          RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND;
+            partition_data->upper_bound_type_ == KuduTableCreator::EXCLUSIVE_BOUND ?
+            RowOperationsPB::RANGE_UPPER_BOUND :
+            RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND;
 
-        encoder.Add(lower_bound_type, *s.lower_bound);
-        encoder.Add(upper_bound_type, *s.upper_bound);
+        encoder.Add(lower_bound_type, *partition_data->lower_bound_);
+        encoder.Add(upper_bound_type, *partition_data->upper_bound_);
+
+        for (const auto& hash_dimension : partition_data->hash_schema_) {
+          auto* custom_hash_schema_pb = pb_step->mutable_add_range_partition()->
+              mutable_custom_hash_schema()->add_hash_schema();
+          for (const auto& column_name : hash_dimension.column_names) {
+            custom_hash_schema_pb->add_columns()->set_name(column_name);
+          }
+          custom_hash_schema_pb->set_num_buckets(hash_dimension.num_buckets);
+          custom_hash_schema_pb->set_seed(hash_dimension.seed);
+        }
 
         if (s.dimension_label) {
-          pb_step->mutable_add_range_partition()->set_dimension_label(s.dimension_label.get());
+          pb_step->mutable_add_range_partition()->set_dimension_label(
+              *s.dimension_label);
         }
         break;
       }
@@ -186,22 +201,24 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
       {
         RowOperationsPBEncoder encoder(pb_step->mutable_drop_range_partition()
                                               ->mutable_range_bounds());
+        auto* partition_data = s.range_partition->data_;
         RowOperationsPB_Type lower_bound_type =
-          s.lower_bound_type == KuduTableCreator::INCLUSIVE_BOUND ?
+            partition_data->lower_bound_type_ == KuduTableCreator::INCLUSIVE_BOUND ?
           RowOperationsPB::RANGE_LOWER_BOUND :
           RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND;
 
         RowOperationsPB_Type upper_bound_type =
-          s.upper_bound_type == KuduTableCreator::EXCLUSIVE_BOUND ?
+            partition_data->upper_bound_type_ == KuduTableCreator::EXCLUSIVE_BOUND ?
           RowOperationsPB::RANGE_UPPER_BOUND :
           RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND;
 
-        encoder.Add(lower_bound_type, *s.lower_bound);
-        encoder.Add(upper_bound_type, *s.upper_bound);
+        encoder.Add(lower_bound_type, *partition_data->lower_bound_);
+        encoder.Add(upper_bound_type, *partition_data->upper_bound_);
         break;
       }
       default:
-        LOG(FATAL) << "unknown step type " << AlterTableRequestPB::StepType_Name(s.step_type);
+        LOG(FATAL) << "unknown step type "
+                   << AlterTableRequestPB::StepType_Name(s.step_type);
     }
   }
   return Status::OK();

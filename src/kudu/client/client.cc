@@ -24,14 +24,16 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <vector>
 
-#include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/common.h>
+#include <google/protobuf/stubs/port.h>
 
 #include "kudu/client/callbacks.h"
 #include "kudu/client/client-internal.h"
@@ -129,6 +131,9 @@ using kudu::rpc::RpcController;
 using kudu::rpc::UserCredentials;
 using kudu::tserver::ScanResponsePB;
 using std::map;
+using std::make_optional;
+using std::nullopt;
+using std::optional;
 using std::set;
 using std::string;
 using std::unique_ptr;
@@ -370,7 +375,7 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
         data_->connection_negotiation_timeout_.ToMilliseconds());
   }
   if (data_->num_reactors_) {
-    builder.set_num_reactors(data_->num_reactors_.get());
+    builder.set_num_reactors(*data_->num_reactors_);
   }
   if (!data_->sasl_protocol_name_.empty()) {
     builder.set_sasl_proto_name(data_->sasl_protocol_name_);
@@ -694,10 +699,10 @@ Status KuduClient::GetTableStatistics(const string& table_name,
   }
   unique_ptr<KuduTableStatistics> table_statistics(new KuduTableStatistics);
   table_statistics->data_ = new KuduTableStatistics::Data(
-      resp.has_on_disk_size() ? boost::optional<int64_t>(resp.on_disk_size()) : boost::none,
-      resp.has_live_row_count() ? boost::optional<int64_t>(resp.live_row_count()) : boost::none,
-      resp.has_disk_size_limit() ? boost::optional<int64_t>(resp.disk_size_limit()) : boost::none,
-      resp.has_row_count_limit() ? boost::optional<int64_t>(resp.row_count_limit()) : boost::none);
+      resp.has_on_disk_size() ? optional<int64_t>(resp.on_disk_size()) : nullopt,
+      resp.has_live_row_count() ? optional<int64_t>(resp.live_row_count()) : nullopt,
+      resp.has_disk_size_limit() ? optional<int64_t>(resp.disk_size_limit()) : nullopt,
+      resp.has_row_count_limit() ? optional<int64_t>(resp.row_count_limit()) : nullopt);
 
   *statistics = table_statistics.release();
   return Status::OK();
@@ -738,8 +743,7 @@ void KuduClient::SetLatestObservedTimestamp(uint64_t ht_timestamp) {
 Status KuduClient::ExportAuthenticationCredentials(string* authn_creds) const {
   AuthenticationCredentialsPB pb;
 
-  boost::optional<security::SignedTokenPB> tok = data_->messenger_->authn_token();
-  if (tok) {
+  if (auto tok = data_->messenger_->authn_token(); tok) {
     pb.mutable_authn_token()->CopyFrom(*tok);
   }
   pb.set_real_user(data_->user_credentials_.real_user());
@@ -916,21 +920,21 @@ Status KuduTableCreator::Create() {
   // Build request.
   CreateTableRequestPB req;
   req.set_name(data_->table_name_);
-  if (data_->num_replicas_ != boost::none) {
-    req.set_num_replicas(data_->num_replicas_.get());
+  if (data_->num_replicas_) {
+    req.set_num_replicas(*data_->num_replicas_);
   }
   if (data_->dimension_label_) {
-    req.set_dimension_label(data_->dimension_label_.get());
+    req.set_dimension_label(*data_->dimension_label_);
   }
   if (data_->extra_configs_) {
     req.mutable_extra_configs()->insert(data_->extra_configs_->begin(),
                                         data_->extra_configs_->end());
   }
-  if (data_->owner_ != boost::none) {
-    req.set_owner(data_->owner_.get());
+  if (data_->owner_) {
+    req.set_owner(*data_->owner_);
   }
-  if (data_->comment_ != boost::none) {
-    req.set_comment(data_->comment_.get());
+  if (data_->comment_) {
+    req.set_comment(*data_->comment_);
   }
   RETURN_NOT_OK_PREPEND(SchemaToPB(*data_->schema_->schema_, req.mutable_schema(),
                                    SCHEMA_PB_WITHOUT_WRITE_DEFAULT),
@@ -971,24 +975,26 @@ Status KuduTableCreator::Create() {
       return Status::InvalidArgument("range bounds must not be null");
     }
 
-    RowOperationsPB_Type lower_bound_type =
+    const RowOperationsPB_Type lower_bound_type =
         range->lower_bound_type_ == KuduTableCreator::INCLUSIVE_BOUND
         ? RowOperationsPB::RANGE_LOWER_BOUND
         : RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND;
 
-    RowOperationsPB_Type upper_bound_type =
+    const RowOperationsPB_Type upper_bound_type =
         range->upper_bound_type_ == KuduTableCreator::EXCLUSIVE_BOUND
         ? RowOperationsPB::RANGE_UPPER_BOUND
         : RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND;
 
-    splits_encoder.Add(lower_bound_type, *range->lower_bound_);
-    splits_encoder.Add(upper_bound_type, *range->upper_bound_);
-
-    if (has_range_with_custom_hash_schema) {
+    if (!has_range_with_custom_hash_schema) {
+      splits_encoder.Add(lower_bound_type, *range->lower_bound_);
+      splits_encoder.Add(upper_bound_type, *range->upper_bound_);
+    } else {
       auto* range_pb = partition_schema->add_custom_hash_schema_ranges();
       RowOperationsPBEncoder encoder(range_pb->mutable_range_bounds());
       encoder.Add(lower_bound_type, *range->lower_bound_);
       encoder.Add(upper_bound_type, *range->upper_bound_);
+      // Now, after adding the information range bounds, add the information
+      // on hash schema for the range.
       if (range->is_table_wide_hash_schema_) {
         // With the presence of a range with custom hash schema when the
         // table-wide hash schema is used for this particular range, also add an
@@ -1023,10 +1029,14 @@ Status KuduTableCreator::Create() {
   }
 
   CreateTableResponsePB resp;
-  RETURN_NOT_OK_PREPEND(data_->client_->data_->CreateTable(
-      data_->client_, req, &resp, deadline, !data_->range_partitions_.empty()),
-                        Substitute("Error creating table $0 on the master",
-                                   data_->table_name_));
+  RETURN_NOT_OK_PREPEND(
+      data_->client_->data_->CreateTable(data_->client_,
+                                         req,
+                                         &resp,
+                                         deadline,
+                                         !data_->range_partitions_.empty(),
+                                         has_range_with_custom_hash_schema),
+      Substitute("Error creating table $0 on the master", data_->table_name_));
   // Spin until the table is fully created, if requested.
   if (data_->wait_) {
     TableIdentifierPB table;
@@ -1479,7 +1489,7 @@ KuduTableAlterer* KuduTableAlterer::SetComment(const string& new_comment) {
 
 KuduColumnSpec* KuduTableAlterer::AddColumn(const string& name) {
   Data::Step s = { AlterTableRequestPB::ADD_COLUMN,
-                   new KuduColumnSpec(name), nullptr, nullptr };
+                   new KuduColumnSpec(name), nullptr };
   auto* spec = s.spec;
   data_->steps_.emplace_back(std::move(s));
   return spec;
@@ -1487,7 +1497,7 @@ KuduColumnSpec* KuduTableAlterer::AddColumn(const string& name) {
 
 KuduColumnSpec* KuduTableAlterer::AlterColumn(const string& name) {
   Data::Step s = { AlterTableRequestPB::ALTER_COLUMN,
-                   new KuduColumnSpec(name), nullptr, nullptr };
+                   new KuduColumnSpec(name), nullptr };
   auto* spec = s.spec;
   data_->steps_.emplace_back(std::move(s));
   return spec;
@@ -1495,7 +1505,7 @@ KuduColumnSpec* KuduTableAlterer::AlterColumn(const string& name) {
 
 KuduTableAlterer* KuduTableAlterer::DropColumn(const string& name) {
   Data::Step s = { AlterTableRequestPB::DROP_COLUMN,
-                   new KuduColumnSpec(name), nullptr, nullptr };
+                   new KuduColumnSpec(name), nullptr };
   data_->steps_.emplace_back(std::move(s));
   return this;
 }
@@ -1533,13 +1543,42 @@ KuduTableAlterer* KuduTableAlterer::AddRangePartitionWithDimension(
 
   Data::Step s { AlterTableRequestPB::ADD_RANGE_PARTITION,
                  nullptr,
-                 unique_ptr<KuduPartialRow>(lower_bound),
-                 unique_ptr<KuduPartialRow>(upper_bound),
-                 lower_bound_type,
-                 upper_bound_type,
-                 dimension_label.empty() ? boost::none : boost::make_optional(dimension_label) };
+                 std::unique_ptr<KuduTableCreator::KuduRangePartition>(
+                     new KuduTableCreator::KuduRangePartition(
+                         lower_bound, upper_bound, lower_bound_type, upper_bound_type)),
+                 dimension_label.empty() ? nullopt : make_optional(dimension_label) };
   data_->steps_.emplace_back(std::move(s));
   data_->has_alter_partitioning_steps = true;
+  return this;
+}
+
+KuduTableAlterer* KuduTableAlterer::AddRangePartition(
+    KuduTableCreator::KuduRangePartition* partition) {
+  CHECK(partition);
+  if (partition->data_->lower_bound_ == nullptr || partition->data_->upper_bound_  == nullptr) {
+    data_->status_ = Status::InvalidArgument("range partition bounds may not be null");
+    return this;
+  }
+  if (partition->data_->lower_bound_->schema() != partition->data_->upper_bound_->schema()) {
+    data_->status_ = Status::InvalidArgument("range partition bounds must have matching schemas");
+    return this;
+  }
+  if (data_->schema_ == nullptr) {
+    data_->schema_ = partition->data_->lower_bound_->schema();
+  } else if (partition->data_->lower_bound_->schema() != data_->schema_) {
+    data_->status_ = Status::InvalidArgument("range partition bounds must have matching schemas");
+    return this;
+  }
+
+  Data::Step s { AlterTableRequestPB::ADD_RANGE_PARTITION,
+                 nullptr,
+                 std::unique_ptr<KuduTableCreator::KuduRangePartition>(partition),
+                 nullopt };
+  data_->steps_.emplace_back(std::move(s));
+  data_->has_alter_partitioning_steps = true;
+  if (!data_->steps_.back().range_partition->data_->is_table_wide_hash_schema_) {
+    data_->adding_range_with_custom_hash_schema = true;
+  }
   return this;
 }
 
@@ -1565,10 +1604,9 @@ KuduTableAlterer* KuduTableAlterer::DropRangePartition(
 
   Data::Step s { AlterTableRequestPB::DROP_RANGE_PARTITION,
                  nullptr,
-                 unique_ptr<KuduPartialRow>(lower_bound),
-                 unique_ptr<KuduPartialRow>(upper_bound),
-                 lower_bound_type,
-                 upper_bound_type };
+                 std::unique_ptr<KuduTableCreator::KuduRangePartition>(
+                     new KuduTableCreator::KuduRangePartition(
+                         lower_bound, upper_bound, lower_bound_type, upper_bound_type)) };
   data_->steps_.emplace_back(std::move(s));
   data_->has_alter_partitioning_steps = true;
   return this;
@@ -1614,8 +1652,10 @@ Status KuduTableAlterer::Alter() {
     data_->timeout_ :
     data_->client_->default_admin_operation_timeout();
   MonoTime deadline = MonoTime::Now() + timeout;
-  RETURN_NOT_OK(data_->client_->data_->AlterTable(data_->client_, req, &resp, deadline,
-                                                  data_->has_alter_partitioning_steps));
+  RETURN_NOT_OK(data_->client_->data_->AlterTable(
+      data_->client_, req, &resp, deadline,
+      data_->has_alter_partitioning_steps,
+      data_->adding_range_with_custom_hash_schema));
 
   if (data_->has_alter_partitioning_steps) {
     // If the table partitions change, clear the local meta cache so that the
@@ -1781,30 +1821,33 @@ Status KuduScanner::AddExclusiveUpperBoundRaw(const Slice& key) {
 }
 
 Status KuduScanner::AddLowerBoundPartitionKeyRaw(const Slice& partition_key) {
-  // TODO(aserbin): use move semantics to pass PartitionKey arguments
-  if (const auto& table = GetKuduTable();
-      table->data_->partition_schema_.HasCustomHashSchemas()) {
-    return Status::InvalidArgument(Substitute(
-        "$0: cannot use AddLowerBoundPartitionKeyRaw() because "
-        "the table has custom per-range hash schemas", table->name()));
-  }
+  // The number of hash dimensions in all hash schemas of a table is an
+  // invariant and checked throughout the code. With that, the table-wide hash
+  // schema is used as a proxy to find the number of hash dimensions to separate
+  // the hash-related prefix from the rest of the encoded partition key in the
+  // code below.
+  //
+  // TODO(KUDU-2671) update this code if allowing for different number of
+  //                 dimensions in range-specific hash schemas
   const auto& hash_schema = GetKuduTable()->partition_schema().hash_schema();
-  auto pkey = Partition::StringToPartitionKey(partition_key.ToString(),
-                                              hash_schema.size());
-  return data_->mutable_configuration()->AddLowerBoundPartitionKeyRaw(pkey);
+  return data_->mutable_configuration()->AddLowerBoundPartitionKeyRaw(
+      Partition::StringToPartitionKey(partition_key.ToString(),
+                                      hash_schema.size()));
 }
 
 Status KuduScanner::AddExclusiveUpperBoundPartitionKeyRaw(const Slice& partition_key) {
-  if (const auto& table = GetKuduTable();
-      table->data_->partition_schema_.HasCustomHashSchemas()) {
-    return Status::InvalidArgument(Substitute(
-        "$0: cannot use AddExclusiveUpperBoundPartitionKeyRaw() because "
-        "the table has custom per-range hash schemas", table->name()));
-  }
+  // The number of hash dimensions in all hash schemas of a table is an
+  // invariant and checked throughout the code. With that, the table-wide hash
+  // schema is used as a proxy to find the number of hash dimensions to separate
+  // the hash-related prefix from the rest of the encoded partition key in the
+  // code below.
+  //
+  // TODO(KUDU-2671) update this code if allowing for different number of
+  //                 dimensions in range-specific hash schemas
   const auto& hash_schema = GetKuduTable()->partition_schema().hash_schema();
-  auto pkey = Partition::StringToPartitionKey(partition_key.ToString(),
-                                              hash_schema.size());
-  return data_->mutable_configuration()->AddUpperBoundPartitionKeyRaw(pkey);
+  return data_->mutable_configuration()->AddUpperBoundPartitionKeyRaw(
+      Partition::StringToPartitionKey(partition_key.ToString(),
+                                      hash_schema.size()));
 }
 
 Status KuduScanner::SetCacheBlocks(bool cache_blocks) {
@@ -1984,7 +2027,6 @@ Status KuduScanner::NextBatch(internal::ScanBatchDataInterface* batch_data) {
   // need to do some swapping of the response objects around to avoid
   // stomping on the memory the user is looking at.
   CHECK(data_->open_);
-  CHECK(data_->proxy_);
 
   batch_data->Clear();
 
@@ -1994,6 +2036,7 @@ Status KuduScanner::NextBatch(internal::ScanBatchDataInterface* batch_data) {
 
   if (data_->data_in_open_) {
     // We have data from a previous scan.
+    CHECK(data_->proxy_);
     VLOG(2) << "Extracting data from " << data_->DebugString();
     data_->data_in_open_ = false;
     return batch_data->Reset(&data_->controller_,
@@ -2005,6 +2048,7 @@ Status KuduScanner::NextBatch(internal::ScanBatchDataInterface* batch_data) {
 
   if (data_->last_response_.has_more_results()) {
     // More data is available in this tablet.
+    CHECK(data_->proxy_);
     VLOG(2) << "Continuing " << data_->DebugString();
 
     MonoTime batch_deadline = MonoTime::Now() + data_->configuration().timeout();

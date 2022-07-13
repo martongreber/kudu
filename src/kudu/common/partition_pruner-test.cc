@@ -20,12 +20,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 
-#include <boost/optional/optional.hpp>
 #include <gtest/gtest.h>
 
 #include "kudu/common/column_predicate.h"
@@ -44,14 +45,17 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
-using boost::optional;
 using std::count_if;
 using std::get;
 using std::make_tuple;
+using std::nullopt;
+using std::optional;
+using std::ostream;
 using std::pair;
 using std::string;
 using std::tuple;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 
@@ -73,44 +77,15 @@ class PartitionPrunerTest : public KuduTest {
       const vector<ColumnNameAndIntValue>& lower_int_cols,
       const vector<ColumnNameAndIntValue>& upper_int_cols,
       const vector<ColumnNamesNumBucketsAndSeed>& hash_schemas,
-      vector<pair<KuduPartialRow, KuduPartialRow>>* bounds,
-      vector<PartitionSchema::HashSchema>* range_hash_schemas,
       PartitionSchemaPB* pb);
+
+  static void CheckPrunedPartitions(const Schema& schema,
+                                    const PartitionSchema& partition_schema,
+                                    const vector<Partition>& partitions,
+                                    const ScanSpec& spec,
+                                    size_t remaining_tablets,
+                                    size_t pruner_ranges);
 };
-
-void CheckPrunedPartitions(const Schema& schema,
-                           const PartitionSchema& partition_schema,
-                           const vector<Partition>& partitions,
-                           const ScanSpec& spec,
-                           size_t remaining_tablets,
-                           size_t pruner_ranges) {
-
-  ScanSpec opt_spec(spec);
-  Arena arena(256);
-  opt_spec.OptimizeScan(schema, &arena, false);
-
-  PartitionPruner pruner;
-  pruner.Init(schema, partition_schema, opt_spec);
-
-  SCOPED_TRACE(strings::Substitute("schema: $0", schema.ToString()));
-  SCOPED_TRACE(strings::Substitute("partition schema: $0", partition_schema.DebugString(schema)));
-  // TODO(mreddy): Remove if check once PartitionSchema::PartitionKeyDebugString is modified.
-  if (partition_schema.ranges_with_hash_schemas().empty()) {
-    SCOPED_TRACE(strings::Substitute("partition pruner: $0",
-                                     pruner.ToString(schema, partition_schema)));
-  }
-  SCOPED_TRACE(strings::Substitute("optimized scan spec: $0", opt_spec.ToString(schema)));
-  SCOPED_TRACE(strings::Substitute("original  scan spec: $0", spec.ToString(schema)));
-
-  int pruned_partitions = count_if(partitions.begin(), partitions.end(),
-                                   [&] (const Partition& partition) {
-                                     return pruner.ShouldPrune(partition);
-                                   });
-
-  ASSERT_EQ(remaining_tablets, partitions.size() - pruned_partitions);
-  ASSERT_EQ(pruner_ranges, pruner.NumRangesRemaining());
-}
-
 
 void PartitionPrunerTest::CreatePartitionSchemaPB(
     const vector<string>& range_columns,
@@ -137,8 +112,6 @@ void PartitionPrunerTest::AddRangePartitionWithSchema(
     const vector<ColumnNameAndIntValue>& lower_int_cols,
     const vector<ColumnNameAndIntValue>& upper_int_cols,
     const vector<ColumnNamesNumBucketsAndSeed>& hash_buckets_info,
-    vector<pair<KuduPartialRow, KuduPartialRow>>* bounds,
-    vector<PartitionSchema::HashSchema>* range_hash_schemas,
     PartitionSchemaPB* pb) {
   auto* range = pb->add_custom_hash_schema_ranges();
   RowOperationsPBEncoder encoder(range->mutable_range_bounds());
@@ -172,8 +145,37 @@ void PartitionPrunerTest::AddRangePartitionWithSchema(
     hash_dimension.seed = get<2>(hash_bucket_info);
     hash_schema.emplace_back(hash_dimension);
   }
-  range_hash_schemas->emplace_back(std::move(hash_schema));
-  bounds->emplace_back(lower, upper);
+}
+
+void PartitionPrunerTest::CheckPrunedPartitions(
+    const Schema& schema,
+    const PartitionSchema& partition_schema,
+    const vector<Partition>& partitions,
+    const ScanSpec& spec,
+    size_t remaining_tablets,
+    size_t pruner_ranges) {
+
+  ScanSpec opt_spec(spec);
+  Arena arena(256);
+  opt_spec.OptimizeScan(schema, &arena, false);
+
+  PartitionPruner pruner;
+  pruner.Init(schema, partition_schema, opt_spec);
+
+  SCOPED_TRACE(strings::Substitute("schema: $0", schema.ToString()));
+  SCOPED_TRACE(strings::Substitute("partition schema: $0", partition_schema.DebugString(schema)));
+  SCOPED_TRACE(strings::Substitute("partition pruner: $0",
+                                   pruner.ToString(schema, partition_schema)));
+  SCOPED_TRACE(strings::Substitute("optimized scan spec: $0", opt_spec.ToString(schema)));
+  SCOPED_TRACE(strings::Substitute("original  scan spec: $0", spec.ToString(schema)));
+
+  int pruned_partitions = count_if(partitions.begin(), partitions.end(),
+                                   [&] (const Partition& partition) {
+                                     return pruner.ShouldPrune(partition);
+                                   });
+
+  ASSERT_EQ(remaining_tablets, partitions.size() - pruned_partitions);
+  ASSERT_EQ(pruner_ranges, pruner.NumRangesRemaining());
 }
 
 TEST_F(PartitionPrunerTest, TestPrimaryKeyRangePruning) {
@@ -202,7 +204,7 @@ TEST_F(PartitionPrunerTest, TestPrimaryKeyRangePruning) {
   ASSERT_OK(split2.SetInt8("c", 10));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, {}, {}, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, {}, schema, &partitions));
 
   // Creates a scan with optional lower and upper bounds, and checks that the
   // expected number of tablets are pruned.
@@ -237,36 +239,36 @@ TEST_F(PartitionPrunerTest, TestPrimaryKeyRangePruning) {
   };
 
   // No bounds
-  NO_FATALS(check(boost::none, boost::none, 3));
+  NO_FATALS(check(nullopt, nullopt, 3));
 
   // PK < (-1, min, min)
-  NO_FATALS(check(boost::none,
+  NO_FATALS(check(nullopt,
                   make_tuple<int8_t, int8_t, int8_t>(-1, INT8_MIN, INT8_MIN),
                   1));
 
   // PK < (10, 10, 10)
-  NO_FATALS(check(boost::none,
+  NO_FATALS(check(nullopt,
                   make_tuple<int8_t, int8_t, int8_t>(10, 10, 10),
                   2));
 
   // PK < (100, min, min)
-  NO_FATALS(check(boost::none,
+  NO_FATALS(check(nullopt,
                   make_tuple<int8_t, int8_t, int8_t>(100, INT8_MIN, INT8_MIN),
                   3));
 
   // PK >= (-10, -10, -10)
   NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(-10, -10, -10),
-                  boost::none,
+                  nullopt,
                   3));
 
   // PK >= (0, 0, 0)
   NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(0, 0, 0),
-                  boost::none,
+                  nullopt,
                   2));
 
   // PK >= (100, 0, 0)
   NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(100, 0, 0),
-                  boost::none,
+                  nullopt,
                   1));
 
   // PK >= (-10, 0, 0)
@@ -320,13 +322,13 @@ TEST_F(PartitionPrunerTest, TestPartialPrimaryKeyRangePruning) {
   ASSERT_OK(split2.SetStringCopy("b", "r"));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, {}, {}, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, {}, schema, &partitions));
 
   // Applies the specified lower and upper bound primary keys against the
   // schema, and checks that the expected number of partitions are pruned.
   const auto check = [&] (optional<tuple<int8_t, string, string>> lower,
-                    optional<tuple<int8_t, string, string>> upper,
-                    size_t remaining_tablets ) {
+                          optional<tuple<int8_t, string, string>> upper,
+                          size_t remaining_tablets ) {
     ScanSpec spec;
     KuduPartialRow lower_bound(&schema);
     KuduPartialRow upper_bound(&schema);
@@ -355,31 +357,31 @@ TEST_F(PartitionPrunerTest, TestPartialPrimaryKeyRangePruning) {
   };
 
   // No bounds
-  NO_FATALS(check(boost::none, boost::none, 3));
+  NO_FATALS(check(nullopt, nullopt, 3));
 
   // PK < (-1, "", "")
-  NO_FATALS(check(boost::none, make_tuple<int8_t, string, string>(-1, "", ""), 1));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, string, string>(-1, "", ""), 1));
 
   // PK < (10, "r", "")
-  NO_FATALS(check(boost::none, make_tuple<int8_t, string, string>(10, "r", ""), 2));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, string, string>(10, "r", ""), 2));
 
   // PK < (10, "r", "z")
-  NO_FATALS(check(boost::none, make_tuple<int8_t, string, string>(10, "r", "z"), 3));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, string, string>(10, "r", "z"), 3));
 
   // PK < (100, "", "")
-  NO_FATALS(check(boost::none, make_tuple<int8_t, string, string>(100, "", ""), 3));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, string, string>(100, "", ""), 3));
 
   // PK >= (-10, "m", "")
-  NO_FATALS(check(make_tuple<int8_t, string, string>(-10, "m", ""), boost::none, 3));
+  NO_FATALS(check(make_tuple<int8_t, string, string>(-10, "m", ""), nullopt, 3));
 
   // PK >= (0, "", "")
-  NO_FATALS(check(make_tuple<int8_t, string, string>(0, "", ""), boost::none, 3));
+  NO_FATALS(check(make_tuple<int8_t, string, string>(0, "", ""), nullopt, 3));
 
   // PK >= (0, "m", "")
-  NO_FATALS(check(make_tuple<int8_t, string, string>(0, "m", ""), boost::none, 2));
+  NO_FATALS(check(make_tuple<int8_t, string, string>(0, "m", ""), nullopt, 2));
 
   // PK >= (100, "", "")
-  NO_FATALS(check(make_tuple<int8_t, string, string>(100, "", ""), boost::none, 1));
+  NO_FATALS(check(make_tuple<int8_t, string, string>(100, "", ""), nullopt, 1));
 
   // PK >= (-10, "", "")
   // PK  < (100, "", "")
@@ -429,13 +431,13 @@ TEST_F(PartitionPrunerTest, TestIntPartialPrimaryKeyRangePruning) {
   ASSERT_OK(split.SetInt8("b", 0));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ split }, {}, {}, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ split }, {}, schema, &partitions));
 
   // Applies the specified lower and upper bound primary keys against the
   // schema, and checks that the expected number of partitions are pruned.
   const auto check = [&] (optional<tuple<int8_t, int8_t, int8_t>> lower,
-                    optional<tuple<int8_t, int8_t, int8_t>> upper,
-                    size_t remaining_tablets ) {
+                          optional<tuple<int8_t, int8_t, int8_t>> upper,
+                          size_t remaining_tablets ) {
     ScanSpec spec;
     KuduPartialRow lower_bound(&schema);
     KuduPartialRow upper_bound(&schema);
@@ -464,32 +466,32 @@ TEST_F(PartitionPrunerTest, TestIntPartialPrimaryKeyRangePruning) {
   };
 
   // No bounds
-  NO_FATALS(check(boost::none, boost::none, 2));
+  NO_FATALS(check(nullopt, nullopt, 2));
 
   // PK < (0, 0, min)
-  NO_FATALS(check(boost::none, make_tuple<int8_t, int8_t, int8_t>(0, 0, INT8_MIN), 1));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, int8_t, int8_t>(0, 0, INT8_MIN), 1));
 
   // PK < (0, 0, 0);
-  NO_FATALS(check(boost::none, make_tuple<int8_t, int8_t, int8_t>(0, 0, 0), 2));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, int8_t, int8_t>(0, 0, 0), 2));
 
   // PK < (0, max, 0);
-  NO_FATALS(check(boost::none, make_tuple<int8_t, int8_t, int8_t>(0, INT8_MAX, 0), 2));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, int8_t, int8_t>(0, INT8_MAX, 0), 2));
 
   // PK < (max, max, min);
-  NO_FATALS(check(boost::none,
+  NO_FATALS(check(nullopt,
                   make_tuple<int8_t, int8_t, int8_t>(INT8_MAX, INT8_MAX, INT8_MIN), 2));
 
   // PK < (max, max, 0);
-  NO_FATALS(check(boost::none, make_tuple<int8_t, int8_t, int8_t>(INT8_MAX, INT8_MAX, 0), 2));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, int8_t, int8_t>(INT8_MAX, INT8_MAX, 0), 2));
 
   // PK >= (0, 0, 0);
-  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(0, 0, 0), boost::none, 1));
+  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(0, 0, 0), nullopt, 1));
 
   // PK >= (0, 0, -1);
-  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(0, 0, -1), boost::none, 1));
+  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(0, 0, -1), nullopt, 1));
 
   // PK >= (0, 0, min);
-  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(0, 0, INT8_MIN), boost::none, 1));
+  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(0, 0, INT8_MIN), nullopt, 1));
 }
 
 TEST_F(PartitionPrunerTest, TestRangePruning) {
@@ -518,7 +520,7 @@ TEST_F(PartitionPrunerTest, TestRangePruning) {
   ASSERT_OK(split2.SetStringCopy("b", "r"));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, {}, {}, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, {}, schema, &partitions));
 
   // Applies the specified predicates to a scan and checks that the expected
   // number of partitions are pruned.
@@ -687,7 +689,7 @@ TEST_F(PartitionPrunerTest, TestHashPruning) {
     ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema));
 
     vector<Partition> partitions;
-    ASSERT_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>(), {}, {},
+    ASSERT_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>(), {},
                                                        schema, &partitions));
 
 
@@ -763,7 +765,7 @@ TEST_F(PartitionPrunerTest, TestInListHashPruning) {
   ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>(), {}, {},
+  ASSERT_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>(), {},
                                                      schema, &partitions));
 
 
@@ -841,9 +843,8 @@ TEST_F(PartitionPrunerTest, TestMultiColumnInListHashPruning) {
   ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>(), {}, {},
+  ASSERT_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>(), {},
                                                      schema, &partitions));
-
 
   // Applies the specified predicates to a scan and checks that the expected
   // number of partitions are pruned.
@@ -940,7 +941,7 @@ TEST_F(PartitionPrunerTest, TestPruning) {
 
   vector<Partition> partitions;
   ASSERT_OK(partition_schema.CreatePartitions(
-      vector<KuduPartialRow>{ split }, {}, {}, schema, &partitions));
+      vector<KuduPartialRow>{ split }, {},  schema, &partitions));
   ASSERT_EQ(4, partitions.size());
 
   // Applies the specified predicates to a scan and checks that the expected
@@ -1047,7 +1048,7 @@ TEST_F(PartitionPrunerTest, TestKudu2173) {
   KuduPartialRow split1(&schema);
   ASSERT_OK(split1.SetInt8("a", 10));
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ split1 }, {}, {}, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ split1 }, {}, schema, &partitions));
 
   // Applies the specified predicates to a scan and checks that the expected
   // number of partitions are pruned.
@@ -1099,9 +1100,6 @@ TEST_F(PartitionPrunerTest, DISABLED_TestHashSchemasPerRangePruning) {
   PartitionSchemaPB pb;
   CreatePartitionSchemaPB({"C"}, { {{"A"}, 2, 0}, {{"B"}, 2, 0} }, &pb);
 
-  vector<pair<KuduPartialRow, KuduPartialRow>> bounds;
-  vector<PartitionSchema::HashSchema> range_hash_schemas;
-
   // Need to add per range hash schema components to the field
   // 'ranges_with_hash_schemas_' of PartitionSchema because PartitionPruner will
   // use them to construct partition key ranges. Currently,
@@ -1112,26 +1110,25 @@ TEST_F(PartitionPrunerTest, DISABLED_TestHashSchemasPerRangePruning) {
 
   // [(_, _, a), (_, _, c))
   AddRangePartitionWithSchema(schema, {{"C", "a"}}, {{"C", "c"}}, {}, {},
-                              { {{"A"}, 3, 0} }, &bounds, &range_hash_schemas, &pb);
+                              { {{"A"}, 3, 0} }, &pb);
 
   // [(_, _, d), (_, _, f))
   AddRangePartitionWithSchema(schema, {{"C", "d"}}, {{"C", "f"}}, {}, {},
-                              { {{"A"}, 2, 0}, {{"B"}, 3, 0} },
-                              &bounds, &range_hash_schemas, &pb);
+                              { {{"A"}, 2, 0}, {{"B"}, 3, 0} }, &pb);
 
   // [(_, _, h), (_, _, j))
-  AddRangePartitionWithSchema(schema, {{"C", "h"}}, {{"C", "j"}}, {}, {},
-                              {}, &bounds, &range_hash_schemas, &pb);
+  AddRangePartitionWithSchema(schema, {{"C", "h"}}, {{"C", "j"}}, {}, {}, {}, &pb);
 
   // [(_, _, k), (_, _, m))
   AddRangePartitionWithSchema(schema, {{"C", "k"}}, {{"C", "m"}}, {}, {},
-                              { {{"B"}, 2, 0} }, &bounds, &range_hash_schemas, &pb);
+                              { {{"B"}, 2, 0} }, &pb);
 
   PartitionSchema partition_schema;
-  ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema));
+  PartitionSchema::RangesWithHashSchemas ranges;
+  ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema, &ranges));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({}, bounds, range_hash_schemas, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions(ranges, schema, &partitions));
   ASSERT_EQ(12, partitions.size());
 
   // Applies the specified predicates to a scan and checks that the expected
@@ -1164,7 +1161,6 @@ TEST_F(PartitionPrunerTest, DISABLED_TestHashSchemasPerRangePruning) {
 
   // No Bounds
   NO_FATALS(check({}, {}, {}, 12, 12));
-
   // A = 1
   NO_FATALS(check({ ColumnPredicate::Equality(schema.column(0), &one) },
             {}, {}, 7, 7));
@@ -1289,37 +1285,35 @@ TEST_F(PartitionPrunerTest, TestHashSchemasPerRangeWithPartialPrimaryKeyRangePru
                 3);
 
   PartitionSchemaPB pb;
-  CreatePartitionSchemaPB({"a", "b"}, {}, &pb);
-
-  vector<pair<KuduPartialRow, KuduPartialRow>> bounds;
-  vector<PartitionSchema::HashSchema> range_hash_schemas;
+  CreatePartitionSchemaPB({"a", "b"}, { {{"c"}, 2, 10} }, &pb);
 
   // [(0, 0, _), (2, 2, _))
   AddRangePartitionWithSchema(schema, {}, {}, {{"a", 0}, {"b", 0}}, {{"a", 2}, {"b", 2}},
-                              { {{"c"}, 2, 0} }, &bounds, &range_hash_schemas, &pb);
+                              { {{"c"}, 2, 0} }, &pb);
 
   // [(2, 2, _), (4, 4, _))
   AddRangePartitionWithSchema(schema, {}, {}, {{"a", 2}, {"b", 2}}, {{"a", 4}, {"b", 4}},
-                              { {{"c"}, 3, 0} }, &bounds, &range_hash_schemas, &pb);
+                              { {{"c"}, 3, 0} }, &pb);
 
   // [(4, 4, _), (6, 6, _))
   AddRangePartitionWithSchema(schema, {}, {}, {{"a", 4}, {"b", 4}}, {{"a", 6}, {"b", 6}},
-                              { {{"c"}, 4, 0} }, &bounds, &range_hash_schemas, &pb);
+                              { {{"c"}, 4, 0} }, &pb);
 
   PartitionSchema partition_schema;
-  ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema));
+  PartitionSchema::RangesWithHashSchemas ranges;
+  ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema, &ranges));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({}, bounds, range_hash_schemas, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions(ranges, schema, &partitions));
   ASSERT_EQ(9, partitions.size());
 
   Arena arena(1024);
   // Applies the specified lower and upper bound primary keys against the
   // schema, and checks that the expected number of partitions are pruned.
   const auto check = [&] (optional<tuple<int8_t, int8_t, int8_t>> lower,
-                    optional<tuple<int8_t, int8_t, int8_t>> upper,
-                    size_t remaining_tablets,
-                    size_t pruner_ranges) {
+                          optional<tuple<int8_t, int8_t, int8_t>> upper,
+                          size_t remaining_tablets,
+                          size_t pruner_ranges) {
     ScanSpec spec;
     KuduPartialRow lower_bound(&schema);
     KuduPartialRow upper_bound(&schema);
@@ -1347,16 +1341,16 @@ TEST_F(PartitionPrunerTest, TestHashSchemasPerRangeWithPartialPrimaryKeyRangePru
   };
 
   // No bounds
-  NO_FATALS(check(boost::none, boost::none, 9, 9));
+  NO_FATALS(check(nullopt, nullopt, 9, 13));
 
   // PK < (2, 2, min)
-  NO_FATALS(check(boost::none, make_tuple<int8_t, int8_t, int8_t>(2, 2, INT8_MIN), 2, 2));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, int8_t, int8_t>(2, 2, INT8_MIN), 2, 4));
 
   // PK < (2, 2, 0)
-  NO_FATALS(check(boost::none, make_tuple<int8_t, int8_t, int8_t>(2, 2, 0), 5, 5));
+  NO_FATALS(check(nullopt, make_tuple<int8_t, int8_t, int8_t>(2, 2, 0), 5, 7));
 
   // PK >= (2, 2, 0)
-  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(2, 2, 0), boost::none, 7, 7));
+  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(2, 2, 0), nullopt, 7, 9));
 
   // PK >= (2, 2, min)
   // PK < (4, 4, min)
@@ -1374,7 +1368,7 @@ TEST_F(PartitionPrunerTest, TestHashSchemasPerRangeWithPartialPrimaryKeyRangePru
                   make_tuple<int8_t, int8_t, int8_t>(4, 2, INT8_MIN), 5, 5));
 
   // PK >= (6, 6, min)
-  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(6, 6, INT8_MIN), boost::none, 0, 0));
+  NO_FATALS(check(make_tuple<int8_t, int8_t, int8_t>(6, 6, INT8_MIN), nullopt, 0, 2));
 
   // PK >= (4, 4, min)
   // PK < (2, 2, min)
@@ -1398,28 +1392,26 @@ TEST_F(PartitionPrunerTest, TestInListHashPruningPerRange) {
   PartitionSchemaPB pb;
   CreatePartitionSchemaPB({"A"}, { {{"B", "C"}, 3, 0} }, &pb);
 
-  vector<pair<KuduPartialRow, KuduPartialRow>> bounds;
-  vector<PartitionSchema::HashSchema> range_hash_schemas;
-
   // None of the ranges below uses the table-wide hash schema.
 
   // [(a, _, _), (c, _, _))
   AddRangePartitionWithSchema(schema, {{"A", "a"}}, {{"A", "c"}}, {}, {},
-                              { {{"B"}, 3, 0} }, &bounds, &range_hash_schemas, &pb);
+                              { {{"B"}, 3, 0} }, &pb);
 
   // [(c, _, _), (e, _, _))
   AddRangePartitionWithSchema(schema, {{"A", "c"}}, {{"A", "e"}}, {}, {},
-                              {}, &bounds, &range_hash_schemas, &pb);
+                              {}, &pb);
 
   // [(e, _, _), (g, _, _))
   AddRangePartitionWithSchema(schema, {{"A", "e"}}, {{"A", "g"}}, {}, {},
-                              { {{"C"}, 3, 0} }, &bounds, &range_hash_schemas, &pb);
+                              { {{"C"}, 3, 0} }, &pb);
 
   PartitionSchema partition_schema;
-  ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema));
+  PartitionSchema::RangesWithHashSchemas ranges;
+  ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema, &ranges));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({}, bounds, range_hash_schemas, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions(ranges, schema, &partitions));
   ASSERT_EQ(7, partitions.size());
 
   // Applies the specified predicates to a scan and checks that the expected
@@ -1446,17 +1438,17 @@ TEST_F(PartitionPrunerTest, TestInListHashPruningPerRange) {
   // B in [0, 1, 8];
   B_values = { &zero, &one, &eight };
   NO_FATALS(check({ ColumnPredicate::InList(schema.column(1), &B_values) },
-                  7, 7));
+                  7, 13));
 
   // B in [0, 1];
   B_values = { &zero, &one };
   NO_FATALS(check({ ColumnPredicate::InList(schema.column(1), &B_values) },
-                  6, 6));
+                  6, 12));
 
   // C in [0, 1];
   C_values = { &zero, &one };
   NO_FATALS(check({ ColumnPredicate::InList(schema.column(2), &C_values) },
-                  6, 6));
+                  6, 12));
 
   // B in [0, 1], C in [0, 1]
   // (0, 0) in bucket 2
@@ -1467,19 +1459,19 @@ TEST_F(PartitionPrunerTest, TestInListHashPruningPerRange) {
   C_values = { &zero, &one };
   NO_FATALS(check({ ColumnPredicate::InList(schema.column(1), &B_values),
                     ColumnPredicate::InList(schema.column(2), &C_values) },
-                  5,  5));
+                  5,  11));
 
   // B = 0, C in [0, 1]
   C_values = { &zero, &one };
   NO_FATALS(check({ ColumnPredicate::Equality(schema.column(1), &zero),
                     ColumnPredicate::InList(schema.column(2), &C_values) },
-                  4, 4));
+                  4, 6));
 
   // B = 1, C in [0, 1]
   C_values = { &zero, &one };
   NO_FATALS(check({ ColumnPredicate::Equality(schema.column(1), &one),
                     ColumnPredicate::InList(schema.column(2), &C_values) },
-                  4, 4));
+                  4, 8));
 }
 
 // TODO(aserbin): re-enable this scenario once varying hash dimensions per range
@@ -1497,30 +1489,27 @@ TEST_F(PartitionPrunerTest, DISABLED_TestSingleRangeElementAndBoundaryCase) {
   PartitionSchemaPB pb;
   CreatePartitionSchemaPB({"A"}, {}, &pb);
 
-  vector<pair<KuduPartialRow, KuduPartialRow>> bounds;
-  vector<PartitionSchema::HashSchema> range_hash_schemas;
-
   // [(_, _), (1, _))
   AddRangePartitionWithSchema(schema, {}, {}, {}, {{"A", 1}},
-                              {{{"B"}, 4, 0}}, &bounds, &range_hash_schemas, &pb);
+                              {{{"B"}, 4, 0}}, &pb);
 
   // [(1, _), (2, _))
   AddRangePartitionWithSchema(schema, {}, {}, {{"A", 1}}, {{"A", 2}},
-                              { {{"B"}, 2, 0} }, &bounds, &range_hash_schemas, &pb);
+                              { {{"B"}, 2, 0} }, &pb);
 
   // [(2, _), (3, _))
   AddRangePartitionWithSchema(schema, {}, {}, {{"A", 2}}, {{"A", 3}},
-                              { {{"B"}, 3, 0} }, &bounds, &range_hash_schemas, &pb);
+                              { {{"B"}, 3, 0} }, &pb);
 
   // [(3, _), (_, _))
-  AddRangePartitionWithSchema(schema, {}, {}, {{"A", 3}}, {},
-                              {}, &bounds, &range_hash_schemas, &pb);
+  AddRangePartitionWithSchema(schema, {}, {}, {{"A", 3}}, {}, {}, &pb);
 
   PartitionSchema partition_schema;
-  ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema));
+  PartitionSchema::RangesWithHashSchemas ranges;
+  ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema, &ranges));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({}, bounds, range_hash_schemas, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions(ranges, schema, &partitions));
   ASSERT_EQ(10, partitions.size());
 
   // Applies the specified predicates to a scan and checks that the expected
@@ -1608,4 +1597,583 @@ TEST_F(PartitionPrunerTest, DISABLED_TestSingleRangeElementAndBoundaryCase) {
   NO_FATALS(check({ ColumnPredicate::Range(schema.column(0), nullptr, &zero),
                     ColumnPredicate::Equality(schema.column(1), &one)}, 1, 1));
 }
+
+// Test for the functionality of PartitionPruner::PrepareRangeSet() method.
+class PartitionPrunerRangeSetTest : public PartitionPrunerTest {
+ public:
+  struct TestStruct {
+    const string description;
+    const string scan_lower_bound;
+    const string scan_upper_bound;
+    const PartitionSchema::HashSchema& table_wide_hash_schema;
+    const PartitionSchema::RangesWithHashSchemas ranges_with_custom_hash_schemas;
+    const PartitionSchema::RangesWithHashSchemas expected_result;
+  };
+
+  static void DoCheck(const TestStruct& t) {
+    PartitionSchema::RangesWithHashSchemas result_ranges;
+    PartitionPruner::PrepareRangeSet(
+        t.scan_lower_bound, t.scan_upper_bound, t.table_wide_hash_schema,
+        t.ranges_with_custom_hash_schemas,
+        &result_ranges);
+    SCOPED_TRACE(t.description);
+    ASSERT_EQ(t.expected_result.size(), result_ranges.size())
+        << result_ranges;
+    for (auto i = 0; i < result_ranges.size(); ++i) {
+      SCOPED_TRACE(Substitute("range $0", i));
+      const auto& lhs = t.expected_result[i];
+      const auto& rhs = result_ranges[i];
+      ASSERT_EQ(lhs.lower, rhs.lower);
+      ASSERT_EQ(lhs.upper, rhs.upper);
+      ASSERT_EQ(lhs.hash_schema.size(), rhs.hash_schema.size());
+      for (auto j = 0; j < lhs.hash_schema.size(); ++j) {
+        SCOPED_TRACE(Substitute("hash dimension $0", j));
+        ASSERT_EQ(lhs.hash_schema[j].num_buckets,
+                  rhs.hash_schema[j].num_buckets);
+      }
+    }
+  }
+};
+
+ostream& operator<<(ostream& os,
+                    const PartitionSchema::RangeWithHashSchema& range) {
+  os << "(" << (range.lower.empty() ? "*" : range.lower)
+     << " " << (range.upper.empty() ? "*" : range.upper) << ")";
+  return os;
+}
+
+ostream& operator<<(ostream& os,
+                    const PartitionSchema::RangesWithHashSchemas& ranges) {
+  for (const auto& range : ranges) {
+    os << range << " ";
+  }
+  return os;
+}
+
+TEST_F(PartitionPrunerRangeSetTest, PrepareRangeSetX) {
+  const PartitionSchema::HashSchema _2 = { { {ColumnId(0)}, 2, 0 } };
+  const PartitionSchema::HashSchema _3 = { { {ColumnId(0)}, 3, 0 } };
+  const PartitionSchema::HashSchema _4 = { { {ColumnId(0)}, 4, 0 } };
+  const PartitionSchema::HashSchema _5 = { { {ColumnId(0)}, 5, 0 } };
+
+  // For each element, there is a representation of the corresponding scenario
+  // in the 'description' field: the first line is for the scan boundaries, the
+  // second line is for the set of ranges with custom hash schemas. Two lines
+  // are properly aligned to express the disposition of the ranges with custom
+  // hash schemas vs the scan range. For the range bounds, the asterisk symbol
+  // means "unlimited", i.e. no bound. Square [] and regular () parentheses
+  // don't have the inclusivity/exclusivity semantics: they are rather to
+  // distinguish scan bounds from range bounds.
+  const vector<TestStruct> test_inputs_and_results = {
+    {
+R"*(
+"[a b]"
+""
+)*",
+      "a", "b", _2,
+      {},
+      { {"a", "b", _2} }
+    },
+    {
+R"*(
+"[a *]"
+"(a *)"
+)*",
+      "a", "", _2,
+      { {"a", "", _3} },
+      { {"a", "", _3} }
+    },
+    {
+R"*(
+"[* b]"
+"(* b)"
+)*",
+      "", "b", _2,
+      { {"", "b", _3} },
+      { {"", "b", _3} }
+    },
+    {
+R"*(
+"[*   c]"
+"  (b c)"
+)*",
+      "", "c", _2,
+      { {"b", "c", _3} },
+      { {"", "b", _2}, {"b", "c", _3} }
+    },
+    {
+R"*(
+"[*   *]"
+"(* b)"
+)*",
+      "", "", _2,
+      { {"", "b", _3} },
+      { {"", "b", _3}, {"b", "", _2} }
+    },
+    {
+R"*(
+"[*   *]"
+"  (b *)"
+)*",
+      "", "", _2,
+      { {"b", "", _3} },
+      { { "", "b", _2}, {"b", "", _3} }
+    },
+    {
+R"*(
+"    [c d]"
+"(a b)"
+)*",
+      "c", "d", _2,
+      { {"a", "b", _3} },
+      { {"c", "d", _2} }
+    },
+    {
+R"*(
+"    [c d]"
+"(* b)"
+)*",
+      "c", "d", _2,
+      { { "", "b", _3} },
+      { {"c", "d", _2} }
+    },
+    {
+R"*(
+"       [c d]"
+"(a b)(b c)"
+)*",
+      "c", "d", _2,
+      { {"a", "b", _3}, {"b", "c", _4} },
+      { {"c", "d", _2} }
+    },
+    {
+R"*(
+"         [d e]"
+"(a b)  (c d)"
+)*",
+      "d", "e", _2,
+      { {"a", "b", _3}, {"c", "d", _4} },
+      { {"d", "e", _2} }
+    },
+    {
+R"*(
+"[a b]"
+"    (c d)"
+)*",
+      "a", "b", _2,
+      { {"c", "d", _3} },
+      { {"a", "b", _2} }
+    },
+    {
+R"*(
+"[a b]"
+"    (c *)"
+)*",
+      "a", "b", _2,
+      { {"c",  "", _3} },
+      { {"a", "b", _2} }
+    },
+    {
+R"*(
+"[* b]"
+"    (c d)"
+)*",
+      "", "b", _2,
+      { {"c", "d", _3} },
+      { { "", "b", _2} }
+    },
+    {
+R"*(
+"[* b]"
+"    (c *)"
+)*",
+      "", "b", _2,
+      { {"c",  "", _3} },
+      { { "", "b", _2} }
+    },
+    {
+R"*(
+"    [c d]"
+"(a b)   (e f)"
+)*",
+      "c", "d", _2,
+      { { "a", "b", _3 }, { "e", "f", _4 } },
+      { { "c", "d", _2 } }
+    },
+    {
+R"*(
+"    [c d]"
+"(* b)   (e f)"
+)*",
+      "c", "d", _2,
+      { { "", "b", _3}, {"e", "f", _4} },
+      { {"c", "d", _2} }
+    },
+    {
+R"*(
+"    [c d]"
+"(a b)   (e *)"
+)*",
+      "c", "d", _2,
+      { {"a", "b", _3}, {"e", "", _4} },
+      { {"c", "d", _2} }
+    },
+    {
+R"*(
+"    [c d]"
+"(* b)   (e *)"
+)*",
+      "c", "d", _2,
+      { { "", "b", _3}, {"e", "", _4} },
+      { {"c", "d", _2} }
+    },
+    {
+R"*(
+"  [b    c]"
+"(a b)  (c d)"
+)*",
+      "b", "c", _2,
+      { {"a", "b", _3}, {"c", "d", _4} },
+      { {"b", "c", _2} }
+    },
+    {
+R"*(
+"  [b    c]"
+"(* b)  (c d)"
+)*",
+      "b", "c", _2,
+      { { "", "b", _3}, {"c", "d", _4} },
+      { {"b", "c", _2} }
+    },
+    {
+R"*(
+"  [b    c]"
+"(a b)  (c *)"
+)*",
+      "b", "c", _2,
+      { {"a", "b", _3}, {"c",  "", _4} },
+      { {"b", "c", _2} }
+    },
+    {
+R"*(
+"  [b    c]"
+"(* b)  (c *)"
+)*",
+      "b", "c", _2,
+      { { "", "b", _3}, {"c",  "", _4} },
+      { {"b", "c", _2} }
+    },
+    {
+R"*(
+"  [b c]"
+"(* b)"
+)*",
+      "b", "c", _2,
+      { { "", "b", _3} },
+      { {"b", "c", _2} }
+    },
+    {
+R"*(
+"  [b c]"
+"(a b)"
+)*",
+      "b", "c", _2,
+      { {"a", "b", _3} },
+      { {"b", "c", _2} }
+    },
+    {
+R"*(
+"[a b]"
+"   (b c)"
+)*",
+      "a", "b", _2,
+      { {"b", "c", _3} },
+      { {"a", "b", _2} }
+    },
+    {
+R"*(
+"[a b]"
+"  (b *)"
+)*",
+      "a", "b", _2,
+      { {"b",  "", _3} },
+      { {"a", "b", _2} }
+    },
+    {
+R"*(
+"[a   c]"
+"(a b)"
+)*",
+      "a", "c", _2,
+      { {"a", "b", _3} },
+      { {"a", "b", _3}, {"b", "c", _2} }
+    },
+    {
+R"*(
+"[a   c]"
+"  (b c)"
+)*",
+      "a", "c", _2,
+      { {"b", "c", _3} },
+      { {"a", "b", _2}, {"b", "c", _3} }
+    },
+    {
+R"*(
+"[a   *]"
+"  (b *)"
+)*",
+      "a", "", _2,
+      { {"b",  "", _3} },
+      { {"a", "b", _2}, {"b",  "", _3} }
+    },
+    {
+R"*(
+"[*   b]"
+"(* a)"
+)*",
+      "", "b", _2,
+      { { "", "a", _3} },
+      { { "", "a", _3}, {"a", "b", _2} }
+    },
+    {
+R"*(
+"[a     d]"
+"  (b c)"
+)*",
+      "a", "d", _2,
+      { {"b", "c", _3} },
+      { {"a", "b", _2}, {"b", "c", _3}, {"c", "d", _2} }
+    },
+    {
+R"*(
+"[*     d]"
+"  (b c)"
+)*",
+      "", "d", _2,
+      { {"b", "c", _3} },
+      { { "", "b", _2}, {"b", "c", _3}, {"c", "d", _2} }
+    },
+    {
+R"*(
+"[*     *]"
+"  (b c)"
+)*",
+      "", "", _2,
+      { {"b", "c", _3} },
+      { { "", "b", _2}, {"b", "c", _3}, {"c", "", _2} }
+    },
+    {
+R"*(
+"  [b c]"
+"(a     d)"
+)*",
+      "b", "c", _2,
+      { {"a", "d", _3} },
+      { {"b", "c", _3} }
+    },
+    {
+R"*(
+"  [b c]"
+"(a     *)"
+)*",
+      "b", "c", _2,
+      { {"a",  "", _3} },
+      { {"b", "c", _3} }
+    },
+    {
+R"*(
+"  [b c]"
+"(*     d)"
+)*",
+      "b", "c", _2,
+      { { "", "d", _3} },
+      { {"b", "c", _3} }
+    },
+    {
+R"*(
+"  [b c]"
+"(*     *)"
+)*",
+      "b", "c", _2,
+      { { "",  "", _3} },
+      { {"b", "c", _3} }
+    },
+    {
+R"*(
+"[a   c]"
+"  (b   *)"
+)*",
+      "a", "c", _2,
+      { {"b",  "", _3} },
+      { {"a", "b", _2}, {"b", "c", _3} }
+    },
+    {
+R"*(
+"[a      c]"
+"(a b)(b c)"
+)*",
+      "a", "c", _2,
+      { {"a", "b", _3}, {"b", "c", _4} },
+      { {"a", "b", _3}, {"b", "c", _4} }
+    },
+    {
+R"*(
+"[a      c]"
+"(a b)(b   *)"
+)*",
+      "a", "c", _2,
+      { {"a", "b", _3}, {"b",  "", _4} },
+      { {"a", "b", _3}, {"b", "c", _4} }
+    },
+    {
+R"*(
+"[a          e]"
+"  (b c)(c d)"
+)*",
+      "a", "e", _2,
+      { {"b", "c", _3}, {"c", "d", _4} },
+      { {"a", "b", _2}, {"b", "c", _3}, {"c", "d", _4}, {"d", "e", _2} }
+    },
+    {
+R"*(
+"[a          *]"
+"  (b c)  (d *)"
+)*",
+      "a", "", _2,
+      { {"b", "c", _3}, {"d",  "", _4} },
+      { {"a", "b", _2}, {"b", "c", _3}, {"c", "d", _2}, {"d",  "", _4} }
+    },
+    {
+R"*(
+"[a          f]"
+"  (b c)  (d   *)"
+)*",
+      "a", "f", _2,
+      { {"b", "c", _3}, {"d",  "", _4} },
+      { {"a", "b", _2}, {"b", "c", _3}, {"c", "d", _2}, {"d", "f", _4} }
+    },
+    {
+R"*(
+"[a            f]"
+"  (b c)  (d e)"
+)*",
+      "a", "f", _2,
+      { {"b", "c", _3}, {"d", "e", _4} },
+      {
+        {"a", "b", _2},
+        {"b", "c", _3},
+        {"c", "d", _2},
+        {"d", "e", _4},
+        {"e", "f", _2},
+      }
+    },
+    {
+R"*(
+"[a            *]"
+"  (b c)  (d e)"
+)*",
+      "a", "", _2,
+      { {"b", "c", _3}, {"d", "e", _4} },
+      {
+        {"a", "b", _2},
+        {"b", "c", _3},
+        {"c", "d", _2},
+        {"d", "e", _4},
+        {"e",  "", _2},
+      }
+    },
+    {
+R"*(
+"[*            f]"
+"  (b c)  (d e)"
+)*",
+      "", "f", _2,
+      { {"b", "c", _3}, {"d", "e", _4} },
+      {
+        { "", "b", _2},
+        {"b", "c", _3},
+        {"c", "d", _2},
+        {"d", "e", _4},
+        {"e", "f", _2},
+      }
+    },
+    {
+R"*(
+"[a     d]"
+"  (b c) (e f)"
+)*",
+      "a", "d", _2,
+      { {"b", "c", _3}, {"e", "f", _4} },
+      { {"a", "b", _2}, {"b", "c", _3}, {"c", "d", _2} }
+    },
+    {
+R"*(
+"  [b        e]"
+"(a   c)  (d   *)"
+)*",
+      "b", "e", _2,
+      { {"a", "c", _3}, {"d", "", _4} },
+      { {"b", "c", _3}, {"c", "d", _2}, {"d", "e", _4} }
+    },
+    {
+R"*(
+"[*          e]"
+"  (b c)  (d   *)"
+)*",
+      "", "e", _2,
+      { {"b", "c", _3}, {"d", "", _4} },
+      { { "", "b", _2}, {"b", "c", _3}, {"c", "d", _2}, {"d", "e", _4} }
+    },
+    {
+R"*(
+"  [b           e]"
+"(a b)  (c d)  (e f)"
+)*",
+      "b", "e", _2,
+      { {"a", "b", _3}, {"c", "d", _4}, {"e", "f", _5}, },
+      { {"b", "c", _2}, {"c", "d", _4}, {"d", "e", _2}, }
+    },
+    {
+R"*(
+"  [b           e]"
+"(* b)  (c d)  (e f)"
+)*",
+      "b", "e", _2,
+      { { "", "b", _3}, {"c", "d", _4}, {"e", "f", _5}, },
+      { {"b", "c", _2}, {"c", "d", _4}, {"d", "e", _2}, }
+    },
+    {
+R"*(
+"  [b           e]"
+"(a b)  (c d)  (e *)"
+)*",
+      "b", "e", _2,
+      { {"a", "b", _3}, {"c", "d", _4}, {"e",  "", _5}, },
+      { {"b", "c", _2}, {"c", "d", _4}, {"d", "e", _2}, }
+    },
+    {
+R"*(
+"  [b           e]"
+"(* b)  (c d)  (e *)"
+)*",
+      "b", "e", _2,
+      { { "", "b", _3}, {"c", "d", _4}, {"e",  "", _5}, },
+      { {"b", "c", _2}, {"c", "d", _4}, {"d", "e", _2}, }
+    },
+    {
+R"*(
+"[*             e]"
+"(* b)  (c d)  (e *)"
+)*",
+      "", "e", _2,
+      { { "", "b", _3}, {"c", "d", _4}, {"e",  "", _5}, },
+      { { "", "b", _3}, {"b", "c", _2}, {"c", "d", _4}, {"d", "e", _2}, }
+    },
+  };
+
+  for (const auto& scenario : test_inputs_and_results) {
+    NO_FATALS(DoCheck(scenario));
+  }
+}
+
 } // namespace kudu

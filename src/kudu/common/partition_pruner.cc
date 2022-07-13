@@ -310,23 +310,135 @@ vector<PartitionPruner::PartitionKeyRange> PartitionPruner::ConstructPartitionKe
   }
 
   // Remove all partition key ranges past the scan spec's upper bound partition key.
-  if (!scan_spec.exclusive_upper_bound_partition_key().empty()) {
+  const auto& upper_bound_partition_key = scan_spec.exclusive_upper_bound_partition_key();
+  if (!upper_bound_partition_key.empty()) {
     for (auto range = partition_key_ranges.rbegin();
          range != partition_key_ranges.rend();
          ++range) {
-      if (!(*range).end.empty() &&
-          scan_spec.exclusive_upper_bound_partition_key() >= (*range).end) {
+      if (!(*range).end.empty() && upper_bound_partition_key >= (*range).end) {
         break;
       }
-      if (scan_spec.exclusive_upper_bound_partition_key() <= (*range).start) {
+      if (upper_bound_partition_key <= (*range).start) {
         partition_key_ranges.pop_back();
       } else {
-        (*range).end = scan_spec.exclusive_upper_bound_partition_key();
+        (*range).end = upper_bound_partition_key;
       }
     }
   }
 
   return partition_key_ranges;
+}
+
+// NOTE: the lower ranges are inclusive, the upper ranges are exclusive.
+void PartitionPruner::PrepareRangeSet(
+    const string& scan_lower_bound,
+    const string& scan_upper_bound,
+    const PartitionSchema::HashSchema& table_wide_hash_schema,
+    const PartitionSchema::RangesWithHashSchemas& ranges,
+    PartitionSchema::RangesWithHashSchemas* result_ranges) {
+  DCHECK(result_ranges);
+  CHECK(scan_upper_bound.empty() || scan_lower_bound < scan_upper_bound);
+
+  // If there aren't any ranges with custom hash schemas or there isn't an
+  // intersection between the set of ranges with custom hash schemas and the
+  // scan range, the result is trivial: the whole scan range is attributed
+  // to the table-wide hash schema.
+  if (ranges.empty() ||
+      (!scan_upper_bound.empty() && scan_upper_bound < ranges.front().lower) ||
+      (!scan_lower_bound.empty() && !ranges.back().upper.empty() &&
+           ranges.back().upper <= scan_lower_bound)) {
+    *result_ranges =
+        { { scan_lower_bound, scan_upper_bound, table_wide_hash_schema } };
+    return;
+  }
+
+  // Find the first range that is at or after the specified bounds.
+  const auto range_it = std::lower_bound(ranges.cbegin(), ranges.cend(),
+      RangeBounds{scan_lower_bound, scan_upper_bound},
+      [] (const PartitionSchema::RangeWithHashSchema& range,
+          const RangeBounds& bounds) {
+        // return true if range < bounds
+        return !range.upper.empty() && range.upper <= bounds.lower;
+      });
+  CHECK(range_it != ranges.cend());
+
+  // Current position of the iterator.
+  string cur_point = scan_lower_bound;
+  // Index of the known range with custom hash schema that the iterator is
+  // currently pointing at or about to point if the iterator is currently
+  // at the scan boundary.
+  size_t cur_idx = distance(ranges.begin(), range_it);
+
+  CHECK_LT(cur_idx, ranges.size());
+
+  // Iterate over the scan range from one known boundary to the next one,
+  // enumerating the resulting consecutive sub-ranges and attributing each
+  // sub-range to a proper hash schema. If that's a known range with custom hash
+  // schema, it's attributed to its range-specific hash schema; otherwise,
+  // a sub-range is attributed to the table-wide hash schema.
+  PartitionSchema::RangesWithHashSchemas result;
+  while (cur_idx < ranges.size() &&
+         (cur_point < scan_upper_bound || scan_upper_bound.empty())) {
+    // Check the disposition of cur_point related to the lower boundary
+    // of the range pointed to by 'cur_idx'.
+    const auto& cur_range = ranges[cur_idx];
+    if (cur_point < cur_range.lower) {
+      // The iterator is before the current range:
+      //     |---|
+      //   ^
+      // The next known bound is either the upper bound of the current range
+      // or the upper bound of the scan.
+      auto upper_bound = scan_upper_bound.empty()
+          ? cur_range.lower : std::min(cur_range.lower, scan_upper_bound);
+      result.emplace_back(PartitionSchema::RangeWithHashSchema{
+          cur_point, upper_bound, table_wide_hash_schema});
+      // Not advancing the 'cur_idx' since cur_point is either at the beginning
+      // of the range or before it at the upper bound of the scan.
+    } else if (cur_point == cur_range.lower) {
+      // The iterator is at the lower boundary of the current range:
+      //   |---|
+      //   ^
+      if ((!cur_range.upper.empty() && cur_range.upper <= scan_upper_bound) ||
+          scan_upper_bound.empty()) {
+        // The current range is within the scan boundaries.
+        result.emplace_back(cur_range);
+      } else {
+        // The current range spans over the upper bound of the scan.
+        result.emplace_back(PartitionSchema::RangeWithHashSchema{
+            cur_point, scan_upper_bound, cur_range.hash_schema});
+      }
+      // Done with the current range, advance to the next one, if any.
+      ++cur_idx;
+    } else {
+      // The iterator is ahead of the current range's lower boundary:
+      //   |---|
+      //     ^
+      if ((!scan_upper_bound.empty() && scan_upper_bound <= cur_range.upper) ||
+          cur_range.upper.empty()) {
+        result.emplace_back(PartitionSchema::RangeWithHashSchema{
+            cur_point, scan_upper_bound, cur_range.hash_schema});
+      } else {
+        result.emplace_back(PartitionSchema::RangeWithHashSchema{
+            cur_point, cur_range.upper, cur_range.hash_schema});
+      }
+      // Done with the current range, advance to the next one, if any.
+      ++cur_idx;
+    }
+    // Advance the iterator.
+    cur_point = result.back().upper;
+  }
+
+  // If exiting from the cycle above by the 'cur_idx < ranges.size()' condition,
+  // check if the upper bound of the scan is beyond the upper bound of the last
+  // range with custom hash schema. If so, add an extra range that spans from
+  // the upper bound of the last range to the upper bound of the scan.
+  if (result.back().upper != scan_upper_bound) {
+    DCHECK_EQ(cur_point, result.back().upper);
+    result.emplace_back(PartitionSchema::RangeWithHashSchema{
+        cur_point, scan_upper_bound, table_wide_hash_schema});
+  }
+
+  *result_ranges = std::move(result);
 }
 
 void PartitionPruner::Init(const Schema& schema,
@@ -426,70 +538,46 @@ void PartitionPruner::Init(const Schema& schema,
     }
   }
 
-  // Store ranges and their corresponding hash schemas if they fall within
-  // the range bounds specified by the scan.
-  if (partition_schema.ranges_with_hash_schemas_.empty()) {
+  if (partition_schema.ranges_with_custom_hash_schemas().empty()) {
     auto partition_key_ranges = ConstructPartitionKeyRanges(
         schema, scan_spec, partition_schema.hash_schema_,
         {scan_range_lower_bound, scan_range_upper_bound});
+    partition_key_ranges_.resize(partition_key_ranges.size());
+    move(partition_key_ranges.rbegin(), partition_key_ranges.rend(),
+         partition_key_ranges_.begin());
+  } else {
+    // Build the preliminary set of ranges: that's to convey information on
+    // range-specific hash schemas since some ranges in the table can have
+    // custom (i.e. different from the table-wide) hash schemas.
+    PartitionSchema::RangesWithHashSchemas preliminary_ranges;
+    PartitionPruner::PrepareRangeSet(
+        scan_range_lower_bound,
+        scan_range_upper_bound,
+        partition_schema.hash_schema(),
+        partition_schema.ranges_with_custom_hash_schemas(),
+        &preliminary_ranges);
+
+    // Construct partition key ranges from the ranges and their respective hash
+    // schemas that falls within the scan's bounds.
+    for (size_t i = 0; i < preliminary_ranges.size(); ++i) {
+      const auto& hash_schema = preliminary_ranges[i].hash_schema;
+      RangeBounds range_bounds {preliminary_ranges[i].lower, preliminary_ranges[i].upper};
+      auto partition_key_ranges = ConstructPartitionKeyRanges(
+          schema, scan_spec, hash_schema, range_bounds);
+      partition_key_ranges_.resize(partition_key_ranges_.size() + partition_key_ranges.size());
+      move(partition_key_ranges.begin(), partition_key_ranges.end(),
+           partition_key_ranges_.rbegin());
+    }
     // Reverse the order of the partition key ranges, so that it is efficient
     // to remove the partition key ranges from the vector in ascending order.
-    range_bounds_to_partition_key_ranges_.resize(1);
-    auto& first_range = range_bounds_to_partition_key_ranges_[0];
-    first_range.partition_key_ranges.resize(partition_key_ranges.size());
-    move(partition_key_ranges.rbegin(), partition_key_ranges.rend(),
-         first_range.partition_key_ranges.begin());
-  } else {
-    vector<RangeBounds> range_bounds;
-    vector<PartitionSchema::HashSchema> hash_schemas_per_range;
-    for (const auto& range : partition_schema.ranges_with_hash_schemas_) {
-      const auto& hash_schema = range.hash_schema;
-      // Both lower and upper bounds of the scan are unbounded.
-      if (scan_range_lower_bound.empty() && scan_range_upper_bound.empty()) {
-        range_bounds.emplace_back(RangeBounds{range.lower, range.upper});
-        hash_schemas_per_range.emplace_back(hash_schema);
-        continue;
+    constexpr struct {
+      bool operator()(const PartitionKeyRange& lhs, const PartitionKeyRange& rhs) const {
+        return lhs.start > rhs.start;
       }
-      // Only one of the lower/upper bounds of the scan is unbounded.
-      if (scan_range_lower_bound.empty()) {
-        if (scan_range_upper_bound > range.lower) {
-          range_bounds.emplace_back(RangeBounds{range.lower, range.upper});
-          hash_schemas_per_range.emplace_back(hash_schema);
-        }
-        continue;
-      }
-      if (scan_range_upper_bound.empty()) {
-        if (range.upper.empty() || scan_range_lower_bound < range.upper) {
-          range_bounds.emplace_back(RangeBounds{range.lower, range.upper});
-          hash_schemas_per_range.emplace_back(hash_schema);
-        }
-        continue;
-      }
-      // Both lower and upper ranges of the scan are bounded.
-      if ((range.upper.empty() || scan_range_lower_bound < range.upper) &&
-          scan_range_upper_bound > range.lower) {
-        range_bounds.emplace_back(RangeBounds{range.lower, range.upper});
-        hash_schemas_per_range.emplace_back(hash_schema);
-      }
-    }
-    DCHECK_EQ(range_bounds.size(), hash_schemas_per_range.size());
-    range_bounds_to_partition_key_ranges_.resize(hash_schemas_per_range.size());
-    // Construct partition key ranges from the ranges and their respective hash schemas
-    // that falls within the scan's bounds.
-    for (size_t i = 0; i < hash_schemas_per_range.size(); ++i) {
-      const auto& hash_schema = hash_schemas_per_range[i];
-      const auto bounds =
-          scan_range_lower_bound.empty() && scan_range_upper_bound.empty()
-          ? RangeBounds{range_bounds[i].lower, range_bounds[i].upper}
-          : RangeBounds{scan_range_lower_bound, scan_range_upper_bound};
-      auto partition_key_ranges = ConstructPartitionKeyRanges(
-          schema, scan_spec, hash_schema, bounds);
-      auto& current_range = range_bounds_to_partition_key_ranges_[i];
-      current_range.range_bounds = range_bounds[i];
-      current_range.partition_key_ranges.resize(partition_key_ranges.size());
-      move(partition_key_ranges.rbegin(), partition_key_ranges.rend(),
-           current_range.partition_key_ranges.begin());
-    }
+    } PartitionKeyRangeLess;
+    sort(partition_key_ranges_.begin(),
+         partition_key_ranges_.end(),
+         PartitionKeyRangeLess);
   }
 
   // Remove all partition key ranges before the scan spec's lower bound partition key.
@@ -504,71 +592,55 @@ bool PartitionPruner::HasMorePartitionKeyRanges() const {
 
 const PartitionKey& PartitionPruner::NextPartitionKey() const {
   CHECK(HasMorePartitionKeyRanges());
-  return range_bounds_to_partition_key_ranges_.back().partition_key_ranges.back().start;
+  return partition_key_ranges_.back().start;
 }
 
 void PartitionPruner::RemovePartitionKeyRange(const PartitionKey& upper_bound) {
   if (upper_bound.empty()) {
-    range_bounds_to_partition_key_ranges_.clear();
+    partition_key_ranges_.clear();
     return;
   }
 
-  for (auto& range_bounds_and_partition_key_range : range_bounds_to_partition_key_ranges_) {
-    auto& partition_key_range = range_bounds_and_partition_key_range.partition_key_ranges;
-    for (auto range_it = partition_key_range.rbegin();
-         range_it != partition_key_range.rend();
-         ++range_it) {
-      if (upper_bound <= (*range_it).start) { break; }
-      if ((*range_it).end.empty() || upper_bound < (*range_it).end) {
-        (*range_it).start = upper_bound;
-      } else {
-        partition_key_range.pop_back();
-      }
+  for (auto range_it = partition_key_ranges_.rbegin();
+       range_it != partition_key_ranges_.rend();
+       ++range_it) {
+    if (upper_bound <= (*range_it).start) { break; }
+    // Condition met if upper_bound lies in the middle of current partition key range
+    if ((*range_it).end.empty() || upper_bound < (*range_it).end) {
+       (*range_it).start = upper_bound;
+    } else {
+      partition_key_ranges_.pop_back();
     }
   }
 }
 
 bool PartitionPruner::ShouldPrune(const Partition& partition) const {
-  for (const auto& [range_bounds, partition_key_ranges] : range_bounds_to_partition_key_ranges_) {
-    // Check if the partition belongs to the same range as the partition key range.
-    if (!range_bounds.lower.empty() && partition.begin().range_key() != range_bounds.lower &&
-        !range_bounds.upper.empty() && partition.end().range_key() != range_bounds.upper) {
-      continue;
-    }
-    // range is an iterator that points to the first partition key range which
-    // overlaps or is greater than the partition.
-    auto range = lower_bound(partition_key_ranges.rbegin(), partition_key_ranges.rend(),
-                             partition, [] (const PartitionKeyRange& scan_range,
-                                 const Partition& partition) {
-                               // return true if scan_range < partition
-                               const auto& scan_upper = scan_range.end;
-                               return !scan_upper.empty()
-                               && scan_upper <= partition.begin();
-                             });
-    if (range == partition_key_ranges.rend()) {
-      continue;
-    }
-    if (partition.end().empty() || (*range).start < partition.end()) {
-      return false;
-    }
+  // range is an iterator that points to the first partition key range which
+  // overlaps or is greater than the partition.
+  auto range = lower_bound(partition_key_ranges_.rbegin(), partition_key_ranges_.rend(), partition,
+                           [] (const PartitionKeyRange& scan_range, const Partition& partition) {
+    // return true if scan_range < partition
+    const auto& scan_upper = scan_range.end;
+    return !scan_upper.empty() && scan_upper <= partition.begin();
+  });
+  if (range == partition_key_ranges_.rend()) {
+    return true;
   }
-  return true;
+  return !(partition.end().empty() || partition.end() > (*range).start);
 }
 
 string PartitionPruner::ToString(const Schema& schema,
                                  const PartitionSchema& partition_schema) const {
   vector<string> strings;
-  for (const auto& partition_key_range : range_bounds_to_partition_key_ranges_) {
-    for (auto range = partition_key_range.partition_key_ranges.rbegin();
-         range != partition_key_range.partition_key_ranges.rend();
-         ++range) {
-      strings.push_back(strings::Substitute(
-          "[($0), ($1))",
-          (*range).start.empty() ? "<start>" :
-            partition_schema.PartitionKeyDebugString((*range).start, schema),
+  for (auto range = partition_key_ranges_.rbegin();
+       range != partition_key_ranges_.rend();
+       ++range) {
+    strings.push_back(strings::Substitute(
+        "[($0), ($1))",
+        (*range).start.empty() ? "<start>" :
+          partition_schema.PartitionKeyDebugString((*range).start, schema),
           (*range).end.empty() ? "<end>" :
-            partition_schema.PartitionKeyDebugString((*range).end, schema)));
-    }
+          partition_schema.PartitionKeyDebugString((*range).end, schema)));
   }
 
   return JoinStrings(strings, ", ");

@@ -23,13 +23,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/common.h>
@@ -42,6 +43,7 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
@@ -106,6 +108,7 @@ TAG_FLAG(heartbeat_inject_required_feature_flag, unsafe);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 
 using kudu::consensus::ReplicaManagementInfoPB;
+using kudu::master::MasterFeatures_Name;
 using kudu::master::MasterErrorPB;
 using kudu::master::MasterFeatures;
 using kudu::master::MasterServiceProxy;
@@ -450,9 +453,7 @@ Status Heartbeater::Thread::DoHeartbeat(MasterErrorPB* error,
 
   // Check with the TS cert manager if it has a cert that needs signing.
   // If so, send the CSR in the heartbeat for the master to sign.
-  boost::optional<security::CertSignRequest> csr =
-      server_->mutable_tls_context()->GetCsrIfNecessary();
-  if (csr != boost::none) {
+  if (auto csr = server_->mutable_tls_context()->GetCsrIfNecessary(); csr) {
     RETURN_NOT_OK(csr->ToString(req.mutable_csr_der(), security::DataFormat::DER));
     VLOG(1) << "Sending a CSR to the master in the next heartbeat";
   }
@@ -615,7 +616,13 @@ void Heartbeater::Thread::RunThread() {
         msg = Substitute("master detected incompatibility: $0", err_msg);
       }
       if (s.IsRemoteError() && error_status.unsupported_feature_flags_size() > 0) {
-        msg = Substitute("master does not support required feature flags: $0", err_msg);
+        const auto required_features_str = JoinMapped(
+            error_status.unsupported_feature_flags(),
+            [](uint32_t feature) {
+              return MasterFeatures_Name(feature);
+            }, ",");
+        msg = Substitute("master does not support required feature flag(s) $0: $1",
+                         required_features_str, err_msg);
       }
       if (!msg.empty()) {
         if (FLAGS_heartbeat_incompatible_replica_management_is_fatal) {

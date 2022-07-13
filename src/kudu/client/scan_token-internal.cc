@@ -20,13 +20,13 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/common.h>
 #include <google/protobuf/stubs/port.h>
@@ -232,7 +232,7 @@ Status KuduScanToken::Data::PBIntoScanner(KuduClient* client,
 
   ScanConfiguration* configuration = scan_builder->data_->mutable_configuration();
   for (const ColumnPredicatePB& pb : message.column_predicates()) {
-    boost::optional<ColumnPredicate> predicate;
+    std::optional<ColumnPredicate> predicate;
     RETURN_NOT_OK(ColumnPredicateFromPB(*schema, configuration->arena(), pb, &predicate));
     configuration->AddConjunctPredicate(std::move(*predicate));
   }
@@ -462,7 +462,6 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
       pruner.RemovePartitionKeyRange(tablet->partition().end());
       continue;
     }
-
     vector<internal::RemoteReplica> replicas;
     tablet->GetRemoteReplicas(&replicas);
 

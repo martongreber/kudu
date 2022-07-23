@@ -14,45 +14,32 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_SERVER_SERVER_BASE_OPTIONS_H
-#define KUDU_SERVER_SERVER_BASE_OPTIONS_H
 
-#include <cstdint>
+#pragma once
+
 #include <string>
 
-#include "kudu/fs/fs_manager.h"
-#include "kudu/server/webserver_options.h"
-#include "kudu/server/rpc_server.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
+namespace security {
 
-class Env;
+// An interface for encrypting and decrypting Kudu's server keys.
+class KeyProvider {
+ public:
+  virtual ~KeyProvider() = default;
 
-namespace server {
+  // Decrypts the server key.
+  virtual Status DecryptServerKey(const std::string& encrypted_server_key,
+                                  const std::string& iv,
+                                  const std::string& key_version,
+                                  std::string* server_key) = 0;
 
-// Options common to both types of servers.
-// The subclass constructor should fill these in with defaults from
-// server-specific flags.
-struct ServerBaseOptions {
-  Env* env;
+  // Generates an encrypted server key.
+  virtual Status GenerateEncryptedServerKey(std::string* encrypted_server_key,
+                                            std::string* iv,
+                                            std::string* key_version) = 0;
 
-  FsManagerOpts fs_opts;
-  RpcServerOptions rpc_opts;
-  WebserverOptions webserver_opts;
-
-  std::string dump_info_path;
-  std::string dump_info_format;
-
-  int32_t metrics_log_interval_ms;
-
-  std::string server_key;
-  std::string server_key_iv;
-  std::string server_key_version;
-
- protected:
-  ServerBaseOptions();
 };
-
-} // namespace server
+} // namespace security
 } // namespace kudu
-#endif /* KUDU_SERVER_SERVER_BASE_OPTIONS_H */

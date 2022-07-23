@@ -14,45 +14,35 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_SERVER_SERVER_BASE_OPTIONS_H
-#define KUDU_SERVER_SERVER_BASE_OPTIONS_H
 
-#include <cstdint>
+#pragma once
+
 #include <string>
+#include <utility>
 
-#include "kudu/fs/fs_manager.h"
-#include "kudu/server/webserver_options.h"
-#include "kudu/server/rpc_server.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
+namespace security {
+class RangerKMSClient {
+ public:
+  RangerKMSClient(std::string kms_url, std::string cluster_key_name)
+    : kms_url_(std::move(kms_url)),
+      cluster_key_name_(std::move(cluster_key_name)) {}
 
-class Env;
+  Status DecryptKey(const std::string& encrypted_key,
+                    const std::string& iv,
+                    const std::string& key_version,
+                    std::string* decrypted_key);
 
-namespace server {
+  Status GenerateEncryptedServerKey(std::string* encrypted_key,
+                                    std::string* iv,
+                                    std::string* key_version);
 
-// Options common to both types of servers.
-// The subclass constructor should fill these in with defaults from
-// server-specific flags.
-struct ServerBaseOptions {
-  Env* env;
+ private:
+  std::string kms_url_;
+  std::string cluster_key_name_;
 
-  FsManagerOpts fs_opts;
-  RpcServerOptions rpc_opts;
-  WebserverOptions webserver_opts;
-
-  std::string dump_info_path;
-  std::string dump_info_format;
-
-  int32_t metrics_log_interval_ms;
-
-  std::string server_key;
-  std::string server_key_iv;
-  std::string server_key_version;
-
- protected:
-  ServerBaseOptions();
 };
-
-} // namespace server
+} // namespace security
 } // namespace kudu
-#endif /* KUDU_SERVER_SERVER_BASE_OPTIONS_H */

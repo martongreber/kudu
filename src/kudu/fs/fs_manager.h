@@ -39,6 +39,12 @@
 #include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
 
+namespace kudu {
+namespace security {
+class KeyProvider;
+}  // namespace security
+}  // namespace kudu
+
 DECLARE_bool(enable_data_block_fsync);
 
 namespace kudu {
@@ -199,14 +205,17 @@ class FsManager {
               std::atomic<int>* containers_total = nullptr );
 
   // Create the initial filesystem layout. If 'uuid' is provided, uses it as
-  // uuid of the filesystem. Otherwise generates one at random. If 'server_key'
-  // is provided, it is used as the server key of the filesystem. Otherwise, if
-  // encryption is enabled, generates one at random.
+  // uuid of the filesystem. Otherwise generates one at random. If 'server_key',
+  // 'server_key_iv', and 'server_key_version' are provided, they are used as
+  // the server key of the filesystem. Otherwise, if encryption is enabled,
+  // generates one at random.
   //
   // Returns an error if the file system is already initialized.
   Status CreateInitialFileSystemLayout(
       std::optional<std::string> uuid = std::nullopt,
-      std::optional<std::string> server_key = std::nullopt);
+      std::optional<std::string> server_key = std::nullopt,
+      std::optional<std::string> server_key_iv = std::nullopt,
+      std::optional<std::string> server_key_version = std::nullopt);
 
   // ==========================================================================
   //  Error handling helpers
@@ -297,6 +306,12 @@ class FsManager {
   // crash. If the file system is not encrypted, it returns an empty string.
   const std::string& server_key() const;
 
+  // Return the initialization vector for the server key.
+  const std::string& server_key_iv() const;
+
+  // Return the version of the server key.
+  const std::string& server_key_version() const;
+
   // ==========================================================================
   //  file-system helpers
   // ==========================================================================
@@ -358,6 +373,8 @@ class FsManager {
   // Create a new InstanceMetadataPB.
   Status CreateInstanceMetadata(std::optional<std::string> uuid,
                                 std::optional<std::string> server_key,
+                                std::optional<std::string> server_key_iv,
+                                std::optional<std::string> server_key_version,
                                 InstanceMetadataPB* metadata);
 
   // Save a InstanceMetadataPB to the filesystem.
@@ -416,6 +433,8 @@ class FsManager {
   std::unique_ptr<fs::FsErrorManager> error_manager_;
   std::unique_ptr<fs::DataDirManager> dd_manager_;
   std::unique_ptr<fs::BlockManager> block_manager_;
+
+  std::unique_ptr<security::KeyProvider> key_provider_;
 
   ObjectIdGenerator oid_generator_;
 

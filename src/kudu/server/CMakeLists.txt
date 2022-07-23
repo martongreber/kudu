@@ -85,3 +85,5 @@ SET_KUDU_TEST_LINK_LIBS(
   security_test_util)
 ADD_KUDU_TEST(rpc_server-test)
 ADD_KUDU_TEST(webserver-test)
+
+SET_KUDU_TEST_LINK_LIBS(server_process)

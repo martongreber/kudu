@@ -311,6 +311,12 @@ Status HmsCatalog::GetNotificationEvents(int64_t last_event_id, int max_events,
   });
 }
 
+Status HmsCatalog::GetCurrentNotificationEventId(int64_t* event_id) {
+  return ha_client_.Execute([&] (HmsClient* client) {
+    return client->GetCurrentNotificationEventId(event_id);
+  });
+}
+
 Status HmsCatalog::GetUuid(string* uuid) {
   std::lock_guard<simple_spinlock> l(uuid_lock_);
   if (!uuid_) {
@@ -416,6 +422,9 @@ Status HmsCatalog::PopulateTable(const string& id,
     fields.emplace_back(column_to_field(column));
   }
   table->sd.cols = std::move(fields);
+  table->sd.inputFormat = HmsClient::kKuduInputFormat;
+  table->sd.outputFormat = HmsClient::kKuduOutputFormat;
+  table->sd.serdeInfo.serializationLib = HmsClient::kKuduSerDeLib;
 
   return Status::OK();
 }

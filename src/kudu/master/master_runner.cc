@@ -326,6 +326,7 @@ Status ClearLocalSystemCatalogAndCopy(const HostPort& src_hp) {
 
 void SetMasterFlagDefaults() {
   constexpr int32_t kDefaultRpcServiceQueueLength = 100;
+  constexpr int32_t kDefaultTabletHistoryMaxAgeSec = 300;
 
   // Reset some default values before parsing gflags.
   CHECK_NE("", SetCommandLineOptionWithMode(
@@ -345,6 +346,17 @@ void SetMasterFlagDefaults() {
   CHECK_NE("", SetCommandLineOptionWithMode(
       "rpc_service_queue_length",
       to_string(kDefaultRpcServiceQueueLength).c_str(),
+      SET_FLAGS_DEFAULT));
+  // Master always reads the latest data snapshot from the system catalog and
+  // never uses any specific timestatmp in past for a read snapshot. With that,
+  // here isn't much sense to keep long chain of UNDO deltas in addition to the
+  // latest version in the MVCC. Keeping short history of deltas frees CPU
+  // cycles, memory, and IO bandwidth that otherwise would be consumed by
+  // background maintenance jobs running compactions. In addition, less disk
+  // space is consumed to store the system tablet's data.
+  CHECK_NE("", SetCommandLineOptionWithMode(
+      "tablet_history_max_age_sec",
+      to_string(kDefaultTabletHistoryMaxAgeSec).c_str(),
       SET_FLAGS_DEFAULT));
   // Setting the default value of the 'force_block_cache_capacity' flag to
   // 'false' makes the corresponding group validator enforce proper settings

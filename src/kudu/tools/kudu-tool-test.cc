@@ -227,6 +227,7 @@ using std::unique_ptr;
 using std::unordered_map;
 using std::unordered_set;
 using std::vector;
+using std::tuple;
 using strings::Substitute;
 
 namespace kudu {
@@ -4370,6 +4371,104 @@ TEST_F(ToolTest, TestLocalReplicaCMetaOps) {
       ASSERT_STR_MATCHES(lines[i], Substitute("tablet: $0, peers: $1",
                                               tablet_ids[i], ts_uuids[0]));
     }
+  }
+}
+
+TEST_F(ToolTest, TestServerSetFlag) {
+  NO_FATALS(StartExternalMiniCluster());
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  { // Test set unsafe flag.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 unlock_unsafe_flags true --force",
+                   master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 enable_data_block_fsync true --force",
+                   master_addr)));
+    // Test invalid unsafe flag.
+    string err;
+    RunActionStderrString(
+        Substitute("master set_flag $0 unlock_unsafe_flags false --force",
+                   master_addr), &err);
+    ASSERT_STR_CONTAINS(err,
+        "Detected inconsistency in command-line flags");
+    // Flag value will not be changed.
+    string out;
+    RunActionStdoutString(
+        Substitute("master get_flags $0 --flags=unlock_unsafe_flags --format=json",
+                   master_addr), &out);
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    const string flag_value = "true";
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["value"].GetString() == flag_value);
+    }
+  }
+  { // Test set experimental flag.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 unlock_experimental_flags true --force",
+                   master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 auto_rebalancing_enabled true --force",
+                   master_addr)));
+    // Test invalid experimental flag.
+    string err;
+    RunActionStderrString(
+        Substitute("master set_flag $0 unlock_experimental_flags false --force",
+                   master_addr), &err);
+    ASSERT_STR_CONTAINS(err,
+        "Detected inconsistency in command-line flags");
+    // Flag value will not be changed.
+    string out;
+    RunActionStdoutString(
+        Substitute("master get_flags $0 --flags=unlock_experimental_flags --format=json",
+                   master_addr), &out);
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    const string flag_value = "true";
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["value"].GetString() == flag_value);
+    }
+  }
+  { // Test set flag using group flag validator.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 unlock_experimental_flags true --force",
+                   master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 raft_prepare_replacement_before_eviction true --force",
+                  master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 auto_rebalancing_enabled true --force",
+                   master_addr)));
+    // Test set flag violating group validator.
+    string err;
+    RunActionStderrString(
+        Substitute("master set_flag $0 raft_prepare_replacement_before_eviction false --force",
+                   master_addr), &err);
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 auto_rebalancing_enabled true --force",
+                   master_addr)));
+    ASSERT_STR_CONTAINS(err, "Detected inconsistency in command-line flags");
+    // Flag value will not be changed.
+    string out;
+    RunActionStdoutString(
+        Substitute("master get_flags $0 --flags=raft_prepare_replacement_before_eviction"
+                   " --format=json",
+                   master_addr), &out);
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    const string flag_value = "true";
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["value"].GetString() == flag_value);
+    }
+  }
+  { // Test set flag using parameter: --run_consistency_check.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 rpc_certificate_file test "
+                   "--force --run_consistency_check=false",
+                   master_addr)));
   }
 }
 
@@ -8624,46 +8723,57 @@ TEST_P(SetFlagForAllTest, TestSetFlagForAll) {
     master_addresses.emplace_back(cluster_->master(i)->bound_rpc_addr().ToString());
   }
   string str_master_addresses = JoinMapped(master_addresses, [](string addr){return addr;}, ",");
-  const string flag_key = "max_log_size";
-  const string flag_value = "10";
-  NO_FATALS(RunActionStdoutNone(
-      Substitute("$0 set_flag_for_all $1 $2 $3",
-          role, str_master_addresses, flag_key, flag_value)));
 
-  int hosts_num = is_master? opts.num_masters : opts.num_tablet_servers;
-  string out;
-  for (int i = 0; i < hosts_num; i++) {
-    if (is_master) {
-      NO_FATALS(RunActionStdoutString(
-          Substitute("$0 get_flags $1 --format=json", role,
-              cluster_->master(i)->bound_rpc_addr().ToString()),
-              &out));
-    } else {
-      NO_FATALS(RunActionStdoutString(
-          Substitute("$0 get_flags $1 --format=json", role,
-          cluster_->tablet_server(i)->bound_rpc_addr().ToString()),
-          &out));
-    }
-    rapidjson::Document doc;
-    doc.Parse<0>(out.c_str());
-    for (int i = 0; i < doc.Size(); i++) {
-      const rapidjson::Value& item = doc[i];
-      ASSERT_TRUE(item["flag"].IsString());
-      if (item["flag"].GetString() == flag_key) {
-        ASSERT_TRUE(item["value"].IsString());
-        ASSERT_TRUE(item["value"].GetString() == flag_value);
-        return;
+  // <flag key, flag value, optional parameter>
+  vector<tuple<string , string , string>> command_parameters;
+  command_parameters.emplace_back(tuple<string, string, string>("max_log_size", "10" , ""));
+  command_parameters.emplace_back(tuple<string, string, string>("log_async", "false" , "--force"));
+
+  for (auto command_parameter : command_parameters) {
+    const string flag_key = std::get<0>(command_parameter);
+    const string flag_value = std::get<1>(command_parameter);
+    const string optional_parameter = std::get<2>(command_parameter);
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("$0 set_flag_for_all $1 $2 $3 $4",
+            role, str_master_addresses, flag_key, flag_value, optional_parameter)));
+
+    int hosts_num = is_master? opts.num_masters : opts.num_tablet_servers;
+    string out;
+    for (int i = 0; i < hosts_num; i++) {
+      if (is_master) {
+        NO_FATALS(RunActionStdoutString(
+            Substitute("$0 get_flags $1 --format=json", role,
+                cluster_->master(i)->bound_rpc_addr().ToString()),
+                &out));
+      } else {
+        NO_FATALS(RunActionStdoutString(
+            Substitute("$0 get_flags $1 --format=json", role,
+            cluster_->tablet_server(i)->bound_rpc_addr().ToString()),
+            &out));
+      }
+      rapidjson::Document doc;
+      doc.Parse<0>(out.c_str());
+      for (int i = 0; i < doc.Size(); i++) {
+        const rapidjson::Value& item = doc[i];
+        ASSERT_TRUE(item["flag"].IsString());
+        if (item["flag"].GetString() == flag_key) {
+          ASSERT_TRUE(item["value"].IsString());
+          ASSERT_TRUE(item["value"].GetString() == flag_value);
+          break;
+        }
       }
     }
   }
 
   // A test for setting a non-existing flag.
+  string stdout;
+  string stderr;
   Status s = RunTool(
-      Substitute("$0 set_flag_for_all $2 test_flag test_value",
+      Substitute("$0 set_flag_for_all $1 test_flag test_value",
           role, str_master_addresses),
-      nullptr, nullptr, nullptr, nullptr);
+      &stdout, &stderr, nullptr, nullptr);
   ASSERT_TRUE(s.IsRuntimeError());
-  ASSERT_STR_CONTAINS(s.ToString(), "set flag failed");
+  ASSERT_STR_CONTAINS(stderr, "result: NO_SUCH_FLAG");
 }
 
 } // namespace tools

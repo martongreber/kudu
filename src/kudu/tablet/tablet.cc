@@ -154,6 +154,7 @@ DEFINE_int32(tablet_history_max_age_sec, 60 * 60 * 24 * 7,
              "initiated at a snapshot that is older than this age will be "
              "rejected. To disable history removal, set to -1.");
 TAG_FLAG(tablet_history_max_age_sec, advanced);
+TAG_FLAG(tablet_history_max_age_sec, runtime);
 TAG_FLAG(tablet_history_max_age_sec, stable);
 
 // Large encoded keys cause problems because we store the min/max encoded key in the
@@ -271,23 +272,23 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
                shared_ptr<MemTracker> parent_mem_tracker,
                MetricRegistry* metric_registry,
                scoped_refptr<LogAnchorRegistry> log_anchor_registry)
-  : key_schema_(metadata->schema()->CreateKeyProjection()),
-    metadata_(std::move(metadata)),
-    log_anchor_registry_(std::move(log_anchor_registry)),
-    mem_trackers_(tablet_id(), std::move(parent_mem_tracker)),
-    next_mrs_id_(0),
-    clock_(clock),
-    txn_participant_(metadata_),
-    rowsets_flush_sem_(1),
-    state_(kInitialized),
-    last_write_time_(MonoTime::Now()),
-    last_read_time_(MonoTime::Now()),
-    last_update_workload_stats_time_(MonoTime::Now()),
-    last_scans_started_(0),
-    last_rows_mutated_(0),
-    last_read_score_(0.0),
-    last_write_score_(0.0) {
-      CHECK(schema()->has_column_ids());
+    : key_schema_(metadata->schema()->CreateKeyProjection()),
+      metadata_(std::move(metadata)),
+      log_anchor_registry_(std::move(log_anchor_registry)),
+      mem_trackers_(tablet_id(), std::move(parent_mem_tracker)),
+      next_mrs_id_(0),
+      clock_(clock),
+      txn_participant_(metadata_),
+      rowsets_flush_sem_(1),
+      state_(kInitialized),
+      last_read_time_(MonoTime::Now()),
+      last_write_time_(last_read_time_),
+      last_update_workload_stats_time_(last_read_time_),
+      last_scans_started_(0),
+      last_rows_mutated_(0),
+      last_read_score_(0.0),
+      last_write_score_(0.0) {
+  CHECK(schema()->has_column_ids());
   compaction_policy_.reset(CreateCompactionPolicy());
 
   if (metric_registry) {
@@ -2410,7 +2411,7 @@ uint64_t Tablet::LastReadElapsedSeconds() const {
   return static_cast<uint64_t>((MonoTime::Now() - last_read_time_).ToSeconds());
 }
 
-void Tablet::UpdateLastReadTime() const {
+void Tablet::UpdateLastReadTime() {
   std::lock_guard<rw_spinlock> l(last_rw_time_lock_);
   last_read_time_ = MonoTime::Now();
 }

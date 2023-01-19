@@ -81,10 +81,10 @@ class CodegenTest : public KuduTest {
     base_ = SchemaBuilder(base_).Build(); // add IDs
 
     // Create an extended default schema
-    cols.emplace_back("int32-R ",  INT32, false, false, kI32R, nullptr);
-    cols.emplace_back("int32-RW",  INT32, false, false, kI32R, kI32W);
-    cols.emplace_back("str32-R ", STRING, false, false, kStrR, nullptr);
-    cols.emplace_back("str32-RW", STRING, false, false, kStrR, kStrW);
+    cols.emplace_back("int32-R ",  INT32, false, false, false, kI32R, nullptr);
+    cols.emplace_back("int32-RW",  INT32, false, false, false, kI32R, kI32W);
+    cols.emplace_back("str32-R ", STRING, false, false, false, kStrR, nullptr);
+    cols.emplace_back("str32-RW", STRING, false, false, false, kStrR, kStrW);
     defaults_.Reset(cols, 1);
     defaults_ = SchemaBuilder(defaults_).Build(); // add IDs
 
@@ -382,11 +382,13 @@ TEST_F(CodegenTest, TestDumpMC) {
 
   const vector<string>& msgs = sink.logged_msgs();
   ASSERT_EQ(msgs.size(), 1);
-  #ifndef __aarch64__
-  EXPECT_THAT(msgs[0], testing::ContainsRegex("retq"));
-  #else
+#if defined(__powerpc__)
+  EXPECT_THAT(msgs[0], testing::ContainsRegex("blr"));
+#elif defined(__aarch64__)
   EXPECT_THAT(msgs[0], testing::ContainsRegex("ret"));
-  #endif //__aarch64__
+#else
+  EXPECT_THAT(msgs[0], testing::ContainsRegex("retq"));
+#endif  // #if defined(__powerpc__) ... #elif defined(__aarch64__) ... #else ...
 }
 
 // Basic test for the CompilationManager code cache.

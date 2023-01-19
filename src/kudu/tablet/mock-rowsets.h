@@ -77,7 +77,7 @@ class MockRowSet : public RowSet {
     LOG(FATAL) << "Unimplemented";
     return "";
   }
-  Status DebugDump(std::vector<std::string>* /*lines*/) override {
+  Status DebugDumpImpl(int64_t* /*rows_left*/, std::vector<std::string>* /*lines*/) override {
     LOG(FATAL) << "Unimplemented";
     return Status::OK();
   }
@@ -154,6 +154,7 @@ class MockRowSet : public RowSet {
   }
 
   Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp /*ancient_history_mark*/,
+                                                     EstimateType /*estimate_type*/,
                                                      int64_t* /*bytes*/) override {
     LOG(FATAL) << "Unimplemented";
     return Status::OK();

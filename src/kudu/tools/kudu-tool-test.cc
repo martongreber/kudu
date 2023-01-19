@@ -143,6 +143,7 @@
 
 DECLARE_bool(enable_tablet_orphaned_block_deletion);
 DECLARE_bool(encrypt_data_at_rest);
+DECLARE_bool(disable_gflag_filter_logic_for_testing);
 DECLARE_bool(fs_data_dirs_consider_available_space);
 DECLARE_bool(hive_metastore_sasl_enabled);
 DECLARE_bool(show_values);
@@ -2932,6 +2933,7 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
   {
     // Dump rowsets' primary key bounds only.
     string stdout;
+    // Unset --dump_all_columns.
     NO_FATALS(RunActionStdoutString(
         Substitute("local_replica dump rowset --nodump_all_columns "
                    "--nodump_metadata --use_readable_format "
@@ -2949,6 +2951,26 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
         ASSERT_STR_CONTAINS(stdout, row_key);
       } else {
         ASSERT_STR_NOT_CONTAINS(stdout, row_key);
+      }
+    }
+
+    // Set --dump_all_columns.
+    NO_FATALS(RunActionStdoutString(
+        Substitute("local_replica dump rowset --dump_all_columns "
+                   "--nodump_metadata --nrows=15 $0 $1 $2",
+                   kTestTablet, fs_paths, encryption_args), &stdout));
+
+    SCOPED_TRACE(stdout);
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 1");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 2");
+    ASSERT_STR_NOT_CONTAINS(stdout, "RowSet metadata");
+    for (int row_idx = 0; row_idx < 30; row_idx++) {
+      string row_prefix = Substitute("Base: (int32 key=$0", row_idx);
+      if (row_idx < 15) {
+        ASSERT_STR_CONTAINS(stdout, row_prefix);
+      } else {
+        ASSERT_STR_NOT_CONTAINS(stdout, row_prefix);
       }
     }
   }
@@ -3178,13 +3200,13 @@ void ToolTest::RunLoadgen(int num_tservers,
         ColumnSchema("int64_val", INT64),
         ColumnSchema("float_val", FLOAT),
         ColumnSchema("double_val", DOUBLE),
-        ColumnSchema("decimal32_val", DECIMAL32, false, false,
+        ColumnSchema("decimal32_val", DECIMAL32, false, false, false,
                      nullptr, nullptr, ColumnStorageAttributes(),
                      ColumnTypeAttributes(9, 9)),
-        ColumnSchema("decimal64_val", DECIMAL64, false, false,
+        ColumnSchema("decimal64_val", DECIMAL64, false, false, false,
                      nullptr, nullptr, ColumnStorageAttributes(),
                      ColumnTypeAttributes(18, 2)),
-        ColumnSchema("decimal128_val", DECIMAL128, false, false,
+        ColumnSchema("decimal128_val", DECIMAL128, false, false, false,
                      nullptr, nullptr, ColumnStorageAttributes(),
                      ColumnTypeAttributes(38, 0)),
         ColumnSchema("unixtime_micros_val", UNIXTIME_MICROS),
@@ -7913,8 +7935,22 @@ TEST_F(ToolTest, TestReplaceTablet) {
   ASSERT_GE(workload.rows_inserted(), CountTableRows(workload_table.get()));
 }
 
-TEST_F(ToolTest, TestGetFlags) {
+class GetFlagsTest :
+    public ToolTest,
+    public ::testing::WithParamInterface<bool> {
+};
+
+INSTANTIATE_TEST_SUITE_P(DisableFlagFilterLogic, GetFlagsTest, ::testing::Bool());
+TEST_P(GetFlagsTest, TestGetFlags) {
   ExternalMiniClusterOptions opts;
+  const string disable_flag_filter_logic_on_server =
+      Substitute("--disable_gflag_filter_logic_for_testing=$0", GetParam());
+  opts.extra_master_flags = {
+    disable_flag_filter_logic_on_server,
+  };
+  opts.extra_tserver_flags = {
+    disable_flag_filter_logic_on_server,
+  };
   opts.num_tablet_servers = 1;
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
 

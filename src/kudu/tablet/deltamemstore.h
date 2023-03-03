@@ -239,7 +239,7 @@ class DMSIterator : public DeltaIterator {
 
   std::string ToString() const override;
 
-  bool HasNext() override;
+  bool HasNext() const override;
 
   bool MayHaveDeltas() const override;
 
@@ -249,6 +249,12 @@ class DMSIterator : public DeltaIterator {
 
   void set_deltas_selected(int64_t deltas_selected) override {
     preparer_.set_deltas_selected(deltas_selected);
+  }
+
+  size_t memory_footprint() override {
+    // TODO(aserbin): implement this if it's necessary to track peak memory
+    //                usage for objects of this type during their lifecycle
+    return 0;
   }
 
  private:

@@ -76,6 +76,7 @@
 #include "kudu/util/flag_validators.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/jsonwriter.h"
+#include "kudu/util/jwt-util.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
@@ -95,6 +96,10 @@
 #include "kudu/util/thread.h"
 #include "kudu/util/user.h"
 #include "kudu/util/version_info.h"
+
+namespace kudu {
+class JwtVerifier;
+}  // namespace kudu
 
 DEFINE_int32(num_reactor_threads, 4, "Number of libev reactor threads to start.");
 TAG_FLAG(num_reactor_threads, advanced);
@@ -240,6 +245,39 @@ DEFINE_uint64(server_max_open_files, 0,
               "automatically calculate this value. This is a soft limit");
 TAG_FLAG(server_max_open_files, advanced);
 
+DEFINE_bool(enable_jwt_token_auth, false,
+    "This enables JWT authentication, meaning that the server expects a valid "
+    "JWT to be sent by the client which will be verified when the connection is "
+    "being established. When true, read the JWT token out of the RPC and extract "
+    "user name from the token payload.");
+TAG_FLAG(enable_jwt_token_auth, experimental);
+
+DEFINE_bool(jwt_validate_signature, true,
+    "When true, validate the signature of JWT token with pre-installed JWKS.");
+TAG_FLAG(jwt_validate_signature, experimental);
+TAG_FLAG(jwt_validate_signature, unsafe);
+
+DEFINE_bool(jwt_allow_without_tls, false,
+    "When this configuration is set to true, Kudu allows JWT authentication on "
+    "unsecure channel. This should be only enabled for testing, or development "
+    "for which TLS is handled by proxy.");
+TAG_FLAG(jwt_allow_without_tls, experimental);
+TAG_FLAG(jwt_allow_without_tls, unsafe);
+
+DEFINE_string(jwks_file_path, "",
+    "File path of the pre-installed JSON Web Key Set (JWKS) for JWT verification.");
+TAG_FLAG(jwks_file_path, experimental);
+
+DEFINE_string(jwks_url, "",
+    "URL of the JSON Web Key Set (JWKS) for JWT verification.");
+TAG_FLAG(jwks_url, experimental);
+
+DEFINE_string(jwks_discovery_endpoint_base, "",
+              "Base URL of the Discovery Endpoint that points to a JSON Web Key Set "
+              "(JWKS) for JWT verification. Additional query parameters, like 'accountId', "
+              "are taken from received JWTs to get the appropriate Discovery Endpoint.");
+TAG_FLAG(jwks_discovery_endpoint_base, experimental);
+
 DECLARE_bool(use_hybrid_clock);
 DECLARE_int32(dns_resolver_max_threads_num);
 DECLARE_uint32(dns_resolver_cache_capacity_mb);
@@ -270,6 +308,14 @@ METRIC_DEFINE_gauge_int64(server, data_dirs_space_available_bytes,
                           "Total space available in all the data directories. Set to "
                           "-1 if reading any of the disks fails",
                           kudu::MetricLevel::kInfo);
+
+#ifdef TCMALLOC_ENABLED
+METRIC_DEFINE_gauge_int64(server, memory_usage,
+                          "Current Memory Usage",
+                          kudu::MetricUnit::kBytes,
+                          "Current memory usage of the server process",
+                          kudu::MetricLevel::kInfo);
+#endif // #ifdef TCMALLOC_ENABLED
 
 using kudu::security::RpcAuthentication;
 using kudu::security::RpcEncryption;
@@ -335,6 +381,27 @@ bool ValidateKeytabPermissions() {
   return true;
 }
 GROUP_FLAG_VALIDATOR(keytab_permissions, &ValidateKeytabPermissions);
+
+bool ValidateJWKSNotEmpty() {
+  if (FLAGS_enable_jwt_token_auth && (FLAGS_jwks_file_path.empty() && FLAGS_jwks_url.empty())) {
+    LOG(ERROR) << "'jwt_token_auth' is enabled, but 'jwks_filepath' and 'jwks_url' are both empty";
+    return false;
+  }
+
+  return true;
+}
+
+GROUP_FLAG_VALIDATOR(jwk_not_empty_validator, &ValidateJWKSNotEmpty);
+
+bool ValidateEitherJWKSFilePathOrUrlSet() {
+  if (!FLAGS_jwks_url.empty() && !FLAGS_jwks_file_path.empty()) {
+    LOG(ERROR) << "only set either 'jwks_url' or 'jwks_file_path' but not both";
+    return false;
+  }
+  return true;
+}
+
+GROUP_FLAG_VALIDATOR(jwks_file_or_url_set_validator, &ValidateEitherJWKSFilePathOrUrlSet);
 
 } // namespace
 
@@ -499,12 +566,12 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
       result_tracker_(new rpc::ResultTracker(shared_ptr<MemTracker>(
           MemTracker::CreateTracker(-1, "result-tracker", mem_tracker_)))),
       is_first_run_(false),
+      stop_background_threads_latch_(1),
       dns_resolver_(new DnsResolver(
           FLAGS_dns_resolver_max_threads_num,
           FLAGS_dns_resolver_cache_capacity_mb * 1024 * 1024,
           MonoDelta::FromSeconds(FLAGS_dns_resolver_cache_ttl_sec))),
-      options_(options),
-      stop_background_threads_latch_(1) {
+      options_(options) {
   metric_entity_->NeverRetire(
       METRIC_merged_entities_count_of_server.InstantiateHidden(metric_entity_, 1));
 
@@ -636,6 +703,17 @@ Status ServerBase::Init() {
 
   // Create the Messenger.
   rpc::MessengerBuilder builder(name_);
+  std::shared_ptr<JwtVerifier> jwt_verifier;
+  if (FLAGS_enable_jwt_token_auth) {
+    if (!FLAGS_jwks_url.empty()) {
+      jwt_verifier = std::make_shared<KeyBasedJwtVerifier>(FLAGS_jwks_url, false);
+    } else if (!FLAGS_jwks_file_path.empty()) {
+      jwt_verifier = std::make_shared<KeyBasedJwtVerifier>(FLAGS_jwks_file_path, true);
+    } else {
+      LOG(WARNING) << Substitute("JWT authentication enabled, but neither 'jwks_url' or "
+          "'jwks_file_path' are set!");
+    }
+  }
   builder.set_num_reactors(FLAGS_num_reactor_threads)
          .set_min_negotiation_threads(FLAGS_min_negotiation_threads)
          .set_max_negotiation_threads(FLAGS_max_negotiation_threads)
@@ -651,6 +729,7 @@ Status ServerBase::Init() {
          .set_epki_cert_key_files(FLAGS_rpc_certificate_file, FLAGS_rpc_private_key_file)
          .set_epki_certificate_authority_file(FLAGS_rpc_ca_certificate_file)
          .set_epki_private_password_key_cmd(FLAGS_rpc_private_key_password_cmd)
+         .set_jwt_verifier(std::move(jwt_verifier))
          .set_keytab_file(FLAGS_keytab_file)
          .enable_inbound_tls();
 
@@ -939,6 +1018,14 @@ Status ServerBase::Start() {
       metric_entity_,
       [this]() {return (MonoTime::Now() - this->start_time()).ToMicroseconds();})->
           AutoDetachToLastValue(&metric_detacher_);
+
+#ifdef TCMALLOC_ENABLED
+  METRIC_memory_usage.InstantiateFunctionGauge(
+      metric_entity_,
+      []() {return process_memory::CurrentConsumption();})->
+          AutoDetachToLastValue(&metric_detacher_);
+#endif // #ifdef TCMALLOC_ENABLED
+
   METRIC_data_dirs_space_available_bytes.InstantiateFunctionGauge(
       metric_entity_,
       [this]() {
@@ -969,6 +1056,7 @@ Status ServerBase::Start() {
     AddPostInitializedDefaultPathHandlers(web_server_.get());
     AddRpczPathHandlers(messenger_, web_server_.get());
     RegisterMetricsJsonHandler(web_server_.get(), metric_registry_.get());
+    RegisterMetricsPrometheusHandler(web_server_.get(), metric_registry_.get());
     TracingPathHandlers::RegisterHandlers(web_server_.get());
     web_server_->set_footer_html(FooterHtml());
     web_server_->SetStartupComplete(true);

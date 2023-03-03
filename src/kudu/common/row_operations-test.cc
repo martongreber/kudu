@@ -23,6 +23,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <gflags/gflags_declare.h>
@@ -125,7 +126,7 @@ void RowOperationsTest::CheckDecodeDoesntCrash(const Schema& client_schema,
 void RowOperationsTest::DoFuzzTest(const Schema& server_schema,
                                    const KuduPartialRow& row,
                                    int n_random_changes) {
-  for (int operation = 0; operation <= 11; operation++) {
+  for (int operation = 0; operation <= 12; operation++) {
     RowOperationsPB pb;
     RowOperationsPBEncoder enc(&pb);
 
@@ -165,6 +166,8 @@ void RowOperationsTest::DoFuzzTest(const Schema& server_schema,
         break;
       case 11:
         enc.Add(RowOperationsPB::DELETE_IGNORE, row);
+      case 12:
+        enc.Add(RowOperationsPB::UPSERT_IGNORE, row);
         break;
     }
 
@@ -298,7 +301,7 @@ TEST_F(RowOperationsTest, SchemaFuzz) {
     g_failing_case.server_schema = &server_schema;
     g_failing_case.row = &row;
     ASAN_SET_DEATH_CALLBACK(&DumpFailingCase);
-    google::InstallFailureFunction(&GlogFailure);
+    google::InstallFailureFunction(reinterpret_cast<google::logging_fail_func_t>(GlogFailure));
 
     for (int i = 0; i < client_schema.num_columns(); i++) {
       if (client_schema.column(i).is_nullable() &&
@@ -326,7 +329,7 @@ TEST_F(RowOperationsTest, SchemaFuzz) {
 
     DoFuzzTest(server_schema, row, 100);
     ASAN_SET_DEATH_CALLBACK(NULL);
-    google::InstallFailureFunction(&abort);
+    google::InstallFailureFunction(reinterpret_cast<google::logging_fail_func_t>(abort));
   }
 }
 
@@ -869,6 +872,7 @@ void CheckExceedCellLimit(const Schema& client_schema,
     case RowOperationsPB::INSERT_IGNORE:
     case RowOperationsPB::UPDATE_IGNORE:
     case RowOperationsPB::DELETE_IGNORE:
+    case RowOperationsPB::UPSERT_IGNORE:
       s = decoder.DecodeOperations<WRITE_OPS>(&ops);
       break;
     case RowOperationsPB::SPLIT_ROW:
@@ -895,7 +899,8 @@ void CheckInsertUpsertExceedCellLimit(const Schema& client_schema,
                                       const string& expect_msg) {
   for (auto op_type : { RowOperationsPB::INSERT,
                         RowOperationsPB::INSERT_IGNORE,
-                        RowOperationsPB::UPSERT }) {
+                        RowOperationsPB::UPSERT,
+                        RowOperationsPB::UPSERT_IGNORE }) {
     NO_FATALS(CheckExceedCellLimit(client_schema, col_values, op_type, expect_status, expect_msg));
   }
 }

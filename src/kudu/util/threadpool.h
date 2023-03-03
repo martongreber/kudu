@@ -140,13 +140,38 @@ class ThreadPoolBuilder {
   MonoDelta queue_overload_threshold_;
   ThreadPoolMetrics metrics_;
   bool enable_scheduler_;
-  uint32_t schedule_period_ms_;
+  uint32_t schedule_period_ms_ = 100;
 
   DISALLOW_COPY_AND_ASSIGN(ThreadPoolBuilder);
 };
 
-
 // SchedulerThread for asynchronized delay task execution.
+//
+// Notice: Take care of Shutdown's order.
+//
+// Firstly, shutdown the ThreadPool and wait SchedulerThread stop.
+// Secondly, delete all the thread pool tokens to release all tokens for the ThreadPool.
+// Lastly, release the ThreadPool.
+//
+// For example:
+//   static void Func(int n) { ... }
+//
+//   unique_ptr<ThreadPool> scheduler_pool;
+//   ThreadPoolBuilder("scheduler")
+//            .set_min_threads(1)
+//            .set_max_threads(4)
+//            .set_enable_scheduler()
+//            .set_schedule_period_ms(100)
+//            .Build(&scheduler_pool);
+//   unique_ptr<ThreadPoolToken> token =
+//            scheduler_pool.NewToken(ThreadPool::ExecutionMode::SERIAL);
+//   RETURN_NOT_OK(token->Schedule([]() { Func(10); }, 1000));
+//
+// The order of Shutdown and Release should adhere to the notice above, for example:
+//   scheduler_pool.Shutdown(); // shutdown scheduler_pool and wait scheduler thread stop.
+//   // The 'token' and 'scheduler_pool' will be released automatically in reverse order of
+//   // their declaration: that's the proper sequence as prescribed above.
+//
 class SchedulerThread {
 public:
   explicit SchedulerThread(std::string thread_pool_name, uint32_t schedule_period_ms);
@@ -159,19 +184,29 @@ public:
   // Shutdown the thread and clear the pending tasks.
   Status Shutdown();
 
-  struct SchedulerTask {
+  class SchedulerTask {
+   public:
+    SchedulerTask(ThreadPoolToken* thread_pool_token, std::function<void()> func)
+        : thread_pool_token_(thread_pool_token), func_(std::move(func)) {}
+    ThreadPoolToken* thread_pool_token() const { return thread_pool_token_; }
+    const std::function<void()>& func() const { return func_; }
+
+   private:
     ThreadPoolToken* thread_pool_token_;
-    std::function<void()> f;
+    std::function<void()> func_;
   };
 
-  void Schedule(ThreadPoolToken* token, std::function<void()> f, const MonoTime& execute_time) {
+  // Submit a task to 'token', execute the task at execute_time.
+  void Schedule(ThreadPoolToken* token,
+                std::function<void()> f,
+                const MonoTime& execute_time) {
     MutexLock unique_lock(mutex_);
-    tasks_.insert({execute_time, SchedulerTask({token, std::move(f)})});
+    future_tasks_.insert({execute_time, SchedulerTask({token, std::move(f)})});
   }
 
   bool empty() const {
     MutexLock unique_lock(mutex_);
-    return tasks_.empty();
+    return future_tasks_.empty();
   }
 
 private:
@@ -181,14 +216,21 @@ private:
   void RunLoop();
 
   const std::string thread_pool_name_;
+
   // scheduler's period checking time.
   const uint32_t schedule_period_ms_;
+
   CountDownLatch shutdown_;
-  // Protect `tasks_` data race.
+
+  // Protect `future_tasks_` data race.
   mutable Mutex mutex_;
 
+  // Thread to drive `future_tasks_` by absolutely time.
   scoped_refptr<Thread> thread_;
-  std::multimap<MonoTime, SchedulerTask> tasks_;
+
+  // Tasks order by their execute timepoint. The `thread_` would execute tasks,
+  // the tasks match the condition its timepoint <= now timepoint.
+  std::multimap<MonoTime, SchedulerTask> future_tasks_;
 };
 
 // Thread pool with a variable number of threads.
@@ -238,6 +280,9 @@ class ThreadPool {
 
   // Submits a new task.
   Status Submit(std::function<void()> f) WARN_UNUSED_RESULT;
+
+  // Submit a task to 'token', execute the task at execute_time.
+  Status Schedule(ThreadPoolToken* token, std::function<void()> f, MonoTime execute_time);
 
   // Waits until all the tasks are completed.
   void Wait();
@@ -466,13 +511,6 @@ class ThreadPool {
   //  * a new task has been scheduled (i.e. added into the queue)
   void NotifyLoadMeterUnlocked(const MonoDelta& queue_time = MonoDelta());
 
-  SchedulerThread* scheduler() {
-    return scheduler_;
-  }
-
-  // Waits until all the tasks and scheduler's tasks completed.
-  void WaitForScheduler();
-
   // Return the number of threads currently running for this thread pool.
   // Used by tests to avoid tsan test case down.
   int num_active_threads() {
@@ -564,7 +602,7 @@ class ThreadPool {
   boost::intrusive::list<IdleThread> idle_threads_; // NOLINT(build/include_what_you_use)
 
   // ExecutionMode::CONCURRENT token used by the pool for tokenless submission.
-  std::unique_ptr<ThreadPoolToken> tokenless_;
+  std::shared_ptr<ThreadPoolToken> tokenless_;
 
   // The meter to track whether the pool's queue is stalled/overloaded.
   // It's nullptr/none if the queue overload threshold is unset.
@@ -573,8 +611,12 @@ class ThreadPool {
   // Metrics for the entire thread pool.
   const ThreadPoolMetrics metrics_;
 
+  // Protect 'scheduler_'.
+  mutable Mutex scheduler_lock_;
+
   // TimerThread is used for some scenarios, such as
   // make a task delay execution.
+  // It would shut down and be deleted firstly when 'Shutdown'.
   SchedulerThread* scheduler_;
   uint32_t schedule_period_ms_;
 

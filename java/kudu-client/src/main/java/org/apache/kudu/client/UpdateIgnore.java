@@ -21,7 +21,8 @@ import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
 /**
- * Represents a single row update ignoring missing rows.
+ * Represents a single row update ignoring missing rows errors and
+ * errors on updating immutable cells.
  * Instances of this class should not be reused.
  */
 @InterfaceAudience.Public

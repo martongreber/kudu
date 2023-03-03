@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <glog/logging.h>
@@ -40,7 +41,6 @@
 #include "kudu/tablet/delta_key.h"
 #include "kudu/tablet/delta_tracker.h"
 #include "kudu/tablet/rowset.h"
-#include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/tablet_mem_trackers.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/util/bloom_filter.h"
@@ -56,6 +56,10 @@ class RowBlock;
 class RowChangeList;
 class RowwiseIterator;
 class Timestamp;
+
+namespace tablet {
+class RowSetMetadata;
+}  // namespace tablet
 
 namespace cfile {
 class BloomFileWriter;
@@ -73,6 +77,13 @@ struct IOContext;
 
 namespace log {
 class LogAnchorRegistry;
+}
+
+namespace tools {
+Status DumpRowSetInternal(const fs::IOContext& ctx,
+                          const std::shared_ptr<tablet::RowSetMetadata>& rs_meta,
+                          int indent,
+                          int64_t* rows_left);
 }
 
 namespace tablet {
@@ -400,8 +411,10 @@ class DiskRowSet :
 
   double DeltaStoresCompactionPerfImprovementScore(DeltaCompactionType type) const override;
 
-  Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp ancient_history_mark,
-                                                     int64_t* bytes) override;
+  Status EstimateBytesInPotentiallyAncientUndoDeltas(
+      Timestamp ancient_history_mark,
+      EstimateType estimate_type,
+      int64_t* bytes) override;
 
   Status IsDeletedAndFullyAncient(Timestamp ancient_history_mark,
                                   bool* deleted_and_ancient) override;
@@ -430,8 +443,14 @@ class DiskRowSet :
     has_been_compacted_.store(true);
   }
 
-  DeltaTracker *delta_tracker() {
-    return DCHECK_NOTNULL(delta_tracker_.get());
+  DeltaTracker* mutable_delta_tracker() {
+    DCHECK(delta_tracker_);
+    return delta_tracker_.get();
+  }
+
+  const DeltaTracker& delta_tracker() const {
+    DCHECK(delta_tracker_);
+    return *delta_tracker_;
   }
 
   std::shared_ptr<RowSetMetadata> metadata() override {
@@ -449,8 +468,6 @@ class DiskRowSet :
         ToString());
   }
 
-  virtual Status DebugDump(std::vector<std::string> *lines) override;
-
  protected:
   DiskRowSet(std::shared_ptr<RowSetMetadata> rowset_metadata,
              log::LogAnchorRegistry* log_anchor_registry,
@@ -464,6 +481,11 @@ class DiskRowSet :
 
   friend class CompactionInput;
   friend class Tablet;
+  friend Status kudu::tools::DumpRowSetInternal(
+      const fs::IOContext& ctx,
+      const std::shared_ptr<tablet::RowSetMetadata>& rs_meta,
+      int indent,
+      int64_t* rows_left);
 
   Status Open(const fs::IOContext* io_context);
 
@@ -477,6 +499,8 @@ class DiskRowSet :
   Status MajorCompactDeltaStoresWithColumnIds(const std::vector<ColumnId>& col_ids,
                                               const fs::IOContext* io_context,
                                               HistoryGcOpts history_gc_opts);
+
+  Status DebugDumpImpl(int64_t* rows_left, std::vector<std::string>* lines) override;
 
   std::shared_ptr<RowSetMetadata> rowset_metadata_;
 

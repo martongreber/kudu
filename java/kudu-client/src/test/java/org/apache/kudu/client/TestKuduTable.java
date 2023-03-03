@@ -23,6 +23,7 @@ import static org.apache.kudu.client.KuduPredicate.ComparisonOp.GREATER_EQUAL;
 import static org.apache.kudu.client.KuduPredicate.ComparisonOp.LESS;
 import static org.apache.kudu.client.KuduPredicate.ComparisonOp.LESS_EQUAL;
 import static org.apache.kudu.test.ClientTestUtil.createBasicSchemaInsert;
+import static org.apache.kudu.test.ClientTestUtil.createSchemaWithImmutableColumns;
 import static org.apache.kudu.test.ClientTestUtil.getBasicCreateTableOptions;
 import static org.apache.kudu.test.ClientTestUtil.getBasicSchema;
 import static org.apache.kudu.test.ClientTestUtil.getBasicTableOptionsWithNonCoveredRange;
@@ -1873,6 +1874,55 @@ public class TestKuduTable {
   }
 
   @Test(timeout = 100000)
+  public void testAlterTableAddRangeCustomHashSchemaWrongBucketsNumber() throws Exception {
+    final List<ColumnSchema> columns = ImmutableList.of(
+        new ColumnSchema.ColumnSchemaBuilder("key", Type.INT32).key(true).build(),
+        new ColumnSchema.ColumnSchemaBuilder("value", Type.STRING).build());
+    final Schema schema = new Schema(columns);
+
+    CreateTableOptions options = getBasicCreateTableOptions();
+    // Add table-wide schema for the table.
+    options.addHashPartitions(ImmutableList.of("key"), 2, 0);
+    // Add a range partition with table-wide hash schema.
+    {
+      PartialRow lower = schema.newPartialRow();
+      lower.addInt(0, -100);
+      PartialRow upper = schema.newPartialRow();
+      upper.addInt(0, 0);
+      options.addRangePartition(lower, upper);
+    }
+
+    client.createTable(tableName, schema, options);
+
+    PartialRow lower = schema.newPartialRow();
+    lower.addInt(0, 0);
+    PartialRow upper = schema.newPartialRow();
+    upper.addInt(0, 100);
+
+    // Try to add range with a single hash bucket -- it should not be possible.
+    for (int hashBucketNum = -1; hashBucketNum < 2; ++hashBucketNum) {
+      try {
+        RangePartitionWithCustomHashSchema range =
+            new RangePartitionWithCustomHashSchema(
+                lower,
+                upper,
+                RangePartitionBound.INCLUSIVE_BOUND,
+                RangePartitionBound.EXCLUSIVE_BOUND);
+        range.addHashPartitions(ImmutableList.of("key"), hashBucketNum, 0);
+
+        client.alterTable(tableName, new AlterTableOptions().addRangePartition(range));
+        fail(String.format("should not be able to add a partition with " +
+            "invalid range-specific hash schema of %d hash buckets", hashBucketNum));
+      } catch (KuduException ex) {
+        final String errmsg = ex.getMessage();
+        assertTrue(errmsg, ex.getStatus().isInvalidArgument());
+        assertTrue(String.format("%d hash buckets: %s", hashBucketNum, errmsg),
+            errmsg.matches("must have at least two hash buckets"));
+      }
+    }
+  }
+
+  @Test(timeout = 100000)
   @KuduTestHarness.MasterServerConfig(flags = {
       "--enable_per_range_hash_schemas=false",
   })
@@ -2437,5 +2487,179 @@ public class TestKuduTable {
     assertTrue(currentStatistics.getOnDiskSize() >= prevStatistics.getOnDiskSize());
     assertTrue(currentStatistics.getLiveRowCount() >= prevStatistics.getLiveRowCount());
     assertEquals(num, currentStatistics.getLiveRowCount());
+  }
+
+  @Test(timeout = 100000)
+  @KuduTestHarness.MasterServerConfig(flags = {
+      "--master_support_immutable_column_attribute=false"
+  })
+  public void testCreateTableWithImmuColsWhenMasterNotSupport() throws Exception {
+    try {
+      CreateTableOptions builder = getBasicCreateTableOptions();
+      client.createTable(tableName, createSchemaWithImmutableColumns(), builder);
+      fail("shouldn't be able to create a table with immutable columns " +
+          "when server side doesn't support required IMMUTABLE_COLUMN_ATTRIBUTE feature");
+    } catch (KuduException ex) {
+      final String errmsg = ex.getMessage();
+      assertTrue(errmsg, ex.getStatus().isRemoteError());
+      assertTrue(errmsg, errmsg.matches(
+          ".* server sent error unsupported feature flags"));
+    }
+  }
+
+  @Test(timeout = 100000)
+  @KuduTestHarness.MasterServerConfig(flags = {
+      "--master_support_immutable_column_attribute=false"
+  })
+  public void testAlterTableAddImmuColsWhenMasterNotSupport() throws Exception {
+    CreateTableOptions builder = getBasicCreateTableOptions();
+    client.createTable(tableName, BASIC_SCHEMA, builder);
+    final ColumnSchema immu_col = new ColumnSchema.ColumnSchemaBuilder("immu_col", Type.INT32)
+        .nullable(true).immutable(true).build();
+    try {
+      client.alterTable(tableName, new AlterTableOptions().addColumn(immu_col));
+      fail("shouldn't be able to alter a table to add a column with immutable attribute " +
+          "when server side doesn't support required IMMUTABLE_COLUMN_ATTRIBUTE feature");
+    } catch (KuduException ex) {
+      final String errmsg = ex.getMessage();
+      assertTrue(errmsg, ex.getStatus().isRemoteError());
+      assertTrue(errmsg, errmsg.matches(
+          ".* server sent error unsupported feature flags"));
+    }
+  }
+
+  @Test(timeout = 100000)
+  @KuduTestHarness.MasterServerConfig(flags = {
+      "--master_support_immutable_column_attribute=false"
+  })
+  public void testAlterTableAlterImmuColsWhenMasterNotSupport() throws Exception {
+    CreateTableOptions builder = getBasicCreateTableOptions();
+    client.createTable(tableName, BASIC_SCHEMA, builder);
+    try {
+      client.alterTable(tableName, new AlterTableOptions().changeImmutable("column1_i", true));
+      fail("shouldn't be able to alter a table to change the immutable attribute on a column " +
+          "when server side doesn't support required IMMUTABLE_COLUMN_ATTRIBUTE feature");
+    } catch (KuduException ex) {
+      final String errmsg = ex.getMessage();
+      assertTrue(errmsg, ex.getStatus().isRemoteError());
+      assertTrue(errmsg, errmsg.matches(
+          ".* server sent error unsupported feature flags"));
+    }
+
+    // No matter if the table has an immutable attribute column or not, we can test the function
+    // on the client side, the request will be processed by the generic RPC code and throw an
+    // exception before reaching particular application code.
+    try {
+      client.alterTable(tableName, new AlterTableOptions().changeImmutable("column1_i", false));
+      fail("shouldn't be able to alter a table to change the immutable attribute on a column " +
+          "when server side doesn't support required IMMUTABLE_COLUMN_ATTRIBUTE feature");
+    } catch (KuduException ex) {
+      final String errmsg = ex.getMessage();
+      assertTrue(errmsg, ex.getStatus().isRemoteError());
+      assertTrue(errmsg, errmsg.matches(
+          ".* server sent error unsupported feature flags"));
+    }
+  }
+
+  /**
+   * Test creating table schemas with non unique primary key columns and
+   * auto-incrementing columns.
+   */
+  @Test(timeout = 100000)
+  public void testCreateSchemaWithNonUniquePrimaryKeys() throws Exception {
+    // Create a schema with two non unique primary key columns and
+    // verify the resulting table's schema.
+    ArrayList<ColumnSchema> columns = new ArrayList<>();
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.INT32)
+        .nonUniqueKey(true).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key2", Type.INT64)
+        .nonUniqueKey(true).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.INT32)
+        .nullable(true).build());
+    Schema schema = new Schema(columns);
+    assertFalse(schema.isPrimaryKeyUnique());
+    assertTrue(schema.hasAutoIncrementingColumn());
+    assertEquals(4, schema.getColumnCount());
+    assertEquals(3, schema.getPrimaryKeyColumnCount());
+    client.createTable(tableName, schema, getBasicCreateTableOptions());
+    KuduTable table = client.openTable(tableName);
+    schema = table.getSchema();
+    assertFalse(schema.isPrimaryKeyUnique());
+    assertTrue(schema.hasAutoIncrementingColumn());
+    assertEquals(4, schema.getColumnCount());
+    assertEquals(3, schema.getPrimaryKeyColumnCount());
+    client.deleteTable(tableName);
+
+    // Create a schema with non unique primary key column and unique primary key column
+    columns.clear();
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.INT32)
+        .nonUniqueKey(true).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key2", Type.INT32)
+        .key(true).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.INT32)
+        .nullable(true).build());
+    try {
+      new Schema(columns);
+      fail("Schema with mixture of unique key and non unique key");
+    } catch (IllegalArgumentException e) {
+      assertTrue(e.getMessage().contains(
+          "Mixture of unique key and non unique key in a table"));
+    }
+
+    // Create a schema with an auto-incrementing column which is marked as non unique
+    // primary key and verify the resulting table's schema.
+    columns.clear();
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.INT32)
+        .nonUniqueKey(true).build());
+    columns.add(new ColumnSchema.AutoIncrementingColumnSchemaBuilder().build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.INT32)
+        .nullable(true).build());
+    schema = new Schema(columns);
+    assertTrue(schema.hasAutoIncrementingColumn());
+    assertFalse(schema.isPrimaryKeyUnique());
+    assertEquals(3, schema.getColumnCount());
+    assertEquals(2, schema.getPrimaryKeyColumnCount());
+    client.createTable(tableName, schema, getBasicCreateTableOptions());
+    table = client.openTable(tableName);
+    schema = table.getSchema();
+    assertTrue(schema.hasAutoIncrementingColumn());
+    assertFalse(schema.isPrimaryKeyUnique());
+    assertEquals(3, schema.getColumnCount());
+    assertEquals(2, schema.getPrimaryKeyColumnCount());
+    client.deleteTable(tableName);
+
+    // Create a schema with a single auto-incrementing column which is marked as non
+    // unique primary key, and verify the resulting table's schema.
+    columns.clear();
+    columns.add(new ColumnSchema.AutoIncrementingColumnSchemaBuilder().build());
+    schema = new Schema(columns);
+    assertTrue(schema.hasAutoIncrementingColumn());
+    assertFalse(schema.isPrimaryKeyUnique());
+    assertEquals(1, schema.getColumnCount());
+    assertEquals(1, schema.getPrimaryKeyColumnCount());
+    CreateTableOptions builder = new CreateTableOptions();
+    builder.setRangePartitionColumns(ImmutableList.of(Schema.getAutoIncrementingColumnName()));
+    client.createTable(tableName, schema, builder);
+    table = client.openTable(tableName);
+    schema = table.getSchema();
+    assertTrue(schema.hasAutoIncrementingColumn());
+    assertFalse(schema.isPrimaryKeyUnique());
+    assertEquals(1, schema.getColumnCount());
+    assertEquals(1, schema.getPrimaryKeyColumnCount());
+    client.deleteTable(tableName);
+
+    // Create a schema with two auto-incrementing columns
+    columns.clear();
+    columns.add(new ColumnSchema.AutoIncrementingColumnSchemaBuilder().build());
+    columns.add(new ColumnSchema.AutoIncrementingColumnSchemaBuilder().build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.INT32)
+        .nullable(true).build());
+    try {
+      new Schema(columns);
+      fail("Schema with two auto-incrementing columns");
+    } catch (IllegalArgumentException e) {
+      assertTrue(e.getMessage().contains(
+          "More than one columns are set as auto-incrementing columns"));
+    }
   }
 }

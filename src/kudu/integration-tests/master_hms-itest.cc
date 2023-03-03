@@ -23,9 +23,11 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include <gflags/gflags_declare.h>
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 
@@ -37,7 +39,9 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/hms/hive_metastore_types.h"
+#include "kudu/hms/hms_catalog.h"
 #include "kudu/hms/hms_client.h"
+#include "kudu/hms/mini_hms.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
 #include "kudu/integration-tests/hms_itest-base.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
@@ -49,6 +53,8 @@
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+
+DECLARE_string(hive_metastore_uris);
 
 using kudu::client::KuduTable;
 using kudu::client::KuduTableAlterer;
@@ -477,6 +483,55 @@ TEST_F(MasterHmsTest, TestDeleteTable) {
   // Create and drop a non-Kudu ('external') HMS table entry and ensure Kudu allows it.
   ASSERT_OK(CreateHmsTable("default", "externalTable", HmsClient::kExternalTable));
   ASSERT_OK(harness_.hms_client()->DropTable("default", "externalTable"));
+}
+
+// Test to verify that the soft-deletion of tables is not supported when
+// HMS is enabled.
+TEST_F(MasterHmsTest, TableSoftDeleteNotSupportedWithHmsEnabled) {
+  // TODO(kedeng) : change the test case when state sync to HMS
+  // Create a Kudu table, then soft delete it from Kudu.
+  ASSERT_OK(CreateKuduTable("default", "a"));
+  NO_FATALS(CheckTable("default", "a", /*user=*/ nullopt));
+  hive::Table hms_table;
+  // Set --hive_metastore_uris to make HmsCatalog::IsEnabled() returns 'true'.
+  const auto& hms_uris = cluster_->hms()->uris();
+  ASSERT_TRUE(!hms_uris.empty());
+  FLAGS_hive_metastore_uris = hms_uris;
+  ASSERT_TRUE(hms::HmsCatalog::IsEnabled());
+  Status s = client_->SoftDeleteTable("default.a", 6000);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  // The RecallTable is not supported, so the table id is ineffective.
+  s = client_->RecallTable("default.a");
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "RecallDeletedTable is not supported");
+  ASSERT_OK(harness_.hms_client()->GetTable("default", "a", &hms_table));
+  // The table is remain in the Kudu cluster.
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable("default.a", &table));
+}
+
+// This test makes sure that with the HMS integration enabled, both alter and
+// drop/delete for a table work as expected after the soft-delete feature for
+// tables has been introduced. There might be other scenarios elsewhere testing
+// for that implicitly, but this scenario is run explicitly to check for the
+// backward compatibility in that context.
+TEST_F(MasterHmsTest, AlterAndDeleteTableWhenHmsEnabled) {
+  // Create the database and Kudu table.
+  ASSERT_OK(CreateDatabase("db"));
+  ASSERT_OK(CreateKuduTable("db", "a"));
+  NO_FATALS(CheckTable("db", "a", /*user=*/nullopt));
+
+  const auto& hms_uris = cluster_->hms()->uris();
+  ASSERT_TRUE(!hms_uris.empty());
+  // Set --hive_metastore_uris to make HmsCatalog::IsEnabled() returns 'true'.
+  FLAGS_hive_metastore_uris = hms_uris;
+  ASSERT_TRUE(hms::HmsCatalog::IsEnabled());
+
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer("db.a"));
+  ASSERT_OK(table_alterer->RenameTo("db.b")->Alter());
+
+  ASSERT_OK(client_->DeleteTable("db.b"));
+  NO_FATALS(CheckTableDoesNotExist("db", "b"));
 }
 
 TEST_F(MasterHmsTest, TestNotificationLogListener) {

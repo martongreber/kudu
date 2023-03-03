@@ -59,11 +59,18 @@ using std::unique_ptr;
 using strings::Substitute;
 
 DECLARE_int32(webserver_max_post_length_bytes);
+DECLARE_string(trusted_certificate_file);
 
 DEFINE_bool(test_sensitive_flag, false, "a sensitive flag");
 TAG_FLAG(test_sensitive_flag, sensitive);
 
 DECLARE_bool(webserver_enable_csp);
+
+// FIPS_mode is removed from OpenSSL3 for test purposes, a fake one is created and
+// set to disabled.
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+int FIPS_mode() { return 0; }
+#endif
 
 namespace kudu {
 
@@ -98,7 +105,10 @@ class WebserverTest : public KuduTest {
     opts.port = 0;
     opts.doc_root = static_dir_;
     opts.enable_doc_root = enable_doc_root();
-    if (use_ssl()) SetSslOptions(&opts);
+    if (use_ssl()) {
+      SetSslOptions(&opts);
+      cert_path_ = opts.certificate_file;
+    }
     if (use_htpasswd()) SetHTPasswdOptions(&opts);
     MaybeSetupSpnego(&opts);
     server_.reset(new Webserver(opts));
@@ -142,6 +152,7 @@ class WebserverTest : public KuduTest {
   Sockaddr addr_;
   string url_;
   string static_dir_;
+  string cert_path_;
 };
 
 class SslWebserverTest : public WebserverTest {
@@ -413,8 +424,8 @@ TEST_F(WebserverTest, TestHttpCompression) {
 }
 
 TEST_F(SslWebserverTest, TestSSL) {
-  // We use a self-signed cert, so we need to disable cert verification in curl.
-  curl_.set_verify_peer(false);
+  // We use a self-signed cert, so we have to trust it manually.
+  FLAGS_trusted_certificate_file = cert_path_;
 
   ASSERT_OK(curl_.FetchURL(url_, &buf_));
   // Should have expected title.

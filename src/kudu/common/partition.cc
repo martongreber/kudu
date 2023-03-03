@@ -701,8 +701,7 @@ bool PartitionSchema::PartitionContainsRowImpl(const Partition& partition,
       return false;
     }
   }
-
-  return RangePartitionContainsRowImpl(partition, row);
+  return RangePartitionContainsEncodedKey(partition, range_key);
 }
 
 template<typename Row>
@@ -727,12 +726,7 @@ bool PartitionSchema::RangePartitionContainsRowImpl(
   string key;
   EncodeColumns(row, range_schema_.column_ids, &key);
 
-  // When all hash buckets match, then the row is contained in the partition
-  // if the row's key is greater or equal to the lower bound, and if there is
-  // either no upper bound or the row's key is less than the upper bound.
-  return
-      (partition.begin().range_key() <= key) &&
-      (partition.end().range_key().empty() || key < partition.end().range_key());
+  return RangePartitionContainsEncodedKey(partition, key);
 }
 
 bool PartitionSchema::PartitionContainsRow(const Partition& partition,
@@ -825,6 +819,12 @@ Status PartitionSchema::DecodeRangeKey(Slice* encoded_key,
                                      column.name()));
     // Mark the column as set.
     BitmapSet(partial_row->isset_bitmap_, column_idx);
+
+    if (column.type_info()->physical_type() == BINARY) {
+      // Copy cell value into the 'partial_row', because in the decoding process above, we just make
+      // row data a pointer to the memory allocated by arena.
+      partial_row->Set(column_idx, cont_row.cell_ptr(column_idx));
+    }
   }
   if (!encoded_key->empty()) {
     return Status::InvalidArgument("unable to fully decode range key",
@@ -901,7 +901,8 @@ string ColumnIdsToColumnNames(const Schema& schema,
 } // namespace
 
 string PartitionSchema::PartitionDebugString(const Partition& partition,
-                                             const Schema& schema) const {
+                                             const Schema& schema,
+                                             HashPartitionInfo hp) const {
   // Partitions are considered metadata, so don't redact them.
   ScopedDisableRedaction no_redaction;
 
@@ -912,11 +913,13 @@ string PartitionSchema::PartitionDebugString(const Partition& partition,
   }
 
   vector<string> components;
-  for (size_t i = 0; i < hash_schema.size(); ++i) {
-    string s = Substitute("HASH ($0) PARTITION $1",
-                          ColumnIdsToColumnNames(schema, hash_schema[i].column_ids),
-                          partition.hash_buckets_[i]);
-    components.emplace_back(std::move(s));
+  if (hp == HashPartitionInfo::SHOW) {
+    for (size_t i = 0; i < hash_schema.size(); ++i) {
+      string s = Substitute("HASH ($0) PARTITION $1",
+                            ColumnIdsToColumnNames(schema, hash_schema[i].column_ids),
+                            partition.hash_buckets_[i]);
+      components.emplace_back(std::move(s));
+    }
   }
 
   if (!range_schema_.column_ids.empty()) {
@@ -1373,6 +1376,16 @@ vector<Partition> PartitionSchema::GenerateHashPartitions(
     hash_partitions = std::move(new_partitions);
   }
   return hash_partitions;
+}
+
+bool PartitionSchema::RangePartitionContainsEncodedKey(
+    const Partition& partition, const string& key) {
+  // When all hash buckets match, then the row is contained in the partition
+  // if the row's key is greater or equal to the lower bound, and if there is
+  // either no upper bound or the row's key is less than the upper bound.
+  return
+      (partition.begin().range_key() <= key) &&
+      (partition.end().range_key().empty() || key < partition.end().range_key());
 }
 
 Status PartitionSchema::ValidateHashSchema(const Schema& schema,

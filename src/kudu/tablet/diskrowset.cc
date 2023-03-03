@@ -50,6 +50,7 @@
 #include "kudu/tablet/multi_column_writer.h"
 #include "kudu/tablet/mutation.h"
 #include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/rowset_metadata.h"
 #include "kudu/util/compression/compression.pb.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
@@ -558,7 +559,7 @@ Status DiskRowSet::MinorCompactDeltaStores(const IOContext* io_context) {
 Status DiskRowSet::MajorCompactDeltaStores(const IOContext* io_context,
                                            HistoryGcOpts history_gc_opts) {
   vector<ColumnId> col_ids;
-  delta_tracker_->GetColumnIdsWithUpdates(&col_ids);
+  delta_tracker_->GetColumnIdsToCompact(&col_ids);
 
   if (col_ids.empty()) {
     VLOG_WITH_PREFIX(2) << "There are no column ids with updates";
@@ -573,8 +574,8 @@ Status DiskRowSet::MajorCompactDeltaStoresWithColumnIds(const vector<ColumnId>& 
                                                         HistoryGcOpts history_gc_opts) {
   VLOG_WITH_PREFIX(1) << "Major compacting REDO delta stores (cols: " << col_ids << ")";
   TRACE_EVENT0("tablet", "DiskRowSet::MajorCompactDeltaStoresWithColumnIds");
-  std::lock_guard<Mutex> l(*delta_tracker()->compact_flush_lock());
-  RETURN_NOT_OK(delta_tracker()->CheckWritableUnlocked());
+  std::lock_guard<Mutex> l(*mutable_delta_tracker()->compact_flush_lock());
+  RETURN_NOT_OK(mutable_delta_tracker()->CheckWritableUnlocked());
 
   // TODO(todd): do we need to lock schema or anything here?
   unique_ptr<MajorDeltaCompaction> compaction;
@@ -704,9 +705,7 @@ Status DiskRowSet::MutateRow(Timestamp timestamp,
     return Status::NotFound("row not found");
   }
 
-  RETURN_NOT_OK(delta_tracker_->Update(timestamp, *row_idx, update, op_id, result));
-
-  return Status::OK();
+  return delta_tracker_->Update(timestamp, *row_idx, update, op_id, result);
 }
 
 Status DiskRowSet::CheckRowPresent(const RowSetKeyProbe &probe,
@@ -847,10 +846,9 @@ double DiskRowSet::DeltaStoresCompactionPerfImprovementScore(DeltaCompactionType
   }
 
   if (type == RowSet::MAJOR_DELTA_COMPACTION) {
-    vector<ColumnId> col_ids_with_updates;
-    delta_tracker_->GetColumnIdsWithUpdates(&col_ids_with_updates);
-    // If we have files but no updates, we don't want to major compact.
-    if (!col_ids_with_updates.empty()) {
+    vector<ColumnId> col_ids_for_compact;
+    delta_tracker_->GetColumnIdsToCompact(&col_ids_for_compact);
+    if (!col_ids_for_compact.empty()) {
       DiskRowSetSpace drss;
       GetDiskRowSetSpaceUsage(&drss);
       double ratio = static_cast<double>(drss.redo_deltas_size) / drss.base_data_size;
@@ -868,9 +866,12 @@ double DiskRowSet::DeltaStoresCompactionPerfImprovementScore(DeltaCompactionType
   return std::min(1.0, perf_improv);
 }
 
-Status DiskRowSet::EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp ancient_history_mark,
-                                                               int64_t* bytes) {
-  return delta_tracker_->EstimateBytesInPotentiallyAncientUndoDeltas(ancient_history_mark, bytes);
+Status DiskRowSet::EstimateBytesInPotentiallyAncientUndoDeltas(
+    Timestamp ancient_history_mark,
+    EstimateType estimate_type,
+    int64_t* bytes) {
+  return delta_tracker_->EstimateBytesInPotentiallyAncientUndoDeltas(
+      ancient_history_mark, estimate_type, bytes);
 }
 
 Status DiskRowSet::IsDeletedAndFullyAncient(Timestamp ancient_history_mark,
@@ -907,14 +908,14 @@ Status DiskRowSet::DeleteAncientUndoDeltas(Timestamp ancient_history_mark,
                                                  blocks_deleted, bytes_deleted);
 }
 
-Status DiskRowSet::DebugDump(vector<string> *lines) {
+Status DiskRowSet::DebugDumpImpl(int64_t* rows_left, vector<string>* lines) {
   // Using CompactionInput to dump our data is an easy way of seeing all the
   // rows and deltas.
   unique_ptr<CompactionInput> input;
   RETURN_NOT_OK(NewCompactionInput(rowset_metadata_->tablet_schema().get(),
                                    MvccSnapshot::CreateSnapshotIncludingAllOps(),
                                    nullptr, &input));
-  return DebugDumpCompactionInput(input.get(), lines);
+  return DebugDumpCompactionInput(input.get(), rows_left, lines);
 }
 
 } // namespace tablet

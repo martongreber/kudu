@@ -49,6 +49,7 @@ struct TabletMetrics {
   scoped_refptr<Counter> rows_updated;
   scoped_refptr<Counter> rows_deleted;
   scoped_refptr<Counter> insert_ignore_errors;
+  scoped_refptr<Counter> upsert_ignore_errors;
   scoped_refptr<Counter> update_ignore_errors;
   scoped_refptr<Counter> delete_ignore_errors;
   scoped_refptr<Counter> insertions_failed_dup_key;
@@ -104,6 +105,10 @@ struct TabletMetrics {
   scoped_refptr<Histogram> undo_delta_block_gc_init_duration;
   scoped_refptr<Histogram> undo_delta_block_gc_delete_duration;
   scoped_refptr<Histogram> undo_delta_block_gc_perform_duration;
+
+  // Metrics specific to rowset merge compaction.
+  scoped_refptr<Histogram> compact_rs_mem_usage;
+  scoped_refptr<Histogram> compact_rs_mem_usage_to_deltas_size_ratio;
 
   scoped_refptr<Counter> leader_memory_pressure_rejections;
 

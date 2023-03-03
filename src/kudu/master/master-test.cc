@@ -30,6 +30,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -54,6 +55,7 @@
 #include "kudu/consensus/replica_management.pb.h"
 #include "kudu/generated/version_defines.h"
 #include "kudu/gutil/dynamic_annotations.h"
+#include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/split.h"
@@ -68,7 +70,6 @@
 #include "kudu/master/mini_master.h"
 #include "kudu/master/sys_catalog.h"
 #include "kudu/master/table_metrics.h"
-#include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
@@ -97,6 +98,12 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/version_info.h"
+
+namespace kudu {
+namespace master {
+class TSDescriptor;
+}  // namespace master
+}  // namespace kudu
 
 using kudu::consensus::ReplicaManagementInfoPB;
 using kudu::itest::GetClusterId;
@@ -222,6 +229,10 @@ class MasterTest : public KuduTest {
   Status GetTablePartitionSchema(const string& table_name,
                                  PartitionSchemaPB* ps_pb);
 
+  Status SoftDelete(const string& table_name, uint32 reserve_seconds);
+
+  Status RecallTable(const string& table_id);
+
   shared_ptr<Messenger> client_messenger_;
   unique_ptr<MiniMaster> mini_master_;
   Master* master_;
@@ -343,6 +354,23 @@ Status MasterTest::GetTablePartitionSchema(const string& table_name,
   return Status::OK();
 }
 
+Status MasterTest::SoftDelete(const string& table_name, uint32 reserve_seconds) {
+  DeleteTableRequestPB req;
+  DeleteTableResponsePB resp;
+  RpcController controller;
+  req.mutable_table()->set_table_name(table_name);
+  req.set_reserve_seconds(reserve_seconds);
+  return master_->catalog_manager()->SoftDeleteTableRpc(req, &resp, nullptr);
+}
+
+Status MasterTest::RecallTable(const string& table_id) {
+  RecallDeletedTableRequestPB req;
+  RecallDeletedTableResponsePB resp;
+  RpcController controller;
+  req.mutable_table()->set_table_id(table_id);
+  return master_->catalog_manager()->RecallDeletedTableRpc(req, &resp, nullptr);
+}
+
 void MasterTest::DoListTables(const ListTablesRequestPB& req, ListTablesResponsePB* resp) {
   RpcController controller;
   ASSERT_OK(proxy_->ListTables(req, resp, &controller));
@@ -415,50 +443,6 @@ TEST_F(MasterTest, TestResetBlockCacheMetricsInSameProcess) {
   });
 }
 
-TEST_F(MasterTest, TestStartupWebPage) {
-  EasyCurl c;
-  faststring buf;
-  string addr = mini_master_->bound_http_addr().ToString();
-  mini_master_->Shutdown();
-  std::atomic<bool> run_status_reader = false;
-  thread read_startup_page([&] {
-    EasyCurl thread_c;
-    faststring thread_buf;
-    while (!run_status_reader) {
-      SleepFor(MonoDelta::FromMilliseconds(10));
-      if (!(thread_c.FetchURL(strings::Substitute("http://$0/startup", addr), &thread_buf)).ok()) {
-        continue;
-      }
-      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"init_status\":(100|0)( |,)");
-      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"read_filesystem_status\":(100|0)( |,)");
-      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"read_instance_metadatafiles_status\""
-                                                    ":(100|0)( |,)");
-      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"read_data_directories_status\":"
-                                                    "([0-9]|[1-9][0-9]|100)( |,)");
-      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"initialize_master_catalog_status\":"
-                                                    "([0-9]|[1-9][0-9]|100)( |,)");
-      ASSERT_STR_MATCHES(thread_buf.ToString(), "\"start_rpc_server_status\":(100|0)( |,)");
-    }
-  });
-  SCOPED_CLEANUP({
-    run_status_reader = true;
-    read_startup_page.join();
-  });
-
-  ASSERT_OK(mini_master_->Restart());
-  ASSERT_OK(mini_master_->WaitForCatalogManagerInit());
-  run_status_reader = true;
-
-  // After all the steps have been completed, ensure every startup step has 100 percent status
-  ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/startup", addr), &buf));
-  ASSERT_STR_CONTAINS(buf.ToString(), "\"init_status\":100");
-  ASSERT_STR_CONTAINS(buf.ToString(), "\"read_filesystem_status\":100");
-  ASSERT_STR_CONTAINS(buf.ToString(), "\"read_instance_metadatafiles_status\":100");
-  ASSERT_STR_CONTAINS(buf.ToString(), "\"read_data_directories_status\":100");
-  ASSERT_STR_CONTAINS(buf.ToString(), "\"initialize_master_catalog_status\":100");
-  ASSERT_STR_CONTAINS(buf.ToString(), "\"start_rpc_server_status\":100");
-}
-
 TEST_F(MasterTest, TestRegisterAndHeartbeat) {
   const char* const kTsUUID = "my-ts-uuid";
 
@@ -521,7 +505,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
   master_->ts_manager()->GetAllDescriptors(&descs);
   ASSERT_EQ(1, descs.size()) << "Should have registered the TS";
   ServerRegistrationPB reg;
-  descs[0]->GetRegistration(&reg);
+  ASSERT_OK(descs[0]->GetRegistration(&reg));
   ASSERT_EQ(SecureDebugString(fake_reg), SecureDebugString(reg))
       << "Master got different registration";
 
@@ -1316,6 +1300,101 @@ TEST_F(MasterTest, AlterTableAddAndDropRangeWithSpecificHashSchema) {
       ASSERT_OK(GetTablePartitionSchema(kTableName, &ps_pb));
       ASSERT_EQ(0, ps_pb.custom_hash_schema_ranges_size());
     }
+  }
+}
+
+TEST_F(MasterTest, AlterTableAddRangeWithSpecificHashSchemaWrongBucketNumber) {
+  constexpr const char* const kTableName = "wrong_bucket_number_in_hash_schema";
+  constexpr const char* const kCol0 = "c_int32";
+  constexpr const char* const kCol1 = "c_int64";
+  const Schema kTableSchema({ColumnSchema(kCol0, INT32),
+                             ColumnSchema(kCol1, INT64)}, 1);
+  FLAGS_default_num_replicas = 1;
+
+  // Create a table with one range partition based on the table-wide hash schema.
+  CreateTableResponsePB create_table_resp;
+  {
+    KuduPartialRow lower(&kTableSchema);
+    ASSERT_OK(lower.SetInt32(kCol0, 0));
+    KuduPartialRow upper(&kTableSchema);
+    ASSERT_OK(upper.SetInt32(kCol0, 100));
+    ASSERT_OK(CreateTable(
+        kTableName, kTableSchema, nullopt, nullopt, nullopt, {}, {{lower, upper}},
+        {}, {{{kCol0}, 2, 0}}, &create_table_resp));
+  }
+
+  // Check the number of tablets in the table before ALTER TABLE.
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    std::vector<scoped_refptr<TableInfo>> tables;
+    master_->catalog_manager()->GetAllTables(&tables);
+    ASSERT_EQ(1, tables.size());
+    ASSERT_EQ(2, tables.front()->num_tablets());
+  }
+
+  const auto& table_id = create_table_resp.table_id();
+
+  // Try altering the table, adding a new range with custom hash schema where
+  // the number of hash buckets is incorrect.
+  for (auto bucket_num = -1; bucket_num < 2; ++bucket_num) {
+    SCOPED_TRACE(Substitute("number of hash buckets: $0", bucket_num));
+    const HashSchema custom_hash_schema{{{kCol0}, bucket_num, 222}};
+
+    AlterTableRequestPB req;
+    AlterTableResponsePB resp;
+    req.mutable_table()->set_table_name(kTableName);
+    req.mutable_table()->set_table_id(table_id);
+
+    // Add the required information on the table's schema:
+    // key and non-null columns must be present in the request.
+    {
+      auto* col = req.mutable_schema()->add_columns();
+      col->set_name(kCol0);
+      col->set_type(INT32);
+      col->set_is_key(true);
+    }
+    {
+      auto* col = req.mutable_schema()->add_columns();
+      col->set_name(kCol1);
+      col->set_type(INT64);
+    }
+
+    AlterTableRequestPB::Step* step = req.add_alter_schema_steps();
+    step->set_type(AlterTableRequestPB::ADD_RANGE_PARTITION);
+    KuduPartialRow lower(&kTableSchema);
+    ASSERT_OK(lower.SetInt32(kCol0, 100));
+    KuduPartialRow upper(&kTableSchema);
+    ASSERT_OK(upper.SetInt32(kCol0, 200));
+    RowOperationsPBEncoder enc(
+        step->mutable_add_range_partition()->mutable_range_bounds());
+    enc.Add(RowOperationsPB::RANGE_LOWER_BOUND, lower);
+    enc.Add(RowOperationsPB::RANGE_UPPER_BOUND, upper);
+    for (const auto& hash_dimension: custom_hash_schema) {
+      auto* hash_dimension_pb = step->mutable_add_range_partition()->
+          mutable_custom_hash_schema()->add_hash_schema();
+      for (const auto& col_name: hash_dimension.columns) {
+        hash_dimension_pb->add_columns()->set_name(col_name);
+      }
+      hash_dimension_pb->set_num_buckets(hash_dimension.num_buckets);
+      hash_dimension_pb->set_seed(hash_dimension.seed);
+    }
+
+    RpcController ctl;
+    ASSERT_OK(proxy_->AlterTable(req, &resp, &ctl));
+    ASSERT_TRUE(resp.has_error());
+    const auto s = StatusFromPB(resp.error().status());
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "must have at least two hash buckets");
+  }
+
+  // One more sanity check: the number of tablets in the table after
+  // attempted, but failed ALTER TABLE should stay the same as before.
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    std::vector<scoped_refptr<TableInfo>> tables;
+    master_->catalog_manager()->GetAllTables(&tables);
+    ASSERT_EQ(1, tables.size());
+    ASSERT_EQ(2, tables.front()->num_tablets());
   }
 }
 
@@ -3153,7 +3232,7 @@ TEST_F(MasterTest, TestDuplicateRequest) {
   master_->ts_manager()->GetAllDescriptors(&descs);
   ASSERT_EQ(1, descs.size()) << "Should have registered the TS";
   ServerRegistrationPB reg;
-  descs[0]->GetRegistration(&reg);
+  ASSERT_OK(descs[0]->GetRegistration(&reg));
   ASSERT_EQ(SecureDebugString(fake_reg), SecureDebugString(reg))
       << "Master got different registration";
   shared_ptr<TSDescriptor> ts_desc;
@@ -3475,8 +3554,183 @@ TEST_P(AuthzTokenMasterTest, TestGenerateAuthzTokens) {
     ASSERT_EQ(supports_authz, resp.has_authz_token());
   }
 }
-
 INSTANTIATE_TEST_SUITE_P(SupportsAuthzTokens, AuthzTokenMasterTest, ::testing::Bool());
+
+class MasterStartupTest : public KuduTest {
+ protected:
+  void SetUp() override {
+    KuduTest::SetUp();
+
+    // The embedded webserver renders the contents of the generated pages
+    // according to mustache's mappings found under the directory pointed to by
+    // the --webserver_doc_root flag, which is set to $KUDU_HOME/www by default.
+    // Since this test assumes to fetch the pre-rendered output for the startup
+    // page, it would fail if the KUDU_HOME environment variable were set and
+    // pointed to the location where 'www' subdirectory contained the required
+    // mustache mappings. Let's explicitly point the document root to nowhere,
+    // so no mustache-based rendering is done.
+    FLAGS_webserver_doc_root = "";
+
+    mini_master_.reset(new MiniMaster(GetTestPath("Master"), HostPort("127.0.0.1", 0)));
+    ASSERT_OK(mini_master_->Start());
+  }
+
+  void TearDown() override {
+    mini_master_->Shutdown();
+    KuduTest::TearDown();
+  }
+
+  unique_ptr<MiniMaster> mini_master_;
+};
+
+TEST_F(MasterStartupTest, StartupWebPage) {
+  const string addr = mini_master_->bound_http_addr().ToString();
+  mini_master_->Shutdown();
+
+  std::atomic<bool> run_status_reader = true;
+  thread status_reader([&] {
+    EasyCurl c;
+    faststring buf;
+    while (run_status_reader) {
+      SleepFor(MonoDelta::FromMilliseconds(10));
+      if (!c.FetchURL(strings::Substitute("http://$0/startup", addr), &buf).ok()) {
+        continue;
+      }
+      ASSERT_STR_MATCHES(buf.ToString(), "\"init_status\":(100|0)( |,)");
+      ASSERT_STR_MATCHES(buf.ToString(), "\"read_filesystem_status\":(100|0)( |,)");
+      ASSERT_STR_MATCHES(buf.ToString(), "\"read_instance_metadatafiles_status\""
+                                             ":(100|0)( |,)");
+      ASSERT_STR_MATCHES(buf.ToString(), "\"read_data_directories_status\":"
+                                             "([0-9]|[1-9][0-9]|100)( |,)");
+      ASSERT_STR_MATCHES(buf.ToString(), "\"initialize_master_catalog_status\":"
+                                             "([0-9]|[1-9][0-9]|100)( |,)");
+      ASSERT_STR_MATCHES(buf.ToString(), "\"start_rpc_server_status\":(100|0)( |,)");
+    }
+  });
+  SCOPED_CLEANUP({
+    run_status_reader = false;
+    status_reader.join();
+  });
+
+  ASSERT_OK(mini_master_->Restart());
+  ASSERT_OK(mini_master_->WaitForCatalogManagerInit());
+  run_status_reader = false;
+
+  // After all the steps have been completed, ensure every startup step has 100 percent status
+  EasyCurl c;
+  faststring buf;
+  ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/startup", addr), &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"init_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"read_filesystem_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"read_instance_metadatafiles_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"read_data_directories_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"initialize_master_catalog_status\":100");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"start_rpc_server_status\":100");
+}
+
+TEST_F(MasterTest, GetTableStatesWithName) {
+  const char* kTableName = "testtable";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  bool is_soft_deleted_table = false;
+  bool is_expired_table = false;
+  TableIdentifierPB table_identifier;
+  table_identifier.set_table_name(kTableName);
+
+  // Create a new table.
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+  ListTablesResponsePB tables;
+  NO_FATALS(DoListAllTables(&tables));
+  ASSERT_EQ(1, tables.tables_size());
+  ASSERT_EQ(kTableName, tables.tables(0).name());
+  string table_id = tables.tables(0).id();
+  ASSERT_FALSE(table_id.empty());
+
+  {
+    // Default table is not expired.
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(master_->catalog_manager()->GetTableStates(
+        table_identifier, CatalogManager::TableInfoMapType::kAllTableType,
+        &is_soft_deleted_table, &is_expired_table));
+    ASSERT_FALSE(is_soft_deleted_table);
+    ASSERT_FALSE(is_expired_table);
+  }
+
+  {
+    // In reserve time, table is not expired.
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(SoftDelete(kTableName, 100));
+    ASSERT_OK(master_->catalog_manager()->GetTableStates(
+        table_identifier, CatalogManager::TableInfoMapType::kAllTableType,
+        &is_soft_deleted_table, &is_expired_table));
+    ASSERT_TRUE(is_soft_deleted_table);
+    ASSERT_FALSE(is_expired_table);
+    ASSERT_OK(RecallTable(table_id));
+  }
+
+  {
+    // After reserve time, table is expired.
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(SoftDelete(kTableName, 1));
+    SleepFor(MonoDelta::FromSeconds(1));
+    ASSERT_OK(master_->catalog_manager()->GetTableStates(
+        table_identifier, CatalogManager::TableInfoMapType::kAllTableType,
+        &is_soft_deleted_table, &is_expired_table));
+    ASSERT_TRUE(is_soft_deleted_table);
+    ASSERT_TRUE(is_expired_table);
+  }
+}
+
+TEST_F(MasterTest, GetTableStatesWithId) {
+  const char* kTableName = "testtable";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  bool is_soft_deleted_table = false;
+  bool is_expired_table = false;
+
+  // Create a new table.
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+  ListTablesResponsePB tables;
+  NO_FATALS(DoListAllTables(&tables));
+  ASSERT_EQ(1, tables.tables_size());
+  ASSERT_EQ(kTableName, tables.tables(0).name());
+  string table_id = tables.tables(0).id();
+  ASSERT_FALSE(table_id.empty());
+  TableIdentifierPB table_identifier;
+  table_identifier.set_table_id(table_id);
+
+  {
+    // Default table is not expired.
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(master_->catalog_manager()->GetTableStates(
+        table_identifier, CatalogManager::TableInfoMapType::kAllTableType,
+        &is_soft_deleted_table, &is_expired_table));
+    ASSERT_FALSE(is_soft_deleted_table);
+    ASSERT_FALSE(is_expired_table);
+  }
+
+  {
+    // In reserve time, table is not expired.
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(SoftDelete(kTableName, 100));
+    ASSERT_OK(master_->catalog_manager()->GetTableStates(
+        table_identifier, CatalogManager::TableInfoMapType::kAllTableType,
+        &is_soft_deleted_table, &is_expired_table));
+    ASSERT_TRUE(is_soft_deleted_table);
+    ASSERT_FALSE(is_expired_table);
+    ASSERT_OK(RecallTable(table_id));
+  }
+
+  {
+    // After reserve time, table is expired.
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(SoftDelete(kTableName, 1));
+    SleepFor(MonoDelta::FromSeconds(1));
+    ASSERT_OK(master_->catalog_manager()->GetTableStates(
+        table_identifier, CatalogManager::TableInfoMapType::kAllTableType,
+        &is_soft_deleted_table, &is_expired_table));
+    ASSERT_TRUE(is_soft_deleted_table);
+    ASSERT_TRUE(is_expired_table);
+  }
+}
 
 } // namespace master
 } // namespace kudu

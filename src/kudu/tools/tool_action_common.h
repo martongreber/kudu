@@ -73,12 +73,16 @@ extern const char* const kTabletIdArg;
 extern const char* const kTabletIdArgDesc;
 extern const char* const kTabletIdsCsvArg;
 extern const char* const kTabletIdsCsvArgDesc;
+extern const char* const kRowsetIdsCsvArg;
+extern const char* const kRowsetIdsCsvArgDesc;
 
 extern const char* const kMasterAddressArg;
 extern const char* const kMasterAddressDesc;
 
 extern const char* const kTServerAddressArg;
 extern const char* const kTServerAddressDesc;
+
+extern const char* const kCurrentLeaderUUIDArg;
 
 // Builder for actions involving RPC communications, either with a whole Kudu
 // cluster or a particular Kudu RPC server.

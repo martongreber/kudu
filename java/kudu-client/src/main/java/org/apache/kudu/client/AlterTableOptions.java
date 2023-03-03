@@ -21,6 +21,7 @@ import static org.apache.kudu.ColumnSchema.CompressionAlgorithm;
 import static org.apache.kudu.ColumnSchema.Encoding;
 import static org.apache.kudu.master.Master.AlterTableRequestPB;
 
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +34,7 @@ import org.apache.yetus.audience.InterfaceStability;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Common;
+import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.client.ProtobufHelper.SchemaPBConversionFlags;
 import org.apache.kudu.master.Master;
@@ -83,6 +85,10 @@ public class AlterTableOptions {
    * @return this instance
    */
   public AlterTableOptions addColumn(ColumnSchema colSchema) {
+    if (colSchema.getName().equalsIgnoreCase(Schema.getAutoIncrementingColumnName())) {
+      throw new IllegalArgumentException("Column name " +
+          Schema.getAutoIncrementingColumnName() + " is reserved by Kudu engine");
+    }
     if (!colSchema.isNullable() && colSchema.getDefaultValue() == null) {
       throw new IllegalArgumentException("A new non-null column must have a default value");
     }
@@ -139,6 +145,10 @@ public class AlterTableOptions {
    * @return this instance
    */
   public AlterTableOptions dropColumn(String name) {
+    if (name.equalsIgnoreCase(Schema.getAutoIncrementingColumnName())) {
+      throw new IllegalArgumentException("Cannot remove auto-incrementing column " +
+          Schema.getAutoIncrementingColumnName());
+    }
     AlterTableRequestPB.Step.Builder step = pb.addAlterSchemaStepsBuilder();
     step.setType(AlterTableRequestPB.StepType.DROP_COLUMN);
     step.setDropColumn(AlterTableRequestPB.DropColumn.newBuilder().setName(name));
@@ -152,6 +162,10 @@ public class AlterTableOptions {
    * @return this instance
    */
   public AlterTableOptions renameColumn(String oldName, String newName) {
+    if (oldName.equalsIgnoreCase(Schema.getAutoIncrementingColumnName())) {
+      throw new IllegalArgumentException("Cannot rename auto-incrementing column " +
+          Schema.getAutoIncrementingColumnName());
+    }
     // For backwards compatibility, this uses the RENAME_COLUMN step type.
     AlterTableRequestPB.Step.Builder step = pb.addAlterSchemaStepsBuilder();
     step.setType(AlterTableRequestPB.StepType.RENAME_COLUMN);
@@ -166,6 +180,10 @@ public class AlterTableOptions {
    * @return this instance
    */
   public AlterTableOptions removeDefault(String name) {
+    if (name.equalsIgnoreCase(Schema.getAutoIncrementingColumnName())) {
+      throw new IllegalArgumentException("Auto-incrementing column " +
+          Schema.getAutoIncrementingColumnName() + " does not have default value");
+    }
     AlterTableRequestPB.Step.Builder step = pb.addAlterSchemaStepsBuilder();
     step.setType(AlterTableRequestPB.StepType.ALTER_COLUMN);
     AlterTableRequestPB.AlterColumn.Builder alterBuilder =
@@ -184,6 +202,10 @@ public class AlterTableOptions {
    * @return this instance
    */
   public AlterTableOptions changeDefault(String name, Object newDefault) {
+    if (name.equalsIgnoreCase(Schema.getAutoIncrementingColumnName())) {
+      throw new IllegalArgumentException("Cannot set default value for " +
+          "auto-incrementing column " + Schema.getAutoIncrementingColumnName());
+    }
     if (newDefault == null) {
       throw new IllegalArgumentException("newDefault cannot be null: " +
           "use removeDefault to clear a default value");
@@ -478,6 +500,28 @@ public class AlterTableOptions {
   }
 
   /**
+   * Change the immutable attribute for the column.
+   *
+   * @param name name of the column
+   * @param immutable the new immutable attribute for the column.
+   * @return this instance
+   */
+  public AlterTableOptions changeImmutable(String name, boolean immutable) {
+    if (name.equalsIgnoreCase(Schema.getAutoIncrementingColumnName())) {
+      throw new IllegalArgumentException("Cannot change immutable for " +
+          "auto-incrementing column " + Schema.getAutoIncrementingColumnName());
+    }
+    AlterTableRequestPB.Step.Builder step = pb.addAlterSchemaStepsBuilder();
+    step.setType(AlterTableRequestPB.StepType.ALTER_COLUMN);
+    AlterTableRequestPB.AlterColumn.Builder alterBuilder =
+            AlterTableRequestPB.AlterColumn.newBuilder();
+    alterBuilder.setDelta(
+            Common.ColumnSchemaDeltaPB.newBuilder().setName(name).setImmutable(immutable));
+    step.setAlterColumn(alterBuilder);
+    return this;
+  }
+
+  /**
    * Change the table's extra configuration properties.
    * These configuration properties will be merged into existing configuration properties.
    *
@@ -532,14 +576,30 @@ public class AlterTableOptions {
   }
 
   List<Integer> getRequiredFeatureFlags() {
-    if (!hasAddDropRangePartitions()) {
-      return ImmutableList.of();
+    boolean hasImmutables = false;
+    for (AlterTableRequestPB.Step.Builder step : pb.getAlterSchemaStepsBuilderList()) {
+      if ((step.getType() == AlterTableRequestPB.StepType.ADD_COLUMN &&
+           step.getAddColumn().getSchema().hasImmutable()) ||
+          (step.getType() == AlterTableRequestPB.StepType.ALTER_COLUMN &&
+           step.getAlterColumn().getDelta().hasImmutable())) {
+        hasImmutables = true;
+        break;
+      }
     }
-    if (!isAddingRangeWithCustomHashSchema) {
-      return ImmutableList.of(Master.MasterFeatures.RANGE_PARTITION_BOUNDS_VALUE);
+
+    List<Integer> requiredFeatureFlags = new ArrayList<>();
+    if (hasImmutables) {
+      requiredFeatureFlags.add(
+              Integer.valueOf(Master.MasterFeatures.IMMUTABLE_COLUMN_ATTRIBUTE_VALUE));
     }
-    return ImmutableList.of(
-        Master.MasterFeatures.RANGE_PARTITION_BOUNDS_VALUE,
-        Master.MasterFeatures.RANGE_SPECIFIC_HASH_SCHEMA_VALUE);
+
+    if (hasAddDropRangePartitions()) {
+      requiredFeatureFlags.add(Integer.valueOf(Master.MasterFeatures.RANGE_PARTITION_BOUNDS_VALUE));
+      if (isAddingRangeWithCustomHashSchema) {
+        requiredFeatureFlags.add(
+                Integer.valueOf(Master.MasterFeatures.RANGE_SPECIFIC_HASH_SCHEMA_VALUE));
+      }
+    }
+    return requiredFeatureFlags;
   }
 }

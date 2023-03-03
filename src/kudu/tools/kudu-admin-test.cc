@@ -16,7 +16,6 @@
 // under the License.
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
@@ -27,6 +26,7 @@
 #include <ostream>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -44,13 +44,18 @@
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/partition.h"
+#include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/quorum_util.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/split.h"
@@ -60,12 +65,17 @@
 #include "kudu/integration-tests/cluster_verifier.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/integration-tests/ts_itest-base.h"
+#include "kudu/master/catalog_manager.h"
+#include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
+#include "kudu/master/master_options.h"
 #include "kudu/master/sys_catalog.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tools/tool_test_util.h"
 #include "kudu/tserver/tablet_server-test-base.h"
+#include "kudu/util/cow_object.h"
 #include "kudu/util/env.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -75,12 +85,6 @@
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-
-namespace kudu {
-namespace tserver {
-class ListTabletsResponsePB;
-}  // namespace tserver
-}  // namespace kudu
 
 DECLARE_int32(num_replicas);
 DECLARE_int32(num_tablet_servers);
@@ -110,6 +114,7 @@ using kudu::consensus::OpId;
 using kudu::itest::FindTabletFollowers;
 using kudu::itest::FindTabletLeader;
 using kudu::itest::GetConsensusState;
+using kudu::itest::ListTablesWithInfo;
 using kudu::itest::StartElection;
 using kudu::itest::WaitUntilLeader;
 using kudu::itest::TabletServerMap;
@@ -118,13 +123,19 @@ using kudu::itest::WAIT_FOR_LEADER;
 using kudu::itest::WaitForReplicasReportedToMaster;
 using kudu::itest::WaitForServersToAgree;
 using kudu::itest::WaitUntilCommittedConfigNumVotersIs;
-using kudu::itest::WaitUntilCommittedOpIdIndexIs;
 using kudu::itest::WaitUntilTabletInState;
 using kudu::itest::WaitUntilTabletRunning;
+using kudu::master::Master;
+using kudu::master::MasterOptions;
+using kudu::master::SysCatalogTable;
+using kudu::master::TableInfo;
+using kudu::master::TableInfoLoader;
+using kudu::master::TableMetadataLock;
+using kudu::master::TabletInfo;
+using kudu::master::TabletInfoLoader;
+using kudu::master::TabletMetadataGroupLock;
 using kudu::master::VOTER_REPLICA;
 using kudu::pb_util::SecureDebugString;
-using kudu::tserver::ListTabletsResponsePB;
-using std::atomic;
 using std::back_inserter;
 using std::copy;
 using std::deque;
@@ -142,7 +153,13 @@ namespace kudu {
 
 namespace tools {
 
-  // Helper to format info when a tool action fails.
+namespace {
+Status NoOpCb() {
+  return Status::OK();
+}
+} // anonymous namespace
+
+// Helper to format info when a tool action fails.
 static string ToolRunInfo(const Status& s, const string& out, const string& err) {
   ostringstream str;
   str << s.ToString() << endl;
@@ -1340,6 +1357,81 @@ TEST_F(AdminCliTest, TestGracefulLeaderStepDown) {
   });
 }
 
+// Test current_leader_uuid flag used to transfer leadership from current node
+// 1. Elect a leader and transfer leadership to a new node.
+// 2. Input new node uuid as an argument to flag current_leader_uuid.
+// 3. Transfer the leadership from current leader to another node.
+// 4. Verify the new leader chosen is one of the two non-leader nodes.
+TEST_F(AdminCliTest, TestGracefulSpecificLeaderStepDown) {
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(10);
+  const vector<string> kMasterFlags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false",
+  };
+
+  // For deterministic control over manual leader selection
+  const vector<string> kTserverFlags = {
+    "--enable_leader_failure_detection=false",
+  };
+  FLAGS_num_tablet_servers = 3;
+  FLAGS_num_replicas = 3;
+  NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
+
+  // Wait for the tablet to be running.
+  vector<TServerDetails*> tservers;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ASSERT_EQ(FLAGS_num_tablet_servers, tservers.size());
+  for (auto& ts : tservers) {
+    ASSERT_OK(WaitUntilTabletRunning(ts, tablet_id_, kTimeout));
+  }
+
+  // Elect the leader and wait for the tservers and master to see the leader.
+  const auto* leader = tservers[0];
+  ASSERT_OK(StartElection(leader, tablet_id_, kTimeout));
+  ASSERT_OK(WaitForServersToAgree(kTimeout, tablet_servers_,
+                                  tablet_id_, /*minimum_index=*/1));
+  TServerDetails* master_observed_leader;
+  ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &master_observed_leader));
+  ASSERT_EQ(leader->uuid(), master_observed_leader->uuid());
+
+  const auto leader_uuid = leader->uuid();
+  string stderr;
+
+  // Ask the leader to transfer leadership and specify the current leader uuid.
+  // Use the leader elected above as current leader input, instead of relying on
+  // master configuration. This is to check whether user specified current
+  // leader uuid is ok to be used as input parameter for new leader election.
+  // Generally, we rely on master configuration to find that out. But for cases
+  // where master configuration is out of sync, user input parameter for
+  // current leader should work just as well.
+  Status s = RunKuduTool({
+    "tablet",
+    "leader_step_down",
+    Substitute("--current_leader_uuid=$0", leader_uuid),
+    cluster_->master()->bound_rpc_addr().ToString(),
+    tablet_id_
+  }, nullptr, &stderr);
+  ASSERT_OK(s);
+
+  // Eventually, a replica at other node should become a leader.
+  const std::unordered_set<string> possible_new_leaders = { tservers[1]->uuid(),
+                                                            tservers[2]->uuid() };
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &master_observed_leader));
+    ASSERT_TRUE(ContainsKey(possible_new_leaders, master_observed_leader->uuid()));
+  });
+
+  // Negative case: When current_leader_uuid belongs to a tablet server
+  // where a follower (and not a leader) replica is running.
+  s = RunKuduTool({
+    "tablet",
+    "leader_step_down",
+    Substitute("--current_leader_uuid=$0", leader_uuid),
+    cluster_->master()->bound_rpc_addr().ToString(),
+    tablet_id_
+  }, nullptr, &stderr);
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
+}
+
 // Leader should reject requests to transfer leadership to a non-member of the
 // config.
 TEST_F(AdminCliTest, TestLeaderTransferToEvictedPeer) {
@@ -1643,25 +1735,108 @@ TEST_F(AdminCliTest, TestDeleteTable) {
   ASSERT_TRUE(tables.empty());
 }
 
-TEST_F(AdminCliTest, TestListTables) {
+TEST_F(AdminCliTest, TestListSoftDeletedTables) {
+  FLAGS_num_tablet_servers = 1;
+  FLAGS_num_replicas = 1;
+
+  NO_FATALS(BuildAndStart());
+
+  {
+    string stdout;
+    string stderr;
+    Status s = RunKuduTool({
+      "table",
+      "list",
+      cluster_->master()->bound_rpc_addr().ToString(),
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+    ASSERT_STR_CONTAINS(stdout, kTableId);
+  }
+
+  {
+    string stdout;
+    ASSERT_OK(RunKuduTool({
+      "table",
+      "list",
+      "-soft_deleted_only=true",
+      cluster_->master()->bound_rpc_addr().ToString()
+    }, &stdout));
+
+    vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
+    ASSERT_EQ(1, stdout_lines.size());
+    ASSERT_EQ("\n", stdout_lines[0]);
+
+    ASSERT_OK(RunKuduTool({
+      "table",
+      "delete",
+      "--reserve_seconds=300",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      kTableId
+    }, &stdout));
+
+    stdout.clear();
+    string stderr;
+    Status s = RunKuduTool({
+      "table",
+      "list",
+      "-soft_deleted_only=true",
+      cluster_->master()->bound_rpc_addr().ToString(),
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+    ASSERT_STR_CONTAINS(stdout, kTableId);
+  }
+}
+
+static vector<string> TableListFormat() {
+  return { "pretty", "json", "json_compact" };
+}
+
+class ListTableCliSimpleParamTest :
+    public AdminCliTest,
+    public ::testing::WithParamInterface<string> {
+};
+
+INSTANTIATE_TEST_SUITE_P(, ListTableCliSimpleParamTest,
+                         ::testing::ValuesIn(TableListFormat()));
+
+TEST_P(ListTableCliSimpleParamTest, TestListTables) {
   FLAGS_num_tablet_servers = 1;
   FLAGS_num_replicas = 1;
 
   NO_FATALS(BuildAndStart());
 
   string stdout;
-  ASSERT_OK(RunKuduTool({
+  string stderr;
+  Status s = RunKuduTool({
     "table",
     "list",
-    cluster_->master()->bound_rpc_addr().ToString()
-  }, &stdout));
+    Substitute("--list_table_output_format=$0", GetParam()),
+    cluster_->master()->bound_rpc_addr().ToString(),
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
 
-  vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
-  ASSERT_EQ(1, stdout_lines.size());
-  ASSERT_EQ(Substitute("$0\n", kTableId), stdout_lines[0]);
+  if (GetParam() == "pretty") {
+    vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
+    ASSERT_EQ(1, stdout_lines.size());
+    ASSERT_STR_CONTAINS(stdout, Substitute("$0\n", kTableId));
+  } else if (GetParam() == "json") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\": \"$0\"", kTableId));
+  } else if (GetParam() == "json_compact") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\":\"$0\"", kTableId));
+  } else {
+    FAIL() << "unexpected table list format" << GetParam();
+  }
 }
 
-TEST_F(AdminCliTest, TestListTablesDetail) {
+class ListTableCliDetailParamTest :
+    public AdminCliTest,
+    public ::testing::WithParamInterface<string> {
+};
+
+INSTANTIATE_TEST_SUITE_P(, ListTableCliDetailParamTest,
+                         ::testing::ValuesIn(TableListFormat()));
+
+TEST_P(ListTableCliDetailParamTest, TestListTablesDetail) {
   FLAGS_num_tablet_servers = 3;
   FLAGS_num_replicas = 3;
 
@@ -1685,25 +1860,53 @@ TEST_F(AdminCliTest, TestListTablesDetail) {
                        MonoDelta::FromSeconds(30), &tablet_ids);
 
   string stdout;
-  ASSERT_OK(RunKuduTool({
+  string stderr;
+  Status s = RunKuduTool({
     "table",
     "list",
     "--list_tablets",
-    cluster_->master()->bound_rpc_addr().ToString()
-  }, &stdout));
+    Substitute("--list_table_output_format=$0", GetParam()),
+    cluster_->master()->bound_rpc_addr().ToString(),
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
 
-  vector<string> stdout_lines = Split(stdout, "\n", strings::SkipEmpty());
+  if (GetParam() == "pretty") {
+    vector<string> stdout_lines = Split(stdout, "\n", strings::SkipEmpty());
 
-  // Verify multiple tables along with their tablets and replica-uuids.
-  ASSERT_EQ(10, stdout_lines.size());
-  ASSERT_STR_CONTAINS(stdout, kTableId);
-  ASSERT_STR_CONTAINS(stdout, kAnotherTableId);
-  ASSERT_STR_CONTAINS(stdout, tablet_ids.front());
-  ASSERT_STR_CONTAINS(stdout, tablet_ids.back());
+    // Verify multiple tables along with their tablets and replica-uuids.
+    ASSERT_STR_CONTAINS(stdout, kTableId);
+    ASSERT_STR_CONTAINS(stdout, kAnotherTableId);
+    ASSERT_STR_CONTAINS(stdout, tablet_ids.front());
+    ASSERT_STR_CONTAINS(stdout, tablet_ids.back());
 
-  for (auto& ts : tservers) {
-    ASSERT_STR_CONTAINS(stdout, ts->uuid());
-    ASSERT_STR_CONTAINS(stdout, ts->uuid());
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, ts->uuid());
+      ASSERT_STR_CONTAINS(stdout, ts->uuid());
+    }
+  } else if (GetParam() == "json") {
+    // The 'json' format output should contain the table id for the table.
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\": \"$0\"", kTableId));
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\": \"$0\"", kAnotherTableId));
+    for (auto& tablet_id : tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"tablet_id\": \"$0\"", tablet_id));
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"uuid\": \"$0\"", ts->uuid()));
+    }
+  } else if (GetParam() == "json_compact") {
+    // The 'json_compact' format output should contain the table id for the table.
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\":\"$0\"", kTableId));
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\":\"$0\"", kAnotherTableId));
+    for (auto& tablet_id : tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"tablet_id\":\"$0\"", tablet_id));
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"uuid\":\"$0\"", ts->uuid()));
+    }
+  } else {
+    FAIL() << "unexpected table list format" << GetParam();
   }
 }
 
@@ -1785,7 +1988,8 @@ TEST_F(AdminCliTest, TestDescribeTable) {
     builder.AddColumn("date_val")->Type(KuduColumnSchema::DATE);
     builder.AddColumn("string_val")->Type(KuduColumnSchema::STRING)
       ->Encoding(KuduColumnStorageAttributes::EncodingType::PREFIX_ENCODING)
-      ->Default(KuduValue::CopyString(Slice("hello")));
+      ->Default(KuduValue::CopyString(Slice("hello")))
+      ->Comment("comment for hello");
     builder.AddColumn("bool_val")->Type(KuduColumnSchema::BOOL)
       ->Default(KuduValue::FromBool(false));
     builder.AddColumn("float_val")->Type(KuduColumnSchema::FLOAT);
@@ -1873,7 +2077,8 @@ TEST_F(AdminCliTest, TestDescribeTable) {
     "describe",
     cluster_->master()->bound_rpc_addr().ToString(),
     kAnotherTableId,
-    "-show_attributes=true"
+    "-show_attributes=true",
+    "-show_column_comment=true"
   }, &stdout, &stderr);
   ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
 
@@ -1890,7 +2095,8 @@ TEST_F(AdminCliTest, TestDescribeTable) {
       "    int64_val INT64 NULLABLE AUTO_ENCODING ZLIB 123 123,\n"
       "    timestamp_val UNIXTIME_MICROS NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
       "    date_val DATE NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
-      "    string_val STRING NULLABLE PREFIX_ENCODING DEFAULT_COMPRESSION \"hello\" \"hello\",\n"
+      "    string_val STRING NULLABLE PREFIX_ENCODING DEFAULT_COMPRESSION \"hello\" \"hello\" "
+      "comment for hello,\n"
       "    bool_val BOOL NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION false false,\n"
       "    float_val FLOAT NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
       "    double_val DOUBLE NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION 123.4 123.4,\n"
@@ -2040,6 +2246,77 @@ TEST_F(AdminCliTest, TestDescribeTable) {
   );
 }
 
+// Simple tests to check whether the column describing flags
+// work, alone and together as well.
+TEST_F(AdminCliTest, TestDescribeTableColumnFlags) {
+
+  NO_FATALS(BuildAndStart());
+  string stdout;
+  const string kTableName = "TestAnotherTable";
+
+  {
+    // Build the schema
+    KuduSchema schema;
+    KuduSchemaBuilder builder;
+    builder.AddColumn("foo")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("bar")->Type(KuduColumnSchema::INT32)->NotNull()
+        ->Comment("comment for bar");
+    builder.SetPrimaryKey({"foo"});
+    ASSERT_OK(builder.Build(&schema));
+
+    // Create the table
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    ASSERT_OK(table_creator->table_name(kTableName)
+                  .schema(&schema)
+                  .set_range_partition_columns({"foo"})
+                  .Create());
+  }
+
+  // Test the describe output with flags
+  ASSERT_OK(RunKuduTool({"table",
+                         "describe",
+                         cluster_->master()->bound_rpc_addr().ToString(),
+                         kTableName,
+                         "-show_column_comment"},
+                        &stdout));
+  ASSERT_STR_CONTAINS(stdout,
+                      "(\n"
+                      "    foo INT32 NOT NULL,\n"
+                      "    bar INT32 NOT NULL comment for bar,\n"
+                      "    PRIMARY KEY (foo)\n"
+                      ")\n");
+  stdout.clear();
+
+  ASSERT_OK(RunKuduTool({"table",
+                         "describe",
+                         cluster_->master()->bound_rpc_addr().ToString(),
+                         kTableName,
+                         "-show_attributes"},
+                        &stdout));
+  ASSERT_STR_CONTAINS(stdout,
+                      "(\n"
+                      "    foo INT32 NOT NULL AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
+                      "    bar INT32 NOT NULL AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
+                      "    PRIMARY KEY (foo)\n"
+                      ")\n");
+  stdout.clear();
+
+  ASSERT_OK(RunKuduTool({"table",
+                         "describe",
+                         cluster_->master()->bound_rpc_addr().ToString(),
+                         kTableName,
+                         "-show_attributes",
+                         "-show_column_comment"},
+                        &stdout));
+  ASSERT_STR_CONTAINS(
+      stdout,
+      "(\n"
+      "    foo INT32 NOT NULL AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
+      "    bar INT32 NOT NULL AUTO_ENCODING DEFAULT_COMPRESSION - - comment for bar,\n"
+      "    PRIMARY KEY (foo)\n"
+      ")\n");
+}
+
 TEST_F(AdminCliTest, TestDescribeTableNoOwner) {
   NO_FATALS(BuildAndStart({}, {"--allow_empty_owner=true"}));
   KuduSchema schema;
@@ -2125,6 +2402,170 @@ TEST_F(AdminCliTest, TestDescribeTableCustomHashSchema) {
       &stdout));
   ASSERT_STR_CONTAINS(stdout, "PARTITION 0 <= VALUES < 100 HASH(key_hash1) PARTITIONS 3,\n"
                               "    PARTITION 100 <= VALUES < 200");
+}
+
+class ListTableCliParamTest :
+    public AdminCliTest,
+    public ::testing::WithParamInterface<tuple<bool /* show_tablet_partition_info*/,
+                                               bool /* show_hash_partition_info*/,
+                                               string /* output format*/>> {
+};
+
+INSTANTIATE_TEST_SUITE_P(, ListTableCliParamTest,
+    ::testing::Combine(::testing::Bool(),
+                       ::testing::Bool(),
+                       ::testing::ValuesIn(TableListFormat())));
+
+// Basic test that the kudu tool works in the list tablets case.
+TEST_P(ListTableCliParamTest, ListTabletWithPartitionInfo) {
+  const auto show_tp = std::get<0>(GetParam()) ? PartitionSchema::HashPartitionInfo::SHOW :
+      PartitionSchema::HashPartitionInfo::HIDE;
+  const auto show_hp = std::get<1>(GetParam()) ? PartitionSchema::HashPartitionInfo::SHOW :
+      PartitionSchema::HashPartitionInfo::HIDE;
+  const auto kTimeout = MonoDelta::FromSeconds(30);
+
+  // This combination of parameters does not meet expectations.
+  if (show_tp == PartitionSchema::HashPartitionInfo::HIDE &&
+      show_hp == PartitionSchema::HashPartitionInfo::SHOW) {
+    return;
+  }
+
+  FLAGS_num_tablet_servers = 1;
+  FLAGS_num_replicas = 1;
+
+  NO_FATALS(BuildAndStart());
+
+  vector<TServerDetails*> tservers;
+  vector<string> base_tablet_ids;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ListRunningTabletIds(tservers.front(), kTimeout, &base_tablet_ids);
+
+  // Test a table with all types in its schema, multiple hash partitioning
+  // levels, multiple range partitions, and non-covered ranges.
+  constexpr const char* const kTableName = "TestTableListPartition";
+  KuduSchema schema;
+
+  // Build the schema.
+  {
+    KuduSchemaBuilder builder;
+    builder.AddColumn("key_hash0")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_hash1")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_hash2")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_range")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.SetPrimaryKey({ "key_hash0", "key_hash1", "key_hash2", "key_range" });
+    ASSERT_OK(builder.Build(&schema));
+  }
+
+  // Set up partitioning and create the table.
+  {
+    unique_ptr<KuduPartialRow> lower_bound0(schema.NewRow());
+    ASSERT_OK(lower_bound0->SetInt32("key_range", 0));
+    unique_ptr<KuduPartialRow> upper_bound0(schema.NewRow());
+    ASSERT_OK(upper_bound0->SetInt32("key_range", 1));
+    unique_ptr<KuduPartialRow> lower_bound1(schema.NewRow());
+    ASSERT_OK(lower_bound1->SetInt32("key_range", 2));
+    unique_ptr<KuduPartialRow> upper_bound1(schema.NewRow());
+    ASSERT_OK(upper_bound1->SetInt32("key_range", 3));
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    ASSERT_OK(table_creator->table_name(kTableName)
+        .schema(&schema)
+        .add_hash_partitions({"key_hash0"}, 2)
+        .add_hash_partitions({"key_hash1", "key_hash2"}, 3)
+        .set_range_partition_columns({"key_range"})
+        .add_range_partition(lower_bound0.release(), upper_bound0.release())
+        .add_range_partition(lower_bound1.release(), upper_bound1.release())
+        .num_replicas(FLAGS_num_replicas)
+        .Create());
+  }
+
+  vector<string> new_tablet_ids;
+  ListRunningTabletIds(tservers.front(), kTimeout, &new_tablet_ids);
+  vector<string> delta_tablet_ids;
+  for (auto& tablet_id : base_tablet_ids) {
+    if (std::find(new_tablet_ids.begin(), new_tablet_ids.end(), tablet_id) ==
+        new_tablet_ids.end()) {
+      delta_tablet_ids.push_back(tablet_id);
+    }
+  }
+
+  // Test the list tablet with partition output.
+  string stdout;
+  string stderr;
+  Status s = RunKuduTool({
+    "table",
+    "list",
+    "--list_tablets",
+    Substitute("--show_tablet_partition_info=$0", std::get<0>(GetParam())),
+    Substitute("--show_hash_partition_info=$0", std::get<1>(GetParam())),
+    Substitute("--list_table_output_format=$0", std::get<2>(GetParam())),
+    "--tables",
+    kTableName,
+    cluster_->master()->bound_rpc_addr().ToString(),
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+
+  client::sp::shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  const auto& partition_schema = table->partition_schema();
+  const auto& schema_internal = KuduSchema::ToSchema(table->schema());
+
+  // make sure table name correct
+  ASSERT_STR_CONTAINS(stdout, kTableName);
+
+  master::ListTablesResponsePB tables_info;
+  ASSERT_OK(ListTablesWithInfo(
+      cluster_->master_proxy(), kTableName, kTimeout, &tables_info));
+  for (const auto& table : tables_info.tables()) {
+    for (const auto& pt : table.tablet_with_partition()) {
+      Partition partition;
+      Partition::FromPB(pt.partition(), &partition);
+      string partition_str;
+      if (show_tp) {
+        partition_str = " : " + partition_schema.PartitionDebugString(partition,
+                                                                      schema_internal,
+                                                                      show_hp);
+      }
+      string tablet_with_partition = pt.tablet_id() + partition_str;
+      if (std::get<2>(GetParam()) == "pretty") {
+        ASSERT_STR_CONTAINS(stdout, tablet_with_partition);
+      }
+    }
+  }
+
+  if (std::get<2>(GetParam()) == "pretty") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("$0", kTableName));
+
+    for (auto& tablet_id : delta_tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, tablet_id);
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, ts->uuid());
+      ASSERT_STR_CONTAINS(stdout, ts->uuid());
+    }
+  } else if (std::get<2>(GetParam()) == "json") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\": \"$0\"", kTableName));
+
+    for (auto& tablet_id : delta_tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"tablet_id\": \"$0\"", tablet_id));
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"uuid\": \"$0\"", ts->uuid()));
+    }
+  } else if (std::get<2>(GetParam()) == "json_compact") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\":\"$0\"", kTableName));
+
+    for (auto& tablet_id : delta_tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"tablet_id\":\"$0\"", tablet_id));
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"uuid\":\"$0\"", ts->uuid()));
+    }
+  } else {
+    FAIL() << "unexpected table list format" << std::get<2>(GetParam());
+  }
 }
 
 TEST_F(AdminCliTest, TestLocateRow) {
@@ -3252,7 +3693,10 @@ constexpr const char* kPrincipal = "oryx";
 
 vector<string> RebuildMasterCmd(const ExternalMiniCluster& cluster,
                                 int tserver_num,
-                                bool is_secure, bool log_to_stderr = false) {
+                                bool is_secure,
+                                bool log_to_stderr = false,
+                                const string& tables = "",
+                                const int& default_replica_num = 1) {
   CHECK_GT(tserver_num, 0);
   CHECK_LE(tserver_num, cluster.num_tablet_servers());
   vector<string> command = {
@@ -3263,6 +3707,9 @@ vector<string> RebuildMasterCmd(const ExternalMiniCluster& cluster,
     "-fs_wal_dir",
     cluster.master()->wal_dir(),
   };
+  if (!tables.empty()) {
+    command.emplace_back(Substitute("-tables=$0", tables));
+  }
   if (Env::Default()->IsEncryptionEnabled()) {
     command.emplace_back("--encrypt_data_at_rest=true");
   }
@@ -3276,6 +3723,7 @@ vector<string> RebuildMasterCmd(const ExternalMiniCluster& cluster,
     auto* ts = cluster.tablet_server(i);
     command.emplace_back(ts->bound_rpc_hostport().ToString());
   }
+  command.emplace_back(Substitute("--default_num_replicas=$0", default_replica_num));
   return command;
 }
 
@@ -3321,6 +3769,118 @@ TEST_F(AdminCliTest, TestRebuildMasterWhenNonEmpty) {
   ASSERT_STR_CONTAINS(stdout,
                       "Rebuilt from 3 tablet servers, of which 0 had errors");
   ASSERT_STR_CONTAINS(stdout, "Rebuilt from 1 replicas, of which 0 had errors");
+}
+
+void delete_table_in_syscatalog(const string& wal_dir,
+                                const std::vector<std::string>& data_dirs,
+                                const string& del_table_name) {
+  MasterOptions opts;
+  opts.fs_opts.wal_root = wal_dir;
+  opts.fs_opts.data_roots = data_dirs;
+  Master master(opts);
+  ASSERT_OK(master.Init());
+  SysCatalogTable sys_catalog(&master, &NoOpCb);
+  ASSERT_OK(sys_catalog.Load(master.fs_manager()));
+  // Get table from sys_catalog.
+  const auto kLeaderTimeout = MonoDelta::FromSeconds(10);
+  ASSERT_OK(sys_catalog.tablet_replica()->consensus()->WaitUntilLeader(kLeaderTimeout));
+  TableInfoLoader table_info_loader;
+  sys_catalog.VisitTables(&table_info_loader);
+  scoped_refptr<TableInfo> table_info;
+  for (const auto& table : table_info_loader.tables) {
+    table->metadata().ReadLock();
+    string table_name = table->metadata().state().name();
+    table->metadata().ReadUnlock();
+    if (table_name == del_table_name) {
+      table_info = table;
+      break;
+    }
+  }
+  ASSERT_NE(nullptr, table_info);
+
+  // Get tablet from sys_catalog.
+  TabletInfoLoader tablet_info_loader;
+  sys_catalog.VisitTablets(&tablet_info_loader);
+  vector<scoped_refptr<TabletInfo>> tablets;
+  for (const auto& tablet : tablet_info_loader.tablets) {
+    tablet->metadata().ReadLock();
+    if (tablet->metadata().state().pb.table_id() == table_info->id())
+      tablets.push_back(tablet);
+    tablet->metadata().ReadUnlock();
+  }
+  ASSERT_GT(tablets.size(), 0);
+
+  // Delete one table and it's tablets.
+  TableMetadataLock l_table(table_info.get(), LockMode::WRITE);
+  TabletMetadataGroupLock l_tablets(LockMode::RELEASED);
+  l_tablets.AddMutableInfos(tablets);
+  l_tablets.Lock(LockMode::WRITE);
+  SysCatalogTable::Actions actions;
+  actions.table_to_delete = table_info;
+  actions.tablets_to_delete = tablets;
+  ASSERT_OK(sys_catalog.Write(actions));
+
+  NO_FATALS(sys_catalog.Shutdown());
+  NO_FATALS(master.Shutdown());
+}
+
+// Rebuild tables according to part of tables not all tables.
+TEST_F(AdminCliTest, TestRebuildTables) {
+  FLAGS_num_tablet_servers = 3;
+  NO_FATALS(BuildAndStart({}, {}, {}, /*create_table*/false));
+  // Create 3 tables.
+  constexpr const char* kTable1 = "TestTable";
+  NO_FATALS(MakeTestTable(kTable1, /*num_rows*/10, /*num_replicas*/1, cluster_.get()));
+  constexpr const char* kTable2 = "TestTable1";
+  NO_FATALS(MakeTestTable(kTable2, /*num_rows*/10, /*num_replicas*/1, cluster_.get()));
+  constexpr const char* kTable3 = "TestTable2";
+  NO_FATALS(MakeTestTable(kTable3, /*num_rows*/10, /*num_replicas*/1, cluster_.get()));
+
+  const string& part_tables = Substitute("$0,$1", kTable1, kTable2);
+  NO_FATALS(cluster_->master()->Shutdown());
+
+  string stdout1;
+  string stderr1;
+  // Rebuild 2 tables in update mode.
+  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, FLAGS_num_tablet_servers,
+                                         /*is_secure*/false, /*log_to_stderr*/true,
+                                         part_tables, /*default_replica_num*/1),
+                        &stdout1, &stderr1));
+  ASSERT_STR_CONTAINS(stdout1,
+                      "Rebuilt from 3 tablet servers, of which 0 had errors");
+  ASSERT_STR_CONTAINS(stdout1, "Rebuilt from 2 replicas, of which 0 had errors");
+  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+    cluster_->tablet_server(i)->Shutdown();
+  }
+  // Restart the cluster to check cluster healthy.
+  cluster_->Restart();
+  WaitForTSAndReplicas();
+  ClusterVerifier cv1(cluster_.get());
+  NO_FATALS(cv1.CheckCluster());
+
+  NO_FATALS(cluster_->master()->Shutdown());
+  // Delete kTable1 in syscatalog.
+  delete_table_in_syscatalog(cluster_->master()->wal_dir(),
+                            cluster_->master()->data_dirs(),
+                            kTable1);
+  string stdout2;
+  string stderr2;
+  // Rebuild kTable1 in add mode.
+  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, FLAGS_num_tablet_servers,
+                                         /*is_secure*/false, /*log_to_stderr*/true, kTable1),
+                        &stdout2, &stderr2));
+  ASSERT_STR_NOT_CONTAINS(stderr2, "must be empty");
+  ASSERT_STR_CONTAINS(stdout2,
+                      "Rebuilt from 3 tablet servers, of which 0 had errors");
+  ASSERT_STR_CONTAINS(stdout2, "Rebuilt from 1 replicas, of which 0 had errors");
+  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+    cluster_->tablet_server(i)->Shutdown();
+  }
+  // Restart the cluster to check cluster healthy.
+  cluster_->Restart();
+  WaitForTSAndReplicas();
+  ClusterVerifier cv2(cluster_.get());
+  NO_FATALS(cv2.CheckCluster());
 }
 
 // Test that the master rebuilder ignores tombstones.
@@ -3420,7 +3980,8 @@ TEST_F(AdminCliTest, TestAddColumnsAndRebuildMaster) {
   // The tool will firstly use schema on tserver-0 which holds an outdated schema, then
   // use the newer schema on tserver-1 to rebuild master.
   string stdout;
-  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, 2, /*is_secure*/false, /*log_to_stderr*/true),
+  ASSERT_OK(RunKuduTool(RebuildMasterCmd(*cluster_, 2,
+                        /*is_secure*/false, /*log_to_stderr*/true, "", 3),
                         &stdout));
   ASSERT_STR_CONTAINS(stdout, "Rebuilt from 2 tablet servers, of which 0 had errors");
   ASSERT_STR_CONTAINS(stdout, "Rebuilt from 2 replicas, of which 0 had errors");
@@ -3464,12 +4025,9 @@ TEST_F(AdminCliTest, TestAddColumnsAndRebuildMaster) {
     KuduSchema schema;
     ASSERT_OK(client_->GetTableSchema(kTableId, &schema));
     ASSERT_EQ(6, schema.num_columns());
-    // Here we use the first column to initialize an object of KuduColumnSchema
-    // for there is no default constructor for it.
-    KuduColumnSchema col_schema = schema.Column(0);
-    ASSERT_TRUE(schema.HasColumn("old_column_0", &col_schema));
-    ASSERT_TRUE(schema.HasColumn("old_column_1", &col_schema));
-    ASSERT_TRUE(schema.HasColumn("new_column_0", &col_schema));
+    ASSERT_TRUE(schema.HasColumn("old_column_0", nullptr));
+    ASSERT_TRUE(schema.HasColumn("old_column_1", nullptr));
+    ASSERT_TRUE(schema.HasColumn("new_column_0", nullptr));
 
     client::sp::shared_ptr<KuduTable> table;
     ASSERT_OK(client_->OpenTable(kTableId, &table));

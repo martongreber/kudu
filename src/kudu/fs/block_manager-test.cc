@@ -26,6 +26,7 @@
 #include <ostream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -112,7 +113,7 @@ template<>
 string block_manager_type<FileBlockManager>() { return "file"; }
 
 template<>
-string block_manager_type<LogBlockManager>() { return "log"; }
+string block_manager_type<LogBlockManagerNativeMeta>() { return "log"; }
 
 template <typename T>
 class BlockManagerTest : public KuduTest {
@@ -126,10 +127,10 @@ class BlockManagerTest : public KuduTest {
     CHECK_OK(file_cache_.Init());
   }
 
-  virtual void SetUp() override {
+  void SetUp() override {
     // Pass in a report to prevent the block manager from logging unnecessarily.
     FsReport report;
-    ASSERT_OK(bm_->Open(&report));
+    ASSERT_OK(bm_->Open(&report, nullptr, nullptr));
     ASSERT_OK(dd_manager_->CreateDataDirGroup(test_tablet_name_));
     ASSERT_OK(dd_manager_->GetDataDirGroupPB(test_tablet_name_, &test_group_pb_));
   }
@@ -190,7 +191,7 @@ class BlockManagerTest : public KuduTest {
           env_, paths, opts, &dd_manager_));
     }
     bm_.reset(CreateBlockManager(metric_entity, parent_mem_tracker));
-    RETURN_NOT_OK(bm_->Open(nullptr));
+    RETURN_NOT_OK(bm_->Open(nullptr, nullptr, nullptr));
 
     // Certain tests may maintain their own directory groups, in which case
     // the default test group should not be used.
@@ -229,6 +230,10 @@ class BlockManagerTest : public KuduTest {
         });
   }
 
+  ~BlockManagerTest() override {
+    dd_manager_->WaitOnClosures();
+  }
+
   // Keep an internal copy of the data dir group to act as metadata.
   DataDirGroupPB test_group_pb_;
   string test_tablet_name_;
@@ -240,11 +245,11 @@ class BlockManagerTest : public KuduTest {
 };
 
 template <>
-void BlockManagerTest<LogBlockManager>::SetUp() {
+void BlockManagerTest<LogBlockManagerNativeMeta>::SetUp() {
   RETURN_NOT_LOG_BLOCK_MANAGER();
   // Pass in a report to prevent the block manager from logging unnecessarily.
   FsReport report;
-  ASSERT_OK(bm_->Open(&report));
+  ASSERT_OK(bm_->Open(&report, nullptr, nullptr));
   ASSERT_OK(dd_manager_->CreateDataDirGroup(test_tablet_name_));
 
   // Store the DataDirGroupPB for tests that reopen the block manager.
@@ -284,7 +289,8 @@ void BlockManagerTest<FileBlockManager>::RunBlockDistributionTest(const vector<s
 }
 
 template <>
-void BlockManagerTest<LogBlockManager>::RunBlockDistributionTest(const vector<string>& paths) {
+void BlockManagerTest<LogBlockManagerNativeMeta>::RunBlockDistributionTest(
+    const vector<string>& paths) {
   vector<int> files_in_each_path(paths.size());
   int num_blocks_per_dir = 30;
   // Spread across 1, then 3, then 5 data directories.
@@ -363,7 +369,7 @@ void BlockManagerTest<FileBlockManager>::RunMultipathTest(const vector<string>& 
 }
 
 template <>
-void BlockManagerTest<LogBlockManager>::RunMultipathTest(const vector<string>& paths) {
+void BlockManagerTest<LogBlockManagerNativeMeta>::RunMultipathTest(const vector<string>& paths) {
   // Write (3 * numPaths * 2) blocks, in groups of (numPaths * 2). That should
   // yield two containers per path.
   CreateBlockOptions opts({ "multipath_test" });
@@ -413,7 +419,7 @@ void BlockManagerTest<FileBlockManager>::RunMemTrackerTest() {
 }
 
 template <>
-void BlockManagerTest<LogBlockManager>::RunMemTrackerTest() {
+void BlockManagerTest<LogBlockManagerNativeMeta>::RunMemTrackerTest() {
   shared_ptr<MemTracker> tracker = MemTracker::CreateTracker(-1, "test tracker");
   ASSERT_OK(ReopenBlockManager(scoped_refptr<MetricEntity>(),
                                tracker,
@@ -433,7 +439,7 @@ void BlockManagerTest<LogBlockManager>::RunMemTrackerTest() {
 
 // What kinds of BlockManagers are supported?
 #if defined(__linux__)
-typedef ::testing::Types<FileBlockManager, LogBlockManager> BlockManagers;
+typedef ::testing::Types<FileBlockManager, LogBlockManagerNativeMeta> BlockManagers;
 #else
 typedef ::testing::Types<FileBlockManager> BlockManagers;
 #endif
@@ -745,7 +751,7 @@ TYPED_TEST(BlockManagerTest, PersistenceTest) {
   unique_ptr<BlockManager> new_bm(this->CreateBlockManager(
       scoped_refptr<MetricEntity>(),
       MemTracker::CreateTracker(-1, "other tracker")));
-  ASSERT_OK(new_bm->Open(nullptr));
+  ASSERT_OK(new_bm->Open(nullptr, nullptr, nullptr));
 
   // Test that the state of all three blocks is properly reflected.
   unique_ptr<ReadableBlock> read_block;

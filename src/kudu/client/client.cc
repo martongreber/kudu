@@ -52,6 +52,7 @@
 #include "kudu/client/scan_predicate-internal.h"
 #include "kudu/client/scan_token-internal.h"
 #include "kudu/client/scanner-internal.h"
+#include "kudu/client/schema-internal.h"
 #include "kudu/client/session-internal.h"
 #include "kudu/client/table-internal.h"
 #include "kudu/client/table_alterer-internal.h"
@@ -83,7 +84,6 @@
 #include "kudu/master/master.proxy.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/request_tracker.h"
-#include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/sasl_common.h"
@@ -92,7 +92,7 @@
 #include "kudu/security/tls_context.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/tserver/tserver.pb.h"
-#include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/tserver/tserver_service.proxy.h" // IWYU pragma: keep
 #include "kudu/util/async_util.h"
 #include "kudu/util/debug-util.h"
 #include "kudu/util/init.h"
@@ -351,6 +351,9 @@ Status ImportAuthnCreds(const string& authn_creds,
     }
     messenger->set_authn_token(tok);
   }
+  if (pb.has_jwt()) {
+    messenger->set_jwt(pb.jwt());
+  }
   if (pb.has_real_user()) {
     user_credentials->set_real_user(pb.real_user());
   }
@@ -511,13 +514,29 @@ Status KuduClient::IsCreateTableInProgress(const string& table_name,
 }
 
 Status KuduClient::DeleteTable(const string& table_name) {
+  // The default param 'reserve_seconds' not be set means the behavior of DeleteRPC is
+  // controlled by the 'default_deleted_table_reserve_seconds' flag.
   return DeleteTableInCatalogs(table_name, true);
 }
 
+Status KuduClient::SoftDeleteTable(const string& table_name,
+                                   uint32_t reserve_seconds) {
+  return DeleteTableInCatalogs(table_name, true, reserve_seconds);
+}
+
 Status KuduClient::DeleteTableInCatalogs(const string& table_name,
-                                         bool modify_external_catalogs) {
+                                         bool modify_external_catalogs,
+                                         int32_t reserve_seconds) {
   MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
-  return data_->DeleteTable(this, table_name, deadline, modify_external_catalogs);
+  std::optional<uint32_t> reserve_time = reserve_seconds >= 0 ?
+      std::make_optional(reserve_seconds) : std::nullopt;
+  return  KuduClient::Data::DeleteTable(this, table_name, deadline, modify_external_catalogs,
+                                        reserve_time);
+}
+
+Status KuduClient::RecallTable(const string& table_id, const string& new_table_name) {
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
+  return KuduClient::Data::RecallTable(this, table_id, deadline, new_table_name);
 }
 
 KuduTableAlterer* KuduClient::NewTableAlterer(const string& table_name) {
@@ -567,9 +586,22 @@ Status KuduClient::ListTabletServers(vector<KuduTabletServer*>* tablet_servers) 
 }
 
 Status KuduClient::ListTables(vector<string>* tables, const string& filter) {
-  tables->clear();
   vector<Data::TableInfo> tables_info;
-  RETURN_NOT_OK(data_->ListTablesWithInfo(this, &tables_info, filter));
+  RETURN_NOT_OK(data_->ListTablesWithInfo(this, &tables_info, filter, false));
+  tables->clear();
+  tables->reserve(tables_info.size());
+  for (auto& info : tables_info) {
+    tables->emplace_back(std::move(info.table_name));
+  }
+  return Status::OK();
+}
+
+Status KuduClient::ListSoftDeletedTables(vector<string>* tables, const string& filter) {
+  vector<Data::TableInfo> tables_info;
+  RETURN_NOT_OK(data_->ListTablesWithInfo(this, &tables_info, filter,
+      /*list_tablet_with_partition=*/ true, /*show_soft_deleted=*/ true));
+  tables->clear();
+  tables->reserve(tables_info.size());
   for (auto& info : tables_info) {
     tables->emplace_back(std::move(info.table_name));
   }
@@ -745,6 +777,10 @@ Status KuduClient::ExportAuthenticationCredentials(string* authn_creds) const {
 
   if (auto tok = data_->messenger_->authn_token(); tok) {
     pb.mutable_authn_token()->CopyFrom(*tok);
+  }
+  auto jwt = data_->messenger_->jwt();
+  if (jwt) {
+    pb.mutable_jwt()->CopyFrom(*jwt);
   }
   pb.set_real_user(data_->user_credentials_.real_user());
 
@@ -1017,6 +1053,15 @@ Status KuduTableCreator::Create() {
     }
   }
 
+  bool has_immutable_column_schema = false;
+  for (size_t i = 0; i < data_->schema_->num_columns(); i++) {
+    const auto& col_schema = data_->schema_->Column(i);
+    if (col_schema.is_immutable()) {
+      has_immutable_column_schema = true;
+      break;
+    }
+  }
+
   if (data_->table_type_) {
     req.set_table_type(*data_->table_type_);
   }
@@ -1035,7 +1080,8 @@ Status KuduTableCreator::Create() {
                                          &resp,
                                          deadline,
                                          !data_->range_partitions_.empty(),
-                                         has_range_with_custom_hash_schema),
+                                         has_range_with_custom_hash_schema,
+                                         has_immutable_column_schema),
       Substitute("Error creating table $0 on the master", data_->table_name_));
   // Spin until the table is fully created, if requested.
   if (data_->wait_) {
@@ -1158,6 +1204,10 @@ KuduInsertIgnore* KuduTable::NewInsertIgnore() {
 
 KuduUpsert* KuduTable::NewUpsert() {
   return new KuduUpsert(shared_from_this());
+}
+
+KuduUpsertIgnore* KuduTable::NewUpsertIgnore() {
+  return new KuduUpsertIgnore(shared_from_this());
 }
 
 KuduUpdate* KuduTable::NewUpdate() {
@@ -1644,6 +1694,16 @@ Status KuduTableAlterer::Alter() {
   AlterTableResponsePB resp;
   RETURN_NOT_OK(data_->ToRequest(&req));
 
+  bool has_immutable_column_schema = false;
+  for (const auto& step : data_->steps_) {
+    if ((step.step_type == AlterTableRequestPB::ADD_COLUMN ||
+         step.step_type == AlterTableRequestPB::ALTER_COLUMN) &&
+        step.spec->data_->immutable) {
+      has_immutable_column_schema = true;
+      break;
+    }
+  }
+
   MonoDelta timeout = data_->timeout_.Initialized() ?
     data_->timeout_ :
     data_->client_->default_admin_operation_timeout();
@@ -1651,7 +1711,8 @@ Status KuduTableAlterer::Alter() {
   RETURN_NOT_OK(data_->client_->data_->AlterTable(
       data_->client_, req, &resp, deadline,
       data_->has_alter_partitioning_steps,
-      data_->adding_range_with_custom_hash_schema));
+      data_->adding_range_with_custom_hash_schema,
+      has_immutable_column_schema));
 
   if (data_->has_alter_partitioning_steps) {
     // If the table partitions change, clear the local meta cache so that the
@@ -2251,6 +2312,10 @@ Status KuduScanTokenBuilder::SetCacheBlocks(bool cache_blocks) {
 
 Status KuduScanTokenBuilder::Build(vector<KuduScanToken*>* tokens) {
   return data_->Build(tokens);
+}
+
+void KuduScanTokenBuilder::SetSplitSizeBytes(uint64_t split_size_bytes) {
+  return data_->SplitSizeBytes(split_size_bytes);
 }
 
 ////////////////////////////////////////////////////////////

@@ -25,17 +25,21 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/kserver/kserver.h"
 #include "kudu/master/master_options.h"
+#include "kudu/server/rpc_server.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/promise.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
-class HostPort;
 class MaintenanceManager;
 class MonoDelta;
 class MonoTime;
+class Sockaddr;
+class Thread;
 class ThreadPool;
 
 namespace rpc {
@@ -100,7 +104,9 @@ class Master : public kserver::KuduServer {
   LocationCache* location_cache() { return location_cache_.get(); }
 
   // Get the RPC and HTTP addresses for this master instance.
-  Status GetMasterRegistration(ServerRegistrationPB* registration) const;
+  // Whether to use external/proxied address for master registration.
+  Status GetMasterRegistration(ServerRegistrationPB* registration,
+                               bool use_external_addr) const;
 
   // Get node instance, Raft role, RPC and HTTP addresses for all
   // masters.
@@ -112,7 +118,8 @@ class Master : public kserver::KuduServer {
   // client; cache this information with a TTL (possibly in another
   // SysTable), so that we don't have to perform an RPC call on every
   // request.
-  Status ListMasters(std::vector<ServerEntryPB>* masters) const;
+  Status ListMasters(std::vector<ServerEntryPB>* masters,
+                     bool use_external_addr) const;
 
   enum MasterType {
     ALL,
@@ -142,6 +149,16 @@ class Master : public kserver::KuduServer {
     return maintenance_manager_.get();
   }
 
+  // A shortcut to get addresses this master server is configured with
+  // for processing RPCs proxied from external networks.
+  const std::vector<Sockaddr>& rpc_proxied_addresses() const {
+    return rpc_server()->GetRpcProxiedAddresses();
+  }
+
+  // Return addresses advertised at a TCP proxy for clients connecting from
+  // external networks.
+  const std::vector<HostPort>& GetProxyAdvertisedHostPorts() const;
+
  private:
   friend class MasterTest;
   friend class CatalogManager;
@@ -162,6 +179,11 @@ class Master : public kserver::KuduServer {
   // issue a warning if calling a virtual function from destructor even if it's
   // safe in a particular case.
   void ShutdownImpl();
+
+  // Start thread to purge soft-deleted tables with expired reservations.
+  Status StartExpiredReservedTablesDeleterThread();
+  void ExpiredReservedTablesDeleterThread();
+  Status DeleteExpiredReservedTables();
 
   enum MasterState {
     kStopped,
@@ -204,6 +226,15 @@ class Master : public kserver::KuduServer {
   std::unique_ptr<LocationCache> location_cache_;
 
   std::unique_ptr<TSManager> ts_manager_;
+
+  scoped_refptr<Thread> expired_reserved_tables_deleter_thread_;
+
+  // RPC endpoints of all masters in this cluster in the external network.
+  // These are sourced from the --master_rpc_proxy_advertised_addresses flag.
+  // These are assumed to be proxied/forwarded to the corresponding RPC
+  // endpoints of this cluster's masters, where latter are specified by
+  // --rpc_proxied_addresses for each master correspondingly.
+  std::vector<HostPort> master_rpc_proxy_advertised_hostports_;
 
   DISALLOW_COPY_AND_ASSIGN(Master);
 };

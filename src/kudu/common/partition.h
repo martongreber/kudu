@@ -382,11 +382,18 @@ class PartitionSchema {
   bool PartitionMayContainRow(const Partition& partition,
                               const KuduPartialRow& row) const;
 
+  // Used to determine whether the partition keys information shows up.
+  enum HashPartitionInfo {
+    HIDE = 0,
+    SHOW = 1,
+  };
+
   // Returns a text description of the partition suitable for debug printing.
   //
   // Partitions are considered metadata, so no redaction will happen on the hash
   // and range bound values.
-  std::string PartitionDebugString(const Partition& partition, const Schema& schema) const;
+  std::string PartitionDebugString(const Partition& partition, const Schema& schema,
+                                   HashPartitionInfo hp = HashPartitionInfo::SHOW) const;
 
   // Returns a text description of a partition key suitable for debug printing.
   std::string PartitionKeyDebugString(const PartitionKey& key,
@@ -556,6 +563,10 @@ class PartitionSchema {
   static std::vector<Partition> GenerateHashPartitions(
       const HashSchema& hash_schema,
       const KeyEncoder<std::string>& hash_encoder);
+
+  // Helper for PartitionContainsRowImpl.
+  static bool RangePartitionContainsEncodedKey(const Partition& partition,
+                                               const std::string& key);
 
   // PartitionKeyDebugString implementation for row types.
   template<typename Row>

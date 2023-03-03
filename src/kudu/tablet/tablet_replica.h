@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -40,7 +41,7 @@
 #include "kudu/tablet/ops/op.h"
 #include "kudu/tablet/ops/op_tracker.h"
 #include "kudu/tablet/ops/write_op.h"
-#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet.h" // IWYU pragma: keep
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/locks.h"
@@ -83,8 +84,7 @@ class ResultTracker;
 } // namespace rpc
 
 namespace tools {
-struct RunnerContext;
-Status CopyFromLocal(const RunnerContext& context);
+class TabletCopier;
 } // namespace tools
 
 namespace tablet {
@@ -395,7 +395,7 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   void BeginTxnParticipantOp(int64_t txn_id, RegisteredTxnCallback began_txn_cb);
 
  private:
-  friend Status kudu::tools::CopyFromLocal(const kudu::tools::RunnerContext& context);
+  friend class kudu::tools::TabletCopier;
   friend class kudu::AlterTableTest;
   friend class RefCountedThreadSafe<TabletReplica>;
   friend class TabletReplicaTest;
@@ -603,9 +603,9 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
 
   clock::Clock* clock_;
 
-  // List of maintenance operations for the tablet that need information that only the peer
-  // can provide.
-  std::vector<MaintenanceOp*> maintenance_ops_;
+  // Maintenance operations for the tablet that need information that only
+  // the peer can provide.
+  std::vector<std::unique_ptr<MaintenanceOp>> maintenance_ops_;
 
   // The result tracker for writes.
   scoped_refptr<rpc::ResultTracker> result_tracker_;

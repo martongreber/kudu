@@ -85,6 +85,7 @@ DECLARE_double(log_container_excess_space_before_cleanup_fraction);
 DECLARE_double(log_container_live_metadata_before_compact_ratio);
 DECLARE_int32(fs_target_data_dirs_per_tablet);
 DECLARE_int64(log_container_max_blocks);
+DECLARE_string(block_manager);
 DECLARE_string(block_manager_preflush_control);
 DECLARE_string(env_inject_eio_globs);
 DECLARE_uint64(log_container_preallocate_bytes);
@@ -138,7 +139,7 @@ class LogBlockManagerTest : public KuduTest, public ::testing::WithParamInterfac
   void SetUp() override {
     // Pass in a report to prevent the block manager from logging unnecessarily.
     FsReport report;
-    ASSERT_OK(bm_->Open(&report));
+    ASSERT_OK(bm_->Open(&report, nullptr, nullptr));
     ASSERT_OK(dd_manager_->CreateDataDirGroup(test_tablet_name_));
     ASSERT_OK(dd_manager_->GetDataDirGroupPB(test_tablet_name_, &test_group_pb_));
   }
@@ -156,8 +157,9 @@ class LogBlockManagerTest : public KuduTest, public ::testing::WithParamInterfac
 
     BlockManagerOptions opts;
     opts.metric_entity = metric_entity;
-    return new LogBlockManager(env_, dd_manager_.get(), &error_manager_,
-                               &file_cache_, std::move(opts));
+    CHECK_EQ(FLAGS_block_manager, "log");
+    return new LogBlockManagerNativeMeta(
+        env_, dd_manager_.get(), &error_manager_, &file_cache_, std::move(opts));
   }
 
   Status ReopenBlockManager(const scoped_refptr<MetricEntity>& metric_entity = nullptr,
@@ -184,7 +186,7 @@ class LogBlockManagerTest : public KuduTest, public ::testing::WithParamInterfac
     }
 
     bm_.reset(CreateBlockManager(metric_entity, test_data_dirs));
-    RETURN_NOT_OK(bm_->Open(report));
+    RETURN_NOT_OK(bm_->Open(report, nullptr, nullptr));
     return Status::OK();
   }
 
@@ -1914,7 +1916,7 @@ TEST_P(LogBlockManagerTest, TestOpenWithFailedDirectories) {
 
   // Check the report, ensuring the correct directory has failed.
   FsReport report;
-  ASSERT_OK(bm_->Open(&report));
+  ASSERT_OK(bm_->Open(&report, nullptr, nullptr));
   ASSERT_EQ(kNumDirs - 1, report.data_dirs.size());
   for (const string& data_dir : report.data_dirs) {
     ASSERT_NE(data_dir, test_dirs[failed_idx]);

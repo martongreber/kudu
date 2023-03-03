@@ -23,6 +23,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -47,14 +48,12 @@
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/tablet/cfile_set.h"
 #include "kudu/tablet/delta_store.h"
 #include "kudu/tablet/delta_tracker.h"
 #include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/memrowset.h"
 #include "kudu/tablet/mutation.h"
 #include "kudu/tablet/mvcc.h"
-#include "kudu/tablet/tablet.pb.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/fault_injection.h"
@@ -138,7 +137,7 @@ class MemRowSetCompactionInput : public CompactionInput {
     return has_more_blocks_;
   }
 
-  Status PrepareBlock(vector<CompactionInputRow> *block) override {
+  Status PrepareBlock(vector<CompactionInputRow>* block) override {
     int num_in_block = iter_->remaining_in_leaf();
     block->resize(num_in_block);
 
@@ -203,8 +202,14 @@ class MemRowSetCompactionInput : public CompactionInput {
     return Status::OK();
   }
 
-  const Schema &schema() const override {
+  const Schema& schema() const override {
     return iter_->schema();
+  }
+
+  size_t memory_footprint() const override {
+    // TODO(aserbin): implement this if it's necessary to track peak memory
+    //                usage for objects of this type during compaction
+    return 0;
   }
 
  private:
@@ -234,8 +239,8 @@ class DiskRowSetCompactionInput : public CompactionInput {
         undo_delta_iter_(std::move(undo_delta_iter)),
         mem_(32 * 1024),
         block_(&base_iter_->schema(), kRowsPerBlock, &mem_),
-        redo_mutation_block_(kRowsPerBlock, static_cast<Mutation *>(nullptr)),
-        undo_mutation_block_(kRowsPerBlock, static_cast<Mutation *>(nullptr)) {}
+        redo_mutation_block_(kRowsPerBlock, static_cast<Mutation*>(nullptr)),
+        undo_mutation_block_(kRowsPerBlock, static_cast<Mutation*>(nullptr)) {}
 
   Status Init() override {
     ScanSpec spec;
@@ -252,12 +257,12 @@ class DiskRowSetCompactionInput : public CompactionInput {
     return base_iter_->HasNext();
   }
 
-  Status PrepareBlock(vector<CompactionInputRow> *block) override {
+  Status PrepareBlock(vector<CompactionInputRow>* block) override {
     RETURN_NOT_OK(base_iter_->NextBlock(&block_));
     std::fill(redo_mutation_block_.begin(), redo_mutation_block_.end(),
-              static_cast<Mutation *>(nullptr));
+              static_cast<Mutation*>(nullptr));
     std::fill(undo_mutation_block_.begin(), undo_mutation_block_.end(),
-                  static_cast<Mutation *>(nullptr));
+                  static_cast<Mutation*>(nullptr));
     RETURN_NOT_OK(redo_delta_iter_->PrepareBatch(
                       block_.nrows(), DeltaIterator::PREPARE_FOR_COLLECT));
     RETURN_NOT_OK(redo_delta_iter_->CollectMutations(&redo_mutation_block_, block_.arena()));
@@ -267,7 +272,7 @@ class DiskRowSetCompactionInput : public CompactionInput {
 
     block->resize(block_.nrows());
     for (int i = 0; i < block_.nrows(); i++) {
-      CompactionInputRow &input_row = block->at(i);
+      CompactionInputRow& input_row = block->at(i);
       input_row.row.Reset(&block_, i);
       input_row.redo_head = redo_mutation_block_[i];
       Mutation::ReverseMutationList(&input_row.redo_head);
@@ -284,8 +289,13 @@ class DiskRowSetCompactionInput : public CompactionInput {
     return Status::OK();
   }
 
-  const Schema &schema() const override {
+  const Schema& schema() const override {
     return base_iter_->schema();
+  }
+
+  size_t memory_footprint() const override {
+    return redo_delta_iter_->memory_footprint() +
+        undo_delta_iter_->memory_footprint();
   }
 
  private:
@@ -298,8 +308,8 @@ class DiskRowSetCompactionInput : public CompactionInput {
 
   // The current block of data which has come from the input iterator
   RowBlock block_;
-  vector<Mutation *> redo_mutation_block_;
-  vector<Mutation *> undo_mutation_block_;
+  vector<Mutation*> redo_mutation_block_;
+  vector<Mutation*> undo_mutation_block_;
 
   enum {
     kRowsPerBlock = 100
@@ -382,7 +392,9 @@ int CompareDuplicatedRows(const CompactionInputRow& left,
       CHECK(right_last->changelist().is_delete());
     }
 #endif
-    if (redos_overlap) *redos_overlap = false;
+    if (redos_overlap) {
+      *redos_overlap = false;
+    }
     return 1;
   }
   if (right.redo_head == nullptr) {
@@ -397,7 +409,9 @@ int CompareDuplicatedRows(const CompactionInputRow& left,
       CHECK(left_last->changelist().is_delete());
     }
 #endif
-    if (redos_overlap) *redos_overlap = false;
+    if (redos_overlap) {
+      *redos_overlap = false;
+    }
     return -1;
   }
   AdvanceToLastInList(&right_last);
@@ -477,7 +491,7 @@ int CompareDuplicatedRows(const CompactionInputRow& left,
 
 void CopyMutations(Mutation* from, Mutation** to, Arena* arena) {
   Mutation* previous = nullptr;
-  for (const Mutation* cur = from; cur != nullptr; cur = cur->acquire_next()) {
+  for (const auto* cur = from; cur != nullptr; cur = cur->acquire_next()) {
     Mutation* copy = Mutation::CreateInArena(arena,
                                              cur->timestamp(),
                                              cur->changelist());
@@ -558,7 +572,7 @@ class MergeCompactionInput : public CompactionInput {
     // row of this block is less than the first row of the other block.
     // In this case, we can remove the other input from the merge until
     // this input's current block has been exhausted.
-    bool Dominates(const MergeState &other, const Schema &schema) const {
+    bool Dominates(const MergeState& other, const Schema& schema) const {
       DCHECK(!empty());
       DCHECK(!other.empty());
 
@@ -569,15 +583,16 @@ class MergeCompactionInput : public CompactionInput {
     vector<CompactionInputRow> pending;
     int pending_idx;
 
-    vector<MergeState *> dominated;
+    vector<MergeState*> dominated;
   };
 
  public:
-  MergeCompactionInput(const vector<shared_ptr<CompactionInput> > &inputs,
+  MergeCompactionInput(const vector<shared_ptr<CompactionInput>>& inputs,
                        const Schema* schema)
-    : schema_(schema),
-      num_dup_rows_(0) {
-    for (const shared_ptr<CompactionInput>& input : inputs) {
+      : schema_(schema),
+        num_dup_rows_(0),
+        max_memory_usage_(0) {
+    for (const auto& input : inputs) {
       unique_ptr<MergeState> state(new MergeState);
       state->input = input;
       states_.push_back(state.release());
@@ -589,7 +604,7 @@ class MergeCompactionInput : public CompactionInput {
   }
 
   Status Init() override {
-    for (MergeState *state : states_) {
+    for (auto* state : states_) {
       RETURN_NOT_OK(state->input->Init());
     }
 
@@ -601,7 +616,7 @@ class MergeCompactionInput : public CompactionInput {
   bool HasMoreBlocks() override {
     // Return true if any of the input blocks has more rows pending
     // or more blocks which have yet to be pulled.
-    for (MergeState *state : states_) {
+    for (auto* state : states_) {
       if (!state->empty() ||
           state->input->HasMoreBlocks()) {
         return true;
@@ -611,7 +626,7 @@ class MergeCompactionInput : public CompactionInput {
     return false;
   }
 
-  Status PrepareBlock(vector<CompactionInputRow> *block) override {
+  Status PrepareBlock(vector<CompactionInputRow>* block) override {
     CHECK(!states_.empty());
 
     block->clear();
@@ -627,7 +642,7 @@ class MergeCompactionInput : public CompactionInput {
       // but some benchmarks indicated that the simpler code path of the O(n k) merge
       // actually ends up a bit faster.
       for (int i = 0; i < states_.size(); i++) {
-        MergeState *state = states_[i];
+        MergeState* state = states_[i];
 
         if (state->empty()) {
           prepared_block_arena_ = state->input->PreparedBlockArena();
@@ -707,11 +722,34 @@ class MergeCompactionInput : public CompactionInput {
   Arena* PreparedBlockArena() override { return prepared_block_arena_; }
 
   Status FinishBlock() override {
-    return ProcessEmptyInputs();
+    auto s = ProcessEmptyInputs();
+
+    // Update the stats on peak memory usage.
+    size_t cur_usage = 0;
+    for (const auto* st : states_) {
+      cur_usage += st->input->memory_footprint();
+      for (const auto* st : st->dominated) {
+        cur_usage += st->input->memory_footprint();
+      }
+    }
+    if (cur_usage > max_memory_usage_) {
+      max_memory_usage_ = cur_usage;
+    }
+    VLOG(2) << Substitute("max memory usage: $0", max_memory_usage_);
+
+    return s;
   }
 
-  const Schema &schema() const override {
+  const Schema& schema() const override {
     return *schema_;
+  }
+
+  // Return the peak amount of memory used by this compaction input.
+  // Since 'max_memory_usage_' isn't protected against concurrent access,
+  // this method should be invoked from the same thread that performs merge
+  // compaction.
+  size_t memory_footprint() const override {
+    return max_memory_usage_;
   }
 
  private:
@@ -725,7 +763,7 @@ class MergeCompactionInput : public CompactionInput {
   Status ProcessEmptyInputs() {
     int j = 0;
     for (int i = 0; i < states_.size(); i++) {
-      MergeState *state = states_[i];
+      MergeState* state = states_[i];
       states_[j++] = state;
 
       if (!state->empty()) {
@@ -757,7 +795,7 @@ class MergeCompactionInput : public CompactionInput {
       // all of those dominance relations and remove any that are no longer
       // valid.
       for (auto it = state->dominated.begin(); it != state->dominated.end(); ++it) {
-        MergeState *dominated = *it;
+        auto* dominated = *it;
         if (!state->Dominates(*dominated, *schema_)) {
           states_.push_back(dominated);
           it = state->dominated.erase(it);
@@ -793,7 +831,7 @@ class MergeCompactionInput : public CompactionInput {
     return Status::OK();
   }
 
-  bool TryInsertIntoDominanceList(MergeState *dominator, MergeState *candidate) {
+  bool TryInsertIntoDominanceList(MergeState* dominator, MergeState* candidate) {
     if (dominator->Dominates(*candidate, *schema_)) {
       dominator->dominated.push_back(candidate);
       return true;
@@ -883,7 +921,7 @@ class MergeCompactionInput : public CompactionInput {
   }
 
   const Schema* schema_;
-  vector<MergeState *> states_;
+  vector<MergeState*> states_;
   Arena* prepared_block_arena_;
 
   // Vector to keep blocks that store duplicated row data.
@@ -891,6 +929,9 @@ class MergeCompactionInput : public CompactionInput {
   // by the the time the most recent version row is processed.
   vector<std::unique_ptr<RowBlock>> duplicated_rows_;
   int num_dup_rows_;
+
+  // An estimate on maximum memory usage by this compaction input.
+  size_t max_memory_usage_;
 
   enum {
     kDuplicatedRowsPerBlock = 10
@@ -1048,9 +1089,9 @@ string CompactionInputRowToString(const CompactionInputRow& input_row) {
 
 ////////////////////////////////////////////////////////////
 
-Status CompactionInput::Create(const DiskRowSet &rowset,
+Status CompactionInput::Create(const DiskRowSet& rowset,
                                const Schema* projection,
-                               const MvccSnapshot &snap,
+                               const MvccSnapshot& snap,
                                const IOContext* io_context,
                                unique_ptr<CompactionInput>* out) {
   CHECK(projection->has_column_ids());
@@ -1082,28 +1123,28 @@ Status CompactionInput::Create(const DiskRowSet &rowset,
   return Status::OK();
 }
 
-CompactionInput *CompactionInput::Create(const MemRowSet &memrowset,
+CompactionInput* CompactionInput::Create(const MemRowSet& memrowset,
                                          const Schema* projection,
-                                         const MvccSnapshot &snap) {
+                                         const MvccSnapshot& snap) {
   CHECK(projection->has_column_ids());
   return new MemRowSetCompactionInput(memrowset, snap, projection);
 }
 
-CompactionInput *CompactionInput::Merge(const vector<shared_ptr<CompactionInput> > &inputs,
+CompactionInput* CompactionInput::Merge(const vector<shared_ptr<CompactionInput>>& inputs,
                                         const Schema* schema) {
   CHECK(schema->has_column_ids());
   return new MergeCompactionInput(inputs, schema);
 }
 
 
-Status RowSetsInCompaction::CreateCompactionInput(const MvccSnapshot &snap,
+Status RowSetsInCompaction::CreateCompactionInput(const MvccSnapshot& snap,
                                                   const Schema* schema,
                                                   const IOContext* io_context,
-                                                  shared_ptr<CompactionInput> *out) const {
+                                                  shared_ptr<CompactionInput>* out) const {
   CHECK(schema->has_column_ids());
 
-  vector<shared_ptr<CompactionInput> > inputs;
-  for (const shared_ptr<RowSet> &rs : rowsets_) {
+  vector<shared_ptr<CompactionInput>> inputs;
+  for (const auto& rs : rowsets_) {
     unique_ptr<CompactionInput> input;
     RETURN_NOT_OK_PREPEND(rs->NewCompactionInput(schema, snap, io_context, &input),
                           Substitute("Could not create compaction input for rowset $0",
@@ -1123,7 +1164,7 @@ Status RowSetsInCompaction::CreateCompactionInput(const MvccSnapshot &snap,
 void RowSetsInCompaction::DumpToLog() const {
   VLOG(1) << "Selected " << rowsets_.size() << " rowsets to compact:";
   // Dump the selected rowsets to the log, and collect corresponding iterators.
-  for (const shared_ptr<RowSet> &rs : rowsets_) {
+  for (const auto& rs : rowsets_) {
     VLOG(1) << rs->ToString() << "(current size on disk: ~"
             << rs->OnDiskSize() << " bytes)";
   }
@@ -1153,8 +1194,8 @@ void RemoveAncientUndos(const HistoryGcOpts& history_gc_opts,
   DVLOG(5) << "Ancient history mark: " << history_gc_opts.ancient_history_mark().ToString()
             << ": " << HybridClock::StringifyTimestamp(history_gc_opts.ancient_history_mark());
 
-  Mutation *prev_undo = nullptr;
-  Mutation *undo_mut = *undo_head;
+  Mutation* prev_undo = nullptr;
+  Mutation* undo_mut = *undo_head;
   while (undo_mut != nullptr) {
     if (history_gc_opts.IsAncientHistory(undo_mut->timestamp())) {
       // Drop all undos following this one in the list; Their timestamps will be lower.
@@ -1199,7 +1240,7 @@ Status ApplyMutationsAndGenerateUndos(const MvccSnapshot& snap,
   Mutation* redo_delete = nullptr;
 
   // Convert the redos into undos.
-  for (const Mutation *redo_mut = src_row.redo_head;
+  for (const auto* redo_mut = src_row.redo_head;
        redo_mut != nullptr;
        redo_mut = redo_mut->acquire_next()) {
 
@@ -1426,11 +1467,11 @@ Status FlushCompactionInput(const string& tablet_id,
 }
 
 Status ReupdateMissedDeltas(const IOContext* io_context,
-                            CompactionInput *input,
+                            CompactionInput* input,
                             const HistoryGcOpts& history_gc_opts,
-                            const MvccSnapshot &snap_to_exclude,
-                            const MvccSnapshot &snap_to_include,
-                            const RowSetVector &output_rowsets) {
+                            const MvccSnapshot& snap_to_exclude,
+                            const MvccSnapshot& snap_to_include,
+                            const RowSetVector& output_rowsets) {
   TRACE_EVENT0("tablet", "ReupdateMissedDeltas");
   RETURN_NOT_OK(input->Init());
 
@@ -1438,9 +1479,9 @@ Status ReupdateMissedDeltas(const IOContext* io_context,
     snap_to_exclude.ToString() << " and " << snap_to_include.ToString();
 
   // Collect the disk rowsets that we'll push the updates into.
-  deque<DiskRowSet *> diskrowsets;
-  for (const shared_ptr<RowSet> &rs : output_rowsets) {
-    diskrowsets.push_back(down_cast<DiskRowSet *>(rs.get()));
+  deque<DiskRowSet*> diskrowsets;
+  for (const auto& rs : output_rowsets) {
+    diskrowsets.push_back(down_cast<DiskRowSet*>(rs.get()));
   }
 
   // The set of updated delta trackers.
@@ -1462,11 +1503,11 @@ Status ReupdateMissedDeltas(const IOContext* io_context,
   while (input->HasMoreBlocks()) {
     RETURN_NOT_OK(input->PrepareBlock(&rows));
 
-    for (const CompactionInputRow &row : rows) {
+    for (const auto& row : rows) {
       DVLOG(4) << "Revisiting row: " << CompactionInputRowToString(row);
 
       bool is_garbage_collected = false;
-      for (const Mutation *mut = row.redo_head;
+      for (const auto* mut = row.redo_head;
            mut != nullptr;
            mut = mut->acquire_next()) {
         is_garbage_collected = false;
@@ -1548,17 +1589,16 @@ Status ReupdateMissedDeltas(const IOContext* io_context,
           RETURN_NOT_OK(cur_drs->CountRows(io_context, &num_rows));
         }
 
-        DeltaTracker* cur_tracker = cur_drs->delta_tracker();
-        unique_ptr<OperationResultPB> result(new OperationResultPB);
+        DeltaTracker* cur_tracker = cur_drs->mutable_delta_tracker();
         DCHECK_LT(idx_in_delta_tracker, num_rows);
-        Status s = cur_tracker->Update(mut->timestamp(),
-                                       idx_in_delta_tracker,
-                                       mut->changelist(),
-                                       max_op_id,
-                                       result.get());
+        const auto s = cur_tracker->Update(mut->timestamp(),
+                                           idx_in_delta_tracker,
+                                           mut->changelist(),
+                                           max_op_id,
+                                           nullptr);
         DCHECK(s.ok()) << "Failed update on compaction for row " << output_row_offset
             << " @" << mut->timestamp() << ": " << mut->changelist().ToString(*schema);
-        if (s.ok()) {
+        if (PREDICT_TRUE(s.ok())) {
           // Update the set of delta trackers with the one we've just updated.
           InsertIfNotPresent(&updated_trackers, cur_tracker);
         }
@@ -1588,7 +1628,7 @@ Status ReupdateMissedDeltas(const IOContext* io_context,
 
   {
     TRACE_EVENT0("tablet", "Flushing missed deltas");
-    for (DeltaTracker* tracker : updated_trackers) {
+    for (auto* tracker : updated_trackers) {
       VLOG(1) << "Flushing DeltaTracker updated with missed deltas...";
       RETURN_NOT_OK_PREPEND(tracker->Flush(io_context, DeltaTracker::NO_FLUSH_METADATA),
                             "Could not flush delta tracker after missed delta update");
@@ -1599,14 +1639,20 @@ Status ReupdateMissedDeltas(const IOContext* io_context,
 }
 
 
-Status DebugDumpCompactionInput(CompactionInput *input, vector<string> *lines) {
+Status DebugDumpCompactionInput(CompactionInput* input, int64_t* rows_left, vector<string>* lines) {
   RETURN_NOT_OK(input->Init());
   vector<CompactionInputRow> rows;
 
   while (input->HasMoreBlocks()) {
+    if (rows_left && *rows_left <= 0) {
+      break;
+    }
     RETURN_NOT_OK(input->PrepareBlock(&rows));
 
-    for (const CompactionInputRow &input_row : rows) {
+    for (const auto& input_row : rows) {
+      if (rows_left && (*rows_left)-- <= 0) {
+        break;
+      }
       LOG_STRING(INFO, lines) << CompactionInputRowToString(input_row);
     }
 

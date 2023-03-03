@@ -302,6 +302,7 @@ public class AsyncKuduClient implements AutoCloseable {
   public static final long NO_TIMESTAMP = -1;
   public static final long INVALID_TXN_ID = -1;
   public static final long DEFAULT_OPERATION_TIMEOUT_MS = 30000;
+  public static final int NO_SOFT_DELETED_STATE_RESERVED_SECONDS = 0;
   public static final long DEFAULT_KEEP_ALIVE_PERIOD_MS = 15000; // 25% of the default scanner ttl.
   public static final long DEFAULT_NEGOTIATION_TIMEOUT_MS = 10000;
   private static final long MAX_RPC_ATTEMPTS = 100;
@@ -696,7 +697,26 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * Delete a table on the cluster with the specified name.
+   * Delete a table with the specified name.
+   * @param name the table's name
+   * @param reserveSeconds the soft deleted table to be alive time
+   * @return a deferred object to track the progress of the deleteTable command
+   */
+  public Deferred<DeleteTableResponse> deleteTable(String name,
+                                                   int reserveSeconds) {
+    checkIsClosed();
+    DeleteTableRequest delete = new DeleteTableRequest(this.masterTable,
+                                                       name,
+                                                       timer,
+                                                       defaultAdminOperationTimeoutMs,
+                                                       reserveSeconds);
+    return sendRpcToTablet(delete);
+  }
+
+  /**
+   * Delete a table with the specified name.
+   * The behavior of DeleteRPC is controlled by the
+   * '--default_deleted_table_reserve_seconds' flag on master.
    * @param name the table's name
    * @return a deferred object to track the progress of the deleteTable command
    */
@@ -707,6 +727,33 @@ public class AsyncKuduClient implements AutoCloseable {
                                                        timer,
                                                        defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(delete);
+  }
+
+  /**
+   * Recall a soft-deleted table on the cluster with the specified id
+   * @param id the table's id
+   * @return a deferred object to track the progress of the recall command
+   */
+  public Deferred<RecallDeletedTableResponse> recallDeletedTable(String id) {
+    return recallDeletedTable(id, "");
+  }
+
+  /**
+   * Recall a soft-deleted table on the cluster with the specified id
+   * @param id the table's id
+   * @param newTableName the table's new name after recall
+   * @return a deferred object to track the progress of the recall command
+   */
+  public Deferred<RecallDeletedTableResponse> recallDeletedTable(String id,
+                                                                 String newTableName) {
+    checkIsClosed();
+    RecallDeletedTableRequest recall = new RecallDeletedTableRequest(
+        this.masterTable,
+        id,
+        newTableName,
+        timer,
+        defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(recall);
   }
 
   /**
@@ -856,25 +903,51 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * Get the list of all the tables.
+   * Get the list of all the regular (i.e. not soft-deleted) tables.
    * @return a deferred object that yields a list of all the tables
    */
   public Deferred<ListTablesResponse> getTablesList() {
-    return getTablesList(null);
+    return getTablesList(null, false);
   }
 
   /**
-   * Get a list of table names. Passing a null filter returns all the tables. When a filter is
-   * specified, it only returns tables that satisfy a substring match.
+   * Get a list of regular table names. Passing a null filter returns all the tables. When a
+   * filter is specified, it only returns tables that satisfy a substring match.
    * @param nameFilter an optional table name filter
    * @return a deferred that yields the list of table names
    */
   public Deferred<ListTablesResponse> getTablesList(String nameFilter) {
     ListTablesRequest rpc = new ListTablesRequest(this.masterTable,
                                                   nameFilter,
+                                                  false,
                                                   timer,
                                                   defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(rpc);
+  }
+
+  /**
+   * Get a list of table names. Passing a null filter returns all the tables. When a filter is
+   * specified, it only returns tables that satisfy a substring match.
+   * @param nameFilter an optional table name filter
+   * @param showSoftDeleted whether to display only regular (i.e. not soft deleted)
+   * tables or all tables (i.e. soft deleted tables and regular tables)
+   * @return a deferred that yields the list of table names
+   */
+  public Deferred<ListTablesResponse> getTablesList(String nameFilter, boolean showSoftDeleted) {
+    ListTablesRequest rpc = new ListTablesRequest(this.masterTable,
+                                                  nameFilter,
+                                                  showSoftDeleted,
+                                                  timer,
+                                                  defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(rpc);
+  }
+
+  /**
+   * Get the list of all the soft deleted tables.
+   * @return a deferred object that yields a list of all the soft deleted tables
+   */
+  public Deferred<ListTablesResponse> getSoftDeletedTablesList() {
+    return getTablesList(null, true);
   }
 
   /**
@@ -2705,7 +2778,8 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * Sends a request to the master to check if the cluster supports ignore operations.
+   * Sends a request to the master to check if the cluster supports ignore operations, including
+   * InsertIgnore, UpdateIgnore and DeleteIgnore operations.
    * @return true if the cluster supports ignore operations
    */
   @InterfaceAudience.Private

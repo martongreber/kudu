@@ -18,9 +18,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -29,9 +32,11 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/client/client-internal.h"
 #include "kudu/client/client-test-util.h"
 #include "kudu/client/client.h"
 #include "kudu/client/client.pb.h"
+#include "kudu/client/meta_cache.h"
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/scan_configuration.h"
 #include "kudu/client/scan_predicate.h"
@@ -42,19 +47,24 @@
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.pb.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/integration-tests/test_workload.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/mini_tablet_server.h"
+#include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/async_util.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
@@ -63,6 +73,8 @@
 #include "kudu/util/test_util.h"
 
 DECLARE_bool(tserver_enforce_access_control);
+DECLARE_int32(scanner_inject_latency_on_each_batch_ms);
+DECLARE_int32(slow_scanner_threshold_ms);
 
 METRIC_DECLARE_histogram(handler_latency_kudu_master_MasterService_GetTableSchema);
 METRIC_DECLARE_histogram(handler_latency_kudu_master_MasterService_GetTableLocations);
@@ -75,7 +87,9 @@ using kudu::master::CatalogManager;
 using kudu::master::TabletInfo;
 using kudu::tablet::TabletReplica;
 using kudu::tserver::MiniTabletServer;
+using kudu::tserver::SharedScanDescriptor;
 using std::atomic;
+using std::map;
 using std::string;
 using std::thread;
 using std::unique_ptr;
@@ -84,6 +98,9 @@ using std::vector;
 
 namespace kudu {
 namespace client {
+
+static constexpr const int32_t kRecordCount = 1000;
+static constexpr const int32_t kBucketNum = 10;
 
 class ScanTokenTest : public KuduTest {
  protected:
@@ -135,13 +152,16 @@ class ScanTokenTest : public KuduTest {
 
   // Similar to CountRows() above, but use the specified client handle
   // and run all the scanners sequentially, one by one.
-  static Status CountRowsSeq(KuduClient* client,
-                             const vector<KuduScanToken*>& tokens,
-                             int64_t* row_count) {
+  static Status CountRowsSeq(
+      KuduClient* client,
+      const vector<KuduScanToken*>& tokens,
+      int64_t* row_count,
+      KuduClient::ReplicaSelection replica_selection = KuduClient::ReplicaSelection::LEADER_ONLY) {
     int64_t count = 0;
     for (auto* t : tokens) {
       unique_ptr<KuduScanner> scanner;
       RETURN_NOT_OK(IntoUniqueScanner(client, *t, &scanner));
+      RETURN_NOT_OK(scanner->SetSelection(replica_selection));
       RETURN_NOT_OK(scanner->Open());
       while (scanner->HasMoreRows()) {
         KuduScanBatch batch;
@@ -246,9 +266,159 @@ class ScanTokenTest : public KuduTest {
     return Status::OK();
   }
 
+  void PrepareEnvForTestReplicaSelection(shared_ptr<KuduTable>* table, vector<string>* tablet_ids) {
+    constexpr const char* const kTableName = "replica_selection";
+    // Set up the mini cluster
+    InternalMiniClusterOptions options;
+    options.num_tablet_servers = 3;
+    cluster_.reset(new InternalMiniCluster(env_, options));
+    ASSERT_OK(cluster_->Start());
+    constexpr int kReplicationFactor = 3;
+
+    // Populate the table with data to scan later.
+    {
+      // Create a table with 10 partitions, 3 replication factor.
+      // and write some rows to make sure all partitions have data.
+      TestWorkload workload(cluster_.get(), TestWorkload::PartitioningType::HASH);
+      workload.set_table_name(kTableName);
+      workload.set_num_tablets(kBucketNum);
+      workload.set_num_replicas(kReplicationFactor);
+      workload.set_num_write_threads(10);
+      workload.set_write_batch_size(128);
+      workload.Setup();
+      workload.Start();
+      ASSERT_EVENTUALLY([&]() { ASSERT_GE(workload.rows_inserted(), kRecordCount); });
+      workload.StopAndJoin();
+    }
+    ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
+    ASSERT_OK(client_->OpenTable(kTableName, table));
+    ASSERT_NE(nullptr, table->get());
+
+    vector<client::KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    client::KuduScanTokenBuilder builder(table->get());
+    ASSERT_OK(builder.Build(&tokens));
+
+    tablet_ids->clear();
+    tablet_ids->reserve(tokens.size());
+    for (const auto* token : tokens) {
+      tablet_ids->emplace_back(token->tablet().id());
+    }
+  }
+
+  void GetSelectedReplicaCount(const vector<string>& tablet_ids,
+                               KuduClient::ReplicaSelection replication_selection,
+                               map<string, int32_t>* replica_num_by_ts_uuid) {
+    for (const auto& tablet_id : tablet_ids) {
+      scoped_refptr<internal::RemoteTablet> rt;
+      Synchronizer sync;
+      client_->data_->meta_cache_->LookupTabletById(
+          client_.get(), tablet_id, MonoTime::Max(), &rt, sync.AsStatusCallback());
+      sync.Wait();
+      vector<internal::RemoteTabletServer*> tservers;
+      rt->GetRemoteTabletServers(&tservers);
+      ASSERT_EQ(3, tservers.size());
+
+      vector<internal::RemoteTabletServer*> candidates;
+      internal::RemoteTabletServer* tserver_picked;
+      ASSERT_OK(client_->data_->GetTabletServer(
+          client_.get(), rt, replication_selection, {}, &candidates, &tserver_picked));
+      auto& count = LookupOrInsert(replica_num_by_ts_uuid, tserver_picked->permanent_uuid(), 0);
+      count++;
+    }
+  }
+
+  void GetScannerCount(map<string, int32_t>* scanner_count_by_ts_uuid) {
+    scanner_count_by_ts_uuid->clear();
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      vector<SharedScanDescriptor> scanners =
+          cluster_->mini_tablet_server(i)->server()->scanner_manager()->ListScans();
+      scanner_count_by_ts_uuid->insert(
+          {cluster_->mini_tablet_server(i)->server()->instance_pb().permanent_uuid(),
+           static_cast<int32_t>(scanners.size())});
+    }
+  }
+
+  uint32_t GetSlowScansCount() {
+    // Just use for the cluster with only 1 tserver.
+    vector<SharedScanDescriptor> scans =
+        cluster_->mini_tablet_server(0)->server()->scanner_manager()->ListSlowScans();
+    return scans.size();
+  }
+
+  uint32_t GetCompletedScansCount() {
+    // Just use for the cluster with only 1 tserver.
+    vector<SharedScanDescriptor> scans =
+        cluster_->mini_tablet_server(0)->server()->scanner_manager()->ListScans();
+    return scans.size();
+  }
+
+  KuduSchema GetTokenProjectionSchema(const KuduScanToken& token) {
+    string serialized_token;
+    CHECK_OK(token.Serialize(&serialized_token));
+    KuduScanner* scanner_ptr;
+    CHECK_OK(KuduScanToken::DeserializeIntoScanner(client_.get(), serialized_token, &scanner_ptr));
+    unique_ptr<KuduScanner> scanner(scanner_ptr);
+    return scanner->GetProjectionSchema();
+  }
+
   shared_ptr<KuduClient> client_;
   unique_ptr<InternalMiniCluster> cluster_;
 };
+
+TEST_F(ScanTokenTest, SlowScansListTest) {
+  constexpr const char* const kTableName = "slow_scans_show";
+  // Create schema
+  KuduSchema schema;
+  {
+    KuduSchemaBuilder builder;
+    builder.AddColumn("key")->NotNull()->Type(KuduColumnSchema::INT64)->PrimaryKey();
+    ASSERT_OK(builder.Build(&schema));
+  }
+
+  // Create table
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(CreateAndOpenTable(kTableName, schema, &table));
+
+  // Only 1 tserver is OK.
+  ASSERT_EQ(1, cluster_->num_tablet_servers());
+
+  // Create session
+  shared_ptr<KuduSession> session = client_->NewSession();
+  session->SetTimeoutMillis(10000);
+  ASSERT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
+
+  // Insert rows
+  for (int i = 0; i < 200; i++) {
+    unique_ptr<KuduInsert> insert(table->NewInsert());
+    ASSERT_OK(insert->mutable_row()->SetInt64("key", i));
+    ASSERT_OK(session->Apply(insert.release()));
+  }
+  ASSERT_OK(session->Flush());
+
+  {
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    ASSERT_OK(KuduScanTokenBuilder(table.get()).Build(&tokens));
+
+    ASSERT_EQ(200, CountRows(tokens));
+    ASSERT_EQ(1, GetCompletedScansCount());
+    ASSERT_EQ(0, GetSlowScansCount());
+  }
+
+  {
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    ASSERT_OK(KuduScanTokenBuilder(table.get()).Build(&tokens));
+
+    // Create a slow scan scenarios.
+    FLAGS_scanner_inject_latency_on_each_batch_ms = 50;
+    FLAGS_slow_scanner_threshold_ms = 40;
+    ASSERT_EQ(200, CountRows(tokens));
+    ASSERT_EQ(2, GetCompletedScansCount());
+    ASSERT_EQ(1, GetSlowScansCount());
+  }
+}
 
 TEST_F(ScanTokenTest, TestScanTokens) {
   // Create schema
@@ -442,6 +612,88 @@ TEST_F(ScanTokenTest, TestScanTokens) {
     ASSERT_GE(8, tokens.size());
     ASSERT_EQ(200, CountRows(tokens));
     NO_FATALS(VerifyTabletInfo(tokens));
+  }
+}
+
+TEST_F(ScanTokenTest, TestScanTokens_NonUniquePrimaryKey) {
+  // Create schema
+  KuduSchema schema;
+  {
+    KuduSchemaBuilder builder;
+    builder.AddColumn("col")->NotNull()->Type(KuduColumnSchema::INT64)->NonUniquePrimaryKey();
+    ASSERT_OK(builder.Build(&schema));
+  }
+
+  // Create table
+  shared_ptr<KuduTable> table;
+  {
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    ASSERT_OK(table_creator->table_name("table")
+                  .schema(&schema)
+                  .add_hash_partitions({"col"}, 4)
+                  .num_replicas(1)
+                  .Create());
+    ASSERT_OK(client_->OpenTable("table", &table));
+  }
+
+  // Create session
+  shared_ptr<KuduSession> session = client_->NewSession();
+
+  // Insert rows
+  for (int i = 0; i < 10; i++) {
+    unique_ptr<KuduInsert> insert(table->NewInsert());
+    ASSERT_OK(insert->mutable_row()->SetInt64("col", i));
+    ASSERT_OK(session->Apply(insert.release()));
+  }
+  ASSERT_OK(session->Flush());
+
+  // No projection, testing default behaviour
+  {
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    KuduScanTokenBuilder builder(table.get());
+    ASSERT_OK(builder.Build(&tokens));
+    ASSERT_EQ(4, tokens.size());
+
+    for (KuduScanToken* token : tokens) {
+      KuduSchema s = GetTokenProjectionSchema(*token);
+      ASSERT_TRUE(s.HasColumn("col", nullptr));
+      ASSERT_TRUE(s.HasColumn(Schema::GetAutoIncrementingColumnName(), nullptr));
+    }
+  }
+
+  // Projection including auto incrementing column
+  {
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    KuduScanTokenBuilder builder(table.get());
+    vector<string> column_names = { "col", Schema::GetAutoIncrementingColumnName() };
+    ASSERT_OK(builder.SetProjectedColumnNames(column_names));
+    ASSERT_OK(builder.Build(&tokens));
+    ASSERT_EQ(4, tokens.size());
+
+    for (KuduScanToken* token : tokens) {
+      KuduSchema s = GetTokenProjectionSchema(*token);
+      ASSERT_TRUE(s.HasColumn("col", nullptr));
+      ASSERT_TRUE(s.HasColumn(Schema::GetAutoIncrementingColumnName(), nullptr));
+    }
+  }
+
+  // Projection excluding auto incrementing column
+  {
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    KuduScanTokenBuilder builder(table.get());
+    vector<string> column_names = { "col" };
+    ASSERT_OK(builder.SetProjectedColumnNames(column_names));
+    ASSERT_OK(builder.Build(&tokens));
+    ASSERT_EQ(4, tokens.size());
+
+    for (KuduScanToken* token : tokens) {
+      KuduSchema s = GetTokenProjectionSchema(*token);
+      ASSERT_TRUE(s.HasColumn("col", nullptr));
+      ASSERT_FALSE(s.HasColumn(Schema::GetAutoIncrementingColumnName(), nullptr));
+    }
   }
 }
 
@@ -1473,6 +1725,51 @@ TEST_F(ScanTokenTest, ToggleFaultToleranceForScanConfiguration) {
   ASSERT_OK(sc.SetFaultTolerant(false));
   ASSERT_FALSE(sc.is_fault_tolerant());
   ASSERT_EQ(KuduScanner::READ_YOUR_WRITES, sc.read_mode());
+}
+
+class ReplicaSelectionTest : public ScanTokenTest,
+                             public ::testing::WithParamInterface<KuduClient::ReplicaSelection> {};
+
+INSTANTIATE_TEST_SUITE_P(PickServer,
+                         ReplicaSelectionTest,
+                         ::testing::Values(KuduClient::ReplicaSelection::LEADER_ONLY,
+                                           KuduClient::ReplicaSelection::CLOSEST_REPLICA,
+                                           KuduClient::ReplicaSelection::FIRST_REPLICA));
+
+// TODO(duyuqi)
+// Using location assignment to test replica selection for ScanToken, refer to:
+//   src/kudu/integration-tests/location_assignment-itest.cc#L76-L150
+//
+// This unit test checks whether LEADER_ONLY/CLOSEST_REPLICA/FIRST_REPLICA replica selection works
+// as expected.
+TEST_P(ReplicaSelectionTest, ReplicaSelection) {
+  shared_ptr<KuduTable> table;
+  map<string, int32_t> replica_num_by_ts_uuid;
+  vector<string> tablet_ids;
+  auto replica_selection = GetParam();
+  PrepareEnvForTestReplicaSelection(&table, &tablet_ids);
+  GetSelectedReplicaCount(tablet_ids, replica_selection, &replica_num_by_ts_uuid);
+
+  map<string, int32_t> scanner_count_by_ts_uuid;
+  GetScannerCount(&scanner_count_by_ts_uuid);
+  vector<KuduScanToken*> tokens;
+  ElementDeleter deleter(&tokens);
+  // Scan all the partitions by specific replica selection.
+  // Launch scan requests.
+  ASSERT_OK(KuduScanTokenBuilder(table.get()).Build(&tokens));
+  int64_t row_count = 0;
+  CountRowsSeq(client_.get(), tokens, &row_count, replica_selection);
+
+  int result = 0;
+  map<string, int32_t> now_scanner_count_by_ts_uuid;
+  GetScannerCount(&now_scanner_count_by_ts_uuid);
+  for (auto& ts_uuid_scanner_count : now_scanner_count_by_ts_uuid) {
+    const auto& permanent_uuid = ts_uuid_scanner_count.first;
+    ASSERT_EQ(replica_num_by_ts_uuid[permanent_uuid],
+              (ts_uuid_scanner_count.second - scanner_count_by_ts_uuid[permanent_uuid]));
+    result += replica_num_by_ts_uuid[permanent_uuid];
+  }
+  ASSERT_EQ(kBucketNum, result);
 }
 
 } // namespace client

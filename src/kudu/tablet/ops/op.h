@@ -28,6 +28,7 @@
 #include <google/protobuf/arena.h>
 
 #include "kudu/common/common.pb.h"
+#include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus.pb.h"
@@ -49,8 +50,6 @@ class Message;
 
 namespace kudu {
 
-class Schema;
-
 namespace tablet {
 class OpCompletionCallback;
 class OpState;
@@ -63,6 +62,7 @@ struct OpMetrics {
   int successful_inserts;
   int insert_ignore_errors;
   int successful_upserts;
+  int upsert_ignore_errors;
   int successful_updates;
   int update_ignore_errors;
   int successful_deletes;

@@ -24,6 +24,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -84,12 +85,16 @@ using kudu::client::KuduTableCreator;
 using kudu::client::KuduTableStatistics;
 using kudu::client::KuduValue;
 using kudu::client::internal::ReplicaController;
+using kudu::iequals;
 using kudu::tools::PartitionPB;
 using std::cerr;
 using std::cout;
 using std::endl;
+using std::find_if;
 using std::make_unique;
 using std::map;
+using std::nullopt;
+using std::ostringstream;
 using std::pair;
 using std::set;
 using std::string;
@@ -112,6 +117,63 @@ DEFINE_bool(list_tablets, false,
 DEFINE_bool(show_table_info, false,
             "Include extra information such as number of tablets, replicas, "
             "and live row count for a table in the output");
+DEFINE_bool(show_tablet_partition_info, false,
+            "Include partition keys information corresponding to tablet in the output.");
+
+bool ValidateShowTabletPartitionInfo() {
+  if (!FLAGS_list_tablets && FLAGS_show_tablet_partition_info) {
+    LOG(ERROR) << Substitute("--show_tablet_partition_info is meaningless "
+                             "when --list_tablets=false");
+    return false;
+  }
+  return true;
+}
+
+GROUP_FLAG_VALIDATOR(show_tablet_partition_info, ValidateShowTabletPartitionInfo);
+
+DEFINE_bool(show_hash_partition_info, false,
+            "Include hash partition keys information corresponding to tablet in the output.");
+
+bool ValidateShowHashPartitionInfo() {
+  if (!FLAGS_show_tablet_partition_info && FLAGS_show_hash_partition_info) {
+    LOG(ERROR) << Substitute("--show_hash_partition_info is meaningless "
+                             "when --show_tablet_partition_info=false");
+    return false;
+  }
+  return true;
+}
+
+GROUP_FLAG_VALIDATOR(show_hash_partition_info, ValidateShowHashPartitionInfo);
+
+DEFINE_bool(soft_deleted_only, false,
+            "Show only soft-deleted tables if set true, otherwise show regular tables.");
+DEFINE_string(new_table_name, "",
+              "The new name for the recalled table. "
+              "Leave empty to recall the table under its original name.");
+DEFINE_string(list_table_output_format, "pretty",
+              "One of 'json', 'json_compact' or 'pretty'. Pretty output flattens "
+              "the table list hierarchy.");
+
+static bool ValidateListTableOutput(const char* flag_name,
+                                    const string& flag_value) {
+  const vector<string> allowed_values = { "pretty", "json", "json_compact" };
+  if (find_if(allowed_values.begin(), allowed_values.end(),
+                   [&](const string& allowed_value) {
+                     return iequals(allowed_value, flag_value);
+                   }) != allowed_values.end()) {
+    return true;
+  }
+
+  LOG(ERROR) << Substitute("'$0' : unsupported value for -- $1 flag; "
+                           "should be one of $2.",
+                           flag_value, flag_name,
+                           JoinStrings(allowed_values, " "));
+
+  return false;
+}
+
+DEFINE_validator(list_table_output_format, ValidateListTableOutput);
+
 DEFINE_bool(modify_external_catalogs, true,
             "Whether to modify external catalogs, such as the Hive Metastore, "
             "when renaming or dropping a table.");
@@ -137,8 +199,12 @@ DEFINE_bool(show_avro_format_schema, false,
             "Display the table schema in avro format. When enabled it only outputs the "
             "table schema in Avro format without any other information like "
             "partition/owner/comments. It cannot be used in conjunction with other flags");
+DEFINE_int32(reserve_seconds, -1,
+              "Grace period before purging a soft-deleted table, in seconds. "
+              "If set to 0, it would be purged when a table is dropped/deleted.");
 
 DECLARE_bool(create_table);
+DECLARE_bool(fault_tolerant);
 DECLARE_int32(create_table_replication_factor);
 DECLARE_bool(row_count_only);
 DECLARE_bool(show_scanner_stats);
@@ -174,29 +240,89 @@ namespace tools {
 // KuduReplica, KuduReplica::Data, and KuduClientBuilder.
 class TableLister {
  public:
+  static string SearchPartitionInfo(const KuduClient::Data::TableInfo& table_info,
+                                    const client::sp::shared_ptr<KuduTable>& table,
+                                    const string& tablet_id) {
+    string pinfo;
+    const auto& partition_with_tablet_info = table_info.partition_with_tablet_info;
+    for (const auto& pt : partition_with_tablet_info) {
+      if (tablet_id != pt.tablet_id) {
+        continue;
+      }
+
+      const auto& schema_internal = KuduSchema::ToSchema(table->schema());
+      const auto& partition_schema = table->partition_schema();
+      auto show_hp = FLAGS_show_hash_partition_info ? PartitionSchema::HashPartitionInfo::SHOW :
+          PartitionSchema::HashPartitionInfo::HIDE;
+      pinfo = partition_schema.PartitionDebugString(pt.partition, schema_internal,
+                                                    show_hp);
+      break;
+    }
+    return pinfo;
+  }
+
+  static string ToPrettyFormat(const TablesInfoPB& tables_info) {
+    string output;
+    for (const auto& table_info : tables_info.tables()) {
+      if (!output.empty()) {
+        output.append("\n");
+      }
+
+      output += table_info.name();
+      if (table_info.has_num_tablets()) {
+        output += Substitute(" num_tablets:$0 num_replicas:$1 live_row_count:$2",
+                             table_info.num_tablets(),
+                             table_info.num_replicas(),
+                             table_info.live_row_count());
+      }
+
+      for (const auto& tablet_info : table_info.tablet_with_partition()) {
+        output += string("\n") + string("  T ") + tablet_info.tablet_id();
+        if (tablet_info.has_partition_info()) {
+          output += tablet_info.partition_info();
+        }
+
+        for (const auto& replica_info : tablet_info.replica_info()) {
+          output += Substitute("\n    $0 $1 $2",
+                               replica_info.role(),
+                               replica_info.uuid(),
+                               replica_info.host_port());
+        }
+      }
+    }
+    return output;
+  }
+
   static Status ListTablets(const vector<string>& master_addresses) {
     client::sp::shared_ptr<KuduClient> client;
     RETURN_NOT_OK(CreateKuduClient(master_addresses,
                                    &client,
-                                   true /* can_see_all_replicas */));
+                                   true/* can_see_all_replicas */));
     vector<kudu::client::KuduClient::Data::TableInfo> tables_info;
     RETURN_NOT_OK(client->data_->ListTablesWithInfo(
-        client.get(), &tables_info, "" /* filter */));
-
+                                          client.get(),
+                                          &tables_info,
+                                          "" /* filter */,
+                                          FLAGS_show_tablet_partition_info,
+                                          FLAGS_soft_deleted_only));
     vector<string> table_filters = Split(FLAGS_tables, ",", strings::SkipEmpty());
+    TablesInfoPB tables_info_pb;
     for (const auto& tinfo : tables_info) {
       const auto& tname = tinfo.table_name;
       if (!MatchesAnyPattern(table_filters, tname)) continue;
+
+      TablesInfoPB::TableInfoPB* table_info_pb = tables_info_pb.add_tables();
+      table_info_pb->set_name(tname);
       if (FLAGS_show_table_info) {
-        cout << tname << " " << "num_tablets:" << tinfo.num_tablets
-             << " num_replicas:" << tinfo.num_replicas
-             << " live_row_count:" << tinfo.live_row_count << endl;
-      } else {
-        cout << tname << endl;
+        table_info_pb->set_num_tablets(tinfo.num_tablets);
+        table_info_pb->set_num_replicas(tinfo.num_replicas);
+        table_info_pb->set_live_row_count(tinfo.live_row_count);
       }
+
       if (!FLAGS_list_tablets) {
         continue;
       }
+
       client::sp::shared_ptr<KuduTable> client_table;
       RETURN_NOT_OK(client->OpenTable(tname, &client_table));
       vector<KuduScanToken*> tokens;
@@ -205,18 +331,42 @@ class TableLister {
       RETURN_NOT_OK(builder.Build(&tokens));
 
       for (const auto* token : tokens) {
-        cout << "  T " << token->tablet().id() << endl;
+        string partition_info;
+        string tablet_id = token->tablet().id();
+        if (FLAGS_show_tablet_partition_info) {
+          if (iequals(FLAGS_list_table_output_format, "pretty")) {
+            partition_info = " : " + SearchPartitionInfo(tinfo, client_table, tablet_id);
+          } else {
+            partition_info = SearchPartitionInfo(tinfo, client_table, tablet_id);
+          }
+        }
+
+        TablesInfoPB::TabletWithPartitionPB* tpinfo = table_info_pb->add_tablet_with_partition();
+        tpinfo->set_tablet_id(tablet_id);
+        tpinfo->set_partition_info(partition_info);
+
         for (const auto* replica : token->tablet().replicas()) {
           const bool is_voter = ReplicaController::is_voter(*replica);
           const bool is_leader = replica->is_leader();
-          cout << Substitute("    $0 $1 $2:$3",
-              is_leader ? "L" : (is_voter ? "V" : "N"), replica->ts().uuid(),
-              replica->ts().hostname(), replica->ts().port()) << endl;
+          TablesInfoPB::ReplicaInfoPB* rinfo = tpinfo->add_replica_info();
+          rinfo->set_role(is_leader ? "L" : (is_voter ? "V" : "N"));
+          rinfo->set_uuid(replica->ts().uuid());
+          rinfo->set_host_port(replica->ts().hostname() + ":" +
+              std::to_string(replica->ts().port()));
         }
-        cout << endl;
       }
-      cout << endl;
     }
+
+    if (iequals(FLAGS_list_table_output_format, "pretty")) {
+      cout << ToPrettyFormat(tables_info_pb) << endl;
+    } else {
+      DCHECK(iequals(FLAGS_list_table_output_format, "json") ||
+          iequals(FLAGS_list_table_output_format, "json_compact"));
+      auto mode = iequals(FLAGS_list_table_output_format, "json") ?
+          JsonWriter::Mode::PRETTY : JsonWriter::Mode::COMPACT;
+      cout << JsonWriter::ToJson(tables_info_pb, mode) << endl;
+    }
+
     return Status::OK();
   }
 };
@@ -237,23 +387,71 @@ class TableAlter {
 
 namespace {
 
-const char* const kNewTableNameArg = "new_table_name";
-const char* const kColumnNameArg = "column_name";
-const char* const kNewColumnNameArg = "new_column_name";
-const char* const kKeyArg = "primary_key";
-const char* const kConfigNameArg = "config_name";
-const char* const kConfigValueArg = "config_value";
-const char* const kErrorMsgArg = "unable to parse value $0 for column $1 of type $2";
-const char* const kTableRangeLowerBoundArg = "table_range_lower_bound";
-const char* const kTableRangeUpperBoundArg = "table_range_upper_bound";
-const char* const kDefaultValueArg = "default_value";
-const char* const kCompressionTypeArg = "compression_type";
-const char* const kEncodingTypeArg = "encoding_type";
-const char* const kBlockSizeArg = "block_size";
-const char* const kColumnCommentArg = "column_comment";
-const char* const kCreateTableJSONArg = "create_table_json";
-const char* const kReplicationFactorArg = "replication_factor";
-const char* const kDataTypeArg = "data_type";
+constexpr const char* const kBlockSizeArg = "block_size";
+constexpr const char* const kColumnCommentArg = "column_comment";
+constexpr const char* const kColumnNameArg = "column_name";
+constexpr const char* const kCompressionTypeArg = "compression_type";
+constexpr const char* const kConfigNameArg = "config_name";
+constexpr const char* const kConfigValueArg = "config_value";
+constexpr const char* const kCreateTableExtraDescription =
+    R"*(provide parameters for the table to create as a JSON object, e.g.
+'{
+  "table_name": "test",
+  "schema": {
+    "columns": [
+      {
+        "column_name": "id",
+        "column_type": "INT32",
+        "default_value": "1"
+      },
+      {
+        "column_name": "key",
+        "column_type": "INT64",
+        "is_nullable": false,
+        "comment": "range partition column"
+      },
+      {
+        "column_name": "name",
+        "column_type": "STRING",
+        "is_nullable": false,
+        "comment": "user name"
+      }
+    ],
+    "key_column_names": ["id", "key"]
+  },
+  "partition": {
+    "hash_partitions": [{"columns": ["id"], "num_buckets": 2, "seed": 8}],
+    "range_partition": {
+      "columns": ["key"],
+      "range_bounds": [
+        {
+          "lower_bound": {"bound_type": "inclusive", "bound_values": ["2"]},
+          "upper_bound": {"bound_type": "exclusive", "bound_values": ["3"]}
+        },
+        {
+          "lower_bound": {"bound_type": "inclusive", "bound_values": ["3"]}
+        }
+      ]
+    }
+  },
+  "extra_configs": {
+    "configs": { "kudu.table.history_max_age_sec": "3600" }
+  },
+  "comment": "a test table",
+  "num_replicas": 3
+}')*";
+constexpr const char* const kCreateTableJSONArg = "create_table_json";
+constexpr const char* const kDataTypeArg = "data_type";
+constexpr const char* const kDefaultValueArg = "default_value";
+constexpr const char* const kEncodingTypeArg = "encoding_type";
+constexpr const char* const kErrorMsgArg =
+    "unable to parse value $0 for column $1 of type $2";
+constexpr const char* const kKeyArg = "primary_key";
+constexpr const char* const kNewColumnNameArg = "new_column_name";
+constexpr const char* const kNewTableNameArg = "new_table_name";
+constexpr const char* const kReplicationFactorArg = "replication_factor";
+constexpr const char* const kTableRangeLowerBoundArg = "table_range_lower_bound";
+constexpr const char* const kTableRangeUpperBoundArg = "table_range_upper_bound";
 
 enum PartitionAction {
   ADD,
@@ -296,7 +494,7 @@ Status AddPrimitiveType(const ColumnSchema& col_schema, const string& type, Json
 Status PopulateAvroSchema(const string& table_name,
                           const string& cluster_id,
                           const KuduSchema& kudu_schema) {
-  std::ostringstream out;
+  ostringstream out;
   JsonWriter writer(&out, JsonWriter::Mode::PRETTY);
   // Start writing in Json format
   writer.StartObject();
@@ -365,7 +563,9 @@ Status DeleteTable(const RunnerContext& context) {
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
   client::sp::shared_ptr<KuduClient> client;
   RETURN_NOT_OK(CreateKuduClient(context, &client));
-  return client->DeleteTableInCatalogs(table_name, FLAGS_modify_external_catalogs);
+  return client->DeleteTableInCatalogs(table_name,
+                                       FLAGS_modify_external_catalogs,
+                                       FLAGS_reserve_seconds);
 }
 
 Status DescribeTable(const RunnerContext& context) {
@@ -380,7 +580,7 @@ Status DescribeTable(const RunnerContext& context) {
   const KuduSchema& schema = table->schema();
   if (FLAGS_show_avro_format_schema) {
     return PopulateAvroSchema(FindOrDie(context.required_args, kTableNameArg),
-                                         client->cluster_id(), schema);
+                                        client->cluster_id(), schema);
   }
   cout << "TABLE " << table_name << " " << schema.ToString() << endl;
   // The partition schema with current range partitions.
@@ -457,6 +657,7 @@ Status LocateRow(const RunnerContext& context) {
       case KuduColumnSchema::INT32:
       case KuduColumnSchema::INT64:
       case KuduColumnSchema::DATE:
+      case KuduColumnSchema::SERIAL:
       case KuduColumnSchema::UNIXTIME_MICROS: {
         int64_t value;
         RETURN_NOT_OK_PREPEND(
@@ -622,6 +823,13 @@ Status SetRowCountLimit(const RunnerContext& context) {
   return alterer->Alter();
 }
 
+Status RecallTable(const RunnerContext& context) {
+  const string& table_id = FindOrDie(context.required_args, kTabletIdArg);
+  client::sp::shared_ptr<KuduClient> client;
+  RETURN_NOT_OK(CreateKuduClient(context, &client));
+  return client->RecallTable(table_id, FLAGS_new_table_name);
+}
+
 Status RenameTable(const RunnerContext& context) {
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
   const string& new_table_name = FindOrDie(context.required_args, kNewTableNameArg);
@@ -688,6 +896,7 @@ Status CopyTable(const RunnerContext& context) {
 
   TableScanner scanner(src_client, src_table_name, dst_client, dst_table_name);
   scanner.SetOutput(&cout);
+  scanner.SetScanBatchSize(FLAGS_scan_batch_size);
   return scanner.StartCopy();
 }
 
@@ -699,8 +908,8 @@ Status SetExtraConfig(const RunnerContext& context) {
   client::sp::shared_ptr<KuduClient> client;
   RETURN_NOT_OK(CreateKuduClient(context, &client));
   unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
-  alterer->AlterExtraConfig({ { config_name, config_value} });
-  return alterer->Alter();
+  return alterer->AlterExtraConfig({ { config_name, config_value} })
+                ->Alter();
 }
 
 Status GetExtraConfigs(const RunnerContext& context) {
@@ -786,6 +995,14 @@ Status ConvertToKuduPartialRow(
             reader.ExtractInt64(values[i], /*field=*/nullptr, &value),
             error_msg);
         RETURN_NOT_OK(range_bound_partial_row->SetInt64(col_name, value));
+        break;
+      }
+      case KuduColumnSchema::SERIAL: {
+        uint64_t value;
+        RETURN_NOT_OK_PREPEND(
+            reader.ExtractUint64(values[i], /*field=*/nullptr, &value),
+            error_msg);
+        RETURN_NOT_OK(range_bound_partial_row->SetSerial(col_name, value));
         break;
       }
       case KuduColumnSchema::DATE: {
@@ -1530,22 +1747,30 @@ Status CreateTable(const RunnerContext& context) {
   RETURN_NOT_OK(CreateKuduClient(context, &client));
   KuduSchema kudu_schema;
   RETURN_NOT_OK(ParseTableSchema(table_req.schema(), &kudu_schema));
-  unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
-  table_creator->table_name(table_req.table_name())
-                                     .schema(&kudu_schema);
-  RETURN_NOT_OK(ParseTablePartition(table_req.partition(), kudu_schema, table_creator.get()));
+  unique_ptr<KuduTableCreator> tc(client->NewTableCreator());
+  auto& table_creator = *tc;
+  table_creator
+      .table_name(table_req.table_name())
+      .schema(&kudu_schema);
+  RETURN_NOT_OK(ParseTablePartition(table_req.partition(), kudu_schema, &table_creator));
   if (table_req.has_num_replicas()) {
-    table_creator->num_replicas(table_req.num_replicas());
+    table_creator.num_replicas(table_req.num_replicas());
   }
   if (table_req.has_extra_configs()) {
     map<string, string> extra_configs(table_req.extra_configs().configs().begin(),
                                       table_req.extra_configs().configs().end());
-    table_creator->extra_configs(extra_configs);
+    table_creator.extra_configs(extra_configs);
   }
   if (table_req.has_dimension_label()) {
-    table_creator->dimension_label(table_req.dimension_label());
+    table_creator.dimension_label(table_req.dimension_label());
   }
-  return table_creator->Create();
+  if (table_req.has_owner()) {
+    table_creator.set_owner(table_req.owner());
+  }
+  if (table_req.has_comment()) {
+    table_creator.set_comment(table_req.comment());
+  }
+  return table_creator.Create();
 }
 
 
@@ -1579,6 +1804,7 @@ unique_ptr<Mode> BuildTableMode() {
       .Description("Delete a table")
       .AddRequiredParameter({ kTableNameArg, "Name of the table to delete" })
       .AddOptionalParameter("modify_external_catalogs")
+      .AddOptionalParameter("reserve_seconds")
       .Build();
 
   unique_ptr<Action> describe_table =
@@ -1586,15 +1812,20 @@ unique_ptr<Mode> BuildTableMode() {
       .Description("Describe a table")
       .AddRequiredParameter({ kTableNameArg, "Name of the table to describe" })
       .AddOptionalParameter("show_attributes")
+      .AddOptionalParameter("show_column_comment")
       .AddOptionalParameter("show_avro_format_schema")
       .Build();
 
   unique_ptr<Action> list_tables =
       ClusterActionBuilder("list", &ListTables)
       .Description("List tables")
+      .AddOptionalParameter("soft_deleted_only")
       .AddOptionalParameter("tables")
       .AddOptionalParameter("list_tablets")
+      .AddOptionalParameter("show_tablet_partition_info")
+      .AddOptionalParameter("show_hash_partition_info")
       .AddOptionalParameter("show_table_info")
+      .AddOptionalParameter("list_table_output_format")
       .Build();
 
   unique_ptr<Action> locate_row =
@@ -1621,6 +1852,14 @@ unique_ptr<Mode> BuildTableMode() {
       .AddRequiredParameter({ kNewColumnNameArg, "New column name" })
       .Build();
 
+  unique_ptr<Action> recall =
+      ActionBuilder("recall", &RecallTable)
+      .Description("Recall a deleted but still reserved table")
+      .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
+      .AddRequiredParameter({ kTabletIdArg, "ID of the table to recall" })
+      .AddOptionalParameter("new_table_name")
+      .Build();
+
   unique_ptr<Action> rename_table =
       ClusterActionBuilder("rename_table", &RenameTable)
       .Description("Rename a table")
@@ -1639,6 +1878,7 @@ unique_ptr<Mode> BuildTableMode() {
       .AddOptionalParameter("row_count_only")
       .AddOptionalParameter("report_scanner_stats")
       .AddOptionalParameter("scan_batch_size")
+      .AddOptionalParameter("fault_tolerant")
       .AddOptionalParameter("fill_cache")
       .AddOptionalParameter("num_threads")
       .AddOptionalParameter("predicates")
@@ -1657,10 +1897,14 @@ unique_ptr<Mode> BuildTableMode() {
       .AddRequiredParameter({ kTableNameArg, "Name of the source table" })
       .AddRequiredParameter({ kDestMasterAddressesArg, kDestMasterAddressesArgDesc })
       .AddOptionalParameter("create_table")
+      .AddOptionalParameter("create_table_hash_bucket_nums")
       .AddOptionalParameter("create_table_replication_factor")
       .AddOptionalParameter("dst_table")
+      .AddOptionalParameter("fault_tolerant")
+      .AddOptionalParameter("fill_cache")
       .AddOptionalParameter("num_threads")
       .AddOptionalParameter("predicates")
+      .AddOptionalParameter("scan_batch_size")
       .AddOptionalParameter("tablets")
       .AddOptionalParameter("write_type")
       .Build();
@@ -1815,21 +2059,9 @@ unique_ptr<Mode> BuildTableMode() {
   unique_ptr<Action> create_table =
       ClusterActionBuilder("create", &CreateTable)
       .Description("Create a new table")
-      .ExtraDescription("Provide the  table-build statements as a JSON object, e.g."
-                        "'{\"table_name\":\"test\",\"schema\":{\"columns\":[{\"column_name"
-                        "\":\"id\",\"column_type\":\"INT32\",\"default_value\":\"1\"},{"
-                        "\"column_name\":\"key\",\"column_type\":\"INT64\",\"is_nullable\""
-                        ":false,\"comment\":\"range key\"},{\"column_name\":\"name\",\""
-                        "column_type\":\"STRING\",\"is_nullable\":false,\"comment\":\""
-                        "user name\"}],\"key_column_names\":[\"id\", \"key\"]},\"partition\""
-                        ":{\"hash_partitions\":[{\"columns\":[\"id\"],\"num_buckets\":2,\"seed"
-                        "\":100}],\"range_partition\":{\"columns\":[\"key\"],\"range_bounds\":"
-                        "[{\"upper_bound\":{\"bound_type\":\"inclusive\",\"bound_values\":[\"2"
-                        "\"]}},{\"lower_bound\": {\"bound_type\":\"exclusive\",\"bound_values"
-                        "\": [\"2\"]},\"upper_bound\":{\"bound_type\":\"inclusive\",\""
-                        "bound_values\":[\"3\"]}}]}},\"extra_configs\":{\"configs\":{\""
-                        "kudu.table.history_max_age_sec\":\"3600\"}},\"num_replicas\":3}'.")
-      .AddRequiredParameter({ kCreateTableJSONArg, "JSON object for creating table" })
+      .ExtraDescription(kCreateTableExtraDescription)
+      .AddRequiredParameter({ kCreateTableJSONArg,
+                              "JSON object for creating table" })
       .Build();
 
   return ModeBuilder("table")
@@ -1853,6 +2085,7 @@ unique_ptr<Mode> BuildTableMode() {
       .AddAction(std::move(get_extra_configs))
       .AddAction(std::move(list_tables))
       .AddAction(std::move(locate_row))
+      .AddAction(std::move(recall))
       .AddAction(std::move(rename_column))
       .AddAction(std::move(rename_table))
       .AddAction(std::move(scan_table))

@@ -16,6 +16,7 @@
 // under the License.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -32,8 +33,8 @@
 #include "kudu/tablet/delta_key.h"
 #include "kudu/tablet/delta_stats.h"
 #include "kudu/tablet/delta_store.h"
+#include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet_mem_trackers.h"
-#include "kudu/util/atomic.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/status.h"
@@ -67,8 +68,6 @@ class DeltaMemStore;
 class OperationResultPB;
 class RowSetMetadata;
 class RowSetMetadataUpdate;
-struct ProbeStats;
-struct RowIteratorOptions;
 
 typedef std::pair<BlockId, std::unique_ptr<DeltaStats>> DeltaBlockIdAndStats;
 
@@ -139,10 +138,10 @@ class DeltaTracker {
   // Update the given row in the database.
   // Copies the data, as well as any referenced values into a local arena.
   // "result" tracks the status of the update as well as which data
-  // structure(s) it ended up at.
+  // structure(s) it ended up at (optional, might be passed as nullptr).
   Status Update(Timestamp timestamp,
                 rowid_t row_idx,
-                const RowChangeList &update,
+                const RowChangeList& update,
                 const consensus::OpId& op_id,
                 OperationResultPB* result);
 
@@ -151,7 +150,7 @@ class DeltaTracker {
   //
   // Sets *deleted to true if so; otherwise sets it to false.
   Status CheckRowDeleted(rowid_t row_idx, const fs::IOContext* io_context,
-                         bool *deleted, ProbeStats* stats) const;
+                         bool* deleted, ProbeStats* stats) const;
 
   // Compacts all REDO delta files.
   Status Compact(const fs::IOContext* io_context);
@@ -176,8 +175,10 @@ class DeltaTracker {
   Status CompactStores(const fs::IOContext* io_context, int start_idx, int end_idx);
 
   // See RowSet::EstimateBytesInPotentiallyAncientUndoDeltas().
-  Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp ancient_history_mark,
-                                                     int64_t* bytes);
+  Status EstimateBytesInPotentiallyAncientUndoDeltas(
+      Timestamp ancient_history_mark,
+      RowSet::EstimateType estimate_type,
+      int64_t* bytes) const;
 
   // Returns whether all redo (DMS and newest redo delta file) are ancient
   // (i.e. that the redo with the highest timestamp is older than the AHM).
@@ -248,7 +249,7 @@ class DeltaTracker {
 
   // Returns true if the DMS doesn't exist. This doesn't rely on the size.
   bool DeltaMemStoreEmpty() const {
-    return !dms_exists_.Load();
+    return !dms_exists_;
   }
 
   // Get the minimum log index for this tracker's DMS, -1 if it wasn't set.
@@ -266,8 +267,8 @@ class DeltaTracker {
   // Return the size on-disk of REDO deltas, in bytes.
   uint64_t RedoDeltaOnDiskSize() const;
 
-  // Retrieves the list of column indexes that currently have updates.
-  void GetColumnIdsWithUpdates(std::vector<ColumnId>* col_ids) const;
+  // Retrieves the list of column indexes to compact.
+  void GetColumnIdsToCompact(std::vector<ColumnId>* col_ids) const;
 
   Mutex* compact_flush_lock() {
     return &compact_flush_lock_;
@@ -336,7 +337,7 @@ class DeltaTracker {
                                          size_t start_idx, size_t end_idx, const Schema* projection,
                                          std::vector<std::shared_ptr<DeltaStore>>* target_stores,
                                          std::vector<BlockId>* target_blocks,
-                                         std::unique_ptr<DeltaIterator>* out);
+                                         std::unique_ptr<DeltaIterator>* out) const;
 
   std::string LogPrefix() const;
 
@@ -369,7 +370,7 @@ class DeltaTracker {
   // The maintenance scheduler calls DeltaMemStoreEmpty() a lot.
   // We use an atomic variable to indicate whether DMS exists or not and
   // to avoid having to take component_lock_ in order to satisfy this call.
-  AtomicBool dms_exists_;
+  std::atomic<bool> dms_exists_;
 
   // read-write lock protecting dms_ and {redo,undo}_delta_stores_.
   // - Readers take this lock in shared mode.
@@ -395,6 +396,13 @@ class DeltaTracker {
   // When the flush completes, this is merged into the RowSetMetadata
   // and reset.
   int64_t deleted_row_count_;
+
+  // As a supplement to KUDU-1625, we need to release storage space for old
+  // tablet metadata that does not support the live row count function.
+  // We record the latest update time of the delta file, so as to trigger
+  // gc scheduler to release storage space after a long time of no update
+  // operation.
+  std::atomic<MonoTime> last_update_time_;
 
   DISALLOW_COPY_AND_ASSIGN(DeltaTracker);
 };

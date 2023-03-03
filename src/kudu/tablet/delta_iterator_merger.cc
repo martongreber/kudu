@@ -18,7 +18,9 @@
 #include "kudu/tablet/delta_iterator_merger.h"
 
 #include <algorithm>
+#include <type_traits>
 
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/delta_key.h"
 
@@ -118,7 +120,7 @@ Status DeltaIteratorMerger::FilterColumnIdsAndCollectDeltas(
   return Status::OK();
 }
 
-bool DeltaIteratorMerger::HasNext() {
+bool DeltaIteratorMerger::HasNext() const {
   for (const unique_ptr<DeltaIterator>& iter : iters_) {
     if (iter->HasNext()) {
       return true;
@@ -140,20 +142,20 @@ bool DeltaIteratorMerger::MayHaveDeltas() const {
 string DeltaIteratorMerger::ToString() const {
   string ret;
   ret.append("DeltaIteratorMerger(");
-
-  bool first = true;
-  for (const unique_ptr<DeltaIterator> &iter : iters_) {
-    if (!first) {
-      ret.append(", ");
-    }
-    first = false;
-
-    ret.append(iter->ToString());
-  }
+  ret.append(JoinMapped(iters_, [](const unique_ptr<DeltaIterator> &iter) {
+        return iter->ToString();
+      }, ", "));
   ret.append(")");
   return ret;
 }
 
+size_t DeltaIteratorMerger::memory_footprint() {
+  size_t result = 0;
+  for (const auto& it : iters_) {
+    result += it->memory_footprint();
+  }
+  return result;
+}
 
 Status DeltaIteratorMerger::Create(
     const vector<shared_ptr<DeltaStore> > &stores,

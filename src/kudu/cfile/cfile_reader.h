@@ -33,7 +33,6 @@
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/util/compression/compression.pb.h"
 #include "kudu/util/faststring.h"
@@ -112,14 +111,14 @@ class CFileReader {
   // Return the number of rows in this cfile.
   // This is assumed to be reasonably fast (i.e does not scan
   // the data)
-  Status CountRows(rowid_t *count) const;
+  Status CountRows(rowid_t* count) const;
 
   // Retrieve the given metadata entry into 'val'.
   // Returns true if the entry was found, otherwise returns false.
   //
   // Note that this implementation is currently O(n), so should not be used
   // in a hot path.
-  bool GetMetadataEntry(const std::string &key, std::string *val) const;
+  bool GetMetadataEntry(const std::string& key, std::string* val) const;
 
   // Can be called before Init().
   uint64_t file_size() const {
@@ -131,12 +130,12 @@ class CFileReader {
     return block_->id();
   }
 
-  const TypeInfo *type_info() const {
+  const TypeInfo* type_info() const {
     DCHECK(init_once_.init_succeeded());
     return type_info_;
   }
 
-  const TypeEncodingInfo *type_encoding_info() const {
+  const TypeEncodingInfo* type_encoding_info() const {
     DCHECK(init_once_.init_succeeded());
     return type_encoding_info_;
   }
@@ -145,12 +144,12 @@ class CFileReader {
     return footer().is_type_nullable();
   }
 
-  const CFileHeaderPB &header() const {
+  const CFileHeaderPB& header() const {
     DCHECK(init_once_.init_succeeded());
     return *DCHECK_NOTNULL(header_.get());
   }
 
-  const CFileFooterPB &footer() const {
+  const CFileFooterPB& footer() const {
     DCHECK(init_once_.init_succeeded());
     return *DCHECK_NOTNULL(footer_.get());
   }
@@ -177,18 +176,14 @@ class CFileReader {
     return BlockPointer(footer().validx_info().root_block());
   }
 
-  // Returns true if the file has checksums on the header, footer, and data blocks.
-  bool has_checksums() const;
-
   // Can be called before Init().
   std::string ToString() const { return block_->id().ToString(); }
 
-  // Handles a corruption error. Functions that may return due to a CFile
-  // corruption should call this method before returning.
-  void HandleCorruption(const fs::IOContext* io_context) const;
-
  private:
   DISALLOW_COPY_AND_ASSIGN(CFileReader);
+
+  static Status VerifyChecksum(ArrayView<const Slice> data,
+                               const Slice& checksum);
 
   CFileReader(ReaderOptions options,
               uint64_t file_size,
@@ -199,14 +194,21 @@ class CFileReader {
 
   Status ReadAndParseHeader();
   Status ReadAndParseFooter();
-  Status VerifyChecksum(ArrayView<const Slice> data, const Slice& checksum) const;
+
+  // Return true if the file has checksum on the header, footer, and data blocks.
+  bool has_checksum() const;
+
+  // Return true if has_checksum() returns true and the checksum verification
+  // is requested.
+  bool do_verify_checksum() const;
 
   // Returns the memory usage of the object including the object itself.
   size_t memory_footprint() const;
 
-#ifdef __clang__
-  __attribute__((__unused__))
-#endif
+  // Handles a corruption error. Functions that may return due to a CFile
+  // corruption should call this method before returning.
+  void HandleCorruption(const fs::IOContext* io_context) const;
+
   const std::unique_ptr<fs::ReadableBlock> block_;
   const uint64_t file_size_;
 
@@ -215,8 +217,10 @@ class CFileReader {
   std::unique_ptr<CFileHeaderPB> header_;
   std::unique_ptr<CFileFooterPB> footer_;
   const CompressionCodec* codec_;
-  const TypeInfo *type_info_;
-  const TypeEncodingInfo *type_encoding_info_;
+  const TypeInfo* type_info_;
+  const TypeEncodingInfo* type_encoding_info_;
+
+  bool do_verify_checksum_;
 
   KuduOnceLambda init_once_;
 
@@ -260,7 +264,7 @@ class ColumnIterator {
   // If there are at least dst->size() values remaining in the underlying file,
   // this will always return *n == dst->size(). In other words, this does not
   // ever result in a "short read".
-  virtual Status PrepareBatch(size_t *n) = 0;
+  virtual Status PrepareBatch(size_t* n) = 0;
 
   // Copy values into the prepared column block.
   // Any indirected values (eg strings) are copied into the ctx's block's
@@ -286,27 +290,29 @@ class ColumnIterator {
 // Example:
 //    DefaultColumnValueIterator iter;
 //    iter.Scan(&column_block);
-class DefaultColumnValueIterator : public ColumnIterator {
+class DefaultColumnValueIterator final : public ColumnIterator {
  public:
-  DefaultColumnValueIterator(const TypeInfo* typeinfo, const void *value)
-    : typeinfo_(typeinfo), value_(value), ordinal_(0) {
+  DefaultColumnValueIterator(const TypeInfo* typeinfo, const void* value)
+      : typeinfo_(typeinfo),
+        value_(value),
+        ordinal_(0) {
   }
 
   Status SeekToOrdinal(rowid_t ord_idx) override;
 
-  bool seeked() const OVERRIDE { return true; }
+  bool seeked() const override { return true; }
 
-  rowid_t GetCurrentOrdinal() const OVERRIDE { return ordinal_; }
+  rowid_t GetCurrentOrdinal() const override { return ordinal_; }
 
-  Status PrepareBatch(size_t* n) OVERRIDE;
+  Status PrepareBatch(size_t* n) override;
   Status Scan(ColumnMaterializationContext* ctx) override;
-  Status FinishBatch() OVERRIDE;
+  Status FinishBatch() override;
 
-  const IteratorStats& io_statistics() const OVERRIDE { return io_stats_; }
+  const IteratorStats& io_statistics() const override { return io_stats_; }
 
  private:
   const TypeInfo* typeinfo_;
-  const void *value_;
+  const void* value_;
 
   size_t batch_;
   rowid_t ordinal_;
@@ -314,7 +320,7 @@ class DefaultColumnValueIterator : public ColumnIterator {
 };
 
 
-class CFileIterator : public ColumnIterator {
+class CFileIterator final : public ColumnIterator {
  public:
   CFileIterator(CFileReader* reader,
                 CFileReader::CacheControl cache_control,
@@ -341,13 +347,13 @@ class CFileIterator : public ColumnIterator {
   //
   // If this iterator was constructed without no value index,
   // then this will return a NotSupported status.
-  Status SeekAtOrAfter(const EncodedKey &encoded_key,
-                       bool *exact_match);
+  Status SeekAtOrAfter(const EncodedKey& encoded_key,
+                       bool* exact_match);
 
   // Return true if this reader is currently seeked.
   // If the iterator is not seeked, it is an error to call any functions except
   // for seek (including GetCurrentOrdinal).
-  bool seeked() const OVERRIDE { return seeked_; }
+  bool seeked() const override { return seeked_; }
 
   // Get the ordinal index that the iterator is currently pointed to.
   //
@@ -355,7 +361,7 @@ class CFileIterator : public ColumnIterator {
   // seek. PrepareBatch() and Scan() do not change the position returned by this
   // function. FinishBatch() advances the ordinal to the position of the next
   // block to be prepared.
-  rowid_t GetCurrentOrdinal() const OVERRIDE;
+  rowid_t GetCurrentOrdinal() const override;
 
   // Prepare to read up to *n into the given column block.
   // On return sets *n to the number of prepared rows, which is always
@@ -366,7 +372,7 @@ class CFileIterator : public ColumnIterator {
   // If there are at least dst->size() values remaining in the underlying file,
   // this will always return *n == dst->size(). In other words, this does not
   // ever result in a "short read".
-  Status PrepareBatch(size_t *n) OVERRIDE;
+  Status PrepareBatch(size_t* n) override;
 
   // Copy values into the prepared column block.
   // Any indirected values (eg strings) are copied into the dst block's
@@ -378,7 +384,7 @@ class CFileIterator : public ColumnIterator {
   // Finish processing the current batch, advancing the iterators
   // such that the next call to PrepareBatch() will start where the previous
   // batch left off.
-  Status FinishBatch() OVERRIDE;
+  Status FinishBatch() override;
 
   // Return true if the next call to PrepareBatch will return at least one row.
   bool HasNext() const;
@@ -386,7 +392,7 @@ class CFileIterator : public ColumnIterator {
   // Convenience method to prepare a batch, scan it, and finish it.
   Status CopyNextValues(size_t* n, ColumnMaterializationContext* ctx);
 
-  const IteratorStats &io_statistics() const OVERRIDE {
+  const IteratorStats& io_statistics() const override {
     return io_stats_;
   }
 
@@ -400,7 +406,9 @@ class CFileIterator : public ColumnIterator {
   // is shared among the multiple BinaryDictBlockDecoders in a single cfile,
   // the reader must expose an interface for all decoders to access the
   // single set of predicate-satisfying codewords.
-  SelectionVector* GetCodeWordsMatchingPredicate() { return codewords_matching_pred_.get(); }
+  SelectionVector* GetCodeWordsMatchingPredicate() {
+    return codewords_matching_pred_.get();
+  }
 
  private:
   DISALLOW_COPY_AND_ASSIGN(CFileIterator);
@@ -446,18 +454,18 @@ class CFileIterator : public ColumnIterator {
   };
 
   // Seek the given PreparedBlock to the given index within it.
-  void SeekToPositionInBlock(PreparedBlock *pb, uint32_t idx_in_block);
+  void SeekToPositionInBlock(PreparedBlock* pb, uint32_t idx_in_block);
 
   // Read the data block currently pointed to by idx_iter_
   // into the given PreparedBlock structure.
   //
   // This does not advance the iterator.
-  Status ReadCurrentDataBlock(const IndexTreeIterator &idx_iter,
-                              PreparedBlock *prep_block);
+  Status ReadCurrentDataBlock(const IndexTreeIterator& idx_iter,
+                              PreparedBlock* prep_block);
 
   // Read the data block currently pointed to by idx_iter_, and enqueue
   // it onto the end of the prepared_blocks_ deque.
-  Status QueueCurrentDataBlock(const IndexTreeIterator &idx_iter);
+  Status QueueCurrentDataBlock(const IndexTreeIterator& idx_iter);
 
   // Fully initialize the underlying cfile reader if needed, and clear any
   // seek-related state.
@@ -477,12 +485,12 @@ class CFileIterator : public ColumnIterator {
 
   // The currently in-use index iterator. This is equal to either
   // posidx_iter_.get(), validx_iter_.get(), or NULL if not seeked.
-  IndexTreeIterator *seeked_;
+  IndexTreeIterator* seeked_;
 
   // Data blocks that contain data relevant to the currently Prepared
   // batch of rows.
   // These pointers are allocated from the prepared_block_pool_ below.
-  std::vector<PreparedBlock *> prepared_blocks_;
+  std::vector<PreparedBlock*> prepared_blocks_;
 
   ObjectPool<PreparedBlock> prepared_block_pool_;
   typedef ObjectPool<PreparedBlock>::scoped_ptr pblock_pool_scoped_ptr;

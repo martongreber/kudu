@@ -173,7 +173,9 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         string& name()
         c_bool is_nullable()
         DataType type()
+        c_bool is_immutable()
         KuduColumnTypeAttributes type_attributes()
+        string& comment()
 
         c_bool Equals(KuduColumnSchema& other)
         void CopyFrom(KuduColumnSchema& other)
@@ -182,6 +184,9 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         KuduSchema()
         KuduSchema(const KuduSchema& schema)
         KuduSchema(vector[KuduColumnSchema]& columns, int key_columns)
+
+        @staticmethod
+        string GetAutoIncrementingColumnName()
 
         c_bool Equals(const KuduSchema& other)
         KuduColumnSchema Column(size_t idx)
@@ -201,8 +206,11 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
          KuduColumnSpec* BlockSize(int32_t block_size)
 
          KuduColumnSpec* PrimaryKey()
+         KuduColumnSpec* NonUniquePrimaryKey()
          KuduColumnSpec* NotNull()
          KuduColumnSpec* Nullable()
+         KuduColumnSpec* Immutable()
+         KuduColumnSpec* Mutable()
          KuduColumnSpec* Type(DataType type_)
 
          KuduColumnSpec* Precision(int8_t precision);
@@ -210,12 +218,14 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
          KuduColumnSpec* Length(uint16_t length);
 
          KuduColumnSpec* RenameTo(const string& new_name)
+         KuduColumnSpec* Comment(const string& comment)
 
 
     cdef cppclass KuduSchemaBuilder:
 
         KuduColumnSpec* AddColumn(string& name)
         KuduSchemaBuilder* SetPrimaryKey(vector[string]& key_col_names);
+        KuduSchemaBuilder* SetNonUniquePrimaryKey(vector[string]& key_col_names);
 
         Status Build(KuduSchema* schema)
 

@@ -23,6 +23,10 @@ from kudu.client import (Partitioning,
                          ENCRYPTION_OPTIONAL,
                          ENCRYPTION_REQUIRED,
                          ENCRYPTION_REQUIRED_REMOTE)
+from kudu.errors import (KuduInvalidArgument,
+                         KuduBadStatus)
+from kudu.schema import (Schema,
+                         KuduValue)
 import kudu
 import datetime
 from pytz import utc
@@ -228,6 +232,43 @@ class TestClient(KuduTestBase, unittest.TestCase):
             except:
                 pass
 
+    def test_create_table_with_auto_incrementing_column(self):
+        table_name = 'create_table_with_auto_incrementing_column'
+        try:
+            builder = kudu.schema_builder()
+            (builder.add_column('key', kudu.int32)
+            .nullable(False)
+            .non_unique_primary_key())
+            builder.add_column('data', kudu.string)
+            schema = builder.build()
+
+            self.client.create_table(
+                table_name, schema,
+                partitioning=Partitioning().add_hash_partitions(['key'], 2))
+
+            table = self.client.table(table_name)
+            session = self.client.new_session()
+            nrows = 10
+            for _ in range(nrows):
+                op = table.new_insert()
+                op['key'] = 1
+                op['data'] = 'text'
+                session.apply(op)
+
+            session.flush()
+
+            scanner = table.scanner()
+            results = scanner.open().read_all_tuples()
+            assert nrows == len(results)
+            for i in range(len(results)):
+                auto_incrementing_value = results[i][1]
+                assert auto_incrementing_value == i+1
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except:
+                pass
+
     def test_insert_nonexistent_field(self):
         table = self.client.table(self.ex_table)
         op = table.new_insert()
@@ -300,6 +341,153 @@ class TestClient(KuduTestBase, unittest.TestCase):
         scanner = table.scanner().open()
         assert len(scanner.read_all_tuples()) == 0
 
+    def test_insert_and_mutate_immutable_column(self):
+        table_name = 'insert_and_mutate_immutable_column'
+        try:
+            builder = kudu.schema_builder()
+            (builder.add_column('key', kudu.int32)
+            .nullable(False)
+            .primary_key())
+            builder.add_column('immutable_data', kudu.string).mutable(False)
+            builder.add_column('mutable_data', kudu.string).mutable(True)
+            schema = builder.build()
+
+            self.client.create_table(
+                table_name, schema,
+                partitioning=Partitioning().add_hash_partitions(['key'], 2))
+
+            table = self.client.table(table_name)
+            session = self.client.new_session()
+            op = table.new_insert()
+            op['key'] = 1
+            op['immutable_data'] = 'text'
+            op['mutable_data'] = 'text'
+            session.apply(op)
+            session.flush()
+
+            # Update the mutable columns
+            op = table.new_update()
+            op['key'] = 1
+            op['mutable_data'] = 'new_text'
+            session.apply(op)
+            session.flush()
+
+            # Update the immutable column
+            op = table.new_update()
+            op['key'] = 1
+            op['immutable_data'] = 'new_text'
+            session.apply(op)
+            try:
+                session.flush()
+            except KuduBadStatus:
+                message = 'Immutable: UPDATE not allowed for immutable column'
+                errors, overflow = session.get_pending_errors()
+                assert not overflow
+                assert len(errors) == 1
+                assert message in repr(errors[0])
+
+            # Update ignore on both mutable and immutable columns. The error is ignored.
+            op = table.new_update_ignore()
+            op['key'] = 1
+            op['immutable_data'] = 'new_text'
+            op['mutable_data'] = 'new_text'
+            session.apply(op)
+            session.flush()
+
+            # Update ignore the immutable column
+            op = table.new_update_ignore()
+            op['key'] = 1
+            op['immutable_data'] = 'new_text'
+            session.apply(op)
+            try:
+                session.flush()
+            except KuduBadStatus:
+                message = 'Invalid argument: No fields updated'
+                errors, overflow = session.get_pending_errors()
+                assert not overflow
+                assert len(errors) == 1
+                assert message in repr(errors[0])
+
+            # TODO: test upsert ignore, once it is supported by the Python client.
+
+            # Upsert the mutable columns
+            op = table.new_upsert()
+            op['key'] = 1
+            op['mutable_data'] = 'new_text'
+            session.apply(op)
+            session.flush()
+
+            # Upsert the immutable column
+            op = table.new_upsert()
+            op['key'] = 1
+            op['immutable_data'] = 'new_text'
+            session.apply(op)
+            try:
+                session.flush()
+            except KuduBadStatus:
+                message = 'Immutable: UPDATE not allowed for immutable column'
+                errors, overflow = session.get_pending_errors()
+                assert not overflow
+                assert len(errors) == 1
+                assert message in repr(errors[0])
+
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except:
+                pass
+
+    def test_insert_with_auto_incrementing_column(self):
+
+        table_name = 'test_insert_with_auto_incrementing_column'
+        try:
+            builder = kudu.schema_builder()
+            (builder.add_column('key', kudu.int32)
+            .nullable(False)
+            .non_unique_primary_key())
+            builder.add_column('data', kudu.string)
+            schema = builder.build()
+
+            self.client.create_table(
+                table_name, schema,
+                partitioning=Partitioning().add_hash_partitions(['key'], 2))
+
+            table = self.client.table(table_name)
+            session = self.client.new_session()
+
+            # Insert with auto incrementing column specified
+            op = table.new_insert()
+            op['key'] = 1
+            op[Schema.get_auto_incrementing_column_name()] = 1
+            session.apply(op)
+            try:
+                session.flush()
+            except KuduBadStatus:
+                message = 'is incorrectly set'
+                errors, overflow = session.get_pending_errors()
+                assert not overflow
+                assert len(errors) == 1
+                assert message in repr(errors[0])
+
+            # TODO: Upsert should be rejected as of now. However the test segfaults: KUDU-3454
+            # TODO: Upsert ignore should be rejected. Once Python client supports upsert ignore.
+
+            # With non-unique primary key, one can't use the tuple/list initialization for new
+            # inserts. In this case, at the second position it would like to get an int64 (the type
+            # of the auto-incrementing counter), therefore we get type error. (Specifying the
+            # auto-incremeintg counter is obviously rejected from the server side)
+            with self.assertRaises(TypeError):
+                op = table.new_insert((1,'text'))
+
+            with self.assertRaises(TypeError):
+                op = table.new_insert([1,'text'])
+
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except:
+                pass
+
     def test_failed_write_op(self):
         # Insert row
         table = self.client.table(self.ex_table)
@@ -348,7 +536,6 @@ class TestClient(KuduTestBase, unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.client.new_session(flush_mode='foo')
-
 
     def test_session_mutation_buffer_settings(self):
         self.client.new_session(flush_mode=kudu.FLUSH_AUTO_BACKGROUND,
@@ -474,6 +661,14 @@ class TestClient(KuduTestBase, unittest.TestCase):
             # Confirm column rename
             col = table['string_val_renamed']
 
+            # Check if existing comment can be altered, and new comment can be specified
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column('key').comment('new_key_comment')
+            alterer.alter_column('int_val').comment('int_val_comment')
+            table = alterer.alter()
+
+            assert table['key'].spec.comment == 'new_key_comment'
+            assert table['int_val'].spec.comment == 'int_val_comment'
         finally:
             self.client.delete_table('alter-column')
 
@@ -601,6 +796,66 @@ class TestClient(KuduTestBase, unittest.TestCase):
             self.assertEqual(0, len(tokens))
 
             self.client.delete_table(table_name)
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except:
+                pass
+
+    def test_alter_table_auto_incrementing_column(self):
+        table_name = 'alter_table_with_auto_incrementing_column'
+        try:
+            builder = kudu.schema_builder()
+            (builder.add_column('key', kudu.int32)
+            .nullable(False)
+            .non_unique_primary_key())
+            schema = builder.build()
+
+            self.client.create_table(
+                table_name, schema,
+                partitioning=Partitioning().add_hash_partitions(['key'], 2))
+
+            col_name = Schema.get_auto_incrementing_column_name()
+            table = self.client.table(table_name)
+
+            # negatives
+            alterer = self.client.new_table_alterer(table)
+            alterer.drop_column(col_name)
+            with self.assertRaises(KuduInvalidArgument):
+                alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.add_column(col_name)
+            with self.assertRaises(KuduInvalidArgument):
+                alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name, "new_column_name")
+            with self.assertRaises(KuduInvalidArgument):
+                alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).remove_default()
+            with self.assertRaises(KuduInvalidArgument):
+                alterer.alter()
+
+            # positives
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).block_size(1)
+            alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).encoding('plain')
+            alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).compression('none')
+            alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).comment('new_comment')
+            alterer.alter()
+
         finally:
             try:
                 self.client.delete_table(table_name)

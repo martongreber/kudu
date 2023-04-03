@@ -49,6 +49,10 @@ RowIteratorOptions::RowIteratorOptions()
       order(OrderMode::UNORDERED),
       include_deleted_rows(false) {}
 
+Status RowSet::DebugDump(std::vector<std::string>* lines) {
+  return DebugDumpImpl(nullptr /* rows_left */, lines);
+}
+
 Status RowSet::NewRowIteratorWithBounds(const RowIteratorOptions& opts,
                                         IterWithBounds* out) const {
   // Get the iterator.
@@ -142,7 +146,6 @@ Status DuplicatingRowSet::NewCompactionInput(const Schema* /*projection*/,
   LOG(FATAL) << "duplicating rowsets do not act as compaction input";
   return Status::OK();
 }
-
 
 Status DuplicatingRowSet::MutateRow(Timestamp timestamp,
                                     const RowSetKeyProbe &probe,
@@ -289,19 +292,19 @@ shared_ptr<RowSetMetadata> DuplicatingRowSet::metadata() {
   return shared_ptr<RowSetMetadata>(reinterpret_cast<RowSetMetadata *>(NULL));
 }
 
-Status DuplicatingRowSet::DebugDump(vector<string> *lines) { // NOLINT(*)
+Status DuplicatingRowSet::DebugDumpImpl(int64_t* rows_left, vector<string>* lines) { // NOLINT(*)
   int i = 1;
   for (const shared_ptr<RowSet> &rs : old_rowsets_) {
     LOG_STRING(INFO, lines) << "Duplicating rowset input " << ToString() << " "
                             << i << "/" << old_rowsets_.size() << ":";
-    RETURN_NOT_OK(rs->DebugDump(lines));
+    RETURN_NOT_OK(rs->DebugDumpImpl(rows_left, lines));
     i++;
   }
   i = 1;
   for (const shared_ptr<RowSet> &rs : new_rowsets_) {
     LOG_STRING(INFO, lines) << "Duplicating rowset output " << ToString() << " "
                             << i << "/" << new_rowsets_.size() << ":";
-    RETURN_NOT_OK(rs->DebugDump(lines));
+    RETURN_NOT_OK(rs->DebugDumpImpl(rows_left, lines));
     i++;
   }
 

@@ -165,6 +165,7 @@ if ("$ENV{NO_REBUILD_THIRDPARTY}" STREQUAL "")
   endif()
 endif()
 
+
 ############################################################
 # Compiler flags
 ############################################################
@@ -188,7 +189,7 @@ if("${ARCH_NAME}" MATCHES "aarch64")
   set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fsigned-char")
   # Turn off fp-contract on aarch64 to avoid multiply-add operation result difference.
   set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -ffp-contract=off")
-else()
+elseif( NOT ( "${ARCH_NAME}" MATCHES "ppc64le" ))
   # -msse4.2: Enable sse4.2 compiler intrinsics.
   set(CXX_COMMON_FLAGS "-msse4.2")
 endif()
@@ -1245,6 +1246,13 @@ include_directories(SYSTEM ${BOOST_INCLUDE_DIR})
 ADD_THIRDPARTY_LIB(boost_date_time
     STATIC_LIB "${BOOST_DATE_TIME_STATIC_LIB}"
     SHARED_LIB "${BOOST_DATE_TIME_SHARED_LIB}")
+
+## rocksdb
+find_package(Rocksdb REQUIRED)
+include_directories(SYSTEM ${ROCKSDB_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(rocksdb
+        STATIC_LIB "${ROCKSDB_STATIC_LIB}"
+        SHARED_LIB "${ROCKSDB_SHARED_LIB}")
 
 ############################################################
 # Enable sized deallocation where supported.

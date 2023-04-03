@@ -21,6 +21,7 @@
 #include <string>
 #include <unordered_set>
 #include <utility>
+// IWYU pragma: no_include <unordered_map>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -28,7 +29,6 @@
 #include "kudu/clock/clock.h"
 #include "kudu/clock/hybrid_clock.h"
 #include "kudu/clock/mock_ntp.h"
-#include "kudu/clock/time_service.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/casts.h"
@@ -46,9 +46,12 @@
 
 DECLARE_string(time_source);
 DECLARE_bool(use_hybrid_clock);
+DEFINE_bool(disable_gflag_filter_logic_for_testing, false,
+            "Whether to disable filter logic on the server side for test purpose.");
 
 using std::string;
 using std::unordered_set;
+using strings::Substitute;
 
 namespace kudu {
 namespace server {
@@ -86,21 +89,23 @@ void GenericServiceImpl::GetFlags(const GetFlagsRequestPB* req,
     if (entry.second.is_default && !all_flags && flags.empty()) {
       continue;
     }
-
-    if (!flags.empty() && !ContainsKey(flags, entry.first)) {
-      continue;
-    }
-
     unordered_set<string> tags;
     GetFlagTags(entry.first, &tags);
-    bool matches = req->tags().empty();
-    for (const auto& tag : req->tags()) {
-      if (ContainsKey(tags, tag)) {
-        matches = true;
-        break;
+
+    if (!FLAGS_disable_gflag_filter_logic_for_testing) {
+      if (!flags.empty() && !ContainsKey(flags, entry.first)) {
+        continue;
       }
+
+      bool matches = req->tags().empty();
+      for (const auto& tag : req->tags()) {
+        if (ContainsKey(tags, tag)) {
+          matches = true;
+          break;
+        }
+      }
+      if (!matches) continue;
     }
-    if (!matches) continue;
 
     auto* flag = resp->add_flags();
     flag->set_name(entry.first);
@@ -150,14 +155,28 @@ void GenericServiceImpl::SetFlag(const SetFlagRequestPB* req,
   if (ret.empty()) {
     resp->set_result(SetFlagResponsePB::BAD_VALUE);
     resp->set_msg("Unable to set flag: bad value");
-  } else {
-    LOG(INFO) << rpc->requestor_string() << " changed flags via RPC: "
-              << req->flag() << " from '" << old_val << "' to '"
-              << req->value() << "'";
-    resp->set_result(SetFlagResponsePB::SUCCESS);
-    resp->set_msg(ret);
+    rpc->RespondSuccess();
+    return;
   }
-
+  // Validate all flags.
+  if (req->run_consistency_check() && !AreFlagsConsistent()) {
+    string res = google::SetCommandLineOption(
+      req->flag().c_str(),
+      old_val.c_str());
+    if (ret.empty()) {
+      LOG(WARNING) << Substitute("Failed to roll back flag '$0' to previous value '$1'",
+                                 req->flag(), old_val);
+    }
+    resp->set_result(SetFlagResponsePB::BAD_VALUE);
+    resp->set_msg("Detected inconsistency in command-line flags");
+    rpc->RespondSuccess();
+    return;
+  }
+  LOG(INFO) << rpc->requestor_string() << " changed flags via RPC: "
+            << req->flag() << " from '" << old_val << "' to '"
+            << req->value() << "'";
+  resp->set_result(SetFlagResponsePB::SUCCESS);
+  resp->set_msg(ret);
   rpc->RespondSuccess();
 }
 

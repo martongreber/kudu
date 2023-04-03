@@ -18,6 +18,7 @@
 #include "kudu/tablet/tablet.h"
 
 #include <algorithm>
+#include <ctime>
 #include <functional>
 #include <iterator>
 #include <memory>
@@ -57,7 +58,6 @@
 #include "kudu/fs/io_context.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/threading/thread_collision_warner.h"
@@ -71,7 +71,6 @@
 #include "kudu/tablet/ops/write_op.h"
 #include "kudu/tablet/row_op.h"
 #include "kudu/tablet/rowset_info.h"
-#include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/rowset_tree.h"
 #include "kudu/tablet/svg_dump.h"
 #include "kudu/tablet/tablet.pb.h"
@@ -86,6 +85,7 @@
 #include "kudu/util/faststring.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/flag_validators.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/memory/arena.h"
@@ -97,6 +97,12 @@
 #include "kudu/util/throttler.h"
 #include "kudu/util/trace.h"
 #include "kudu/util/url-coding.h"
+
+namespace kudu {
+namespace tablet {
+class RowSetMetadata;
+}  // namespace tablet
+}  // namespace kudu
 
 DEFINE_bool(prevent_kudu_2233_corruption, true,
             "Whether or not to prevent KUDU-2233 corruptions. Used for testing only!");
@@ -148,6 +154,7 @@ DEFINE_int32(tablet_history_max_age_sec, 60 * 60 * 24 * 7,
              "initiated at a snapshot that is older than this age will be "
              "rejected. To disable history removal, set to -1.");
 TAG_FLAG(tablet_history_max_age_sec, advanced);
+TAG_FLAG(tablet_history_max_age_sec, runtime);
 TAG_FLAG(tablet_history_max_age_sec, stable);
 
 // Large encoded keys cause problems because we store the min/max encoded key in the
@@ -189,6 +196,33 @@ DEFINE_int32(rows_writed_per_sec_for_hot_tablets, 1000,
 TAG_FLAG(rows_writed_per_sec_for_hot_tablets, experimental);
 TAG_FLAG(rows_writed_per_sec_for_hot_tablets, runtime);
 
+DEFINE_double(rowset_compaction_ancient_delta_max_ratio, 0.2,
+              "The ratio of data in ancient UNDO deltas to the total amount "
+              "of data in all deltas across rowsets picked for rowset merge "
+              "compaction used as a threshold to determine whether to run "
+              "the operation when --rowset_compaction_ancient_delta_max_ratio "
+              "is set to 'true'. If the ratio is greater than the threshold "
+              "defined by this flag, CompactRowSetsOp operations are postponed "
+              "until UndoDeltaBlockGCOp purges enough of ancient UNDO deltas.");
+TAG_FLAG(rowset_compaction_ancient_delta_max_ratio, advanced);
+TAG_FLAG(rowset_compaction_ancient_delta_max_ratio, runtime);
+
+DEFINE_bool(rowset_compaction_ancient_delta_threshold_enabled, true,
+            "Whether to check the ratio of data in ancient UNDO deltas against "
+            "the threshold set by --rowset_compaction_ancient_delta_max_ratio "
+            "before running rowset merge compaction. If the ratio of ancient "
+            "data in UNDO deltas is greater than the threshold, postpone "
+            "running CompactRowSetsOp until UndoDeltaBlockGCOp purges ancient "
+            "data and the ratio drops below the threshold (NOTE: regardless of "
+            "the setting, the effective "
+            "value of this flag becomes 'false' if "
+            "--enable_undo_delta_block_gc is set to 'false')");
+TAG_FLAG(rowset_compaction_ancient_delta_threshold_enabled, advanced);
+TAG_FLAG(rowset_compaction_ancient_delta_threshold_enabled, runtime);
+
+DECLARE_bool(enable_undo_delta_block_gc);
+DECLARE_uint32(rowset_compaction_estimate_min_deltas_size_mb);
+
 METRIC_DEFINE_entity(tablet);
 METRIC_DEFINE_gauge_size(tablet, memrowset_size, "MemRowSet Memory Usage",
                          kudu::MetricUnit::kBytes,
@@ -223,6 +257,7 @@ using kudu::log::LogAnchorRegistry;
 using kudu::log::MinLogIndexAnchorer;
 using std::endl;
 using std::make_shared;
+using std::make_unique;
 using std::nullopt;
 using std::optional;
 using std::ostream;
@@ -234,16 +269,44 @@ using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
+
+namespace {
+
+bool ValidateAncientDeltaMaxRatio(const char* flag, double val) {
+  constexpr double kMinVal = 0.0;
+  constexpr double kMaxVal = 1.0;
+  if (val < kMinVal || val > kMaxVal) {
+    LOG(ERROR) << Substitute(
+        "$0: invalid value for --$1 flag, should be between $2 and $3",
+        val, flag, kMinVal, kMaxVal);
+    return false;
+  }
+  return true;
+}
+DEFINE_validator(rowset_compaction_ancient_delta_max_ratio,
+                 &ValidateAncientDeltaMaxRatio);
+
+bool ValidateRowsetCompactionGuard() {
+  if (FLAGS_rowset_compaction_ancient_delta_threshold_enabled &&
+      !FLAGS_enable_undo_delta_block_gc) {
+    LOG(WARNING) << Substitute(
+        "rowset compaction ancient ratio threshold is enabled "
+        "but UNDO delta block GC is disabled: check current settings of "
+        "--rowset_compaction_ancient_delta_threshold_enabled and "
+        "--enable_undo_delta_block_gc flags");
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(rowset_compaction, &ValidateRowsetCompactionGuard);
+
+} // anonymous namespace
+
 namespace kudu {
 
 class RowBlock;
 struct IteratorStats;
 
 namespace tablet {
-
-static CompactionPolicy *CreateCompactionPolicy() {
-  return new BudgetedCompactionPolicy(FLAGS_tablet_compaction_budget_mb);
-}
 
 ////////////////////////////////////////////////////////////
 // TabletComponents
@@ -265,24 +328,24 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
                shared_ptr<MemTracker> parent_mem_tracker,
                MetricRegistry* metric_registry,
                scoped_refptr<LogAnchorRegistry> log_anchor_registry)
-  : key_schema_(metadata->schema()->CreateKeyProjection()),
-    metadata_(std::move(metadata)),
-    log_anchor_registry_(std::move(log_anchor_registry)),
-    mem_trackers_(tablet_id(), std::move(parent_mem_tracker)),
-    next_mrs_id_(0),
-    clock_(clock),
-    txn_participant_(metadata_),
-    rowsets_flush_sem_(1),
-    state_(kInitialized),
-    last_write_time_(MonoTime::Now()),
-    last_read_time_(MonoTime::Now()),
-    last_update_workload_stats_time_(MonoTime::Now()),
-    last_scans_started_(0),
-    last_rows_mutated_(0),
-    last_read_score_(0.0),
-    last_write_score_(0.0) {
-      CHECK(schema()->has_column_ids());
-  compaction_policy_.reset(CreateCompactionPolicy());
+    : key_schema_(metadata->schema()->CreateKeyProjection()),
+      metadata_(std::move(metadata)),
+      log_anchor_registry_(std::move(log_anchor_registry)),
+      mem_trackers_(tablet_id(), std::move(parent_mem_tracker)),
+      next_mrs_id_(0),
+      auto_incrementing_counter_(0),
+      clock_(clock),
+      txn_participant_(metadata_),
+      rowsets_flush_sem_(1),
+      state_(kInitialized),
+      last_read_time_(MonoTime::Now()),
+      last_write_time_(last_read_time_),
+      last_update_workload_stats_time_(last_read_time_),
+      last_scans_started_(0),
+      last_rows_mutated_(0),
+      last_read_score_(0.0),
+      last_write_score_(0.0) {
+  CHECK(schema()->has_column_ids());
 
   if (metric_registry) {
     MetricEntity::AttributeMap attrs;
@@ -310,6 +373,9 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
         MergeType::kMin)
         ->AutoDetach(&metric_detacher_);
   }
+
+  compaction_policy_.reset(new BudgetedCompactionPolicy(
+      FLAGS_tablet_compaction_budget_mb, metrics_.get()));
 
   if (FLAGS_tablet_throttler_rpc_per_sec > 0 || FLAGS_tablet_throttler_bytes_per_sec > 0) {
     throttler_.reset(new Throttler(MonoTime::Now(),
@@ -340,8 +406,6 @@ Status Tablet::Open(const unordered_set<int64_t>& in_flight_txn_ids,
 
   next_mrs_id_ = metadata_->last_durable_mrs_id() + 1;
 
-  RowSetVector rowsets_opened;
-
   // If we persisted the state of any transaction IDs before shutting down,
   // initialize those that were in-flight here as kOpen. If there were any ops
   // applied that didn't get persisted to the tablet metadata, the bootstrap
@@ -352,6 +416,8 @@ Status Tablet::Open(const unordered_set<int64_t>& in_flight_txn_ids,
 
   fs::IOContext io_context({ tablet_id() });
   // open the tablet row-sets
+  RowSetVector rowsets_opened;
+  rowsets_opened.reserve(metadata_->rowsets().size());
   for (const shared_ptr<RowSetMetadata>& rowset_meta : metadata_->rowsets()) {
     shared_ptr<DiskRowSet> rowset;
     Status s = DiskRowSet::Open(rowset_meta,
@@ -365,12 +431,12 @@ Status Tablet::Open(const unordered_set<int64_t>& in_flight_txn_ids,
       return s;
     }
 
-    rowsets_opened.push_back(rowset);
+    rowsets_opened.emplace_back(std::move(rowset));
   }
 
   {
     auto new_rowset_tree(make_shared<RowSetTree>());
-    CHECK_OK(new_rowset_tree->Reset(rowsets_opened));
+    RETURN_NOT_OK(new_rowset_tree->Reset(rowsets_opened));
 
     // Now that the current state is loaded, create the new MemRowSet with the next id.
     shared_ptr<MemRowSet> new_mrs;
@@ -531,7 +597,8 @@ Status Tablet::NewRowIterator(RowIteratorOptions opts,
 }
 
 Status Tablet::DecodeWriteOperations(const Schema* client_schema,
-                                     WriteOpState* op_state) {
+                                     WriteOpState* op_state,
+                                     bool is_leader) {
   TRACE_EVENT0("tablet", "Tablet::DecodeWriteOperations");
 
   DCHECK(op_state->row_ops().empty());
@@ -551,7 +618,7 @@ Status Tablet::DecodeWriteOperations(const Schema* client_schema,
                              client_schema,
                              schema_ptr.get(),
                              op_state->arena());
-  RETURN_NOT_OK(dec.DecodeOperations<DecoderMode::WRITE_OPS>(&ops));
+  RETURN_NOT_OK(dec.DecodeOperations<DecoderMode::WRITE_OPS>(&ops, &auto_incrementing_counter_));
   TRACE_COUNTER_INCREMENT("num_ops", ops.size());
 
   // Important to set the schema before the ops -- we need the
@@ -637,17 +704,14 @@ void Tablet::AssignTimestampAndStartOpForTests(WriteOpState* op_state) {
 }
 
 void Tablet::StartOp(WriteOpState* op_state) {
-  unique_ptr<ScopedOp> mvcc_op;
   DCHECK(op_state->has_timestamp());
-  mvcc_op.reset(new ScopedOp(&mvcc_, op_state->timestamp()));
-  op_state->SetMvccOp(std::move(mvcc_op));
+  op_state->SetMvccOp(make_unique<ScopedOp>(&mvcc_, op_state->timestamp()));
 }
 
 void Tablet::StartOp(ParticipantOpState* op_state) {
   if (op_state->request()->op().type() == tserver::ParticipantOpPB::BEGIN_COMMIT) {
     DCHECK(op_state->has_timestamp());
-    unique_ptr<ScopedOp> mvcc_op(new ScopedOp(&mvcc_, op_state->timestamp()));
-    op_state->SetMvccOp(std::move(mvcc_op));
+    op_state->SetMvccOp(make_unique<ScopedOp>(&mvcc_, op_state->timestamp()));
   }
 }
 
@@ -673,6 +737,7 @@ Status Tablet::ValidateOp(const RowOp& op) {
     case RowOperationsPB::INSERT:
     case RowOperationsPB::INSERT_IGNORE:
     case RowOperationsPB::UPSERT:
+    case RowOperationsPB::UPSERT_IGNORE:
       return ValidateInsertOrUpsertUnlocked(op);
 
     case RowOperationsPB::UPDATE:
@@ -701,7 +766,7 @@ Status Tablet::ValidateInsertOrUpsertUnlocked(const RowOp& op) {
 Status Tablet::ValidateMutateUnlocked(const RowOp& op) {
   RowChangeListDecoder rcl_decoder(op.decoded_op.changelist);
   RETURN_NOT_OK(rcl_decoder.Init());
-  if (rcl_decoder.is_reinsert()) {
+  if (PREDICT_FALSE(rcl_decoder.is_reinsert())) {
     // REINSERT mutations are the byproduct of an INSERT on top of a ghost
     // row, not something the user is allowed to specify on their own.
     return Status::InvalidArgument("User may not specify REINSERT mutations");
@@ -731,6 +796,7 @@ Status Tablet::InsertOrUpsertUnlocked(const IOContext* io_context,
   if (op->present_in_rowset) {
     switch (op_type) {
       case RowOperationsPB::UPSERT:
+      case RowOperationsPB::UPSERT_IGNORE:
         return ApplyUpsertAsUpdate(io_context, op_state, op, op->present_in_rowset, stats);
       case RowOperationsPB::INSERT_IGNORE:
         op->SetErrorIgnored();
@@ -748,6 +814,7 @@ Status Tablet::InsertOrUpsertUnlocked(const IOContext* io_context,
     }
   }
 
+  DCHECK(!op->present_in_rowset);
   Timestamp ts = op_state->timestamp();
   ConstContiguousRow row(schema().get(), op->decoded_op.row_data);
 
@@ -801,6 +868,7 @@ Status Tablet::InsertOrUpsertUnlocked(const IOContext* io_context,
     if (s.IsAlreadyPresent()) {
       switch (op_type) {
         case RowOperationsPB::UPSERT:
+        case RowOperationsPB::UPSERT_IGNORE:
           return ApplyUpsertAsUpdate(io_context, op_state, op, comps->memrowset.get(), stats);
         case RowOperationsPB::INSERT_IGNORE:
           op->SetErrorIgnored();
@@ -824,18 +892,32 @@ Status Tablet::ApplyUpsertAsUpdate(const IOContext* io_context,
                                    RowOp* upsert,
                                    RowSet* rowset,
                                    ProbeStats* stats) {
+  const auto op_type = upsert->decoded_op.type;
   const auto* schema = this->schema().get();
   ConstContiguousRow row(schema, upsert->decoded_op.row_data);
   faststring buf;
   RowChangeListEncoder enc(&buf);
-  for (int i = 0; i < schema->num_columns(); i++) {
-    if (schema->is_key_column(i)) continue;
-
+  for (int i = schema->num_key_columns(); i < schema->num_columns(); i++) {
     // If the user didn't explicitly set this column in the UPSERT, then we should
     // not turn it into an UPDATE. This prevents the UPSERT from updating
     // values back to their defaults when unset.
     if (!BitmapTest(upsert->decoded_op.isset_bitmap, i)) continue;
     const auto& c = schema->column(i);
+    if (c.is_immutable()) {
+      if (op_type == RowOperationsPB::UPSERT) {
+        Status s = Status::Immutable("UPDATE not allowed for immutable column", c.ToString());
+        upsert->SetFailed(s);
+        return s;
+      }
+      DCHECK_EQ(op_type, RowOperationsPB::UPSERT_IGNORE);
+      // Only set upsert->error_ignored flag instead of calling SetErrorIgnored() to avoid setting
+      // upsert->result which can be set only once. Then the upsert operation can be continued to
+      // mutate the other cells even if the current cell has been skipped, the upsert->result can be
+      // set normally in the next steps.
+      upsert->error_ignored = true;
+      continue;
+    }
+
     const void* val = c.is_nullable() ? row.nullable_cell_ptr(i) : row.cell_ptr(i);
     enc.AddColumnUpdate(c, schema->column_id(i), val);
   }
@@ -1297,8 +1379,9 @@ Status Tablet::ApplyRowOperation(const IOContext* io_context,
     case RowOperationsPB::INSERT:
     case RowOperationsPB::INSERT_IGNORE:
     case RowOperationsPB::UPSERT:
+    case RowOperationsPB::UPSERT_IGNORE:
       s = InsertOrUpsertUnlocked(io_context, op_state, row_op, stats);
-      if (s.IsAlreadyPresent()) {
+      if (s.IsAlreadyPresent() || s.IsImmutable()) {
         return Status::OK();
       }
       return s;
@@ -1783,33 +1866,28 @@ void Tablet::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
     DCHECK(maintenance_ops_.empty());
   }
 
-  vector<MaintenanceOp*> maintenance_ops;
-  unique_ptr<MaintenanceOp> rs_compact_op(new CompactRowSetsOp(this));
-  maint_mgr->RegisterOp(rs_compact_op.get());
-  maintenance_ops.push_back(rs_compact_op.release());
+  vector<unique_ptr<MaintenanceOp>> maintenance_ops;
+  maintenance_ops.emplace_back(new CompactRowSetsOp(this));
+  maint_mgr->RegisterOp(maintenance_ops.back().get());
 
-  unique_ptr<MaintenanceOp> minor_delta_compact_op(new MinorDeltaCompactionOp(this));
-  maint_mgr->RegisterOp(minor_delta_compact_op.get());
-  maintenance_ops.push_back(minor_delta_compact_op.release());
+  maintenance_ops.emplace_back(new MinorDeltaCompactionOp(this));
+  maint_mgr->RegisterOp(maintenance_ops.back().get());
 
-  unique_ptr<MaintenanceOp> major_delta_compact_op(new MajorDeltaCompactionOp(this));
-  maint_mgr->RegisterOp(major_delta_compact_op.get());
-  maintenance_ops.push_back(major_delta_compact_op.release());
+  maintenance_ops.emplace_back(new MajorDeltaCompactionOp(this));
+  maint_mgr->RegisterOp(maintenance_ops.back().get());
 
-  unique_ptr<MaintenanceOp> undo_delta_block_gc_op(new UndoDeltaBlockGCOp(this));
-  maint_mgr->RegisterOp(undo_delta_block_gc_op.get());
-  maintenance_ops.push_back(undo_delta_block_gc_op.release());
+  maintenance_ops.emplace_back(new UndoDeltaBlockGCOp(this));
+  maint_mgr->RegisterOp(maintenance_ops.back().get());
 
   // The deleted rowset GC operation relies on live rowset counting. If this
   // tablet doesn't support such counting, do not register the op.
   if (metadata_->supports_live_row_count()) {
-    unique_ptr<MaintenanceOp> deleted_rowset_gc_op(new DeletedRowsetGCOp(this));
-    maint_mgr->RegisterOp(deleted_rowset_gc_op.get());
-    maintenance_ops.push_back(deleted_rowset_gc_op.release());
+    maintenance_ops.emplace_back(new DeletedRowsetGCOp(this));
+    maint_mgr->RegisterOp(maintenance_ops.back().get());
   }
 
   std::lock_guard<simple_spinlock> l(state_lock_);
-  maintenance_ops_.swap(maintenance_ops);
+  maintenance_ops_ = std::move(maintenance_ops);
 }
 
 void Tablet::UnregisterMaintenanceOps() {
@@ -1821,21 +1899,24 @@ void Tablet::UnregisterMaintenanceOps() {
   // operation to finish in Unregister(), a different one can't get re-scheduled.
   CancelMaintenanceOps();
 
+  decltype(maintenance_ops_) ops;
+  {
+    std::lock_guard<simple_spinlock> l(state_lock_);
+    ops = std::move(maintenance_ops_);
+    maintenance_ops_.clear();
+  }
+
   // We don't lock here because unregistering ops may take a long time.
   // 'maintenance_registration_fake_lock_' is sufficient to ensure nothing else
   // is updating 'maintenance_ops_'.
-  for (MaintenanceOp* op : maintenance_ops_) {
+  for (auto& op : ops) {
     op->Unregister();
   }
-
-  // Finally, delete the ops under lock.
-  std::lock_guard<simple_spinlock> l(state_lock_);
-  STLDeleteElements(&maintenance_ops_);
 }
 
 void Tablet::CancelMaintenanceOps() {
   std::lock_guard<simple_spinlock> l(state_lock_);
-  for (MaintenanceOp* op : maintenance_ops_) {
+  for (auto& op : maintenance_ops_) {
     op->CancelAndDisable();
   }
 }
@@ -1873,6 +1954,17 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   VLOG_WITH_PREFIX(1) << Substitute("$0: entering phase 1 (flushing snapshot). "
                                     "Phase 1 snapshot: $1",
                                     op_name, flush_snap.ToString());
+
+  // Save the stats on the total on-disk size of all deltas in selected rowsets.
+  size_t deltas_on_disk_size = 0;
+  if (mrs_being_flushed == TabletMetadata::kNoMrsFlushed) {
+    for (const auto& rs : input.rowsets()) {
+      DiskRowSetSpace drss;
+      DiskRowSet* drs = down_cast<DiskRowSet*>(rs.get());
+      drs->GetDiskRowSetSpaceUsage(&drss);
+      deltas_on_disk_size += drss.redo_deltas_size + drss.undo_deltas_size;
+    }
+  }
 
   if (common_hooks_) {
     RETURN_NOT_OK_PREPEND(common_hooks_->PostTakeMvccSnapshot(),
@@ -1912,12 +2004,16 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
 
   // The RollingDiskRowSet writer wrote out one or more RowSets as the
   // output. Open these into 'new_rowsets'.
-  vector<shared_ptr<RowSet> > new_disk_rowsets;
   RowSetMetadataVector new_drs_metas;
   drsw.GetWrittenRowSetMetadata(&new_drs_metas);
-
-  if (metrics_.get()) metrics_->bytes_flushed->IncrementBy(drsw.written_size());
   CHECK(!new_drs_metas.empty());
+
+  if (metrics_) {
+    metrics_->bytes_flushed->IncrementBy(drsw.written_size());
+  }
+
+  vector<shared_ptr<RowSet>> new_disk_rowsets;
+  new_disk_rowsets.reserve(new_drs_metas.size());
   {
     TRACE_EVENT0("tablet", "Opening compaction results");
     for (const shared_ptr<RowSetMetadata>& meta : new_drs_metas) {
@@ -1934,7 +2030,7 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
                                  << meta->ToString() << ": " << s.ToString();
         return s;
       }
-      new_disk_rowsets.push_back(new_rowset);
+      new_disk_rowsets.emplace_back(std::move(new_rowset));
     }
   }
 
@@ -1968,7 +2064,7 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
                                     "duplicate updates in new rowsets)",
                                     op_name);
   shared_ptr<DuplicatingRowSet> inprogress_rowset(
-      new DuplicatingRowSet(input.rowsets(), new_disk_rowsets));
+      make_shared<DuplicatingRowSet>(input.rowsets(), new_disk_rowsets));
 
   // The next step is to swap in the DuplicatingRowSet, and at the same time,
   // determine an MVCC snapshot which includes all of the ops that saw a
@@ -2017,6 +2113,9 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
     RETURN_NOT_OK_PREPEND(common_hooks_->PostSwapInDuplicatingRowSet(),
                           "PostSwapInDuplicatingRowSet hook failed");
   }
+
+  // Store the stats on the max memory used for compaction phase 1.
+  const size_t peak_mem_usage_ph1 = merge->memory_footprint();
 
   // Phase 2. Here we re-scan the compaction input, copying those missed updates into the
   // new rowset's DeltaTracker.
@@ -2073,12 +2172,38 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   AtomicSwapRowSets({ inprogress_rowset }, new_disk_rowsets);
   UpdateAverageRowsetHeight();
 
+  const size_t peak_mem_usage = std::max(peak_mem_usage_ph1,
+                                         merge->memory_footprint());
+  // For rowset merge compactions, update the stats on the max peak memory used
+  // and ratio of the amount of memory used to the size of all deltas on disk.
+  if (deltas_on_disk_size > 0) {
+    // Update the peak memory usage metric.
+    metrics_->compact_rs_mem_usage->Increment(peak_mem_usage);
+
+    // Update the ratio of the peak memory usage to the size of deltas on disk.
+    // To keep the stats relevant for larger rowsets, filter out rowsets with
+    // relatively small amount of data in deltas. Update the memory-to-disk size
+    // ratio metric only when the on-disk size of deltas crosses the configured
+    // threshold.
+    const int64_t min_deltas_size_bytes =
+        FLAGS_rowset_compaction_estimate_min_deltas_size_mb * 1024 * 1024;
+    if (deltas_on_disk_size > min_deltas_size_bytes) {
+      // Round up the ratio. Since the ratio is used to estimate the amount of
+      // memory needed to perform merge rowset compaction based on the amount of
+      // data stored in rowsets' deltas, it's safer to provide an upper rather
+      // than a lower bound estimate.
+      metrics_->compact_rs_mem_usage_to_deltas_size_ratio->Increment(
+          (peak_mem_usage + deltas_on_disk_size - 1) / deltas_on_disk_size);
+    }
+  }
+
   const auto rows_written = drsw.rows_written_count();
   const auto drs_written = drsw.drs_written_count();
   const auto bytes_written = drsw.written_size();
   TRACE_COUNTER_INCREMENT("rows_written", rows_written);
   TRACE_COUNTER_INCREMENT("drs_written", drs_written);
   TRACE_COUNTER_INCREMENT("bytes_written", bytes_written);
+  TRACE_COUNTER_INCREMENT("peak_mem_usage", peak_mem_usage);
   VLOG_WITH_PREFIX(1) << Substitute("$0 successful on $1 rows ($2 rowsets, $3 bytes)",
                                     op_name,
                                     rows_written,
@@ -2118,12 +2243,14 @@ void Tablet::UpdateAverageRowsetHeight() {
   scoped_refptr<TabletComponents> comps;
   GetComponents(&comps);
   std::lock_guard<std::mutex> l(compact_select_lock_);
-  double rowset_total_height, rowset_total_width;
+  double rowset_total_height;
+  double rowset_total_width;
   RowSetInfo::ComputeCdfAndCollectOrdered(*comps->rowsets,
+                                          /*is_on_memory_budget=*/nullopt,
                                           &rowset_total_height,
                                           &rowset_total_width,
-                                          nullptr,
-                                          nullptr);
+                                          /*info_by_min_key=*/nullptr,
+                                          /*info_by_max_key=*/nullptr);
   metrics_->average_diskrowset_height->set_value(rowset_total_height, rowset_total_width);
 }
 
@@ -2162,7 +2289,7 @@ void Tablet::UpdateCompactionStats(MaintenanceOpStats* stats) {
   }
 
   double quality = 0;
-  unordered_set<const RowSet*> picked_set_ignored;
+  unordered_set<const RowSet*> picked;
 
   shared_ptr<RowSetTree> rowsets_copy;
   {
@@ -2172,13 +2299,70 @@ void Tablet::UpdateCompactionStats(MaintenanceOpStats* stats) {
 
   {
     std::lock_guard<std::mutex> compact_lock(compact_select_lock_);
-    WARN_NOT_OK(compaction_policy_->PickRowSets(*rowsets_copy, &picked_set_ignored, &quality, NULL),
+    WARN_NOT_OK(compaction_policy_->PickRowSets(*rowsets_copy, &picked, &quality, nullptr),
                 Substitute("Couldn't determine compaction quality for $0", tablet_id()));
   }
 
-  VLOG_WITH_PREFIX(1) << "Best compaction for " << tablet_id() << ": " << quality;
+  // An estimate for the total amount of data stored in the UNDO deltas across
+  // all the rowsets selected for this rowset compaction.
+  uint64_t undos_total_size = 0;
 
-  stats->set_runnable(quality >= 0);
+  // An estimate for the amount of data stored in ancient UNDO deltas across
+  // all the rowsets picked for this rowset compaction.
+  int64_t ancient_undos_total_size = 0;
+
+  for (const auto* rs : picked) {
+    const auto* drs = down_cast<const DiskRowSet*>(rs);
+    const auto& dt = drs->delta_tracker();
+
+    // Using RowSet::UNDERESTIMATE as the estimate type in this context: it's
+    // necessary to be 100% sure the delta is ancient to apply the criterion
+    // based on the --rowset_compaction_ancient_delta_max_ratio threshold.
+    // Otherwise, the rowset merge compaction task might skip over rowsets that
+    // contain mostly recent deltas until they indeed become ancient and GC-ed
+    // by the UNDO delta GC maintenance task.
+    int64_t size = 0;
+    {
+      Timestamp ancient_history_mark;
+      if (Tablet::GetTabletAncientHistoryMark(&ancient_history_mark)) {
+        WARN_NOT_OK(dt.EstimateBytesInPotentiallyAncientUndoDeltas(
+            ancient_history_mark, RowSet::UNDERESTIMATE, &size),
+            "could not estimate size of ancient UNDO deltas");
+      }
+    }
+    ancient_undos_total_size += size;
+    undos_total_size += dt.UndoDeltaOnDiskSize();
+  }
+
+  // Whether there is too much of data accumulated in ancient UNDO deltas.
+  bool much_of_ancient_data = false;
+  if (FLAGS_rowset_compaction_ancient_delta_threshold_enabled) {
+    // Check if too much of the UNDO data in the selected rowsets is ancient.
+    // If so, wait while the UNDO delta GC maintenance task does its job, if
+    // the latter is enabled. Don't waste too much of IO, memory, and CPU cycles
+    // working with the data that will be discarded later on.
+    //
+    // TODO(aserbin): instead of this workaroud, update CompactRowSetsOp
+    //                maintenance operation to avoid reading in, working with,
+    //                and discarding of ancient deltas; right now it's done
+    //                only in the very end before persisting the result
+    const auto ancient_undos_threshold = static_cast<int64_t>(
+        FLAGS_rowset_compaction_ancient_delta_max_ratio *
+        static_cast<double>(undos_total_size));
+    if (ancient_undos_threshold < ancient_undos_total_size) {
+      much_of_ancient_data = true;
+      LOG_WITH_PREFIX(INFO) << Substitute(
+          "compaction isn't runnable because of too much data in "
+          "ancient UNDO deltas: $0 out of $1 total bytes",
+          ancient_undos_total_size, undos_total_size);
+    }
+    VLOG_WITH_PREFIX(2) << Substitute(
+        "UNDO deltas estimated size: $0 ancient; $1 total",
+        ancient_undos_total_size, undos_total_size);
+  }
+  VLOG_WITH_PREFIX(1) << Substitute("compaction quality: $0", quality);
+
+  stats->set_runnable(!much_of_ancient_data && quality >= 0);
   stats->set_perf_improvement(quality);
 }
 
@@ -2385,7 +2569,7 @@ uint64_t Tablet::LastReadElapsedSeconds() const {
   return static_cast<uint64_t>((MonoTime::Now() - last_read_time_).ToSeconds());
 }
 
-void Tablet::UpdateLastReadTime() const {
+void Tablet::UpdateLastReadTime() {
   std::lock_guard<rw_spinlock> l(last_rw_time_lock_);
   last_read_time_ = MonoTime::Now();
 }
@@ -2538,21 +2722,21 @@ int64_t Tablet::GetReplaySizeForIndex(int64_t min_log_index,
   return it->second;
 }
 
-Status Tablet::FlushBiggestDMS() {
+Status Tablet::FlushBiggestDMSForTests() {
   RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   scoped_refptr<TabletComponents> comps;
   GetComponents(&comps);
 
-  int64_t max_size = -1;
+  size_t max_size = 0;
   shared_ptr<RowSet> biggest_drs;
-  for (const shared_ptr<RowSet> &rowset : comps->rowsets->all_rowsets()) {
-    int64_t current = rowset->DeltaMemStoreSize();
+  for (const auto& rowset : comps->rowsets->all_rowsets()) {
+    size_t current = rowset->DeltaMemStoreSize();
     if (current > max_size) {
       max_size = current;
       biggest_drs = rowset;
     }
   }
-  return max_size > 0 ? biggest_drs->FlushDeltas(nullptr) : Status::OK();
+  return biggest_drs ? biggest_drs->FlushDeltas(nullptr) : Status::OK();
 }
 
 Status Tablet::FlushAllDMSForTests() {
@@ -2574,7 +2758,8 @@ Status Tablet::MajorCompactAllDeltaStoresForTests() {
   for (const auto& rs : comps->rowsets->all_rowsets()) {
     if (!rs->IsAvailableForCompaction()) continue;
     DiskRowSet* drs = down_cast<DiskRowSet*>(rs.get());
-    RETURN_NOT_OK(drs->delta_tracker()->InitAllDeltaStoresForTests(DeltaTracker::REDOS_ONLY));
+    RETURN_NOT_OK(drs->mutable_delta_tracker()->InitAllDeltaStoresForTests(
+        DeltaTracker::REDOS_ONLY));
     RETURN_NOT_OK_PREPEND(drs->MajorCompactDeltaStores(&io_context, GetHistoryGcOpts()),
                           "Failed major delta compaction on " + rs->ToString());
   }
@@ -2630,7 +2815,7 @@ double Tablet::GetPerfImprovementForBestDeltaCompactUnlocked(RowSet::DeltaCompac
   GetComponents(&comps);
   double worst_delta_perf = 0;
   shared_ptr<RowSet> worst_rs;
-  for (const shared_ptr<RowSet> &rowset : comps->rowsets->all_rowsets()) {
+  for (const auto& rowset : comps->rowsets->all_rowsets()) {
     if (!rowset->IsAvailableForCompaction()) {
       continue;
     }
@@ -2641,7 +2826,7 @@ double Tablet::GetPerfImprovementForBestDeltaCompactUnlocked(RowSet::DeltaCompac
     }
   }
   if (rs && worst_delta_perf > 0) {
-    *rs = worst_rs;
+    *rs = std::move(worst_rs);
   }
   return worst_delta_perf;
 }
@@ -2662,8 +2847,11 @@ Status Tablet::EstimateBytesInPotentiallyAncientUndoDeltas(int64_t* bytes) {
   int64_t tablet_bytes = 0;
   for (const auto& rowset : comps->rowsets->all_rowsets()) {
     int64_t rowset_bytes;
-    RETURN_NOT_OK(rowset->EstimateBytesInPotentiallyAncientUndoDeltas(ancient_history_mark,
-                                                                      &rowset_bytes));
+    // Since the estimate is for "potentially ancient" deltas, the deltas
+    // with no information on their age should be included into the result:
+    // Row::OVERESTIMATE provides the desired type of estimate in this case.
+    RETURN_NOT_OK(rowset->EstimateBytesInPotentiallyAncientUndoDeltas(
+        ancient_history_mark, RowSet::OVERESTIMATE, &rowset_bytes));
     tablet_bytes += rowset_bytes;
   }
 
@@ -2689,14 +2877,16 @@ Status Tablet::InitAncientUndoDeltas(MonoDelta time_budget, int64_t* bytes_in_an
   RowSetVector rowsets = comps->rowsets->all_rowsets();
 
   // Estimate the size of the ancient undos in each rowset so that we can
-  // initialize them greedily.
+  // initialize them greedily. Using the RowSet::OVERESTIMATE estimate type here
+  // as in Tablet::EstimateBytesInPotentiallyAncientUndoDeltas() above
+  // for the same reason.
   vector<pair<size_t, int64_t>> rowset_ancient_undos_est_sizes; // index, bytes
   rowset_ancient_undos_est_sizes.reserve(rowsets.size());
   for (size_t i = 0; i < rowsets.size(); i++) {
     const auto& rowset = rowsets[i];
     int64_t bytes;
-    RETURN_NOT_OK(rowset->EstimateBytesInPotentiallyAncientUndoDeltas(ancient_history_mark,
-                                                                      &bytes));
+    RETURN_NOT_OK(rowset->EstimateBytesInPotentiallyAncientUndoDeltas(
+      ancient_history_mark, RowSet::OVERESTIMATE, &bytes));
     rowset_ancient_undos_est_sizes.emplace_back(i, bytes);
   }
 
@@ -2929,9 +3119,12 @@ void Tablet::PrintRSLayout(ostream* o) {
     out << "</p>";
   }
 
-  double rowset_total_height, rowset_total_width;
-  vector<RowSetInfo> min, max;
+  double rowset_total_height;
+  double rowset_total_width;
+  vector<RowSetInfo> min;
+  vector<RowSetInfo> max;
   RowSetInfo::ComputeCdfAndCollectOrdered(*rowsets_copy,
+                                          /*is_on_memory_budget=*/nullopt,
                                           &rowset_total_height,
                                           &rowset_total_width,
                                           &min,

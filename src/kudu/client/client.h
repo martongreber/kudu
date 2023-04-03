@@ -56,9 +56,9 @@ namespace kudu {
 class AlterTableTest;
 class AuthzTokenTest;
 class ClientStressTest_TestUniqueClientIds_Test;
-class MetaCacheLookupStressTest_PerfSynthetic_Test;
 class DisableWriteWhenExceedingQuotaTest;
 class KuduPartialRow;
+class MetaCacheLookupStressTest_PerfSynthetic_Test;
 class MonoDelta;
 class Partition;
 class PartitionSchema;
@@ -107,6 +107,7 @@ class KuduTabletServer;
 class KuduUpdate;
 class KuduUpdateIgnore;
 class KuduUpsert;
+class KuduUpsertIgnore;
 class KuduValue;
 class KuduWriteOperation;
 class ResourceMetrics;
@@ -681,12 +682,48 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   Status IsCreateTableInProgress(const std::string& table_name,
                                  bool* create_in_progress);
 
-  /// Delete/drop a table.
+  /// Delete/drop a table without reserving.
+  /// The deleted table may turn to soft-deleted status with the flag
+  /// --default_deleted_table_reserve_seconds set to nonzero on the master side.
+  ///
+  /// The delete operation or drop operation means that the service will directly
+  /// delete the table after receiving the instruction. Which means that once we
+  /// delete the table by mistake, we have no way to recall the deleted data.
+  /// We have added a new API @SoftDeleteTable to allow the deleted data to be
+  /// reserved for a period of time, which means that the wrongly deleted data may
+  /// be recalled. In order to be compatible with the previous versions, this interface
+  /// will continue to directly delete tables without reserving the table.
+  ///
+  /// Refer to SoftDeleteTable for detailed usage examples.
   ///
   /// @param [in] table_name
   ///   Name of the table to drop.
   /// @return Operation status.
   Status DeleteTable(const std::string& table_name);
+
+  /// Soft delete/drop a table.
+  ///
+  /// Usage Example1:
+  /// Equal to DeleteTable(table_name) and the table will not be reserved.
+  /// @code
+  /// client->SoftDeleteTable(table_name);
+  /// @endcode
+  ///
+  /// Usage Example2:
+  /// The table will be reserved for 600s after delete operation.
+  /// We can recall the table in time after the delete.
+  /// @code
+  /// client->SoftDeleteTable(table_name, false, 600);
+  /// client->RecallTable(table_id);
+  /// @endcode
+
+  /// @param [in] table_name
+  ///   Name of the table to drop.
+  /// @param [in] reserve_seconds
+  ///   Reserve seconds after being deleted.
+  /// @return Operation status.
+  Status SoftDeleteTable(const std::string& table_name,
+                         uint32_t reserve_seconds = 0);
 
   /// @cond PRIVATE_API
 
@@ -699,9 +736,25 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   /// @param [in] modify_external_catalogs
   ///   Whether to apply the deletion to external catalogs, such as the Hive Metastore,
   ///   which the Kudu master has been configured to integrate with.
+  /// @param [in] reserve_seconds
+  ///   Reserve seconds after being deleted.
+  ///   Default value '-1' means not specified and the server will use master side config.
+  ///   '0' means purge immediately and other values means reserve some seconds.
   /// @return Operation status.
   Status DeleteTableInCatalogs(const std::string& table_name,
-                               bool modify_external_catalogs) KUDU_NO_EXPORT;
+                               bool modify_external_catalogs,
+                               int32_t reserve_seconds = -1) KUDU_NO_EXPORT;
+
+  /// Recall a deleted but still reserved table.
+  ///
+  /// @param [in] table_id
+  ///   ID of the table to recall.
+  /// @param [in] new_table_name
+  ///   New table name for the recalled table. The recalled table will use the original
+  ///   table name if the parameter is empty string (i.e. "").
+  /// @return Operation status.
+  Status RecallTable(const std::string& table_id, const std::string& new_table_name = "");
+
   /// @endcond
 
   /// Create a KuduTableAlterer object.
@@ -740,7 +793,8 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   /// @return Operation status.
   Status ListTabletServers(std::vector<KuduTabletServer*>* tablet_servers);
 
-  /// List only those tables whose names pass a substring match on @c filter.
+  /// List non-soft-deleted tables whose names pass a substring
+  /// match on @c filter.
   ///
   /// @param [out] tables
   ///   The placeholder for the result. Appended only on success.
@@ -749,6 +803,17 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   /// @return Status object for the operation.
   Status ListTables(std::vector<std::string>* tables,
                     const std::string& filter = "");
+
+  /// List soft-deleted tables only those names pass a substring
+  /// with names matching the specified @c filter.
+  ///
+  /// @param [out] tables
+  ///   The placeholder for the result. Appended only on success.
+  /// @param [in] filter
+  ///   Substring filter to use; empty sub-string filter matches all tables.
+  /// @return Status object for the operation.
+  Status ListSoftDeletedTables(std::vector<std::string>* tables,
+                               const std::string& filter = "");
 
   /// Check if the table given by 'table_name' exists.
   ///
@@ -998,6 +1063,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class tools::LeaderMasterProxy;
   friend class tools::RemoteKsckCluster;
   friend class tools::TableLister;
+  friend class ScanTokenTest;
 
   FRIEND_TEST(kudu::ClientStressTest, TestUniqueClientIds);
   FRIEND_TEST(kudu::MetaCacheLookupStressTest, PerfSynthetic);
@@ -1563,6 +1629,11 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   ///   responsibility to free the result, unless it is passed to
   ///   KuduSession::Apply().
   KuduUpsert* NewUpsert();
+
+  /// @return New @c UPSERT_IGNORE operation for this table. It is the
+  ///   caller's responsibility to free the result, unless it is passed to
+  ///   KuduSession::Apply().
+  KuduUpsertIgnore* NewUpsertIgnore();
 
   /// @return New @c UPDATE operation for this table. It is the caller's
   ///   responsibility to free the result, unless it is passed to
@@ -3085,6 +3156,7 @@ class KUDU_EXPORT KuduScanner {
   FRIEND_TEST(ClientTest, TestReadAtSnapshotNoTimestampSet);
   FRIEND_TEST(ConsistencyITest, TestSnapshotScanTimestampReuse);
   FRIEND_TEST(ScanTokenTest, TestScanTokens);
+  FRIEND_TEST(ScanTokenTest, TestScanTokens_NonUniquePrimaryKey);
 
   // Owned.
   Data* data_;
@@ -3287,6 +3359,11 @@ class KUDU_EXPORT KuduScanTokenBuilder {
   ///   elements.
   /// @return Operation result status.
   Status Build(std::vector<KuduScanToken*>* tokens) WARN_UNUSED_RESULT;
+
+  /// Set the size of the data in each key range.
+  /// The default value is 0 without set and tokens build by meta cache.
+  /// It's corresponding to 'setSplitSizeBytes' in Java client.
+  void SetSplitSizeBytes(uint64_t split_size_bytes);
 
  private:
   class KUDU_NO_EXPORT Data;

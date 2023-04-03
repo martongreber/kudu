@@ -21,6 +21,7 @@
 #include <optional>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -102,9 +103,20 @@ TAG_FLAG(master_support_change_config, advanced);
 TAG_FLAG(master_support_change_config, runtime);
 
 DEFINE_bool(master_support_ignore_operations, true,
-            "Whether the cluster supports support ignore operations.");
+            "Whether the cluster supports ignore operations, including "
+            "INSERT_IGNORE, DELETE_IGNORE and UPDATE_IGNORE).");
 TAG_FLAG(master_support_ignore_operations, hidden);
 TAG_FLAG(master_support_ignore_operations, runtime);
+
+DEFINE_bool(master_support_upsert_ignore_operations, true,
+            "Whether the cluster supports UPSERT_IGNORE operations.");
+TAG_FLAG(master_support_upsert_ignore_operations, hidden);
+TAG_FLAG(master_support_upsert_ignore_operations, runtime);
+
+DEFINE_bool(master_support_immutable_column_attribute, true,
+            "Whether the cluster supports immutable attribute on column schema.");
+TAG_FLAG(master_support_immutable_column_attribute, hidden);
+TAG_FLAG(master_support_immutable_column_attribute, runtime);
 
 
 using google::protobuf::Message;
@@ -505,12 +517,17 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
   }
 
+  const auto use_external_addr = IsAddrOneOf(
+      rpc->local_address(), server_->rpc_proxied_addresses());
+
   CatalogManager::TSInfosDict infos_dict(resp->GetArena());
   for (const string& tablet_id : req->tablet_ids()) {
     // TODO(todd): once we have catalog data. ACL checks would also go here, probably.
     TabletLocationsPB* locs_pb = resp->add_tablet_locations();
     Status s = server_->catalog_manager()->GetTabletLocations(
-        tablet_id, req->replica_type_filter(),
+        tablet_id,
+        req->replica_type_filter(),
+        use_external_addr,
         locs_pb,
         req->intern_ts_infos_in_response() ? &infos_dict : nullptr,
         rpc->remote_user().username());
@@ -565,7 +582,30 @@ void MasterServiceImpl::DeleteTable(const DeleteTableRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->DeleteTableRpc(*req, resp, rpc);
+  Status s = server_->catalog_manager()->SoftDeleteTableRpc(*req, resp, rpc);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::RecallDeletedTable(const RecallDeletedTableRequestPB* req,
+                                           RecallDeletedTableResponsePB* resp,
+                                           rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+
+  // Soft-delete related functions is not supported when HMS is enabled.
+  if (hms::HmsCatalog::IsEnabled()) {
+    StatusToPB(Status::NotSupported("RecallDeletedTable is not supported when HMS is enabled."),
+               resp->mutable_error()->mutable_status());
+    resp->mutable_error()->set_code(MasterErrorPB::UNKNOWN_ERROR);
+    rpc->RespondSuccess();
+    return;
+  }
+
+  Status s = server_->catalog_manager()->RecallDeletedTableRpc(
+             *req, resp, rpc);
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -640,8 +680,11 @@ void MasterServiceImpl::GetTableLocations(const GetTableLocationsRequestPB* req,
     if (PREDICT_FALSE(FLAGS_master_inject_latency_on_tablet_lookups_ms > 0)) {
       SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
     }
+
+    const auto use_external_addr = IsAddrOneOf(
+        rpc->local_address(), server_->rpc_proxied_addresses());
     s = server_->catalog_manager()->GetTableLocations(
-        req, resp, rpc->remote_user().username());
+        req, resp, use_external_addr, rpc->remote_user().username());
   }
 
   CheckRespErrorOrSetUnknown(s, resp);
@@ -670,6 +713,9 @@ void MasterServiceImpl::GetTableSchema(const GetTableSchemaRequestPB* req,
 void MasterServiceImpl::ListTabletServers(const ListTabletServersRequestPB* req,
                                           ListTabletServersResponsePB* resp,
                                           rpc::RpcContext* rpc) {
+  const auto use_external_addr = IsAddrOneOf(
+      rpc->local_address(), server_->rpc_proxied_addresses());
+
   TSManager* ts_manager = server_->ts_manager();
   TServerStateMap states = req->include_states() ?
       ts_manager->GetTServerStates() : TServerStateMap();
@@ -677,8 +723,13 @@ void MasterServiceImpl::ListTabletServers(const ListTabletServersRequestPB* req,
   server_->ts_manager()->GetAllDescriptors(&descs);
   for (const std::shared_ptr<TSDescriptor>& desc : descs) {
     ListTabletServersResponsePB::Entry* entry = resp->add_servers();
+    if (auto s = desc->GetRegistration(entry->mutable_registration(),
+                                       use_external_addr); !s.ok()) {
+      LOG(WARNING) << s.ToString();
+      resp->mutable_servers()->RemoveLast();
+      continue;
+    }
     desc->GetNodeInstancePB(entry->mutable_instance_id());
-    desc->GetRegistration(entry->mutable_registration());
     entry->set_millis_since_heartbeat(desc->TimeSinceHeartbeat().ToMilliseconds());
     if (desc->location()) {
       entry->set_location(*desc->location());
@@ -707,12 +758,13 @@ void MasterServiceImpl::ListTabletServers(const ListTabletServersRequestPB* req,
   rpc->RespondSuccess();
 }
 
-void MasterServiceImpl::ListMasters(const ListMastersRequestPB* req,
+void MasterServiceImpl::ListMasters(const ListMastersRequestPB* /*req*/,
                                     ListMastersResponsePB* resp,
                                     rpc::RpcContext* rpc) {
+  const auto use_external_addr = IsAddrOneOf(
+      rpc->local_address(), server_->rpc_proxied_addresses());
   vector<ServerEntryPB> masters;
-  Status s = server_->ListMasters(&masters);
-  if (!s.ok()) {
+  if (const auto s = server_->ListMasters(&masters, use_external_addr); !s.ok()) {
     StatusToPB(s, resp->mutable_error()->mutable_status());
     resp->mutable_error()->set_code(MasterErrorPB::UNKNOWN_ERROR);
 
@@ -726,9 +778,10 @@ void MasterServiceImpl::ListMasters(const ListMastersRequestPB* req,
   rpc->RespondSuccess();
 }
 
-void MasterServiceImpl::GetMasterRegistration(const GetMasterRegistrationRequestPB* req,
-                                              GetMasterRegistrationResponsePB* resp,
-                                              rpc::RpcContext* rpc) {
+void MasterServiceImpl::GetMasterRegistration(
+    const GetMasterRegistrationRequestPB* /*req*/,
+    GetMasterRegistrationResponsePB* resp,
+    rpc::RpcContext* rpc) {
   // instance_id must always be set in order for status pages to be useful.
   resp->mutable_instance_id()->CopyFrom(server_->instance_pb());
 
@@ -737,7 +790,10 @@ void MasterServiceImpl::GetMasterRegistration(const GetMasterRegistrationRequest
     return;
   }
 
-  Status s = server_->GetMasterRegistration(resp->mutable_registration());
+  const auto use_external_addr = IsAddrOneOf(
+      rpc->local_address(), server_->rpc_proxied_addresses());
+  const auto s = server_->GetMasterRegistration(
+      resp->mutable_registration(), use_external_addr);
   CheckRespErrorOrSetUnknown(s, resp);
   const auto& role_and_member = server_->catalog_manager()->GetRoleAndMemberType();
   resp->set_role(role_and_member.first);
@@ -756,17 +812,27 @@ void MasterServiceImpl::ConnectToMaster(const ConnectToMasterRequestPB* /*req*/,
 
   // Set the info about the other masters, so that the client can verify
   // it has the full set of info.
-  vector<HostPort> addresses;
-  Status s = server_->GetMasterHostPorts(&addresses);
-  if (!s.ok()) {
-    StatusToPB(s, resp->mutable_error()->mutable_status());
-    resp->mutable_error()->set_code(MasterErrorPB::UNKNOWN_ERROR);
-    rpc->RespondSuccess();
-    return;
-  }
-  resp->mutable_master_addrs()->Reserve(addresses.size());
-  for (const auto& hp : addresses) {
-    *resp->add_master_addrs() = HostPortToPB(hp);
+  {
+    // Check if the request came through the dedicated RPC endpoint meaning
+    // it's been proxied from external network.
+    if (IsAddrOneOf(rpc->local_address(), server_->rpc_proxied_addresses())) {
+      for (const auto& hp : server_->GetProxyAdvertisedHostPorts()) {
+        *resp->add_master_addrs() = HostPortToPB(hp);
+      }
+    } else {
+      vector<HostPort> addresses;
+      if (const auto s = server_->GetMasterHostPorts(&addresses);
+          PREDICT_FALSE(!s.ok())) {
+        StatusToPB(s, resp->mutable_error()->mutable_status());
+        resp->mutable_error()->set_code(MasterErrorPB::UNKNOWN_ERROR);
+        rpc->RespondSuccess();
+        return;
+      }
+      resp->mutable_master_addrs()->Reserve(addresses.size());
+      for (const auto& hp : addresses) {
+        *resp->add_master_addrs() = HostPortToPB(hp);
+      }
+    }
   }
 
   const bool is_leader = l.leader_status().ok();
@@ -886,6 +952,10 @@ bool MasterServiceImpl::SupportsFeature(uint32_t feature) const {
       return FLAGS_master_support_ignore_operations;
     case MasterFeatures::RANGE_SPECIFIC_HASH_SCHEMA:
       return FLAGS_enable_per_range_hash_schemas;
+    case MasterFeatures::UPSERT_IGNORE:
+      return FLAGS_master_support_upsert_ignore_operations;
+    case MasterFeatures::IMMUTABLE_COLUMN_ATTRIBUTE:
+      return FLAGS_master_support_immutable_column_attribute;
     default:
       return false;
   }

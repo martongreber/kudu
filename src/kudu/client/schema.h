@@ -229,7 +229,8 @@ class KUDU_EXPORT KuduColumnSchema {
     DECIMAL = 10,
     VARCHAR = 11,
     TIMESTAMP = UNIXTIME_MICROS, //!< deprecated, use UNIXTIME_MICROS
-    DATE = 12
+    DATE = 12,
+    SERIAL = 13
   };
 
   /// @param [in] type
@@ -303,6 +304,9 @@ class KUDU_EXPORT KuduColumnSchema {
 
   /// @return @c true iff the column schema has the nullable attribute set.
   bool is_nullable() const;
+
+  /// @return @c true iff the column schema has the immutable attribute set.
+  bool is_immutable() const;
   ///@}
 
   /// @return Type attributes of the column schema.
@@ -340,6 +344,8 @@ class KUDU_EXPORT KuduColumnSchema {
       const std::string &name,
       DataType type,
       bool is_nullable = false,
+      bool is_immutable = false,
+      bool is_auto_incrementing = false,
       const void* default_value = NULL, //NOLINT(modernize-use-nullptr)
       const KuduColumnStorageAttributes& storage_attributes = KuduColumnStorageAttributes(),
       const KuduColumnTypeAttributes& type_attributes = KuduColumnTypeAttributes(),
@@ -480,8 +486,33 @@ class KUDU_EXPORT KuduColumnSpec {
   ///
   /// @note Primary keys may not be changed after a table is created.
   ///
+  /// @note A call to PrimaryKey() or NonUniquePrimaryKey() overrides any previous call
+  ///   to these two methods.
+  ///
   /// @return Pointer to the modified object.
   KuduColumnSpec* PrimaryKey();
+
+  ///@{
+  /// Set the column to be a non-unique primary key of the table.
+  ///
+  /// This may only be used to set non-composite non-unique primary keys. If a composite
+  /// key is desired, use KuduSchemaBuilder::SetNonUniquePrimaryKey(). This may not be
+  /// used in conjunction with KuduSchemaBuilder::SetNonUniquePrimaryKey().
+  ///
+  /// @note Non-unique primary keys may not be changed after a table is created.
+  ///
+  /// @note By specifying non-unique primary key, an auto incrementing column is created
+  ///   automatically. They form together the effective primary key. The auto incrementing field
+  ///   is populated on the server side, it must not be specified during insertion. All subsequent
+  ///   operations like scans will contain the auto incrementing column by default. If one wants to
+  ///   omit the auto incrementing column, it can be accomplished through existing projection
+  ///   methods.
+  ///
+  /// @note A call to PrimaryKey() or NonUniquePrimaryKey() overrides any previous call
+  ///   to these two methods.
+  ///
+  /// @return Pointer to the modified object.
+  KuduColumnSpec* NonUniquePrimaryKey();
 
   /// Set the column to be not nullable.
   ///
@@ -496,6 +527,16 @@ class KUDU_EXPORT KuduColumnSpec {
   ///
   /// @return Pointer to the modified object.
   KuduColumnSpec* Nullable();
+
+  /// Set the column to be immutable.
+  ///
+  /// @return Pointer to the modified object.
+  KuduColumnSpec* Immutable();
+
+  /// Set the column to be mutable (the default).
+  ///
+  /// @return Pointer to the modified object.
+  KuduColumnSpec* Mutable();
 
   /// Set the data type of the column.
   ///
@@ -595,10 +636,33 @@ class KUDU_EXPORT KuduSchemaBuilder {
   ///
   /// This may be used to specify a compound primary key.
   ///
+  /// @note A call to SetPrimaryKey() or SetNonUniquePrimaryKey() overrides any previous
+  ///   call to these two methods.
+  ///
   /// @param [in] key_col_names
   ///   Names of the columns to include into the compound primary key.
   /// @return Pointer to the modified object.
   KuduSchemaBuilder* SetPrimaryKey(const std::vector<std::string>& key_col_names);
+
+  /// Set the non-unique primary key of the new Schema based on the given column names.
+  ///
+  /// This may be used to specify a compound non-unique primary key.
+  ///
+  /// @note By specifying non-unique primary keys, an auto incrementing column is created
+  ///   automatically. They form together the effective primary key. The auto incrementing field
+  ///   is populated on the server side, it must not be specified during insertion. All subsequent
+  ///   operations like scans will contain the auto incrementing column by default. If one wants to
+  ///   omit the auto incrementing column, it can be accomplished through existing projection
+  ///   methods.
+  ///
+  /// @note A call to SetPrimaryKey() or SetNonUniquePrimaryKey() overrides any previous
+  ///   call to these two methods.
+  ///
+  /// @param [in] key_col_names
+  ///   Names of the columns to include into the compound non-unique primary key.
+  /// @return Pointer to the modified object.
+  KuduSchemaBuilder* SetNonUniquePrimaryKey(
+      const std::vector<std::string>& key_col_names);
 
   /// Build the schema based on current configuration of the builder object.
   ///
@@ -649,6 +713,9 @@ class KUDU_EXPORT KuduSchema {
   ///
   /// @todo Remove KuduSchema::Reset().
   ///
+  /// @note KuduSchema::Reset() is deprecated API. It does not support
+  ///    non-unique primary key and does not add auto incrementing column.
+  ///
   /// @param [in] columns
   ///   Per-column schema information.
   /// @param [in] key_columns
@@ -693,7 +760,7 @@ class KUDU_EXPORT KuduSchema {
   /// @param [in] col_name
   ///   Column name.
   /// @param [out] col_schema
-  ///   Schema for the specified column.
+  ///   If not null pointer, then the schema for the specified column.
   /// @return @c true iff the specified column exists.
   bool HasColumn(const std::string& col_name, KuduColumnSchema* col_schema) const;
 
@@ -709,6 +776,22 @@ class KUDU_EXPORT KuduSchema {
   /// @param [out] indexes
   ///   The placeholder for the result.
   void GetPrimaryKeyColumnIndexes(std::vector<int>* indexes) const;
+
+  /// Get the index of the auto incrementing column within this Schema.
+  ///
+  /// @attention In current versions of Kudu, key column indexes will always be
+  ///   contiguous indexes starting with 0. The auto incrementing column is
+  ///   always the last key column. However, in future versions this assumption
+  ///   may not hold, so callers should not assume it is the case.
+  ///
+  /// @return The index of the auto incrementing column. If the column does not
+  ///   exist the return value is -1.
+  int GetAutoIncrementingColumnIndex() const;
+
+  /// Utility function to return the actual name of the auto incrementing column.
+  ///
+  /// @return The name of the auto incrementing column.
+  static const char* const GetAutoIncrementingColumnName();
 
   /// Create a new row corresponding to this schema.
   ///

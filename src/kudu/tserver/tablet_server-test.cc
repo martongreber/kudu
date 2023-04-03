@@ -33,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -58,7 +59,6 @@
 #include "kudu/consensus/log-test-base.h"
 #include "kudu/consensus/log.h"
 #include "kudu/consensus/metadata.pb.h"
-#include "kudu/consensus/raft_consensus.h"
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/data_dirs.h"
@@ -207,6 +207,7 @@ DECLARE_int32(workload_stats_metric_collection_interval_ms);
 DECLARE_string(block_manager);
 DECLARE_string(env_inject_eio_globs);
 DECLARE_string(env_inject_full_globs);
+DECLARE_string(webserver_doc_root);
 DECLARE_uint32(tablet_apply_pool_overload_threshold_ms);
 
 // Declare these metrics prototypes for simpler unit testing of their behavior.
@@ -772,6 +773,16 @@ enum class ErrorType {
 class TabletServerStartupWebPageTest : public TabletServerTestBase {
  public:
   void SetUp() override {
+    // The embedded webserver renders the contents of the generated pages
+    // according to mustache's mappings found under the directory pointed to by
+    // the --webserver_doc_root flag, which is set to $KUDU_HOME/www by default.
+    // Since this test assumes to fetch the pre-rendered output for the startup
+    // page, it would fail if the KUDU_HOME environment variable were set and
+    // pointed to the location where 'www' subdirectory contained the required
+    // mustache mappings. Let's explicitly point the document root to nowhere,
+    // so no mustache-based rendering is done.
+    FLAGS_webserver_doc_root = "";
+
     NO_FATALS(TabletServerTestBase::SetUp());
     NO_FATALS(StartTabletServer(kNumDirs));
     // Create a bunch of tablets with a bunch of rowsets.
@@ -825,12 +836,13 @@ class TabletServerStartupWebPageTest : public TabletServerTestBase {
 };
 
 TEST_F(TabletServerStartupWebPageTest, TestStartupWebPage) {
-  EasyCurl c;
-  faststring buf;
   const string url = Substitute("http://$0/startup", mini_server_->bound_http_addr().ToString());
 
   // Verify if the startup status is complete.
   mini_server_->WaitStarted();
+
+  EasyCurl c;
+  faststring buf;
   ASSERT_OK(c.FetchURL(url, &buf));
   NO_FATALS(IsStatusComplete(buf.ToString()));
 
@@ -842,13 +854,13 @@ TEST_F(TabletServerStartupWebPageTest, TestStartupWebPage) {
   // Restart the tablet server and monitor the startup page contents.
   tablet_replica_.reset();
   mini_server_->Shutdown();
-  std::atomic<bool> run_status_reader = false;
+  std::atomic<bool> run_status_reader = true;
 
   // Hammer the webpage and validate the status percentages.
-  thread read_startup_page([&] {
+  thread status_reader([&] {
     EasyCurl thread_c;
     faststring thread_buf;
-    while (!run_status_reader) {
+    while (run_status_reader) {
       if (!thread_c.FetchURL(url, &thread_buf).ok()) {
         continue;
       }
@@ -856,13 +868,13 @@ TEST_F(TabletServerStartupWebPageTest, TestStartupWebPage) {
     }
   });
   SCOPED_CLEANUP({
-    run_status_reader = true;
-    read_startup_page.join();
+    run_status_reader = false;
+    status_reader.join();
   });
 
   mini_server_->Start();
   mini_server_->WaitStarted();
-  run_status_reader = true;
+  run_status_reader = false;
 
   // After the server has startup up, ensure every startup step has 100 percent status.
   ASSERT_OK(c.FetchURL(url, &buf));
@@ -1674,12 +1686,18 @@ TEST_F(TabletServerTest, TestInsertAndMutate) {
 // Try sending write requests that do not contain write operations. Make sure
 // we get an error that makes sense.
 TEST_F(TabletServerTest, TestInvalidWriteRequest_WrongOpType) {
-  const vector<RowOperationsPB::Type> wrong_op_types = {
+  const RowOperationsPB::Type wrong_op_types[] = {
     RowOperationsPB::SPLIT_ROW,
     RowOperationsPB::RANGE_LOWER_BOUND,
     RowOperationsPB::RANGE_UPPER_BOUND,
     RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND,
     RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND,
+  };
+  const RowOperationsPB::Type unknown_op_types[] = {
+    RowOperationsPB::UNKNOWN,
+  };
+  const RowOperationsPB::Type unsupported_op_types[] = {
+    static_cast<RowOperationsPB::Type>(RowOperationsPB_Type_Type_MAX + 1),
   };
   const auto send_bad_write = [&] (RowOperationsPB::Type op_type) {
     WriteRequestPB req;
@@ -1694,26 +1712,35 @@ TEST_F(TabletServerTest, TestInvalidWriteRequest_WrongOpType) {
     CHECK_OK(proxy_->Write(req, &resp, &controller));
     return resp;
   };
-  // Send a bunch of op types that are inappropriate for write requests.
-  for (const auto& op_type : wrong_op_types) {
+  const auto check_op_type = [&] (RowOperationsPB::Type op_type,
+                                  AppStatusPB::ErrorCode expected_code,
+                                  const string& expected_msg_substr) {
     WriteResponsePB resp = send_bad_write(op_type);
     SCOPED_TRACE(SecureDebugString(resp));
     ASSERT_TRUE(resp.has_error());
     ASSERT_EQ(TabletServerErrorPB::MISMATCHED_SCHEMA, resp.error().code());
-    ASSERT_EQ(AppStatusPB::INVALID_ARGUMENT, resp.error().status().code());
-    ASSERT_STR_CONTAINS(resp.error().status().message(),
-                        "Invalid write operation type");
+    ASSERT_EQ(expected_code, resp.error().status().code());
+    ASSERT_STR_CONTAINS(resp.error().status().message(), expected_msg_substr);
+  };
+
+  // Send a bunch of op types that are inappropriate for write requests.
+  for (const auto& op_type : wrong_op_types) {
+    NO_FATALS(check_op_type(op_type,
+                            AppStatusPB::INVALID_ARGUMENT,
+                            "Invalid write operation type"));
   }
-  {
-    // Do the same for UNKNOWN, which is an unexpected operation type in all
-    // cases, and thus results in a different error message.
-    WriteResponsePB resp = send_bad_write(RowOperationsPB::UNKNOWN);
-    SCOPED_TRACE(SecureDebugString(resp));
-    ASSERT_TRUE(resp.has_error());
-    ASSERT_EQ(TabletServerErrorPB::MISMATCHED_SCHEMA, resp.error().code());
-    ASSERT_EQ(AppStatusPB::NOT_SUPPORTED, resp.error().status().code());
-    ASSERT_STR_CONTAINS(resp.error().status().message(),
-                        "Unknown row operation type");
+  // Do the same for UNKNOWN.
+  for (const auto& op_type : unknown_op_types) {
+    NO_FATALS(check_op_type(op_type,
+                            AppStatusPB::INVALID_ARGUMENT,
+                            "Invalid write operation type"));
+  }
+  // Try one more value which isn't among the defined ones in the
+  // RowOperationsPB::Type enumeration.
+  for (const auto& op_type : unsupported_op_types) {
+    NO_FATALS(check_op_type(op_type,
+                            AppStatusPB::NOT_SUPPORTED,
+                            "Unknown operation type"));
   }
 }
 
@@ -1955,7 +1982,7 @@ TEST_F(TabletServerTest, TestKUDU_176_RecoveryAfterMajorDeltaCompaction) {
 
   // Update it, flush deltas.
   ANFF(UpdateTestRowRemote(1, 2));
-  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMSForTests());
   ANFF(VerifyRows(schema_, { KeyValue(1, 2) }));
 
   // Major compact deltas.
@@ -2078,7 +2105,7 @@ TEST_F(TabletServerTest, TestKUDU_177_RecoveryOfDMSEditsAfterMajorDeltaCompactio
 
   // Update it, flush deltas.
   ANFF(UpdateTestRowRemote(1, 2));
-  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMSForTests());
 
   // Update it again, so this last update is in the DMS.
   ANFF(UpdateTestRowRemote(1, 3));
@@ -3168,10 +3195,10 @@ TEST_F(TabletServerTest, TestScanWithSimplifiablePredicates) {
     auto scan_descriptors = mini_server_->server()->scanner_manager()->ListScans();
     ASSERT_EQ(1, projection.columns().size());
     ASSERT_EQ(1, scan_descriptors.size());
-    ASSERT_EQ(projection.columns().size(), scan_descriptors[0].projected_columns.size());
-    ASSERT_EQ(2, scan_descriptors[0].predicates.size());
-    ASSERT_EQ(projection.columns().size(), scan_descriptors[0].iterator_stats.size());
-    ASSERT_EQ(projection.column(0).name(), scan_descriptors[0].iterator_stats[0].first);
+    ASSERT_EQ(projection.columns().size(), scan_descriptors[0]->projected_columns.size());
+    ASSERT_EQ(2, scan_descriptors[0]->predicates.size());
+    ASSERT_EQ(projection.columns().size(), scan_descriptors[0]->iterator_stats.size());
+    ASSERT_EQ(projection.column(0).name(), scan_descriptors[0]->iterator_stats[0].first);
   }
 
   // Drain all the rows from the scanner.
@@ -3469,6 +3496,26 @@ TEST_F(TabletServerTest, TestInvalidScanRequest_UnknownOrderMode) {
   NO_FATALS(VerifyScanRequestFailure(req,
                                      TabletServerErrorPB::INVALID_SCAN_SPEC,
                                      "Unknown order mode specified"));
+}
+
+TEST_F(TabletServerTest, InvalidScanRequestNoGreaterKey) {
+  const int32_t key_val = INT32_MAX;
+  Arena arena(64);
+  EncodedKeyBuilder ekb(&schema_, &arena);
+  ekb.AddColumnKey(&key_val);
+  EncodedKey* key_encoded = ekb.BuildEncodedKey();
+
+  ScanRequestPB req;
+  NewScanRequestPB* scan = req.mutable_new_scan_request();
+  scan->set_tablet_id(kTabletId);
+  scan->set_order_mode(OrderMode::ORDERED);
+  scan->set_read_mode(ReadMode::READ_AT_SNAPSHOT);
+  scan->set_last_primary_key(key_encoded->encoded_key().ToString());
+  ASSERT_OK(SchemaToColumnPBs(schema_, scan->mutable_projected_columns()));
+  req.set_call_seq_id(0);
+  NO_FATALS(VerifyScanRequestFailure(req,
+                                     TabletServerErrorPB::INVALID_SCAN_SPEC,
+                                     "No lexicographically greater key exists"));
 }
 
 // Test that passing a projection with Column IDs throws an exception.

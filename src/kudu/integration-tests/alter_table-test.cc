@@ -26,6 +26,7 @@
 #include <ostream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -331,7 +332,7 @@ class AlterTableTest : public KuduTest {
 
   void VerifyRows(int start_row, int num_rows, VerifyPattern pattern);
 
-  void InsertRows(int start_row, int num_rows);
+  void InsertRows(int start_row, int num_rows, bool only_set_first_col = true);
   void DeleteRow(int row_key);
 
   Status InsertRowsSequential(const string& table_name, int start_row, int num_rows);
@@ -369,12 +370,12 @@ class AlterTableTest : public KuduTest {
                      vector<unique_ptr<KuduPartialRow>> split_rows,
                      vector<pair<unique_ptr<KuduPartialRow>, unique_ptr<KuduPartialRow>>> bounds);
 
-  void CheckMaintenancePriority(int32_t expect_priority) {
-    for (auto op : tablet_replica_->maintenance_ops_) {
-      ASSERT_EQ(op->priority(), expect_priority);
+  void CheckMaintenancePriority(int32_t expected_priority) {
+    for (auto& op : tablet_replica_->maintenance_ops_) {
+      ASSERT_EQ(expected_priority, op->priority());
     }
-    for (auto op : tablet_replica_->tablet()->maintenance_ops_) {
-      ASSERT_EQ(op->priority(), expect_priority);
+    for (auto& op : tablet_replica_->tablet()->maintenance_ops_) {
+      ASSERT_EQ(expected_priority, op->priority());
     }
   }
 
@@ -708,7 +709,8 @@ TEST_F(AlterTableTest, TestGetSchemaAfterAlterTable) {
   ASSERT_OK(client_->GetTableSchema(kTableName, &s));
 }
 
-void AlterTableTest::InsertRows(int start_row, int num_rows) {
+void AlterTableTest::InsertRows(int start_row, int num_rows,
+                                bool only_set_first_col) {
   shared_ptr<KuduSession> session = client_->NewSession();
   shared_ptr<KuduTable> table;
   CHECK_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
@@ -724,8 +726,13 @@ void AlterTableTest::InsertRows(int start_row, int num_rows) {
     int32_t key = bswap_32(i);
     CHECK_OK(insert->mutable_row()->SetInt32(0, key));
 
-    if (table->schema().num_columns() > 1) {
-      CHECK_OK(insert->mutable_row()->SetInt32(1, i));
+    for (int cid = 1; cid < table->schema().num_columns(); cid++) {
+      if (table->schema().Column(cid).type() == KuduColumnSchema::INT32) {
+        CHECK_OK(insert->mutable_row()->SetInt32(cid, i));
+        if (only_set_first_col) {
+          break;
+        }
+      }
     }
 
     CHECK_OK(session->Apply(insert.release()));
@@ -1028,7 +1035,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterUpdatingRemovedColumn) {
   UpdateRow(0, { {"c1", 54321} });
 
   // Make sure the delta is in a delta-file.
-  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMSForTests());
 
   // Drop c1.
   LOG(INFO) << "Dropping c1";
@@ -1078,7 +1085,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasIntoMissingBaseData) {
   UpdateRow(0, { {"c2", 54321} });
 
   // Make sure the delta is in a delta-file.
-  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMSForTests());
 
   NO_FATALS(ScanToStrings(&rows));
   ASSERT_EQ(2, rows.size());
@@ -1128,7 +1135,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterAddUpdateRemoveColumn) {
   UpdateRow(0, { {"c2", 54321} });
 
   // Make sure the delta is in a delta-file.
-  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMSForTests());
 
   NO_FATALS(ScanToStrings(&rows));
   ASSERT_EQ(1, rows.size());
@@ -2543,6 +2550,80 @@ TEST_F(AlterTableTest, TestDisableCompactAlter) {
   Status s = table_alterer->AlterExtraConfig(
                            {{"kudu.table.disable_compaction", "ok"}})->Alter();
   ASSERT_TRUE(s.IsInvalidArgument());
+}
+
+TEST_F(AlterTableTest, AddAndRemoveImmutableAttribute) {
+  InsertRows(0, 1);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  vector<string> rows;
+  ScanToStrings(&rows);
+  ASSERT_EQ(1, rows.size());
+  EXPECT_EQ("(int32 c0=0, int32 c1=0)", rows[0]);
+
+  {
+    // Add immutable attribute to a column.
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("c1")->Immutable();
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  // Here we use the first column to initialize an object of KuduColumnSchema
+  // for there is no default constructor for it.
+  KuduColumnSchema col_schema = table->schema().Column(0);
+  ASSERT_TRUE(table->schema().HasColumn("c1", &col_schema));
+  ASSERT_TRUE(col_schema.is_immutable());
+
+  InsertRows(1, 1);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  ScanToStrings(&rows);
+  ASSERT_EQ(2, rows.size());
+  EXPECT_EQ("(int32 c0=0, int32 c1=0)", rows[0]);
+  EXPECT_EQ("(int32 c0=16777216, int32 c1=1)", rows[1]);
+
+  {
+    // Remove immutable attribute from a column.
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("c1")->Mutable();
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  ASSERT_TRUE(table->schema().HasColumn("c1", &col_schema));
+  ASSERT_FALSE(col_schema.is_immutable());
+
+  InsertRows(2, 1);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  ScanToStrings(&rows);
+  ASSERT_EQ(3, rows.size());
+  EXPECT_EQ("(int32 c0=0, int32 c1=0)", rows[0]);
+  EXPECT_EQ("(int32 c0=16777216, int32 c1=1)", rows[1]);
+  EXPECT_EQ("(int32 c0=33554432, int32 c1=2)", rows[2]);
+
+  {
+    // Add a column with immutable attribute.
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AddColumn("c2")->Type(KuduColumnSchema::INT32)->Immutable();
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  ASSERT_TRUE(table->schema().HasColumn("c2", &col_schema));
+  ASSERT_TRUE(col_schema.is_immutable());
+
+  InsertRows(3, 1, false);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  ScanToStrings(&rows);
+  ASSERT_EQ(4, rows.size());
+  EXPECT_EQ("(int32 c0=0, int32 c1=0, int32 c2=NULL)", rows[0]);
+  EXPECT_EQ("(int32 c0=16777216, int32 c1=1, int32 c2=NULL)", rows[1]);
+  EXPECT_EQ("(int32 c0=33554432, int32 c1=2, int32 c2=NULL)", rows[2]);
+  EXPECT_EQ("(int32 c0=50331648, int32 c1=3, int32 c2=3)", rows[3]);
 }
 
 } // namespace kudu

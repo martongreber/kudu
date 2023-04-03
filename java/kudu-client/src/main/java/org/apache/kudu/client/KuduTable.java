@@ -185,9 +185,29 @@ public class KuduTable {
   /**
    * Get a new upsert configured with this table's schema. The returned object should not be reused.
    * @return an upsert with this table's schema
+   * @throws UnsupportedOperationException if the table has auto-incrementing column
    */
   public Upsert newUpsert() {
+    if (schema.hasAutoIncrementingColumn()) {
+      throw new UnsupportedOperationException(
+          "Tables with auto-incrementing column do not support UPSERT operations");
+    }
     return new Upsert(this);
+  }
+
+  /**
+   * Get a new upsert ignore configured with this table's schema. The operation ignores errors of
+   * updating immutable cells in a row. This is useful when upserting rows in a table with immutable
+   * columns.
+   * @return an upsert with this table's schema
+   * @throws UnsupportedOperationException if the table has auto-incrementing column
+   */
+  public UpsertIgnore newUpsertIgnore() {
+    if (schema.hasAutoIncrementingColumn()) {
+      throw new UnsupportedOperationException(
+          "Tables with auto-incrementing column do not support UPSERT_IGNORE operations");
+    }
+    return new UpsertIgnore(this);
   }
 
   /**
@@ -202,7 +222,8 @@ public class KuduTable {
 
   /**
    * Get a new update ignore configured with this table's schema. An update ignore will
-   * ignore missing row errors. This is useful to update a row only if it exists.
+   * ignore missing row errors and updating on immutable columns errors. This is useful to
+   * update a row only if it exists, or update a row with immutable columns.
    * The returned object should not be reused.
    * @return an update ignore with this table's schema
    */

@@ -40,6 +40,16 @@ METRIC_DEFINE_counter(tablet, rows_upserted, "Rows Upserted",
     kudu::MetricUnit::kRows,
     "Number of rows upserted into this tablet since service start",
     kudu::MetricLevel::kInfo);
+METRIC_DEFINE_counter(tablet, upsert_ignore_errors, "Upsert Ignore Errors",
+                      kudu::MetricUnit::kRows,
+                      "Number of upsert ignore operations for this tablet which were "
+                      "ignored due to an error since service start. This metric counts "
+                      "the number of attempts to update a present row by changing the "
+                      "value of any of its immutable cells. Note that the rest of the "
+                      "cells (i.e. the mutable ones) in such case are updated accordingly "
+                      "to the operation's data，and rows_upserted will be counted too if "
+                      "upsert successfully.",
+                      kudu::MetricLevel::kDebug);
 METRIC_DEFINE_counter(tablet, rows_updated, "Rows Updated",
     kudu::MetricUnit::kRows,
     "Number of row update operations performed on this tablet since service start",
@@ -47,7 +57,11 @@ METRIC_DEFINE_counter(tablet, rows_updated, "Rows Updated",
 METRIC_DEFINE_counter(tablet, update_ignore_errors, "Update Ignore Errors",
                       kudu::MetricUnit::kRows,
                       "Number of update ignore operations for this tablet which were "
-                      "ignored due to an error since service start",
+                      "ignored due to an error since service start. Note that when "
+                      "ignoring to update the immutable cells, the rest of the cells "
+                      "(i.e. the mutable ones) in such case are updated accordingly to "
+                      "the operation's data，and rows_updated will be counted too if "
+                      "update successfully.",
                       kudu::MetricLevel::kDebug);
 METRIC_DEFINE_counter(tablet, rows_deleted, "Rows Deleted",
     kudu::MetricUnit::kRows,
@@ -340,6 +354,21 @@ METRIC_DEFINE_histogram(tablet, undo_delta_block_gc_perform_duration,
   kudu::MetricLevel::kInfo,
   60000LU, 1);
 
+METRIC_DEFINE_histogram(tablet, compact_rs_mem_usage,
+  "Peak Memory Usage for CompactRowSetsOp",
+  kudu::MetricUnit::kBytes,
+  "Peak memory usage of rowset merge compaction operations (CompactRowSetsOp)",
+  kudu::MetricLevel::kInfo,
+  60000LU, 1);
+
+METRIC_DEFINE_histogram(tablet, compact_rs_mem_usage_to_deltas_size_ratio,
+  "Peak Memory Usage to On-Disk Delta Size Ratio for CompactRowSetsOp",
+  kudu::MetricUnit::kUnits,
+  "Ratio of the peak memory usage to the estimated on-disk size of all deltas "
+  "for rowsets involved in rowset merge compaction (CompactRowSetsOp)",
+  kudu::MetricLevel::kInfo,
+  60000LU, 1);
+
 METRIC_DEFINE_histogram(tablet, deleted_rowset_gc_duration,
   "Deleted Rowset GC Duration",
   kudu::MetricUnit::kMilliseconds,
@@ -374,6 +403,7 @@ TabletMetrics::TabletMetrics(const scoped_refptr<MetricEntity>& entity)
     MINIT(rows_updated),
     MINIT(rows_deleted),
     MINIT(insert_ignore_errors),
+    MINIT(upsert_ignore_errors),
     MINIT(update_ignore_errors),
     MINIT(delete_ignore_errors),
     MINIT(insertions_failed_dup_key),
@@ -419,6 +449,8 @@ TabletMetrics::TabletMetrics(const scoped_refptr<MetricEntity>& entity)
     MINIT(undo_delta_block_gc_init_duration),
     MINIT(undo_delta_block_gc_delete_duration),
     MINIT(undo_delta_block_gc_perform_duration),
+    MINIT(compact_rs_mem_usage),
+    MINIT(compact_rs_mem_usage_to_deltas_size_ratio),
     MINIT(leader_memory_pressure_rejections),
     MEANINIT(average_diskrowset_height),
     HIDEINIT(merged_entities_count_of_tablet, 1) {

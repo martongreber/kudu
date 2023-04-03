@@ -153,23 +153,30 @@ Status ColumnSchema::ApplyDelta(const ColumnSchemaDelta& col_delta) {
   if (col_delta.new_comment) {
     comment_ = col_delta.new_comment.value();
   }
+  if (col_delta.immutable) {
+    is_immutable_ = col_delta.immutable.value();
+  }
   return Status::OK();
 }
 
-string ColumnSchema::ToString(ToStringMode mode) const {
-  return Substitute("$0 $1$2",
+string ColumnSchema::ToString(uint8_t mode) const {
+  return Substitute("$0 $1$2$3",
                     name_,
                     TypeToString(),
-                    mode == ToStringMode::WITH_ATTRIBUTES ? " " + AttrToString() : "");
+                    mode & ToStringMode::WITH_ATTRIBUTES ?
+                    " " + AttrToString() : "",
+                    mode & ToStringMode::WITH_COMMENTS
+                    && comment_.length() ? " " + comment_ : "");
 }
 
 string ColumnSchema::TypeToString() const {
   string type_name = type_info_->name();
   ToUpperCase(type_name, &type_name);
-  return Substitute("$0$1 $2",
+  return Substitute("$0$1 $2$3",
                     type_name,
                     type_attributes().ToStringForType(type_info()->type()),
-                    is_nullable_ ? "NULLABLE" : "NOT NULL");
+                    is_nullable_ ? "NULLABLE" : "NOT NULL",
+                    is_immutable_ ? " IMMUTABLE" : "");
 }
 
 string ColumnSchema::AttrToString() const {
@@ -221,6 +228,7 @@ void Schema::CopyFrom(const Schema& other) {
 
   first_is_deleted_virtual_column_idx_ = other.first_is_deleted_virtual_column_idx_;
   has_nullables_ = other.has_nullables_;
+  auto_incrementing_col_idx_ = other.auto_incrementing_col_idx_;
 }
 
 Schema::Schema(Schema&& other) noexcept
@@ -232,7 +240,8 @@ Schema::Schema(Schema&& other) noexcept
       name_to_index_(std::move(other.name_to_index_)),
       id_to_index_(std::move(other.id_to_index_)),
       first_is_deleted_virtual_column_idx_(other.first_is_deleted_virtual_column_idx_),
-      has_nullables_(other.has_nullables_) {
+      has_nullables_(other.has_nullables_),
+      auto_incrementing_col_idx_(other.auto_incrementing_col_idx_) {
 }
 
 Schema& Schema::operator=(Schema&& other) noexcept {
@@ -246,6 +255,7 @@ Schema& Schema::operator=(Schema&& other) noexcept {
     first_is_deleted_virtual_column_idx_ = other.first_is_deleted_virtual_column_idx_;
     has_nullables_ = other.has_nullables_;
     name_to_index_ = std::move(other.name_to_index_);
+    auto_incrementing_col_idx_ = other.auto_incrementing_col_idx_;
   }
   return *this;
 }
@@ -272,14 +282,24 @@ Status Schema::Reset(vector<ColumnSchema> cols,
   }
 
   // Verify that the key columns are not nullable
+  int auto_incrementing_col_idx = kColumnNotFound;
   for (int i = 0; i < key_columns; ++i) {
     if (PREDICT_FALSE(cols_[i].is_nullable())) {
       return Status::InvalidArgument(
         "Bad schema", Substitute("Nullable key columns are not supported: $0",
                                  cols_[i].name()));
     }
+    if (cols_[i].is_auto_incrementing()) {
+      // Schemas can have at most one auto-incrementing column
+      DCHECK_EQ(auto_incrementing_col_idx, kColumnNotFound);
+      DCHECK_EQ(cols_[i].type_info()->type(), INT64);
+      DCHECK(!cols_[i].is_nullable());
+      DCHECK(!cols_[i].is_immutable());
+      auto_incrementing_col_idx = i;
+    }
   }
 
+  auto_incrementing_col_idx_ = auto_incrementing_col_idx;
   // Calculate the offset of each column in the row format.
   col_offsets_.clear();
   col_offsets_.reserve(cols_.size() + 1);  // Include space for total byte size at the end.
@@ -289,6 +309,11 @@ Status Schema::Reset(vector<ColumnSchema> cols,
   for (const ColumnSchema& col : cols_) {
     if (col.name().empty()) {
       return Status::InvalidArgument("column names must be non-empty");
+    }
+    if (col.name() == Schema::GetAutoIncrementingColumnName() &&
+        !col.is_auto_incrementing()) {
+      return Status::InvalidArgument(Substitute(
+          "$0 is a reserved column name", Schema::GetAutoIncrementingColumnName()));
     }
     // The map uses the 'name' string from within the ColumnSchema object.
     if (!InsertIfNotPresent(&name_to_index_, col.name(), i++)) {
@@ -455,7 +480,7 @@ Status Schema::GetMappedReadProjection(const Schema& projection,
   return Status::OK();
 }
 
-string Schema::ToString(ToStringMode mode) const {
+string Schema::ToString(uint8_t mode) const {
   if (cols_.empty()) return "()";
 
   vector<string> pk_strs;
@@ -464,12 +489,15 @@ string Schema::ToString(ToStringMode mode) const {
     pk_strs.push_back(cols_[i].name());
   }
 
-  auto col_mode = ColumnSchema::ToStringMode::WITHOUT_ATTRIBUTES;
+  uint8_t col_mode = ColumnSchema::ToStringMode::WITHOUT_ATTRIBUTES;
   if (mode & ToStringMode::WITH_COLUMN_ATTRIBUTES) {
-    col_mode = ColumnSchema::ToStringMode::WITH_ATTRIBUTES;
+    col_mode |= ColumnSchema::ToStringMode::WITH_ATTRIBUTES;
+  }
+  if (mode & ToStringMode::WITH_COLUMN_COMMENTS) {
+    col_mode |= ColumnSchema::ToStringMode::WITH_COMMENTS;
   }
   vector<string> col_strs;
-  if (has_column_ids() && (mode & ToStringMode::WITH_COLUMN_IDS)) {
+  if (has_column_ids() && mode & ToStringMode::WITH_COLUMN_IDS) {
     for (size_t i = 0; i < cols_.size(); ++i) {
       col_strs.push_back(Substitute("$0:$1", col_ids_[i], cols_[i].ToString(col_mode)));
     }
@@ -593,10 +621,39 @@ Status SchemaBuilder::AddColumn(const string& name,
                                 bool is_nullable,
                                 const void* read_default,
                                 const void* write_default) {
+  return AddColumn(name, type, is_nullable, false, read_default, write_default);
+}
+
+Status SchemaBuilder::AddColumn(const std::string& name,
+                                DataType type,
+                                bool is_nullable,
+                                bool is_immutable,
+                                const void* read_default,
+                                const void* write_default) {
+  return AddColumn(name, type, is_nullable, is_immutable, false, read_default, write_default);
+}
+
+Status SchemaBuilder::AddColumn(const std::string& name,
+                                DataType type,
+                                bool is_nullable,
+                                bool is_immutable,
+                                bool is_auto_incrementing,
+                                const void* read_default,
+                                const void* write_default) {
   if (name.empty()) {
     return Status::InvalidArgument("column name must be non-empty");
   }
-  return AddColumn(ColumnSchema(name, type, is_nullable, read_default, write_default), false);
+
+  if (is_auto_incrementing) {
+    DCHECK_EQ(type, INT64);
+    DCHECK(!is_nullable);
+    DCHECK(!is_immutable);
+    DCHECK_EQ(read_default, (void *)nullptr);
+    DCHECK_EQ(write_default, (void *)nullptr);
+  }
+
+  return AddColumn(ColumnSchema(name, type, is_nullable, is_immutable,
+                                is_auto_incrementing, read_default, write_default), false);
 }
 
 Status SchemaBuilder::RemoveColumn(const string& name) {

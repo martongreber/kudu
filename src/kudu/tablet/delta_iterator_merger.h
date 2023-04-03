@@ -81,7 +81,7 @@ class DeltaIteratorMerger : public DeltaIterator {
                                          std::vector<DeltaKeyAndUpdate>* out,
                                          Arena* arena) override;
 
-  bool HasNext() override;
+  bool HasNext() const override;
 
   bool MayHaveDeltas() const override;
 
@@ -94,6 +94,8 @@ class DeltaIteratorMerger : public DeltaIterator {
   void set_deltas_selected(int64_t /*deltas_selected*/) override {
     LOG(DFATAL) << "Not implemented";
   }
+
+  size_t memory_footprint() override;
 
  private:
   explicit DeltaIteratorMerger(std::vector<std::unique_ptr<DeltaIterator> > iters);

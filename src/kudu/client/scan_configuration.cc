@@ -168,6 +168,8 @@ Status ScanConfiguration::SetReadMode(KuduScanner::ReadMode read_mode) {
 
 Status ScanConfiguration::SetFaultTolerant(bool fault_tolerant) {
   if (fault_tolerant) {
+    // TODO(yingchun): this will overwrite the user set read mode, maybe it
+    // should return error if there is any conflict.
     RETURN_NOT_OK(SetReadMode(KuduScanner::READ_AT_SNAPSHOT));
   }
   is_fault_tolerant_ = fault_tolerant;
@@ -242,6 +244,8 @@ Status ScanConfiguration::AddIsDeletedColumn() {
   ColumnSchema is_deleted(col_name,
                           IS_DELETED,
                           /*is_nullable=*/false,
+                          /*is_immutable=*/false,
+                          /*is_auto_incrementing=*/false,
                           &read_default);
   cols.emplace_back(std::move(is_deleted));
 

@@ -49,7 +49,6 @@
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/master_runner.h"
 #include "kudu/master/sys_catalog.h"
-#include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/tools/ksck.h"
 #include "kudu/tools/ksck_remote.h"
@@ -72,6 +71,7 @@ DECLARE_int64(timeout_ms);
 DECLARE_string(columns);
 DECLARE_string(fs_wal_dir);
 DECLARE_string(fs_data_dirs);
+DECLARE_string(tables);
 
 DEFINE_string(master_uuid, "", "Permanent UUID of the master. Only needed to disambiguate in case "
                                "of multiple masters with same RPC address");
@@ -823,6 +823,7 @@ unique_ptr<Mode> BuildMasterMode() {
         .AddRequiredParameter({ kFlagArg, "Name of the gflag" })
         .AddRequiredParameter({ kValueArg, "New value for the gflag" })
         .AddOptionalParameter("force")
+        .AddOptionalParameter("run_consistency_check")
         .Build();
     builder.AddAction(std::move(set_flag));
   }
@@ -913,30 +914,33 @@ unique_ptr<Mode> BuildMasterMode() {
   }
 
   {
-    const char* rebuild_extra_description = "Attempts to create on-disk metadata\n"
-        "that can be used by a non-replicated master to recover a Kudu cluster\n"
-        "that has permanently lost its masters. It has a number of limitations:\n"
-        " - Security metadata like cryptographic keys are not rebuilt. Tablet servers\n"
-        "   and clients must be restarted before starting the new master in order to\n"
-        "   communicate with the new master.\n"
-        " - Table IDs are known only by the masters. Reconstructed tables will have\n"
-        "   new IDs.\n"
-        " - If a create, delete, or alter table was in progress when the masters were lost,\n"
-        "   it may not be possible to restore the table.\n"
-        " - If all replicas of a tablet are missing, it may not be able to recover the\n"
-        "   table fully. Moreover, the rebuild tool cannot detect that a tablet is\n"
-        "   missing.\n"
-        " - It's not possible to determine the replication factor of a table from tablet\n"
-        "   server metadata. The rebuild tool sets the replication factor of each\n"
-        "   table to --default_num_replicas instead.\n"
-        " - It's not possible to determine the next column id for a table from tablet\n"
-        "   server metadata. Instead, the rebuilt tool sets the next column id to\n"
-        "   a very large number.\n"
-        " - Table metadata like comments, owners, and configurations are not stored on\n"
-        "   tablet servers and are thus not restored.\n"
-        "WARNING: This tool is potentially unsafe. Only use it when there is no\n"
-        "possibility of recovering the original masters, and you know what you\n"
-        "are doing.";
+    const char* rebuild_extra_description = "Attempts to create or update on-disk metadata "
+        "that can be used by a non-replicated master to recover a Kudu cluster "
+        "that has permanently lost its masters. It has a number of limitations:\n\n"
+        " - Security metadata like cryptographic keys are not rebuilt. Tablet servers "
+        "and clients must be restarted before starting the new master in order to "
+        "communicate with the new master.\n\n"
+        " - Table IDs are known only by the masters. Reconstructed tables will have "
+        "new IDs.\n\n"
+        " - If a create, delete, or alter table was in progress when the masters were lost, "
+        "it may not be possible to restore the table.\n\n"
+        " - If all replicas of a tablet are missing, it may not be able to recover the "
+        "table fully. Moreover, the rebuild tool cannot detect that a tablet is "
+        "missing.\n\n"
+        " - It's not possible to determine the replication factor of a table from tablet "
+        "server metadata. The rebuild tool sets the replication factor of each "
+        "table to --default_num_replicas instead.\n\n"
+        " - It's not possible to determine the next column id for a table from tablet "
+        "server metadata. Instead, the rebuilt tool sets the next column id to "
+        "a very large number.\n\n"
+        " - Table metadata like comments, owners, and configurations are not stored on "
+        "tablet servers and are thus not restored.\n\n"
+        " - Without '--tables', the tool will build a brand new syscatalog table based on "
+        "tablet data on tablet server metadata.\n\n"
+        " - With '--tables', the tool will update specific tables in current syscatalog.\n\n"
+        "WARNING: This tool is potentially unsafe. Only use it when there is no "
+        "possibility of recovering the original masters, and you know what you "
+        "are doing.\n";
     unique_ptr<Action> unsafe_rebuild =
         ActionBuilder("unsafe_rebuild", &RebuildMaster)
         .Description("Rebuild a Kudu master from tablet server metadata")
@@ -947,6 +951,7 @@ unique_ptr<Mode> BuildMasterMode() {
         .AddOptionalParameter("fs_data_dirs")
         .AddOptionalParameter("fs_metadata_dir")
         .AddOptionalParameter("fs_wal_dir")
+        .AddOptionalParameter("tables")
         .Build();
     builder.AddAction(std::move(unsafe_rebuild));
   }

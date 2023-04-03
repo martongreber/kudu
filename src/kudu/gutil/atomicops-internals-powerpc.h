@@ -33,20 +33,24 @@
 #define GUTIL_ATOMICOPS_INTERNALS_POWERPC_H_
 
 typedef int32_t Atomic32;
+typedef int64_t Atomic64;
 #define BASE_HAS_ATOMIC64 1  // Use only in tests and base/atomic*
 
 
 #define ATOMICOPS_COMPILER_BARRIER() __asm__ __volatile__("" : : : "memory")
 
 // 32-bit PowerPC is not supported yet.
-#ifndef ARCH_POWERPC64
+#ifndef __powerpc64__ 
 #error "Only PowerPC64 is supported"
 #endif
 
 namespace base {
 namespace subtle {
 
+typedef int32_t Atomic32;
 typedef int64_t Atomic64;
+inline void PauseCPU() {
+}
 
 // sync vs. lwsync:
 // 1. lwsync only works in cache enabled memory (system memory).  lwsync is

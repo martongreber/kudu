@@ -33,7 +33,6 @@
 #include "kudu/common/rowid.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #include "kudu/tablet/mvcc.h"
 #include "kudu/util/bloom_filter.h"
 #include "kudu/util/status.h"
@@ -41,6 +40,7 @@
 
 namespace kudu {
 
+class Arena;
 class MonoTime; // IWYU pragma: keep
 class RowChangeList;
 class RowwiseIterator;
@@ -110,6 +110,16 @@ class RowSet {
     MINOR_DELTA_COMPACTION
   };
 
+  // Estimate types used in EstimateBytesInPotentiallyAncientUndoDeltas().
+  // The information on the age of a delta might be absent in some contexts,
+  // and such a delta is treated differently depending on the requested estimate
+  // type: it's considered as ancient when an overestimate is appropriate,
+  // and not so when an underestimate is desired.
+  enum EstimateType {
+    OVERESTIMATE,
+    UNDERESTIMATE,
+  };
+
   // Check if a given row key is present in this rowset.
   // Sets *present and returns Status::OK, unless an error
   // occurs.
@@ -175,9 +185,10 @@ class RowSet {
   // Return a displayable string for this rowset.
   virtual std::string ToString() const = 0;
 
-  // Dump the full contents of this rowset, for debugging.
-  // This is very verbose so only useful within unit tests.
-  virtual Status DebugDump(std::vector<std::string> *lines = nullptr) = 0;
+  // Dump the full contents of this rowset to the given vector, for debugging.
+  // This is very verbose so only useful within unit tests or CLI tools.
+  // If 'lines' is nullptr, dumps to LOG(INFO).
+  Status DebugDump(std::vector<std::string>* lines);
 
   // Return the size of this rowset on disk, in bytes.
   virtual uint64_t OnDiskSize() const = 0;
@@ -230,10 +241,13 @@ class RowSet {
                                           bool* deleted_and_ancient) = 0;
 
   // Estimate the number of bytes in ancient undo delta stores. This may be an
-  // overestimate. The argument 'ancient_history_mark' must be valid (it may
-  // not be equal to Timestamp::kInvalidTimestamp).
-  virtual Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp ancient_history_mark,
-                                                             int64_t* bytes) = 0;
+  // overestimate or an underestimate depending on 'estimate_type,. The argument
+  // 'ancient_history_mark' must be valid: it must not be equal to
+  // Timestamp::kInvalidTimestamp.
+  virtual Status EstimateBytesInPotentiallyAncientUndoDeltas(
+      Timestamp ancient_history_mark,
+      EstimateType estimate_type,
+      int64_t* bytes) = 0;
 
   // Initialize undo delta blocks until the given 'deadline' is passed, or
   // until all undo delta blocks with a max timestamp older than
@@ -306,6 +320,12 @@ class RowSet {
   // Set after a compaction has completed to indicate that the rowset has been
   // removed from the rowset tree and is thus longer available for compaction.
   virtual void set_has_been_compacted() = 0;
+
+  // Similar to DebugDump, but adds an extra 'rows_left' parameter. DebugDump invokes
+  // DebugDumpImpl with 'rows_left' as nullptr.
+  // If 'rows_left' is nullptr, there is no limit on the number of rows to dump.
+  // If the content of 'rows_left' equal to or less than 0, no rows will be dumped.
+  virtual Status DebugDumpImpl(int64_t* rows_left, std::vector<std::string>* lines) = 0;
 };
 
 // Used often enough, may as well typedef it.
@@ -426,8 +446,6 @@ class DuplicatingRowSet : public RowSet {
 
   std::string ToString() const override;
 
-  virtual Status DebugDump(std::vector<std::string> *lines = nullptr) override;
-
   std::shared_ptr<RowSetMetadata> metadata() override;
 
   // A flush-in-progress rowset should never be selected for compaction.
@@ -471,8 +489,10 @@ class DuplicatingRowSet : public RowSet {
     return Status::OK();
   }
 
-  Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp /*ancient_history_mark*/,
-                                                     int64_t* bytes) override {
+  Status EstimateBytesInPotentiallyAncientUndoDeltas(
+      Timestamp /*ancient_history_mark*/,
+      EstimateType /*estimate_type*/,
+      int64_t* bytes) override {
     DCHECK(bytes);
     *bytes = 0;
     return Status::OK();
@@ -507,6 +527,8 @@ class DuplicatingRowSet : public RowSet {
       const fs::IOContext* /*io_context*/) override { return Status::OK(); }
 
  private:
+  Status DebugDumpImpl(int64_t* rows_left, std::vector<std::string>* lines) override;
+
   friend class Tablet;
 
   DISALLOW_COPY_AND_ASSIGN(DuplicatingRowSet);

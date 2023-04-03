@@ -156,7 +156,8 @@ class Tablet {
   // Decode the Write (insert/mutate) operations from within a user's
   // request.
   Status DecodeWriteOperations(const Schema* client_schema,
-                               WriteOpState* op_state);
+                               WriteOpState* op_state,
+                               bool is_leader = false);
 
   // Acquire locks for each of the operations in the given write op.
   // This also sets the row op's RowSetKeyProbe.
@@ -254,7 +255,6 @@ class Tablet {
   // in a new (initially empty) MemRowSet in its place.
   //
   // This doesn't flush any DeltaMemStores for any existing RowSets.
-  // To do that, call FlushBiggestDMS() for example.
   Status Flush();
 
   // Prepares the op context for the alter schema operation.
@@ -328,8 +328,8 @@ class Tablet {
   // Flushes the DMS with the highest retention.
   Status FlushBestDMS(const ReplaySizeMap &replay_size_map) const;
 
-  // Flush only the biggest DMS
-  Status FlushBiggestDMS();
+  // Flush only the biggest DMS. Only used for tests.
+  Status FlushBiggestDMSForTests();
 
   // Flush all delta memstores. Only used for tests.
   Status FlushAllDMSForTests();
@@ -522,9 +522,7 @@ class Tablet {
                      std::vector<KeyRange>* ranges);
 
   // Update the last read operation timestamp.
-  // NOTE: It's a const function, because we have to call it in Iterator, where Tablet is a const
-  // variable there.
-  void UpdateLastReadTime() const;
+  void UpdateLastReadTime();
 
   // Collect and update recent workload statistics for the tablet.
   // Return the current workload score of the tablet.
@@ -541,6 +539,13 @@ class Tablet {
                                              int64_t* replay_size = nullptr,
                                              MonoTime* earliest_dms_time = nullptr) const;
 
+  int64_t GetAutoIncrementingCounter() const {
+    return auto_incrementing_counter_;
+  }
+
+  void SetAutoIncrementingCounter(int64_t auto_incrementing_counter) {
+    auto_incrementing_counter_ = auto_incrementing_counter;
+  }
  private:
   friend class kudu::AlterTableTest;
   friend class Iterator;
@@ -617,7 +622,7 @@ class Tablet {
   // Validate the given update/delete operation.
   static Status ValidateMutateUnlocked(const RowOp& op);
 
-  // Perform an INSERT, INSERT_IGNORE, or UPSERT operation, assuming that the op is
+  // Perform an INSERT, INSERT_IGNORE, UPSERT, or UPSERT_IGNORE operation, assuming that the op is
   // already in a prepared state. This state ensures that:
   // - the row lock is acquired
   // - the tablet components have been acquired
@@ -799,6 +804,10 @@ class Tablet {
 
   int64_t next_mrs_id_;
 
+  // Counter for an auto-incrementing column. It is expected that this is only
+  // updated by the prepare thread.
+  int64_t auto_incrementing_counter_;
+
   // A pointer to the server's clock.
   clock::Clock* clock_;
 
@@ -843,12 +852,13 @@ class Tablet {
   std::shared_ptr<FlushFaultHooks> flush_hooks_;
   std::shared_ptr<FlushCompactCommonHooks> common_hooks_;
 
-  std::vector<MaintenanceOp*> maintenance_ops_;
+  // Tablet owns MaintenanceOp objects allocated on the heap.
+  std::vector<std::unique_ptr<MaintenanceOp>> maintenance_ops_;
 
   // Lock protecting access to 'last_write_time_' and 'last_read_time_'.
   mutable rw_spinlock last_rw_time_lock_;
+  MonoTime last_read_time_;
   MonoTime last_write_time_;
-  mutable MonoTime last_read_time_;
 
   // NOTE: it's important that this is the first member to be destructed. This
   // ensures we do not attempt to collect metrics while calling the destructor.

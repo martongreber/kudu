@@ -114,6 +114,7 @@ void AddWritePrivilegesForRowOperations(const RowOperationsPB::Type& op_type,
       InsertIfNotPresent(privileges, WritePrivilegeType::INSERT);
       break;
     case RowOperationsPB::UPSERT:
+    case RowOperationsPB::UPSERT_IGNORE:
       InsertIfNotPresent(privileges, WritePrivilegeType::INSERT);
       InsertIfNotPresent(privileges, WritePrivilegeType::UPDATE);
       break;
@@ -154,7 +155,8 @@ WriteOp::WriteOp(unique_ptr<WriteOpState> state, DriverType type)
 void WriteOp::NewReplicateMsg(unique_ptr<ReplicateMsg>* replicate_msg) {
   replicate_msg->reset(new ReplicateMsg);
   (*replicate_msg)->set_op_type(consensus::OperationType::WRITE_OP);
-  (*replicate_msg)->mutable_write_request()->CopyFrom(*state()->request());
+  auto* write_req = (*replicate_msg)->mutable_write_request();
+  write_req->CopyFrom(*state()->request());
   if (state()->are_results_tracked()) {
     (*replicate_msg)->mutable_request_id()->CopyFrom(state()->request_id());
   }
@@ -187,8 +189,22 @@ Status WriteOp::Prepare() {
       return s;
     }
   }
-
-  s = tablet->DecodeWriteOperations(&client_schema, state());
+  // In case of leader replica, set the auto-incrementing column value in the raft consensus
+  // replicate message and in case of follower replica update the auto increment counter to
+  // the value present in the raft consensus replicate message.
+  bool is_leader = type() == consensus::LEADER;
+  if (state_->consensus_round() &&
+      state_->tablet_replica()->tablet()->schema()->has_auto_incrementing()) {
+    if (is_leader) {
+      auto* write_req = state_->consensus_round()->replicate_msg()->mutable_write_request();
+      write_req->mutable_auto_incrementing_column()->set_auto_incrementing_counter(
+          tablet->GetAutoIncrementingCounter());
+    } else {
+      tablet->SetAutoIncrementingCounter(state_->consensus_round()->
+          replicate_msg()->write_request().auto_incrementing_column().auto_incrementing_counter());
+    }
+  }
+  s = tablet->DecodeWriteOperations(&client_schema, state(), is_leader);
   if (!s.ok()) {
     // TODO(unknown): is MISMATCHED_SCHEMA always right here? probably not.
     state()->completion_callback()->set_error(s, TabletServerErrorPB::MISMATCHED_SCHEMA);
@@ -317,6 +333,7 @@ void WriteOp::Finish(OpResult result) {
     metrics->rows_inserted->IncrementBy(op_m.successful_inserts);
     metrics->insert_ignore_errors->IncrementBy(op_m.insert_ignore_errors);
     metrics->rows_upserted->IncrementBy(op_m.successful_upserts);
+    metrics->upsert_ignore_errors->IncrementBy(op_m.upsert_ignore_errors);
     metrics->rows_updated->IncrementBy(op_m.successful_updates);
     metrics->update_ignore_errors->IncrementBy(op_m.update_ignore_errors);
     metrics->rows_deleted->IncrementBy(op_m.successful_deletes);
@@ -504,6 +521,17 @@ void WriteOpState::UpdateMetricsForOp(const RowOp& op) {
       DCHECK(!op.error_ignored);
       op_metrics_.successful_upserts++;
       break;
+    case RowOperationsPB::UPSERT_IGNORE:
+      if (op.error_ignored) {
+        op_metrics_.upsert_ignore_errors++;
+      }
+      // This op may be completed even if it's error_ignored. It make sense
+      // when attempting to update immutable cells, the rest of cells may be updated
+      // except the immutable cells.
+      if (!op.failed) {
+        op_metrics_.successful_upserts++;
+      }
+      break;
     case RowOperationsPB::UPDATE:
       DCHECK(!op.error_ignored);
       op_metrics_.successful_updates++;
@@ -511,7 +539,11 @@ void WriteOpState::UpdateMetricsForOp(const RowOp& op) {
     case RowOperationsPB::UPDATE_IGNORE:
       if (op.error_ignored) {
         op_metrics_.update_ignore_errors++;
-      } else {
+      }
+      // This op may be completed even if it's error_ignored. It make sense
+      // when attempting to update immutable cells, the rest of cells may be updated
+      // except the immutable cells.
+      if (!op.failed) {
         op_metrics_.successful_updates++;
       }
       break;
@@ -669,6 +701,7 @@ void WriteOpState::FillResponseMetrics(consensus::DriverType type) {
   resp_metrics->set_successful_inserts(op_m.successful_inserts);
   resp_metrics->set_insert_ignore_errors(op_m.insert_ignore_errors);
   resp_metrics->set_successful_upserts(op_m.successful_upserts);
+  resp_metrics->set_upsert_ignore_errors(op_m.upsert_ignore_errors);
   resp_metrics->set_successful_updates(op_m.successful_updates);
   resp_metrics->set_update_ignore_errors(op_m.update_ignore_errors);
   resp_metrics->set_successful_deletes(op_m.successful_deletes);

@@ -36,6 +36,7 @@ allprojects {
   repositories {
     maven { url gbnUrl }
     maven { url repositoryUrl }
+    maven { url clouderaClientsGbnUrl }
     mavenCentral()
     mavenLocal()
   }

@@ -137,8 +137,8 @@ DEFINE_validator(encryption_key_provider, [](const char* /*n*/, const std::strin
 });
 
 DEFINE_string(ranger_kms_url, "",
-              "URL of the Ranger KMS server. Must be set when 'encryption_key_provider' "
-              "is set to 'ranger-kms'.");
+              "Comma-separated list of Ranger KMS server URLs. Must be set when "
+              "'encryption_key_provider' is set to 'ranger-kms'.");
 
 DEFINE_string(encryption_cluster_key_name, "kudu_cluster_key",
               "Name of the cluster key that is used to encrypt server encryption keys as "
@@ -146,7 +146,10 @@ DEFINE_string(encryption_cluster_key_name, "kudu_cluster_key",
 
 bool ValidateRangerKMSFlags() {
   if (FLAGS_encryption_key_provider == "ranger-kms") {
-    if (FLAGS_ranger_kms_url.empty() || FLAGS_encryption_cluster_key_name.empty()) {
+    if (FLAGS_ranger_kms_url.empty() ||
+        FLAGS_encryption_cluster_key_name.empty() ||
+        static_cast<std::vector<std::string>>(strings::Split(
+            FLAGS_ranger_kms_url, ",", strings::SkipEmpty())).empty()) {
       LOG(ERROR) << "If 'encryption_key_provider' is set to 'ranger-kms', then "
                     "'ranger_kms_url' and 'encryption_cluster_key_name' must also be set.";
       return false;
@@ -169,7 +172,7 @@ using kudu::fs::ErrorNotificationCb;
 using kudu::fs::FsErrorManager;
 using kudu::fs::FileBlockManager;
 using kudu::fs::FsReport;
-using kudu::fs::LogBlockManager;
+using kudu::fs::LogBlockManagerNativeMeta;
 using kudu::fs::ReadableBlock;
 using kudu::fs::UpdateInstanceBehavior;
 using kudu::fs::WritableBlock;
@@ -377,9 +380,11 @@ void FsManager::InitBlockManager() {
   if (opts_.block_manager_type == "file") {
     block_manager_.reset(new FileBlockManager(
         env_, dd_manager_.get(), error_manager_.get(), opts_.file_cache, std::move(bm_opts)));
-  } else {
-    block_manager_.reset(new LogBlockManager(
+  } else if (opts_.block_manager_type == "log") {
+    block_manager_.reset(new LogBlockManagerNativeMeta(
         env_, dd_manager_.get(), error_manager_.get(), opts_.file_cache, std::move(bm_opts)));
+  } else {
+    LOG(FATAL) << "Unknown block_manager_type: " << opts_.block_manager_type;
   }
 }
 
@@ -547,7 +552,7 @@ Status FsManager::Open(FsReport* report, Timer* read_instance_metadata_files,
     InitBlockManager();
     LOG_TIMING(INFO, "opening block manager") {
       if (opts_.block_manager_type == "file") {
-        RETURN_NOT_OK(block_manager_->Open(report));
+        RETURN_NOT_OK(block_manager_->Open(report, nullptr, nullptr));
       } else {
         RETURN_NOT_OK(block_manager_->Open(report, containers_processed, containers_total));
       }

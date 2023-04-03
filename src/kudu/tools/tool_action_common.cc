@@ -101,6 +101,9 @@ DEFINE_bool(force, false, "If true, allows the set_flag command to set a flag "
             "which is not explicitly marked as runtime-settable. Such flag "
             "changes may be simply ignored on the server, or may cause the "
             "server to crash.");
+DEFINE_bool(run_consistency_check, true, "If true, Kudu server checks all flags for consistency "
+            "upon setting a flag. In this mode, the server rolls the flag back to its previous "
+            "value and sends corresponding error response if an inconsistency is detected.");
 DEFINE_bool(print_meta, true, "Include metadata in output");
 DEFINE_string(print_entries, "decoded",
               "How to print entries:\n"
@@ -250,6 +253,7 @@ using std::setw;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::unordered_set;
 using std::vector;
 using strings::a2b_hex;
 using strings::Split;
@@ -259,6 +263,7 @@ namespace kudu {
 namespace tools {
 
 const char* const kMasterAddressesArg = "master_addresses";
+const char* const kCurrentLeaderUUIDArg = "current_leader_uuid";
 const char* const kMasterAddressesArgDesc = "Either comma-separated list of Kudu "
     "master addresses where each address is of form 'hostname:port', or a cluster name if it has "
     "been configured in ${KUDU_CONFIG}/kudurc";
@@ -272,6 +277,9 @@ const char* const kTabletIdArgDesc = "Tablet Identifier";
 const char* const kTabletIdsCsvArg = "tablet_ids";
 const char* const kTabletIdsCsvArgDesc =
     "Comma-separated list of Tablet Identifiers";
+const char* const kRowsetIdsCsvArg = "rowset_ids";
+const char* const kRowsetIdsCsvArgDesc =
+    "Comma-separated list of Rowset Identifiers";
 
 const char* const kMasterAddressArg = "master_address";
 const char* const kMasterAddressDesc = "Address of a Kudu Master of form "
@@ -430,17 +438,39 @@ Status GetServerFlags(const string& address,
   rpc.set_timeout(MonoDelta::FromMilliseconds(FLAGS_timeout_ms));
 
   req.set_all_flags(all_flags);
-  for (StringPiece tag : strings::Split(flag_tags, ",", strings::SkipEmpty())) {
+  const vector<string> filter_tags = strings::Split(flag_tags, ",", strings::SkipEmpty());
+  for (StringPiece tag : filter_tags) {
     req.add_tags(tag.as_string());
   }
-  for (StringPiece flag: strings::Split(flags_to_get, ",", strings::SkipEmpty())) {
+  const unordered_set<string> filter_flags =
+      strings::Split(flags_to_get, ",", strings::SkipEmpty());
+  for (StringPiece flag: filter_flags) {
     req.add_flags(flag.as_string());
   }
 
   RETURN_NOT_OK(proxy->GetFlags(req, &resp, &rpc));
 
   flags->clear();
-  std::move(resp.flags().begin(), resp.flags().end(), std::back_inserter(*flags));
+  // Filter flags according to -flags_to_get and -flags_tags. Currently, the filter
+  // logic has been implemented on the server side, but some old versions do not support
+  // the filter logic on the server side, which makes new version kudu tool can not be
+  // used in old version of Kudu server. Therefore, it is better to implement filter
+  // logic on the kudu tool side again.
+  for (const auto& flag : resp.flags()) {
+    if (!filter_flags.empty() && !ContainsKey(filter_flags, flag.name())) {
+      continue;
+    }
+    bool matches = filter_tags.empty();
+    unordered_set<string> contained_tags(flag.tags().begin(), flag.tags().end());
+    for (const auto& tag : filter_tags) {
+      if (ContainsKey(contained_tags, tag)) {
+        matches = true;
+        break;
+      }
+    }
+    if (!matches) continue;
+    flags->push_back(flag);
+  }
   return Status::OK();
 }
 
@@ -628,6 +658,7 @@ Status SetServerFlag(const string& address, uint16_t default_port,
   req.set_flag(flag);
   req.set_value(value);
   req.set_force(FLAGS_force);
+  req.set_run_consistency_check(FLAGS_run_consistency_check);
 
   RETURN_NOT_OK(proxy->SetFlag(req, &resp, &rpc));
   switch (resp.result()) {

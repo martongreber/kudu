@@ -48,6 +48,7 @@
 
 namespace kudu {
 class Schema;
+
 typedef std::shared_ptr<Schema> SchemaPtr;
 }  // namespace kudu
 
@@ -66,7 +67,6 @@ typedef std::shared_ptr<Schema> SchemaPtr;
                                  << (s2).ToString(); \
   } while (0)
 
-template <class X> struct GoodFastHash;
 
 namespace kudu {
 
@@ -197,6 +197,8 @@ public:
   std::optional<int32_t> cfile_block_size;
 
   std::optional<std::string> new_comment;
+
+  std::optional<bool> immutable;
 };
 
 // The schema for a given column.
@@ -208,6 +210,12 @@ class ColumnSchema {
   // name: column name
   // type: column type (e.g. UINT8, INT32, STRING, ...)
   // is_nullable: true if a row value can be null
+  // is_immutable: true if the column is immutable.
+  //    Immutable column means the cell value can not be updated after the first insert.
+  // is_auto_incrementing: true if the column is auto-incrementing column.
+  //    Auto-incrementing column cannot be updated but written to by a client and is auto
+  //    filled in by Kudu by incrementing the previous highest written value to the tablet.
+  //    There can only be a single auto-incrementing column per table.
   // read_default: default value used on read if the column was not present before alter.
   //    The value will be copied and released on ColumnSchema destruction.
   // write_default: default value added to the row if the column value was
@@ -218,13 +226,17 @@ class ColumnSchema {
   // Example:
   //   ColumnSchema col_a("a", UINT32)
   //   ColumnSchema col_b("b", STRING, true);
+  //   ColumnSchema col_b("b", STRING, false, true);
   //   uint32_t default_i32 = -15;
-  //   ColumnSchema col_c("c", INT32, false, &default_i32);
+  //   ColumnSchema col_c("c", INT32, false, false, false, &default_i32);
   //   Slice default_str("Hello");
-  //   ColumnSchema col_d("d", STRING, false, &default_str);
+  //   ColumnSchema col_d("d", STRING, false, false, false, &default_str);
+  //   ColumnSchema col_e("e", STRING, false, false, true, &default_str);
   ColumnSchema(std::string name,
                DataType type,
                bool is_nullable = false,
+               bool is_immutable = false,
+               bool is_auto_incrementing = false,
                const void* read_default = nullptr,
                const void* write_default = nullptr,
                ColumnStorageAttributes attributes = ColumnStorageAttributes(),
@@ -233,6 +245,8 @@ class ColumnSchema {
       : name_(std::move(name)),
         type_info_(GetTypeInfo(type)),
         is_nullable_(is_nullable),
+        is_immutable_(is_immutable),
+        is_auto_incrementing_(is_auto_incrementing),
         read_default_(read_default ? std::make_shared<Variant>(type, read_default) : nullptr),
         attributes_(attributes),
         type_attributes_(type_attributes),
@@ -252,21 +266,31 @@ class ColumnSchema {
     return is_nullable_;
   }
 
+  bool is_immutable() const {
+    return is_immutable_;
+  }
+
+  bool is_auto_incrementing() const {
+    return is_auto_incrementing_;
+  }
+
   const std::string& name() const {
     return name_;
   }
 
   // Enum to configure how a ColumnSchema is stringified.
-  enum class ToStringMode {
+  enum ToStringMode : uint8_t {
+    // Do not include below attributes.
+    WITHOUT_ATTRIBUTES = 0,
     // Include encoding type, compression type, and default read/write value.
-    WITH_ATTRIBUTES,
-    // Do not include above attributes.
-    WITHOUT_ATTRIBUTES,
+    WITH_ATTRIBUTES = 1 << 0,
+    // Include comments
+    WITH_COMMENTS = 1 << 1
   };
 
   // Return a string identifying this column, including its
   // name.
-  std::string ToString(ToStringMode mode = ToStringMode::WITHOUT_ATTRIBUTES) const;
+  std::string ToString(uint8_t mode = ToStringMode::WITHOUT_ATTRIBUTES) const;
 
   // Same as above, but only including the type information.
   // For example, "STRING NOT NULL".
@@ -370,6 +394,14 @@ class ColumnSchema {
       if (comment_ != other.comment_) {
         return false;
       }
+
+      if (is_immutable_ != other.is_immutable_) {
+        return false;
+      }
+
+      if (is_auto_incrementing_ != other.is_auto_incrementing_) {
+        return false;
+      }
     }
     return true;
   }
@@ -436,6 +468,8 @@ class ColumnSchema {
   std::string name_;
   const TypeInfo* type_info_;
   bool is_nullable_;
+  bool is_immutable_;
+  bool is_auto_incrementing_;
   // use shared_ptr since the ColumnSchema is always copied around.
   std::shared_ptr<Variant> read_default_;
   std::shared_ptr<Variant> write_default_;
@@ -464,7 +498,8 @@ class Schema {
       // the default (32).
       name_to_index_(1),
       first_is_deleted_virtual_column_idx_(kColumnNotFound),
-      has_nullables_(false) {
+      has_nullables_(false),
+      auto_incrementing_col_idx_(kColumnNotFound) {
     name_to_index_.set_empty_key(StringPiece());
   }
 
@@ -534,6 +569,7 @@ class Schema {
   // Return the number of bytes needed to represent
   // only the key portion of this schema.
   size_t key_byte_size() const {
+    DCHECK(initialized());
     return col_offsets_[num_key_columns_];
   }
 
@@ -545,6 +581,7 @@ class Schema {
     // division-by-a-constant gets optimized into multiplication,
     // the multiplication instruction has a significantly higher latency
     // than the simple load.
+    DCHECK_EQ(cols_.size(), name_to_index_.size());
     return name_to_index_.size();
   }
 
@@ -597,12 +634,19 @@ class Schema {
   // Return the column index corresponding to the given column,
   // or kColumnNotFound if the column is not in this schema.
   int find_column(const StringPiece col_name) const {
-    auto iter = name_to_index_.find(col_name);
+    const auto iter = name_to_index_.find(col_name);
     if (PREDICT_FALSE(iter == name_to_index_.end())) {
       return kColumnNotFound;
-    } else {
-      return (*iter).second;
     }
+    return iter->second;
+  }
+
+  int auto_incrementing_col_idx() const {
+    return auto_incrementing_col_idx_;
+  }
+
+  bool has_auto_incrementing() const {
+    return auto_incrementing_col_idx_ != kColumnNotFound;
   }
 
   // Returns true if the schema contains nullable columns
@@ -622,8 +666,9 @@ class Schema {
 
   // Returns the list of primary key column IDs.
   std::vector<ColumnId> get_key_column_ids() const {
-    return std::vector<ColumnId>(
-        col_ids_.begin(), col_ids_.begin() + num_key_columns_);
+    DCHECK_LE(num_key_columns_, col_ids_.size());
+    return std::vector<ColumnId>(col_ids_.begin(),
+                                 col_ids_.begin() + num_key_columns_);
   }
 
   // Return true if this Schema is initialized and valid.
@@ -717,15 +762,19 @@ class Schema {
 
   // Return the projection of this schema which contains only
   // the key columns.
-  // TODO: this should take a Schema* out-parameter to avoid an
+  //
+  // TODO(todd): this should take a Schema* out-parameter to avoid an
   // extra copy of the ColumnSchemas.
-  // TODO this should probably be cached since the key projection
+  //
+  // TODO(dralves): this should probably be cached since the key projection
   // is not supposed to change, for a single schema.
   Schema CreateKeyProjection() const {
+    DCHECK_LE(num_key_columns_, cols_.size());
     std::vector<ColumnSchema> key_cols(cols_.begin(),
-                                  cols_.begin() + num_key_columns_);
+                                       cols_.begin() + num_key_columns_);
     std::vector<ColumnId> col_ids;
     if (!col_ids_.empty()) {
+      DCHECK_LE(num_key_columns_, col_ids_.size());
       col_ids.assign(col_ids_.begin(), col_ids_.begin() + num_key_columns_);
     }
 
@@ -777,16 +826,19 @@ class Schema {
   }
 
   // Enum to configure how a Schema is stringified.
-  enum ToStringMode {
+  enum ToStringMode : uint8_t {
     BASE_INFO = 0,
     // Include column ids if this instance has them.
     WITH_COLUMN_IDS = 1 << 0,
     // Include column attributes.
     WITH_COLUMN_ATTRIBUTES = 1 << 1,
+    // Include column comments.
+    WITH_COLUMN_COMMENTS = 1 << 2
   };
+
   // Stringify this Schema. This is not particularly efficient,
   // so should only be used when necessary for output.
-  std::string ToString(ToStringMode mode = ToStringMode::WITH_COLUMN_IDS) const;
+  std::string ToString(uint8_t mode = ToStringMode::WITH_COLUMN_IDS) const;
 
   bool operator==(const Schema& other) const {
     if (this == &other) {
@@ -869,7 +921,7 @@ class Schema {
     const bool use_column_ids = base_schema.has_column_ids() && has_column_ids();
 
     int proj_idx = 0;
-    for (int i = 0; i < num_columns(); ++i) {
+    for (size_t i = 0; i < num_columns(); ++i) {
       const ColumnSchema& col_schema = cols_[i];
 
       // try to lookup the column by ID if present or just by name.
@@ -933,6 +985,11 @@ class Schema {
     return first_is_deleted_virtual_column_idx_;
   }
 
+  // Utility function to return the actual name of the auto incrementing column.
+  static constexpr const char* const GetAutoIncrementingColumnName() {
+    return auto_incrementing_col_name_;
+  }
+
  private:
   // Return a stringified version of the first 'num_columns' columns of the
   // row.
@@ -983,6 +1040,12 @@ class Schema {
 
   // Cached indicator whether any columns are nullable.
   bool has_nullables_;
+
+  // Cached index of the auto-incrementing column, or kColumnNotFound if no
+  // such column exists in the schema.
+  int auto_incrementing_col_idx_;
+
+  static constexpr const char* const auto_incrementing_col_name_ = "auto_incrementing_id";
 
   // NOTE: if you add more members, make sure to add the appropriate code to
   // CopyFrom() and the move constructor and assignment operator as well, to
@@ -1038,16 +1101,31 @@ class SchemaBuilder {
   Status AddColumn(const ColumnSchema& column, bool is_key);
 
   Status AddColumn(const std::string& name, DataType type) {
-    return AddColumn(name, type, false, nullptr, nullptr);
+    return AddColumn(name, type, false, false, nullptr, nullptr);
   }
 
   Status AddNullableColumn(const std::string& name, DataType type) {
-    return AddColumn(name, type, true, nullptr, nullptr);
+    return AddColumn(name, type, true, false, nullptr, nullptr);
   }
 
   Status AddColumn(const std::string& name,
                    DataType type,
                    bool is_nullable,
+                   const void* read_default,
+                   const void* write_default);
+
+  Status AddColumn(const std::string& name,
+                   DataType type,
+                   bool is_nullable,
+                   bool is_immutable,
+                   const void* read_default,
+                   const void* write_default);
+
+  Status AddColumn(const std::string& name,
+                   DataType type,
+                   bool is_nullable,
+                   bool is_immutable,
+                   bool is_auto_incrementing,
                    const void* read_default,
                    const void* write_default);
 

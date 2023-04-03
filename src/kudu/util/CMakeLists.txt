@@ -221,6 +221,7 @@ set(UTIL_SRCS
   pb_util.cc
   pb_util-internal.cc
   process_memory.cc
+  prometheus_writer.cc
   random_util.cc
   rolling_log.cc
   rw_mutex.cc
@@ -351,6 +352,17 @@ target_link_libraries(kudu_curl_util
   curl
   glog
   gutil)
+
+#######################################
+# kudu_jwt_util
+#######################################
+add_library(kudu_jwt_util
+  jwt-util.cc)
+target_link_libraries(kudu_jwt_util
+  gutil
+  security
+  kudu_curl_util
+  kudu_util)
 
 #######################################
 # kudu_cloud_util
@@ -506,6 +518,7 @@ ADD_KUDU_TEST(once-test)
 ADD_KUDU_TEST(os-util-test)
 ADD_KUDU_TEST(path_util-test)
 ADD_KUDU_TEST(process_memory-test RUN_SERIAL true)
+ADD_KUDU_TEST(pstack_watcher-test)
 ADD_KUDU_TEST(random-test)
 ADD_KUDU_TEST(random_util-test)
 ADD_KUDU_TEST(rle-test)
@@ -535,7 +548,6 @@ ADD_KUDU_TEST(yamlreader-test)
 
 if (NOT APPLE)
   ADD_KUDU_TEST(minidump-test)
-  ADD_KUDU_TEST(pstack_watcher-test)
 endif()
 
 #######################################
@@ -609,6 +621,16 @@ ADD_KUDU_TEST(curl_util-test)
 if(NOT NO_TESTS)
   target_link_libraries(curl_util-test
     kudu_curl_util)
+endif()
+
+#######################################
+# jwt-util-test
+#######################################
+ADD_KUDU_TEST(jwt-util-test)
+if(NOT NO_TESTS)
+  target_link_libraries(jwt-util-test
+    kudu_jwt_util
+    server_process)
 endif()
 
 #######################################

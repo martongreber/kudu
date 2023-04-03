@@ -118,6 +118,7 @@ static Status StatusFromRpcError(const ErrorStatusPB& error) {
 ClientNegotiation::ClientNegotiation(unique_ptr<Socket> socket,
                                      const security::TlsContext* tls_context,
                                      std::optional<security::SignedTokenPB> authn_token,
+                                     std::optional<security::JwtRawPB> jwt,
                                      RpcEncryption encryption,
                                      bool encrypt_loopback,
                                      std::string sasl_proto_name)
@@ -129,6 +130,7 @@ ClientNegotiation::ClientNegotiation(unique_ptr<Socket> socket,
       tls_negotiated_(false),
       encrypt_loopback_(encrypt_loopback),
       authn_token_(std::move(authn_token)),
+      jwt_(std::move(jwt)),
       psecret_(nullptr, std::free),
       negotiated_authn_(AuthenticationType::INVALID),
       negotiated_mech_(SaslMechanism::INVALID),
@@ -193,8 +195,9 @@ Status ClientNegotiation::Negotiate(unique_ptr<ErrorStatusPB>* rpc_error) {
       ContainsKey(server_features_, TLS)) {
     RETURN_NOT_OK(tls_context_->InitiateHandshake(&tls_handshake_));
 
-    if (negotiated_authn_ == AuthenticationType::SASL) {
-      // When using SASL authentication, verifying the server's certificate is
+    if (negotiated_authn_ == AuthenticationType::SASL ||
+        negotiated_authn_ == AuthenticationType::JWT) {
+      // When using SASL or JWT authentication, verifying the server's certificate is
       // not necessary. This allows the client to still use TLS encryption for
       // connections to servers which only have a self-signed certificate.
       tls_handshake_.set_verification_mode(security::TlsVerificationMode::VERIFY_NONE);
@@ -223,6 +226,9 @@ Status ClientNegotiation::Negotiate(unique_ptr<ErrorStatusPB>* rpc_error) {
       break;
     case AuthenticationType::TOKEN:
       RETURN_NOT_OK(AuthenticateByToken(&recv_buf, rpc_error));
+      break;
+    case AuthenticationType::JWT:
+      RETURN_NOT_OK(AuthenticateByJwt(&recv_buf, rpc_error));
       break;
     case AuthenticationType::CERTIFICATE:
       // The TLS handshake has already authenticated the server.
@@ -349,6 +355,11 @@ Status ClientNegotiation::SendNegotiate() {
     msg.add_authn_types()->mutable_token();
   }
 
+  if (jwt_) {
+    // TODO(zchovan): make sure that we are using a trusted certificate
+    msg.add_authn_types()->mutable_jwt();
+  }
+
   if (PREDICT_FALSE(msg.authn_types().empty())) {
     return Status::NotAuthorized("client is not configured with an authentication type");
   }
@@ -399,6 +410,13 @@ Status ClientNegotiation::HandleNegotiate(const NegotiatePB& response) {
               "server chose token authentication, but client has no token");
         }
         negotiated_authn_ = AuthenticationType::TOKEN;
+        return Status::OK();
+      case AuthenticationTypePB::kJwt:
+        if (!jwt_) {
+          return Status::RuntimeError(
+              "server chose JWT authentication, but client has no JWT");
+        }
+        negotiated_authn_ = AuthenticationType::JWT;
         return Status::OK();
       case AuthenticationTypePB::kCertificate:
         if (!tls_context_->has_signed_cert()) {
@@ -541,11 +559,31 @@ Status ClientNegotiation::AuthenticateBySasl(faststring* recv_buf,
   return HandleSaslSuccess(success);
 }
 
+Status ClientNegotiation::AuthenticateByJwt(faststring* recv_buf,
+                                            unique_ptr<ErrorStatusPB>* rpc_error) {
+  NegotiatePB pb;
+  pb.set_step(NegotiatePB::JWT_EXCHANGE);
+  *pb.mutable_jwt_raw() = std::move(*jwt_);
+  RETURN_NOT_OK(SendNegotiatePB(pb));
+  pb.Clear();
+  RETURN_NOT_OK(RecvNegotiatePB(&pb, recv_buf, rpc_error));
+  if (pb.step() != NegotiatePB::JWT_EXCHANGE) {
+    return Status::NotAuthorized("expected JWT_EXCHANGE step",
+                                 NegotiatePB::NegotiateStep_Name(pb.step()));
+  }
+  return Status::OK();
+}
+
 Status ClientNegotiation::AuthenticateByToken(faststring* recv_buf,
                                               unique_ptr<ErrorStatusPB>* rpc_error) {
   // Sanity check that TLS has been negotiated. Sending the token on an
   // unencrypted channel is a big no-no.
-  CHECK(tls_negotiated_);
+  if (PREDICT_FALSE(!tls_negotiated_)) {
+    constexpr const char* const kErrMsg =
+        "received authn token over an unencrypted channel";
+    LOG(DFATAL) << kErrMsg;
+    return Status::IllegalState(kErrMsg);
+  }
 
   // Send the token to the server.
   NegotiatePB pb;

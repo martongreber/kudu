@@ -41,7 +41,7 @@
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
-#include <gmock/gmock-matchers.h>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <rapidjson/document.h>
 
@@ -67,7 +67,6 @@
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
-#include "kudu/consensus/raft_consensus.h"
 #include "kudu/consensus/ref_counted_replicate.h"
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
@@ -124,6 +123,7 @@
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/env.h"
+#include "kudu/util/jsonreader.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -141,12 +141,16 @@
 #include "kudu/util/test_util.h"
 #include "kudu/util/url-coding.h"
 
+DECLARE_bool(enable_tablet_orphaned_block_deletion);
 DECLARE_bool(encrypt_data_at_rest);
+DECLARE_bool(disable_gflag_filter_logic_for_testing);
 DECLARE_bool(fs_data_dirs_consider_available_space);
 DECLARE_bool(hive_metastore_sasl_enabled);
 DECLARE_bool(show_values);
 DECLARE_bool(show_attributes);
 DECLARE_int32(catalog_manager_inject_latency_load_ca_info_ms);
+DECLARE_int32(flush_threshold_mb);
+DECLARE_int32(flush_threshold_secs);
 DECLARE_int32(heartbeat_interval_ms);
 DECLARE_int32(tserver_unresponsive_timeout_ms);
 DECLARE_int32(rpc_negotiation_inject_delay_ms);
@@ -213,6 +217,7 @@ using kudu::tserver::TabletServerErrorPB;
 using kudu::tserver::WriteRequestPB;
 using std::back_inserter;
 using std::copy;
+using std::find;
 using std::make_pair;
 using std::map;
 using std::max;
@@ -227,6 +232,7 @@ using std::unique_ptr;
 using std::unordered_map;
 using std::unordered_set;
 using std::vector;
+using std::tuple;
 using strings::Substitute;
 
 namespace kudu {
@@ -522,6 +528,7 @@ class ToolTest : public KuduTest {
     string columns;
     TableCopyMode mode;
     int32_t create_table_replication_factor;
+    string create_table_hash_bucket_nums;
   };
 
   void RunCopyTableCheck(const RunCopyTableCheckArgs& args) {
@@ -569,9 +576,11 @@ class ToolTest : public KuduTest {
 
     // Execute copy command.
     string stdout;
-    NO_FATALS(RunActionStdoutString(
+    string stderr;
+    Status s = RunActionStdoutStderrString(
                 Substitute("table copy $0 $1 $2 -dst_table=$3 -predicates=$4 -write_type=$5 "
-                           "-create_table=$6 -create_table_replication_factor=$7",
+                           "-create_table=$6 -create_table_replication_factor=$7 "
+                           "-create_table_hash_bucket_nums=$8",
                            cluster_->master()->bound_rpc_addr().ToString(),
                            args.src_table_name,
                            cluster_->master()->bound_rpc_addr().ToString(),
@@ -579,8 +588,36 @@ class ToolTest : public KuduTest {
                            args.predicates_json,
                            write_type,
                            create_table,
-                           args.create_table_replication_factor),
-                &stdout));
+                           args.create_table_replication_factor,
+                           args.create_table_hash_bucket_nums),
+                &stdout, &stderr);
+    if (args.create_table_hash_bucket_nums == "10,aa") {
+      ASSERT_STR_CONTAINS(stderr, "cannot parse the number of hash buckets.");
+      return;
+    }
+    if (args.create_table_hash_bucket_nums == "10,20,30") {
+      ASSERT_STR_CONTAINS(stderr, "The count of hash bucket numbers must be equal to the "
+                                  "number of hash schema dimensions.");
+      return;
+    }
+    if (args.create_table_hash_bucket_nums == "10") {
+      ASSERT_STR_CONTAINS(stderr, "The count of hash bucket numbers must be equal to the "
+                                  "number of hash schema dimensions.");
+      return;
+    }
+    if (args.create_table_hash_bucket_nums == "10,1") {
+      ASSERT_STR_CONTAINS(stderr, "The number of hash buckets must not be less than 2.");
+      return;
+    }
+    if (args.create_table_hash_bucket_nums == "10,1") {
+      ASSERT_STR_CONTAINS(stderr, "The number of hash buckets must not be less than 2.");
+      return;
+    }
+    if (args.create_table_hash_bucket_nums == "10,50") {
+      ASSERT_STR_CONTAINS(stderr, "There are no hash partitions defined in this table.");
+      return;
+    }
+    ASSERT_TRUE(s.ok());
 
     // Check total count.
     int64_t total = max<int64_t>(args.max_value - args.min_value + 1, 0);
@@ -612,6 +649,32 @@ class ToolTest : public KuduTest {
         // Replication factor is different when explicitly set it to 3 (default 1).
         if (args.create_table_replication_factor == 3 &&
             HasPrefixString(src_schema[i], "REPLICAS ")) continue;
+        vector<string> hash_bucket_nums = Split(args.create_table_hash_bucket_nums,
+                                            ",", strings::SkipEmpty());
+        if (args.create_table_hash_bucket_nums == "10,20" &&
+            HasPrefixString(src_schema[i], "HASH (key_hash0)")) {
+          ASSERT_STR_CONTAINS(dst_schema[i], Substitute("PARTITIONS $0",
+                                                        hash_bucket_nums[0]));
+          continue;
+        }
+        if (args.create_table_hash_bucket_nums == "10,20" &&
+            HasPrefixString(src_schema[i], "HASH (key_hash1, key_hash2)")) {
+          ASSERT_STR_CONTAINS(dst_schema[i], Substitute("PARTITIONS $0",
+                                                        hash_bucket_nums[1]));
+          continue;
+        }
+        if (args.create_table_hash_bucket_nums == "10,2" &&
+            HasPrefixString(src_schema[i], "HASH (key_hash0)")) {
+          ASSERT_STR_CONTAINS(dst_schema[i], Substitute("PARTITIONS $0",
+                                                        hash_bucket_nums[0]));
+          continue;
+        }
+        if (args.create_table_hash_bucket_nums == "10,2" &&
+            HasPrefixString(src_schema[i], "HASH (key_hash1, key_hash2)")) {
+          ASSERT_STR_CONTAINS(dst_schema[i], Substitute("PARTITIONS $0",
+                                                        hash_bucket_nums[1]));
+          continue;
+        }
         ASSERT_EQ(src_schema[i], dst_schema[i]);
       }
     }
@@ -683,6 +746,40 @@ class ToolTest : public KuduTest {
     return JoinStrings(master_addrs, ",");
   }
 
+  Status ListTabletRowsetIds(const string& metadata_path,
+                             const string& tablet_id,
+                             const string& encryption_args,
+                             set<int64_t>* rowset_ids) {
+    string stdout;
+    RunActionStdoutString(Substitute("pbc dump $0 $1 --json",
+                                     JoinPathSegments(metadata_path, tablet_id), encryption_args),
+                          &stdout);
+
+    JsonReader r(stdout);
+    RETURN_NOT_OK(r.Init());
+    vector<const rapidjson::Value*> results;
+    Status s = r.ExtractObjectArray(r.root(), "rowsets", &results);
+
+    rowset_ids->clear();
+    if (s.IsNotFound()) {
+      return Status::OK();
+    }
+    RETURN_NOT_OK(s);
+    LOG(INFO) << "results size: " << results.size();
+    for (const auto& result : results) {
+      string rowset_id_str;
+      RETURN_NOT_OK(r.ExtractString(result, "id", &rowset_id_str));
+      LOG(INFO) << "rowset_id_str: " << rowset_id_str;
+      int64_t rowset_id;
+      if (!safe_strto64(rowset_id_str, &rowset_id)) {
+        return Status::InvalidArgument(Substitute("invalid rowset id: $0", rowset_id_str));
+      }
+      InsertOrDie(rowset_ids, rowset_id);
+    }
+
+    return Status::OK();
+  }
+
  protected:
   // Note: Each test case must have a single invocation of RunLoadgen() otherwise it leads to
   //       memory leaks.
@@ -720,7 +817,8 @@ enum RunCopyTableCheckArgsType {
   kTestCopyTableSchemaOnly,
   kTestCopyTableComplexSchema,
   kTestCopyUnpartitionedTable,
-  kTestCopyTablePredicates
+  kTestCopyTablePredicates,
+  kTestCopyTableWithStringBounds
 };
 // Subclass of ToolTest that allows running individual test cases with different parameters to run
 // 'kudu table copy' CLI tool.
@@ -753,6 +851,13 @@ class ToolTestCopyTableParameterized :
       KuduSchema schema;
       ASSERT_OK(CreateUnpartitionedTable(&schema));
       ww.set_schema(schema);
+    } else if (test_case_ == kTestCopyTableWithStringBounds) {
+      // Regression for KUDU-3306, verify copying a table with string columns in its range key.
+      KuduSchema schema;
+      ASSERT_OK(CreateTableWithStringBounds(&schema));
+      ww.set_schema(schema);
+      ww.Setup();
+      return;
     }
     ww.Setup();
     ww.Start();
@@ -804,13 +909,57 @@ class ToolTestCopyTableParameterized :
         }
         return multi_args;
       }
-      case kTestCopyTableComplexSchema:
+      case kTestCopyTableComplexSchema: {
         args.columns = kComplexSchemaColumns;
         args.mode = TableCopyMode::INSERT_TO_NOT_EXIST_TABLE;
-        return { args };
-      case kTestCopyUnpartitionedTable:
+        vector<RunCopyTableCheckArgs> multi_args;
+        {
+          auto args_temp = args;
+          args.create_table_hash_bucket_nums = "10,20";
+          multi_args.emplace_back(std::move(args_temp));
+        }
+        {
+          auto args_temp = args;
+          args_temp.create_table_hash_bucket_nums = "10,aa";
+          multi_args.emplace_back(std::move(args_temp));
+        }
+        {
+          auto args_temp = args;
+          args_temp.create_table_hash_bucket_nums = "10,20,30";
+          multi_args.emplace_back(std::move(args_temp));
+        }
+        {
+          auto args_temp = args;
+          args_temp.create_table_hash_bucket_nums = "10";
+          multi_args.emplace_back(std::move(args_temp));
+        }
+        {
+          auto args_temp = args;
+          args_temp.create_table_hash_bucket_nums = "10,1";
+          multi_args.emplace_back(std::move(args_temp));
+        }
+        {
+          auto args_temp = args;
+          args_temp.create_table_hash_bucket_nums = "10,2";
+          multi_args.emplace_back(std::move(args_temp));
+        }
+        {
+          auto args_temp = args;
+          args_temp.create_table_hash_bucket_nums = "";
+          multi_args.emplace_back(std::move(args_temp));
+        }
+        return multi_args;
+      }
+      case kTestCopyUnpartitionedTable: {
         args.mode = TableCopyMode::INSERT_TO_NOT_EXIST_TABLE;
-        return {args};
+        vector<RunCopyTableCheckArgs> multi_args;
+        {
+          auto args_temp = args;
+          args.create_table_hash_bucket_nums = "10,50";
+          multi_args.emplace_back(std::move(args_temp));
+        }
+        return multi_args;
+      }
       case kTestCopyTablePredicates: {
         auto mid = total_rows_ / 2;
         vector<RunCopyTableCheckArgs> multi_args;
@@ -876,6 +1025,10 @@ class ToolTestCopyTableParameterized :
         }
         return multi_args;
       }
+      case kTestCopyTableWithStringBounds:
+        args.mode = TableCopyMode::COPY_SCHEMA_ONLY;
+        args.columns = "";
+        return {args};
       default:
         LOG(FATAL) << "Unknown type " << test_case_;
     }
@@ -963,6 +1116,35 @@ class ToolTestCopyTableParameterized :
     return Status::OK();
   }
 
+  Status CreateTableWithStringBounds(KuduSchema* schema) {
+    shared_ptr<KuduClient> client;
+    RETURN_NOT_OK(cluster_->CreateClient(nullptr, &client));
+    unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+    *schema = KuduSchema::FromSchema(
+        Schema({ColumnSchema("int_key", INT32), ColumnSchema("string_key", STRING)}, 2));
+
+    unique_ptr<KuduPartialRow> first_lower_bound(schema->NewRow());
+    unique_ptr<KuduPartialRow> first_upper_bound(schema->NewRow());
+    RETURN_NOT_OK(first_lower_bound->SetStringNoCopy("string_key", "2020-01-01"));
+    RETURN_NOT_OK(first_upper_bound->SetStringNoCopy("string_key", "2020-01-01"));
+
+    unique_ptr<KuduPartialRow> second_lower_bound(schema->NewRow());
+    unique_ptr<KuduPartialRow> second_upper_bound(schema->NewRow());
+    RETURN_NOT_OK(second_lower_bound->SetStringNoCopy("string_key", "2021-01-01"));
+    RETURN_NOT_OK(second_upper_bound->SetStringNoCopy("string_key", "2021-01-01"));
+    KuduTableCreator::RangePartitionBound bound_type = KuduTableCreator::INCLUSIVE_BOUND;
+
+    return table_creator->table_name(kTableName)
+        .schema(schema)
+        .set_range_partition_columns({"string_key"})
+        .add_range_partition(
+            first_lower_bound.release(), first_upper_bound.release(), bound_type, bound_type)
+        .add_range_partition(
+            second_lower_bound.release(), second_upper_bound.release(), bound_type, bound_type)
+        .num_replicas(1)
+        .Create();
+  }
+
   void InsertOneRowWithNullCell() {
     shared_ptr<KuduClient> client;
     ASSERT_OK(cluster_->CreateClient(nullptr, &client));
@@ -998,7 +1180,8 @@ INSTANTIATE_TEST_SUITE_P(CopyTableParameterized,
                                            kTestCopyTableSchemaOnly,
                                            kTestCopyTableComplexSchema,
                                            kTestCopyUnpartitionedTable,
-                                           kTestCopyTablePredicates));
+                                           kTestCopyTablePredicates,
+                                           kTestCopyTableWithStringBounds));
 
 void ToolTest::StartExternalMiniCluster(ExternalMiniClusterOptions opts) {
   cluster_.reset(new ExternalMiniCluster(std::move(opts)));
@@ -1079,6 +1262,7 @@ TEST_F(ToolTest, TestTopLevelHelp) {
 }
 
 TEST_F(ToolTest, TestModeHelp) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   {
     const string kCmd = "cluster";
     const vector<string> kClusterModeRegexes = {
@@ -1091,6 +1275,7 @@ TEST_F(ToolTest, TestModeHelp) {
   {
     const vector<string> kDiagnoseModeRegexes = {
         "parse_stacks.*Parse sampled stack traces",
+        "parse_metrics.*Parse metrics out of a diagnostics log",
     };
     NO_FATALS(RunTestHelp("diagnose", kDiagnoseModeRegexes));
   }
@@ -1134,9 +1319,10 @@ TEST_F(ToolTest, TestModeHelp) {
   {
     const vector<string> kLocalReplicaModeRegexes = {
         "cmeta.*Operate on a local tablet replica's consensus",
+        "tmeta.*Edit a local tablet metadata",
         "data_size.*Summarize the data size",
         "dump.*Dump a Kudu filesystem",
-        "copy_from_remote.*Copy a tablet replica from a remote server",
+        "copy_from_remote.*Copy tablet replicas from a remote server",
         "copy_from_local.*Copy tablet replicas from local filesystem",
         "delete.*Delete tablet replicas from the local filesystem",
         "list.*Show list of tablet replicas",
@@ -1165,7 +1351,7 @@ TEST_F(ToolTest, TestModeHelp) {
   }
   {
     const vector<string> kLocalReplicaCopyFromRemoteRegexes = {
-        "Copy a tablet replica from a remote server",
+        "Copy tablet replicas from a remote server",
     };
     NO_FATALS(RunTestHelp("local_replica copy_from_remote --help",
                           kLocalReplicaCopyFromRemoteRegexes));
@@ -1182,6 +1368,12 @@ TEST_F(ToolTest, TestModeHelp) {
     // Try with hyphens instead of underscores.
     NO_FATALS(RunTestHelp("local-replica copy-from-local --help",
                           kLocalReplicaCopyFromRemoteRegexes));
+  }
+  {
+    const vector<string> kLocalReplicaTmetaRegexes = {
+        "delete_rowsets.*Delete rowsets from a local replica.",
+    };
+    NO_FATALS(RunTestHelp("local_replica tmeta", kLocalReplicaTmetaRegexes));
   }
   {
     const string kCmd = "master";
@@ -1282,6 +1474,7 @@ TEST_F(ToolTest, TestModeHelp) {
         "get_extra_configs.*Get the extra configuration properties for a table",
         "list.*List tables",
         "locate_row.*Locate which tablet a row belongs to",
+        "recall.*Recall a deleted but still reserved table",
         "rename_column.*Rename a column",
         "rename_table.*Rename a table",
         "scan.*Scan rows from a table",
@@ -2652,8 +2845,8 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
   {
     string stdout;
     NO_FATALS(RunActionStdoutString(
-        Substitute("local_replica dump rowset $0 $1 $2",
-                   kTestTablet, fs_paths, encryption_args), &stdout));
+        Substitute("local_replica dump rowset $0 $1 $2", kTestTablet, fs_paths, encryption_args),
+        &stdout));
 
     SCOPED_TRACE(stdout);
     ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
@@ -2668,27 +2861,39 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
     ASSERT_STR_CONTAINS(stdout, "undo_deltas {");
 
     ASSERT_STR_CONTAINS(stdout,
-                       "RowIdxInBlock: 0; Base: (int32 key=0, int32 int_val=0,"
-                       " string string_val=\"HelloWorld\"); "
-                       "Undo Mutations: [@1(DELETE)]; Redo Mutations: [];");
+                        "RowIdxInBlock: 0; Base: (int32 key=0, int32 int_val=0,"
+                        " string string_val=\"HelloWorld\"); "
+                        "Undo Mutations: [@1(DELETE)]; Redo Mutations: [];");
     ASSERT_STR_MATCHES(stdout, ".*---------------------.*");
-
+  }
+  {
     // This is expected to fail with Invalid argument for kRowId.
+    string stdout;
     string stderr;
-    Status s = RunTool(
-        Substitute("local_replica dump rowset $0 $1 --rowset_index=$2 $3",
-                   kTestTablet, fs_paths, kRowId, encryption_args),
-                   &stdout, &stderr, nullptr, nullptr);
+    Status s = RunTool(Substitute("local_replica dump rowset $0 $1 --rowset_index=$2 $3",
+                                  kTestTablet,
+                                  fs_paths,
+                                  kRowId,
+                                  encryption_args),
+                       &stdout,
+                       &stderr,
+                       nullptr,
+                       nullptr);
     ASSERT_TRUE(s.IsRuntimeError());
     SCOPED_TRACE(stderr);
-    string expected = "Could not find rowset " + SimpleItoa(kRowId) +
-        " in tablet id " + kTestTablet;
+    string expected =
+        "Could not find rowset " + SimpleItoa(kRowId) + " in tablet id " + kTestTablet;
     ASSERT_STR_CONTAINS(stderr, expected);
-
-    NO_FATALS(RunActionStdoutString(
-        Substitute("local_replica dump rowset --nodump_all_columns "
-                   "--nodump_metadata --nrows=15 $0 $1 $2",
-                   kTestTablet, fs_paths, encryption_args), &stdout));
+  }
+  {
+    // Dump rowsets' primary keys in comparable format.
+    string stdout;
+    NO_FATALS(RunActionStdoutString(Substitute("local_replica dump rowset --nodump_all_columns "
+                                               "--nodump_metadata --nrows=15 $0 $1 $2",
+                                               kTestTablet,
+                                               fs_paths,
+                                               encryption_args),
+                                    &stdout));
 
     SCOPED_TRACE(stdout);
     ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
@@ -2701,6 +2906,71 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
         ASSERT_STR_CONTAINS(stdout, row_key);
       } else {
         ASSERT_STR_NOT_CONTAINS(stdout, row_key);
+      }
+    }
+  }
+
+  {
+    // Dump rowsets' primary keys in human readable format.
+    string stdout;
+    NO_FATALS(
+        RunActionStdoutString(Substitute("local_replica dump rowset --nodump_all_columns "
+                                         "--nodump_metadata --use_readable_format $0 $1 $2",
+                                         kTestTablet,
+                                         fs_paths,
+                                         encryption_args),
+                              &stdout));
+
+    SCOPED_TRACE(stdout);
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 1");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 2");
+    ASSERT_STR_NOT_CONTAINS(stdout, "RowSet metadata");
+    for (int row_idx = 0; row_idx < 30; row_idx++) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("(int32 key=$0)", row_idx));
+    }
+  }
+  {
+    // Dump rowsets' primary key bounds only.
+    string stdout;
+    // Unset --dump_all_columns.
+    NO_FATALS(RunActionStdoutString(
+        Substitute("local_replica dump rowset --nodump_all_columns "
+                   "--nodump_metadata --use_readable_format "
+                   "--dump_primary_key_bounds_only $0 $1 $2",
+                   kTestTablet, fs_paths, encryption_args), &stdout));
+
+    SCOPED_TRACE(stdout);
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 1");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 2");
+    ASSERT_STR_NOT_CONTAINS(stdout, "RowSet metadata");
+    for (int row_idx = 0; row_idx < 30; row_idx++) {
+      string row_key = Substitute("(int32 key=$0)", row_idx);
+      if (row_idx % 10 == 0 || row_idx % 10 == 9) {
+        ASSERT_STR_CONTAINS(stdout, row_key);
+      } else {
+        ASSERT_STR_NOT_CONTAINS(stdout, row_key);
+      }
+    }
+
+    // Set --dump_all_columns.
+    NO_FATALS(RunActionStdoutString(
+        Substitute("local_replica dump rowset --dump_all_columns "
+                   "--nodump_metadata --nrows=15 $0 $1 $2",
+                   kTestTablet, fs_paths, encryption_args), &stdout));
+
+    SCOPED_TRACE(stdout);
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 1");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 2");
+    ASSERT_STR_NOT_CONTAINS(stdout, "RowSet metadata");
+    for (int row_idx = 0; row_idx < 30; row_idx++) {
+      string row_prefix = Substitute("Base: (int32 key=$0", row_idx);
+      if (row_idx < 15) {
+        ASSERT_STR_CONTAINS(stdout, row_prefix);
+      } else {
+        ASSERT_STR_NOT_CONTAINS(stdout, row_prefix);
       }
     }
   }
@@ -2806,6 +3076,16 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
     string stdout;
     NO_FATALS(RunActionStdoutString(Substitute("local_replica list $0 $1",
                                                fs_paths, encryption_args), &stdout));
+
+    SCOPED_TRACE(stdout);
+    ASSERT_STR_MATCHES(stdout, kTestTablet);
+  }
+
+  {
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("local_replica list $0 $1 --list_detail=true",
+                   fs_paths, encryption_args), &stdout));
 
     SCOPED_TRACE(stdout);
     ASSERT_STR_MATCHES(stdout, kTestTablet);
@@ -2920,14 +3200,14 @@ void ToolTest::RunLoadgen(int num_tservers,
         ColumnSchema("int64_val", INT64),
         ColumnSchema("float_val", FLOAT),
         ColumnSchema("double_val", DOUBLE),
-        ColumnSchema("decimal32_val", DECIMAL32, false,
-                     NULL, NULL, ColumnStorageAttributes(),
+        ColumnSchema("decimal32_val", DECIMAL32, false, false, false,
+                     nullptr, nullptr, ColumnStorageAttributes(),
                      ColumnTypeAttributes(9, 9)),
-        ColumnSchema("decimal64_val", DECIMAL64, false,
-                     NULL, NULL, ColumnStorageAttributes(),
+        ColumnSchema("decimal64_val", DECIMAL64, false, false, false,
+                     nullptr, nullptr, ColumnStorageAttributes(),
                      ColumnTypeAttributes(18, 2)),
-        ColumnSchema("decimal128_val", DECIMAL128, false,
-                     NULL, NULL, ColumnStorageAttributes(),
+        ColumnSchema("decimal128_val", DECIMAL128, false, false, false,
+                     nullptr, nullptr, ColumnStorageAttributes(),
                      ColumnTypeAttributes(38, 0)),
         ColumnSchema("unixtime_micros_val", UNIXTIME_MICROS),
         ColumnSchema("string_val", STRING),
@@ -3136,6 +3416,7 @@ TEST_F(ToolTest, TestLoadgenKeepAutoTableAndData) {
   NO_FATALS(RunLoadgen(1, { "--keep_auto_table=true",
                             "--table_num_hash_partitions=1",
                             "--table_num_range_partitions=1" }));
+
   string auto_table_name;
   NO_FATALS(RunActionStdoutString(Substitute("table list $0",
       HostPort::ToCommaSeparatedString(cluster_->master_rpc_addrs())), &auto_table_name));
@@ -3179,6 +3460,7 @@ TEST_F(ToolTest, TestLoadgenKeepAutoTableAndData) {
 }
 
 TEST_F(ToolTest, TestLoadgenHmsEnabled) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
@@ -3257,6 +3539,7 @@ TEST_F(ToolTest, TestLoadgenAutoGenTablePartitioning) {
 
 // Run the loadgen with txn-related options.
 TEST_F(ToolTest, LoadgenTxnBasics) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   {
     ExternalMiniClusterOptions opts;
     // Prefer lighter cluster to speed up testing.
@@ -3418,6 +3701,7 @@ R"(state
 // Test that a non-random workload results in the behavior we would expect when
 // running against an auto-generated range partitioned table.
 TEST_F(ToolTest, TestNonRandomWorkloadLoadgen) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   {
     ExternalMiniClusterOptions opts;
     opts.num_tablet_servers = 1;
@@ -3547,6 +3831,28 @@ TEST_F(ToolTest, PerfTableScanReplicaSelection) {
         &out, &err);
     ASSERT_TRUE(s.ok()) << s.ToString() << ": " << err;
     ASSERT_STR_CONTAINS(out, "Total count 8 ");
+  }
+}
+
+TEST_F(ToolTest, PerfTableScanFaultTolerant) {
+  constexpr const char* const kTableName = "perf.table_scan.fault_tolerant";
+  NO_FATALS(RunLoadgen(1,
+                       {
+                           "--num_threads=8",
+                           "--num_rows_per_thread=111",
+                       },
+                       kTableName));
+  for (const auto& flag : {"true", "false"}) {
+    string out;
+    string err;
+    vector<string> out_lines;
+    const auto s = RunTool(
+        Substitute("perf table_scan $0 $1 --fault_tolerant=$2",
+                   cluster_->master()->bound_rpc_addr().ToString(), kTableName, flag),
+        &out, &err, &out_lines);
+    ASSERT_TRUE(s.ok()) << s.ToString() << ": " << err;
+    ASSERT_EQ(1, out_lines.size()) << out;
+    ASSERT_STR_CONTAINS(out, "Total count 888 ");
   }
 }
 
@@ -3921,8 +4227,7 @@ TEST_F(ToolTest, TestLocalReplicaDelete) {
       tablet_id, tserver_dir, encryption_args),
       nullptr, &stderr, nullptr, nullptr);
   ASSERT_TRUE(s.IsRuntimeError());
-  ASSERT_STR_CONTAINS(stderr, "Not found: Could not load tablet metadata");
-  ASSERT_STR_CONTAINS(stderr, "No such file or directory");
+  ASSERT_STR_CONTAINS(stderr, "Not found: specified tablet id (pattern) does not exist");
 
   // Try to remove the same tablet replica again if --ignore_nonexistent
   // is specified. The tool should report success and output information on the
@@ -3932,11 +4237,7 @@ TEST_F(ToolTest, TestLocalReplicaDelete) {
                  "--fs_data_dirs=$1 --ignore_nonexistent $2",
                  tablet_id, tserver_dir, encryption_args),
       &stderr));
-  ASSERT_STR_CONTAINS(stderr, Substitute("ignoring error for tablet replica $0 "
-                                         "because of the --ignore_nonexistent flag",
-                                         tablet_id));
-  ASSERT_STR_CONTAINS(stderr, "Not found: Could not load tablet metadata");
-  ASSERT_STR_CONTAINS(stderr, "No such file or directory");
+  ASSERT_STR_CONTAINS(stderr, "ignoring some non-existent or mismatched tablet replicas");
 
   // Verify that the total size of the data on disk after 'delete' action
   // is less than before. Although this doesn't necessarily check
@@ -3997,6 +4298,157 @@ TEST_F(ToolTest, TestLocalReplicaDeleteMultiple) {
     ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
     ASSERT_EQ(0, tablet_replicas.size());
   }
+}
+
+// Test 'kudu local_replica delete' tool with --tables flag for deleting
+// tablets by table name.
+TEST_F(ToolTest, TestLocalReplicaDeleteByTableName) {
+  static constexpr int kNumTablets = 10;
+  constexpr const char* const kTableName = "test_table";
+  constexpr const char* const kDefaultTableName = "default_table";
+  NO_FATALS(StartMiniCluster());
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(mini_cluster_->CreateClient(nullptr, &client));
+
+  // TestWorkLoad.Setup() creates a table named 'test_table' with 10 tablets.
+  TestWorkload workload(mini_cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_num_replicas(1);
+  workload.set_num_tablets(kNumTablets);
+  workload.Setup();
+
+  // TestWorkLoad.Setup() creates a default table with 1 tablet.
+  workload.set_table_name(kDefaultTableName);
+  workload.set_num_replicas(1);
+  workload.set_num_tablets(1);
+  workload.Setup();
+
+  MiniTabletServer* ts = mini_cluster_->mini_tablet_server(0);
+  vector<string> kudu_tables;
+  ASSERT_OK(client->ListTables(&kudu_tables));
+  ASSERT_EQ(2, kudu_tables.size());
+  {
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(1 + kNumTablets, tablet_replicas.size());
+  }
+
+  // Tablet server should be shutdown to release the lock and allow operating
+  // on its data.
+  ts->Shutdown();
+  const string& tserver_dir = ts->options()->fs_opts.wal_root;
+  NO_FATALS(RunActionStdoutNone(Substitute(
+      "local_replica delete * --fs_wal_dir=$0 --fs_data_dirs=$0 "
+      "--tables=$1 --clean_unsafe $2", tserver_dir, kTableName,
+      env_->IsEncryptionEnabled() ? GetEncryptionArgs() : "")));
+
+  ASSERT_OK(ts->Start());
+  ASSERT_OK(ts->WaitStarted());
+  vector<scoped_refptr<TabletReplica>> tablet_replicas;
+  ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+  ASSERT_EQ(1, tablet_replicas.size());
+  ASSERT_EQ(kDefaultTableName, tablet_replicas[0]->tablet()->metadata()->table_name());
+}
+
+// Test 'kudu local_replica delete' tool with --tables flag for deleting
+// tablets by multiple table names.
+TEST_F(ToolTest, TestLocalReplicaDeleteByMultipleTableNames) {
+  static constexpr int kNumTables = 10;
+  static constexpr int kNumTablets = 10;
+  constexpr const char* const kTableNamePrefix = "test_table";
+  NO_FATALS(StartMiniCluster());
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(mini_cluster_->CreateClient(nullptr, &client));
+
+  vector<string> table_names;
+  // Use TestWorkLoad.Setup() create multiple tables.
+  TestWorkload workload(mini_cluster_.get());
+  for (int i = 0; i < kNumTables; ++i) {
+    string table_name = Substitute("$0_$1", kTableNamePrefix, i);
+    workload.set_table_name(table_name);
+    workload.set_num_replicas(1);
+    workload.set_num_tablets(kNumTablets);
+    workload.Setup();
+    table_names.emplace_back(table_name);
+  }
+
+  MiniTabletServer* ts = mini_cluster_->mini_tablet_server(0);
+  vector<string> kudu_tables;
+  ASSERT_OK(client->ListTables(&kudu_tables));
+  ASSERT_EQ(kNumTables, kudu_tables.size());
+  {
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(kNumTables * kNumTablets, tablet_replicas.size());
+  }
+
+  // Tablet server should be shutdown to release the lock and allow operating
+  // on its data.
+  ts->Shutdown();
+  const string& tserver_dir = ts->options()->fs_opts.wal_root;
+  const string table_names_csv_str = JoinStrings(table_names, ",");
+  NO_FATALS(RunActionStdoutNone(Substitute(
+      "local_replica delete * --fs_wal_dir=$0 --fs_data_dirs=$0 "
+      "--tables=$1 --clean_unsafe $2", tserver_dir, table_names_csv_str,
+      env_->IsEncryptionEnabled() ? GetEncryptionArgs() : "")));
+
+  ASSERT_OK(ts->Start());
+  ASSERT_OK(ts->WaitStarted());
+  vector<scoped_refptr<TabletReplica>> tablet_replicas;
+  ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+  ASSERT_EQ(0, tablet_replicas.size());
+}
+
+// Test 'kudu local_replica delete' tool with non-exist tablet id pattern.
+TEST_F(ToolTest, TestLocalReplicaDeleteWithNonExistentTabletIdPattern) {
+  constexpr const char* const kTableName = "test_table";
+  static constexpr int kNumTablets = 10;
+  NO_FATALS(StartMiniCluster());
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(mini_cluster_->CreateClient(nullptr, &client));
+
+  // TestWorkLoad.Setup() creates a table.
+  TestWorkload workload(mini_cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_num_replicas(1);
+  workload.set_num_tablets(kNumTablets);
+  workload.Setup();
+
+  MiniTabletServer* ts = mini_cluster_->mini_tablet_server(0);
+  vector<string> kudu_tables;
+  ASSERT_OK(client->ListTables(&kudu_tables));
+  ASSERT_EQ(1, kudu_tables.size());
+  {
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(kNumTablets, tablet_replicas.size());
+  }
+
+  // Tablet server should be shutdown to release the lock and allow operating
+  // on its data.
+  ts->Shutdown();
+  const string& tserver_dir = ts->options()->fs_opts.wal_root;
+  // Try to remove tablet replicas by a non-exist tablet id pattern.
+  string stderr;
+  Status s = RunActionStderrString(
+      Substitute("local_replica delete nonexist* --fs_wal_dir=$0 --fs_data_dirs=$0 "
+                 "--clean_unsafe $1",
+                 tserver_dir,
+                 env_->IsEncryptionEnabled() ? GetEncryptionArgs() : ""),
+      &stderr);
+  ASSERT_TRUE(s.IsRuntimeError());
+  ASSERT_STR_CONTAINS(stderr, "Not found: specified tablet id (pattern) does not exist");
+
+  // Try to remove tablet replicas with a non-exist tablet id again if --ignore_nonexistent
+  // is specified. The tool should report success and output information on the
+  // error ignored.
+  ASSERT_OK(RunActionStderrString(
+      Substitute("local_replica delete nonexist* --clean_unsafe --fs_wal_dir=$0 "
+                 "--fs_data_dirs=$0 --ignore_nonexistent $1",
+                 tserver_dir,
+                 env_->IsEncryptionEnabled() ? GetEncryptionArgs() : ""),
+      &stderr));
+  ASSERT_STR_CONTAINS(stderr, "ignoring some non-existent or mismatched tablet replicas");
 }
 
 // Test 'kudu local_replica delete' tool for tombstoning the tablet.
@@ -4188,6 +4640,104 @@ TEST_F(ToolTest, TestLocalReplicaCMetaOps) {
       ASSERT_STR_MATCHES(lines[i], Substitute("tablet: $0, peers: $1",
                                               tablet_ids[i], ts_uuids[0]));
     }
+  }
+}
+
+TEST_F(ToolTest, TestServerSetFlag) {
+  NO_FATALS(StartExternalMiniCluster());
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  { // Test set unsafe flag.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 unlock_unsafe_flags true --force",
+                   master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 enable_data_block_fsync true --force",
+                   master_addr)));
+    // Test invalid unsafe flag.
+    string err;
+    RunActionStderrString(
+        Substitute("master set_flag $0 unlock_unsafe_flags false --force",
+                   master_addr), &err);
+    ASSERT_STR_CONTAINS(err,
+        "Detected inconsistency in command-line flags");
+    // Flag value will not be changed.
+    string out;
+    RunActionStdoutString(
+        Substitute("master get_flags $0 --flags=unlock_unsafe_flags --format=json",
+                   master_addr), &out);
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    const string flag_value = "true";
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["value"].GetString() == flag_value);
+    }
+  }
+  { // Test set experimental flag.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 unlock_experimental_flags true --force",
+                   master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 auto_rebalancing_enabled true --force",
+                   master_addr)));
+    // Test invalid experimental flag.
+    string err;
+    RunActionStderrString(
+        Substitute("master set_flag $0 unlock_experimental_flags false --force",
+                   master_addr), &err);
+    ASSERT_STR_CONTAINS(err,
+        "Detected inconsistency in command-line flags");
+    // Flag value will not be changed.
+    string out;
+    RunActionStdoutString(
+        Substitute("master get_flags $0 --flags=unlock_experimental_flags --format=json",
+                   master_addr), &out);
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    const string flag_value = "true";
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["value"].GetString() == flag_value);
+    }
+  }
+  { // Test set flag using group flag validator.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 unlock_experimental_flags true --force",
+                   master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 raft_prepare_replacement_before_eviction true --force",
+                  master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 auto_rebalancing_enabled true --force",
+                   master_addr)));
+    // Test set flag violating group validator.
+    string err;
+    RunActionStderrString(
+        Substitute("master set_flag $0 raft_prepare_replacement_before_eviction false --force",
+                   master_addr), &err);
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 auto_rebalancing_enabled true --force",
+                   master_addr)));
+    ASSERT_STR_CONTAINS(err, "Detected inconsistency in command-line flags");
+    // Flag value will not be changed.
+    string out;
+    RunActionStdoutString(
+        Substitute("master get_flags $0 --flags=raft_prepare_replacement_before_eviction"
+                   " --format=json",
+                   master_addr), &out);
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    const string flag_value = "true";
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["value"].GetString() == flag_value);
+    }
+  }
+  { // Test set flag using parameter: --run_consistency_check.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 rpc_certificate_file test "
+                   "--force --run_consistency_check=false",
+                   master_addr)));
   }
 }
 
@@ -4403,8 +4953,9 @@ TEST_F(ToolTest, TestDeleteTable) {
   ASSERT_EQ(exist, true);
 
   // Delete the table.
-  NO_FATALS(RunActionStdoutNone(Substitute("table delete $0 $1 --nomodify_external_catalogs",
-                                           master_addr, kTableName)));
+  NO_FATALS(RunActionStdoutNone(Substitute(
+      "table delete $0 $1 --nomodify_external_catalogs",
+      master_addr, kTableName)));
 
   // Check that the table does not exist.
   ASSERT_OK(client->TableExists(kTableName, &exist));
@@ -4437,6 +4988,58 @@ TEST_F(ToolTest, TestRenameTable) {
         Substitute("table rename_table $0 $1 $2 --nomodify_external_catalogs",
           master_addr, kNewTableName, kTableName)));
   ASSERT_OK(client->OpenTable(kTableName, &table));
+}
+
+TEST_F(ToolTest, TestRecallTable) {
+  NO_FATALS(StartExternalMiniCluster());
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+
+  constexpr const char* const kTableName = "kudu.table";
+
+  // Create the table.
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_num_replicas(1);
+  workload.Setup();
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  string table_id = table->id();
+
+  // Soft-delete the table.
+  string out;
+  NO_FATALS(RunActionStdoutNone(Substitute(
+      "table delete $0 $1 --reserve_seconds=300",
+      master_addr, kTableName)));
+
+  // List soft_deleted table.
+  vector<string> kudu_tables;
+  ASSERT_OK(client->ListSoftDeletedTables(&kudu_tables));
+  ASSERT_EQ(1, kudu_tables.size());
+  kudu_tables.clear();
+  ASSERT_OK(client->ListTables(&kudu_tables));
+  ASSERT_EQ(0, kudu_tables.size());
+
+  // Can't create a table with the same name whose state is in soft_deleted.
+  workload.set_table_name(kTableName);
+  workload.set_num_replicas(1);
+  NO_FATALS(workload.Setup());
+  ASSERT_OK(client->ListTables(&kudu_tables));
+  ASSERT_EQ(0, kudu_tables.size());
+
+  const string kNewTableName = "kudu.table.new";
+  // Try to recall the soft_deleted table with new name.
+  NO_FATALS(RunActionStdoutNone(Substitute("table recall $0 $1 --new_table_name=$2",
+                                           master_addr, table_id, kNewTableName)));
+
+  ASSERT_OK(client->ListTables(&kudu_tables));
+  ASSERT_EQ(1, kudu_tables.size());
+  ASSERT_TRUE(kNewTableName == kudu_tables[0]);
+  kudu_tables.clear();
+  ASSERT_OK(client->ListSoftDeletedTables(&kudu_tables));
+  ASSERT_EQ(0, kudu_tables.size());
 }
 
 TEST_F(ToolTest, TestRenameColumn) {
@@ -4477,6 +5080,7 @@ TEST_F(ToolTest, TestRenameColumn) {
 }
 
 TEST_F(ToolTest, TestListTables) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   NO_FATALS(StartExternalMiniCluster());
   shared_ptr<KuduClient> client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &client));
@@ -4514,12 +5118,14 @@ TEST_F(ToolTest, TestListTables) {
     if (kNumTables != num) {
       filter = Substitute("--tables=$0", JoinStrings(expected, ","));
     }
+
     vector<string> lines;
     NO_FATALS(RunActionStdoutLines(
         Substitute("table list $0 $1", master_addr, filter), &lines));
 
-    std::sort(lines.begin(), lines.end());
-    ASSERT_EQ(expected, lines);
+    for (auto& e : expected) {
+      ASSERT_STRINGS_ANY_MATCH(lines, e);
+    }
   };
 
   const auto ProcessTablets = [&] (const int num) {
@@ -4540,6 +5146,10 @@ TEST_F(ToolTest, TestListTables) {
       if (lines[i].empty()) {
         continue;
       }
+      if (MatchPattern(lines[i], "kudu.table_")) {
+        continue;
+      }
+      lines[i].erase(0, lines[i].find_first_not_of(' '));
       ASSERT_LE(i + 2, lines.size());
       output[lines[i]] = pair<string, string>(lines[i + 1], lines[i + 2]);
       i += 2;
@@ -4583,8 +5193,9 @@ TEST_F(ToolTest, TestListTables) {
     NO_FATALS(RunActionStdoutLines(
         Substitute("table list $0 $1 --show_table_info", master_addr, filter), &lines));
 
-    std::sort(lines.begin(), lines.end());
-    ASSERT_EQ(expected, lines);
+    for (auto& e : expected) {
+      ASSERT_STRINGS_ANY_MATCH(lines, e);
+    }
   };
 
   // List the tables and tablets.
@@ -4834,7 +5445,53 @@ TEST_F(ToolTest, TableScanCustomBatchSize) {
   }
 }
 
+TEST_F(ToolTest, TableScanFaultTolerant) {
+  constexpr const char* const kTableName = "kudu.table.scan.fault_tolerant";
+  NO_FATALS(RunLoadgen(1,
+                       {
+                           "--num_threads=8",
+                           "--num_rows_per_thread=111",
+                       },
+                       kTableName));
+  for (const auto& flag : {"true", "false"}) {
+    string out;
+    string err;
+    vector<string> out_lines;
+    const auto s = RunTool(
+        Substitute("table scan $0 $1 --fault_tolerant=$2",
+                   cluster_->master()->bound_rpc_addr().ToString(), kTableName, flag),
+        &out, &err, &out_lines);
+    ASSERT_TRUE(s.ok()) << s.ToString() << ": " << err;
+    ASSERT_STR_CONTAINS(out, "Total count 888 ");
+  }
+}
+
+TEST_F(ToolTest, TableCopyFaultTolerant) {
+  constexpr const char* const kTableName = "kudu.table.copy.fault_tolerant.from";
+  constexpr const char* const kNewTableName = "kudu.table.copy.fault_tolerant.to";
+  NO_FATALS(RunLoadgen(1,
+                       {
+                           "--num_threads=8",
+                           "--num_rows_per_thread=111",
+                       },
+                       kTableName));
+  for (const auto& flag : {"true", "false"}) {
+    string out;
+    string err;
+    vector<string> out_lines;
+    const auto s = RunTool(
+        Substitute("table copy $0 $1 $2 --dst_table=$3 --write_type=upsert --fault_tolerant=$4",
+                   cluster_->master()->bound_rpc_addr().ToString(), kTableName,
+                   cluster_->master()->bound_rpc_addr().ToString(), kNewTableName,
+                   flag),
+        &out, &err, &out_lines);
+    ASSERT_TRUE(s.ok()) << s.ToString() << ": " << err;
+    ASSERT_STR_CONTAINS(out, "Total count 888 ");
+  }
+}
+
 TEST_P(ToolTestCopyTableParameterized, TestCopyTable) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   for (const auto& arg : GenerateArgs()) {
     NO_FATALS(RunCopyTableCheck(arg));
   }
@@ -5526,6 +6183,7 @@ void ValidateHmsEntries(HmsClient* hms_client,
 }
 
 TEST_P(ToolTestKerberosParameterized, TestHmsDowngrade) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
   opts.enable_kerberos = EnableKerberos();
@@ -5586,6 +6244,7 @@ Status AlterHmsWithReplacedParam(HmsClient* hms_client,
 // Test HMS inconsistencies that can be automatically fixed.
 // Kerberos is enabled in order to test the tools work in secure clusters.
 TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   string kUsername = "alice";
   string kOtherUsername = "bob";
   string kOtherComment = "a table comment";
@@ -5972,7 +6631,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   NO_FATALS(ValidateHmsEntries(&hms_client, kudu_client, "my_db", "table", master_addrs_str));
 
   vector<string> kudu_tables;
-  kudu_client->ListTables(&kudu_tables);
+  ASSERT_OK(kudu_client->ListTables(&kudu_tables));
   std::sort(kudu_tables.begin(), kudu_tables.end());
   ASSERT_EQ(vector<string>({
     "default.bad_id",
@@ -6014,6 +6673,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
 // TODO(ghenke): Add test case for external table using the same name as
 //  an existing Kudu table.
 TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   string kUsername = "alice";
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::DISABLE_HIVE_METASTORE;
@@ -6134,7 +6794,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
 
   // Ensure the tables are available.
   vector<string> kudu_tables;
-  kudu_client->ListTables(&kudu_tables);
+  ASSERT_OK(kudu_client->ListTables(&kudu_tables));
   std::sort(kudu_tables.begin(), kudu_tables.end());
   ASSERT_EQ(vector<string>({
     "default.conflicting_legacy_table",
@@ -6147,6 +6807,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
 }
 
 TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.num_masters = 2;
   opts.hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
@@ -6230,7 +6891,28 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
       Substitute("hms check $0 --noignore-other-clusters", master_addrs_str)));
 }
 
+// Make sure that `kudu table delete` works as expected when HMS integration
+// is enabled, keeping the behavior of the tool backward-compatible even after
+// introducing the "table soft-delete" feature.
+TEST_F(ToolTest, DropTableHmsEnabled) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  ExternalMiniClusterOptions opts;
+  opts.hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+  const auto& master_rpc_addr =
+      HostPort::ToCommaSeparatedString(cluster_->master_rpc_addrs());
+  string out;
+  NO_FATALS(RunActionStdoutString(
+      Substitute("perf loadgen --keep_auto_table $0", master_rpc_addr), &out));
+  NO_FATALS(RunActionStdoutString(
+      Substitute("table list $0", master_rpc_addr), &out));
+  const auto table_name = out;
+  NO_FATALS(RunActionStdoutNone(
+      Substitute("table delete $0 $1", master_rpc_addr, table_name)));
+}
+
 TEST_F(ToolTest, TestHmsPrecheck) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
@@ -6302,6 +6984,7 @@ TEST_F(ToolTest, TestHmsPrecheck) {
 }
 
 TEST_F(ToolTest, TestHmsList) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
   opts.enable_kerberos = EnableKerberos();
@@ -6369,6 +7052,7 @@ TEST_F(ToolTest, TestHmsList) {
 }
 
 TEST_F(ToolTest, TestHMSAddressLog) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
   opts.enable_kerberos = EnableKerberos();
@@ -6474,6 +7158,7 @@ INSTANTIATE_TEST_SUITE_P(SerializationModes, ControlShellToolTest,
                                             ::testing::Bool()));
 
 TEST_P(ControlShellToolTest, TestControlShell) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   constexpr auto kNumMasters = 1;
   constexpr auto kNumTservers = 3;
 
@@ -6978,6 +7663,12 @@ static void CreateTableWithFlushedData(const string& table_name,
   KuduSchema schema;
   ASSERT_OK(schema_builder.Build(&schema));
 
+
+#if defined(THREAD_SANITIZER)
+  constexpr auto kNumRows = 1000;
+#else
+  constexpr auto kNumRows = 10000;
+#endif
   // Create a table and write some data to it.
   TestWorkload workload(cluster);
   workload.set_schema(schema);
@@ -6987,7 +7678,7 @@ static void CreateTableWithFlushedData(const string& table_name,
   workload.Setup();
   workload.Start();
   ASSERT_EVENTUALLY([&]() {
-    ASSERT_GE(workload.rows_inserted(), 10000);
+    ASSERT_GE(workload.rows_inserted(), kNumRows);
   });
   workload.StopAndJoin();
 
@@ -7132,6 +7823,7 @@ TEST_F(ToolTest, TestFsRemoveDataDirWithTombstone) {
 }
 
 TEST_F(ToolTest, TestFsAddRemoveDataDirEndToEnd) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   const string kTableFoo = "foo";
   const string kTableBar = "bar";
 
@@ -7320,6 +8012,7 @@ TEST_F(ToolTest, TestCheckFSWithNonDefaultMetadataDir) {
 }
 
 TEST_F(ToolTest, TestReplaceTablet) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   constexpr int kNumTservers = 3;
   constexpr int kNumTablets = 3;
   constexpr int kNumRows = 1000;
@@ -7388,8 +8081,22 @@ TEST_F(ToolTest, TestReplaceTablet) {
   ASSERT_GE(workload.rows_inserted(), CountTableRows(workload_table.get()));
 }
 
-TEST_F(ToolTest, TestGetFlags) {
+class GetFlagsTest :
+    public ToolTest,
+    public ::testing::WithParamInterface<bool> {
+};
+
+INSTANTIATE_TEST_SUITE_P(DisableFlagFilterLogic, GetFlagsTest, ::testing::Bool());
+TEST_P(GetFlagsTest, TestGetFlags) {
   ExternalMiniClusterOptions opts;
+  const string disable_flag_filter_logic_on_server =
+      Substitute("--disable_gflag_filter_logic_for_testing=$0", GetParam());
+  opts.extra_master_flags = {
+    disable_flag_filter_logic_on_server,
+  };
+  opts.extra_tserver_flags = {
+    disable_flag_filter_logic_on_server,
+  };
   opts.num_tablet_servers = 1;
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
 
@@ -7466,6 +8173,7 @@ TEST_F(ToolTest, TestGetFlags) {
 
 // This is a synthetic test to provide coverage for regressions of KUDU-2819.
 TEST_F(ToolTest, TabletServersWithUnusualFlags) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // Run many tablet servers: it helps in detection of races, if any.
 #if defined(THREAD_SANITIZER)
   // In case of TSAN builds, it takes too long to wait for the start up of too
@@ -7523,9 +8231,70 @@ TEST_F(ToolTest, TestParseStacks) {
   Status s = RunActionStderrString(
       Substitute("diagnose parse_stacks $0", kBadDataPath),
       &stderr);
-  ASSERT_TRUE(s.IsRuntimeError());
-  ASSERT_STR_MATCHES(stderr, "failed to parse stacks from .*: at line 1: "
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
+  ASSERT_STR_MATCHES(stderr, "failed to parse stacks from .* line 1.*"
                              "invalid JSON payload.*Missing a closing quotation mark in string");
+}
+
+TEST_F(ToolTest, TestParseMetrics) {
+  const string kDataPath = JoinPathSegments(GetTestExecutableDirectory(),
+                                            "testdata/sample-diagnostics-log.txt");
+  const string kBadDataPath = JoinPathSegments(GetTestExecutableDirectory(),
+                                               "testdata/bad-diagnostics-log.txt");
+  // Check out tablet metrics.
+  {
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("diagnose parse_metrics $0 -simple-metrics=tablet.on_disk_size:size_bytes "
+                   "-rate-metrics=tablet.on_disk_size:bytes_rate", kDataPath),
+        &stdout));
+    // Spot check a few of the things that should be in the output.
+    ASSERT_STR_CONTAINS(stdout, "timestamp\tsize_bytes\tbytes_rate");
+    ASSERT_STR_CONTAINS(stdout, "1521053715220449\t69705682\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053775220513\t69705682\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053835220611\t69712809\t118.78313932087244");
+    ASSERT_STR_CONTAINS(stdout, "1521053895220710\t69712809\t0");
+    ASSERT_STR_CONTAINS(stdout, "1661840031227204\t69712809\t0");
+  }
+  // Check out table metrics.
+  {
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("diagnose parse_metrics $0 "
+                   "-simple-metrics=table.on_disk_size:size,table.live_row_count:row_count",
+                   kDataPath),
+        &stdout));
+    // Spot check a few of the things that should be in the output.
+    ASSERT_STR_CONTAINS(stdout, "timestamp\trow_count\tsize");
+    ASSERT_STR_CONTAINS(stdout, "1521053715220449\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053775220513\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053835220611\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053895220710\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1661840031227204\t228265\t78540528");
+  }
+  // Check out table metrics with default metric names.
+  {
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("diagnose parse_metrics $0 "
+                   "-simple-metrics=table.on_disk_size,table.live_row_count",
+                   kDataPath),
+        &stdout));
+    // Spot check a few of the things that should be in the output.
+    ASSERT_STR_CONTAINS(stdout, "timestamp\tlive_row_count\ton_disk_size");
+    ASSERT_STR_CONTAINS(stdout, "1521053715220449\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053775220513\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053835220611\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053895220710\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1661840031227204\t228265\t78540528");
+  }
+
+  string stderr;
+  ASSERT_OK(RunActionStderrString(
+      Substitute("diagnose parse_metrics $0 -simple-metrics=tablet.on_disk_size:size",
+      kBadDataPath), &stderr));
+  ASSERT_STR_MATCHES(stderr, "Skipping file.*invalid JSON payload.*Missing "
+                             "a closing quotation mark in string");
 }
 
 TEST_F(ToolTest, ClusterNameResolverEnvNotSet) {
@@ -7692,6 +8461,7 @@ class AuthzTServerChecksumTest : public ToolTest {
 
 // Test the authorization of Checksum scans via the CLI.
 TEST_F(AuthzTServerChecksumTest, TestAuthorizeChecksum) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // First, let's create a table.
   const vector<string> loadgen_args = {
     "perf", "loadgen",
@@ -7713,6 +8483,7 @@ TEST_F(AuthzTServerChecksumTest, TestAuthorizeChecksum) {
 
 // Regression test for KUDU-2851.
 TEST_F(ToolTest, TestFailedTableScan) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // Create a table using the loadgen tool.
   const string kTableName = "db.table";
   NO_FATALS(RunLoadgen(/*num_tservers*/1, /*tool_args*/{},kTableName));
@@ -7736,6 +8507,7 @@ TEST_F(ToolTest, TestFailedTableScan) {
 }
 
 TEST_F(ToolTest, TestFailedTableCopy) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // Create a table using the loadgen tool.
   const string kTableName = "db.table";
   NO_FATALS(RunLoadgen(/*num_tservers*/1, /*tool_args*/{},kTableName));
@@ -7805,8 +8577,11 @@ TEST_F(ToolTest, ConnectionNegotiationTimeoutOption) {
     auto s = RunActionStderrString(Substitute(kPattern, rpc_addr, 10, 11), &msg);
     ASSERT_TRUE(s.IsRuntimeError());
     ASSERT_STR_CONTAINS(msg, Substitute(
-        "Timed out: Client connection negotiation failed: client connection to "
-        "$0: received 0 of 4 requested bytes", rpc_addr));
+        "Timed out: Client connection negotiation failed: "
+        "client connection to $0", rpc_addr));
+    ASSERT_STR_MATCHES(msg,
+        "(Timeout exceeded waiting to connect)|"
+        "(received|sent) 0 of .* requested bytes");
   }
 
   {
@@ -7837,6 +8612,7 @@ TEST_F(ToolTest, TestDuplicateMastersInKsck) {
 }
 
 TEST_F(ToolTest, TestNonDefaultPrincipal) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.enable_kerberos = true;
   opts.principal = "oryx";
@@ -7860,6 +8636,7 @@ class UnregisterTServerTest : public ToolTest, public ::testing::WithParamInterf
 INSTANTIATE_TEST_SUITE_P(, UnregisterTServerTest, ::testing::Bool());
 
 TEST_P(UnregisterTServerTest, TestUnregisterTServer) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   bool remove_tserver_state = GetParam();
 
   // Set a short timeout that masters consider a tserver dead.
@@ -7976,6 +8753,7 @@ TEST_F(UnregisterTServerTest, TestUnregisterTServerNotPresumedDead) {
 }
 
 TEST_F(ToolTest, TestLocalReplicaCopyLocal) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // TODO(abukor): Rewrite the test to make sure it works with encryption
   // enabled.
   //
@@ -8069,7 +8847,43 @@ TEST_F(ToolTest, TestLocalReplicaCopyLocal) {
   ASSERT_EQ(src_stdout, dst_stdout);
 }
 
+TEST_F(ToolTest, TestLocalReplicaCopyRemote) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  InternalMiniClusterOptions opts;
+  opts.num_tablet_servers = 2;
+  NO_FATALS(StartMiniCluster(std::move(opts)));
+  NO_FATALS(CreateTableWithFlushedData("table1", mini_cluster_.get(), 3, 1));
+  NO_FATALS(CreateTableWithFlushedData("table2", mini_cluster_.get(), 3, 1));
+  int source_tserver_tablet_count = mini_cluster_->mini_tablet_server(0)->ListTablets().size();
+  int target_tserver_tablet_count_before = mini_cluster_->mini_tablet_server(1)
+                                                        ->ListTablets().size();
+  string tablet_ids_str = JoinStrings(mini_cluster_->mini_tablet_server(0)->ListTablets(), ",");
+  string source_tserver_rpc_addr = mini_cluster_->mini_tablet_server(0)
+                                                ->bound_rpc_addr().ToString();
+  string wal_dir = mini_cluster_->mini_tablet_server(1)->options()->fs_opts.wal_root;
+  string data_dirs = JoinStrings(mini_cluster_->mini_tablet_server(1)
+                                              ->options()->fs_opts.data_roots, ",");
+  NO_FATALS(mini_cluster_->mini_tablet_server(1)->Shutdown());
+  // Copy tablet replicas from tserver0 to tserver1.
+  NO_FATALS(RunActionStdoutNone(
+      Substitute("local_replica copy_from_remote $0 $1 "
+                 "-fs_data_dirs=$2 -fs_wal_dir=$3 -num_threads=3",
+                 tablet_ids_str,
+                 source_tserver_rpc_addr,
+                 data_dirs,
+                 wal_dir)));
+  NO_FATALS(mini_cluster_->mini_tablet_server(1)->Start());
+  const vector<string>& target_tablet_ids = mini_cluster_->mini_tablet_server(1)->ListTablets();
+  ASSERT_EQ(source_tserver_tablet_count + target_tserver_tablet_count_before,
+            target_tablet_ids.size());
+  for (string tablet_id : mini_cluster_->mini_tablet_server(0)->ListTablets()) {
+    ASSERT_TRUE(find(target_tablet_ids.begin(), target_tablet_ids.end(), tablet_id)
+                != target_tablet_ids.end());
+  }
+}
+
 TEST_F(ToolTest, TestRebuildTserverByLocalReplicaCopy) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // Local copies are not supported on encrypted severs at this time.
   if (FLAGS_encrypt_data_at_rest) {
     GTEST_SKIP();
@@ -8167,6 +8981,116 @@ TEST_F(ToolTest, TestRebuildTserverByLocalReplicaCopy) {
   });
 }
 
+// Test for 'local_replica tmeta' functionality.
+TEST_F(ToolTest, TestLocalReplicaTmeta) {
+  constexpr const char* const kTableName = "kudu.local_replica.tmeta";
+  const int kNumTablets = 4;
+  const int kNumTabletServers = 1;
+
+  FLAGS_flush_threshold_mb = 1;
+  FLAGS_flush_threshold_secs = 1;
+  InternalMiniClusterOptions opts;
+  opts.num_tablet_servers = kNumTabletServers;
+  NO_FATALS(StartMiniCluster(std::move(opts)));
+
+  TestWorkload workload(mini_cluster_.get());
+  workload.set_num_tablets(kNumTablets);
+  workload.set_num_replicas(1);
+  workload.set_table_name(kTableName);
+  workload.Setup();
+  workload.Start();
+  // Make sure there are some rowsets flushed.
+  SleepFor(MonoDelta::FromSeconds(2));
+  workload.StopAndJoin();
+  int64_t total_row_count = workload.rows_inserted();
+
+  string encryption_args;
+  if (env_->IsEncryptionEnabled()) {
+    encryption_args =
+        GetEncryptionArgs() + " --instance_file=" +
+        JoinPathSegments(mini_cluster_->mini_tablet_server(0)->options()->fs_opts.wal_root,
+                         "instance");
+  }
+  const string& flags =
+      Substitute("-fs_wal_dir=$0 --fs_data_dirs=$1 $2",
+                 mini_cluster_->mini_tablet_server(0)->options()->fs_opts.wal_root,
+                 JoinStrings(mini_cluster_->mini_tablet_server(0)->options()->fs_opts.data_roots,
+                             ","),
+                 encryption_args);
+
+  // Find the tablet to edit.
+  vector<string> tablet_ids;
+  NO_FATALS(RunActionStdoutLines(Substitute("local_replica list $0", flags), &tablet_ids));
+  ASSERT_EQ(kNumTablets, tablet_ids.size());
+  const string& tablet_id = tablet_ids[0];
+  const string& metadata_path = mini_cluster_->mini_tablet_server(0)->server()
+                                    ->fs_manager()->GetTabletMetadataDir();
+  const string& original_file = JoinPathSegments(metadata_path, tablet_id);
+
+  // The server should be shutdown before editing.
+  string stdout;
+  string stderr;
+  Status s = RunActionStdoutStderrString(
+      Substitute("local_replica tmeta delete_rowsets $0 $1 $2", tablet_id, 0, flags),
+      &stdout, &stderr);
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
+  ASSERT_STR_CONTAINS(stderr, "failed to load instance files");
+
+  // List rowsets after server shutdown, the rowsets set will not change if not edit the tablet
+  // metadata.
+  mini_cluster_->Shutdown();
+  set<int64_t> rowset_ids;
+  ASSERT_OK(ListTabletRowsetIds(metadata_path, tablet_id, encryption_args, &rowset_ids));
+  ASSERT_FALSE(rowset_ids.empty());
+  int64_t rowset_id_to_delete = *rowset_ids.begin();
+
+  // Remove one rowset from the tablet.
+  ASSERT_OK(RunActionStdoutStderrString(
+      Substitute("local_replica tmeta delete_rowsets $0 $1 $2 --backup_metadata=true "
+                 "--enable_tablet_orphaned_block_deletion=false",
+                 tablet_id, rowset_id_to_delete, flags),
+      &stdout, &stderr));
+
+  // Check the rowset has been deleted successfully.
+  set<int64_t> new_rowset_ids;
+  ASSERT_OK(ListTabletRowsetIds(metadata_path, tablet_id, encryption_args, &new_rowset_ids));
+  ASSERT_EQ(rowset_ids.size() - 1, new_rowset_ids.size());
+  ASSERT_FALSE(ContainsKey(new_rowset_ids, rowset_id_to_delete));
+
+  // The server can be started successfully.
+  // Disable orphaned blocks deletion, because we will roll back to check the original data.
+  FLAGS_enable_tablet_orphaned_block_deletion = false;
+  ASSERT_OK(mini_cluster_->Start());
+  ASSERT_EVENTUALLY([&] {
+    ClusterVerifier v(mini_cluster_.get());
+    NO_FATALS(v.CheckRowCount(kTableName, ClusterVerifier::AT_LEAST, 1));
+  });
+
+  // Roll back the metadata and restart server.
+  mini_cluster_->Shutdown();
+  string backup_file;
+  vector<string> metadata_files;
+  ASSERT_OK(env_->GetChildren(metadata_path, &metadata_files));
+  for (const auto& metadata_file : metadata_files) {
+    if (MatchPattern(metadata_file, Substitute("*$0.bak.*", tablet_id))) {
+      backup_file = metadata_file;
+      break;
+    }
+  }
+  ASSERT_FALSE(backup_file.empty());
+  ASSERT_OK(env_->RenameFile(JoinPathSegments(metadata_path, backup_file), original_file));
+  // Now it's safe to enable orphaned blocks deletion, because there is no orphaned blocks in
+  // original tablet metadata file.
+  FLAGS_enable_tablet_orphaned_block_deletion = true;
+  ASSERT_OK(mini_cluster_->Start());
+
+  // Check there isn't any data loss.
+  ASSERT_EVENTUALLY([&] {
+    ClusterVerifier v(mini_cluster_.get());
+    NO_FATALS(v.CheckRowCount(kTableName, ClusterVerifier::EXACTLY, total_row_count));
+  });
+}
+
 class SetFlagForAllTest :
     public ToolTest,
     public ::testing::WithParamInterface<bool> {
@@ -8192,46 +9116,57 @@ TEST_P(SetFlagForAllTest, TestSetFlagForAll) {
     master_addresses.emplace_back(cluster_->master(i)->bound_rpc_addr().ToString());
   }
   string str_master_addresses = JoinMapped(master_addresses, [](string addr){return addr;}, ",");
-  const string flag_key = "max_log_size";
-  const string flag_value = "10";
-  NO_FATALS(RunActionStdoutNone(
-      Substitute("$0 set_flag_for_all $1 $2 $3",
-          role, str_master_addresses, flag_key, flag_value)));
 
-  int hosts_num = is_master? opts.num_masters : opts.num_tablet_servers;
-  string out;
-  for (int i = 0; i < hosts_num; i++) {
-    if (is_master) {
-      NO_FATALS(RunActionStdoutString(
-          Substitute("$0 get_flags $1 --format=json", role,
-              cluster_->master(i)->bound_rpc_addr().ToString()),
-              &out));
-    } else {
-      NO_FATALS(RunActionStdoutString(
-          Substitute("$0 get_flags $1 --format=json", role,
-          cluster_->tablet_server(i)->bound_rpc_addr().ToString()),
-          &out));
-    }
-    rapidjson::Document doc;
-    doc.Parse<0>(out.c_str());
-    for (int i = 0; i < doc.Size(); i++) {
-      const rapidjson::Value& item = doc[i];
-      ASSERT_TRUE(item["flag"].IsString());
-      if (item["flag"].GetString() == flag_key) {
-        ASSERT_TRUE(item["value"].IsString());
-        ASSERT_TRUE(item["value"].GetString() == flag_value);
-        return;
+  // <flag key, flag value, optional parameter>
+  vector<tuple<string , string , string>> command_parameters;
+  command_parameters.emplace_back(tuple<string, string, string>("max_log_size", "10" , ""));
+  command_parameters.emplace_back(tuple<string, string, string>("log_async", "false" , "--force"));
+
+  for (auto command_parameter : command_parameters) {
+    const string flag_key = std::get<0>(command_parameter);
+    const string flag_value = std::get<1>(command_parameter);
+    const string optional_parameter = std::get<2>(command_parameter);
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("$0 set_flag_for_all $1 $2 $3 $4",
+            role, str_master_addresses, flag_key, flag_value, optional_parameter)));
+
+    int hosts_num = is_master? opts.num_masters : opts.num_tablet_servers;
+    string out;
+    for (int i = 0; i < hosts_num; i++) {
+      if (is_master) {
+        NO_FATALS(RunActionStdoutString(
+            Substitute("$0 get_flags $1 --format=json", role,
+                cluster_->master(i)->bound_rpc_addr().ToString()),
+                &out));
+      } else {
+        NO_FATALS(RunActionStdoutString(
+            Substitute("$0 get_flags $1 --format=json", role,
+            cluster_->tablet_server(i)->bound_rpc_addr().ToString()),
+            &out));
+      }
+      rapidjson::Document doc;
+      doc.Parse<0>(out.c_str());
+      for (int i = 0; i < doc.Size(); i++) {
+        const rapidjson::Value& item = doc[i];
+        ASSERT_TRUE(item["flag"].IsString());
+        if (item["flag"].GetString() == flag_key) {
+          ASSERT_TRUE(item["value"].IsString());
+          ASSERT_TRUE(item["value"].GetString() == flag_value);
+          break;
+        }
       }
     }
   }
 
   // A test for setting a non-existing flag.
+  string stdout;
+  string stderr;
   Status s = RunTool(
-      Substitute("$0 set_flag_for_all $2 test_flag test_value",
+      Substitute("$0 set_flag_for_all $1 test_flag test_value",
           role, str_master_addresses),
-      nullptr, nullptr, nullptr, nullptr);
+      &stdout, &stderr, nullptr, nullptr);
   ASSERT_TRUE(s.IsRuntimeError());
-  ASSERT_STR_CONTAINS(s.ToString(), "set flag failed");
+  ASSERT_STR_CONTAINS(stderr, "result: NO_SUCH_FLAG");
 }
 
 } // namespace tools

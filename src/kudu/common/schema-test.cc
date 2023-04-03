@@ -232,14 +232,14 @@ TEST_P(ParameterizedSchemaTest, TestCopyAndMove) {
 // Test basic functionality of Schema definition with decimal columns
 TEST_F(TestSchema, TestSchemaWithDecimal) {
   ColumnSchema col1("key", STRING);
-  ColumnSchema col2("decimal32val", DECIMAL32, false,
-                    NULL, NULL, ColumnStorageAttributes(),
+  ColumnSchema col2("decimal32val", DECIMAL32, false, false, false,
+                    nullptr, nullptr, ColumnStorageAttributes(),
                     ColumnTypeAttributes(9, 4));
-  ColumnSchema col3("decimal64val", DECIMAL64, true,
-                    NULL, NULL, ColumnStorageAttributes(),
+  ColumnSchema col3("decimal64val", DECIMAL64, true, false, false,
+                    nullptr, nullptr, ColumnStorageAttributes(),
                     ColumnTypeAttributes(18, 10));
-  ColumnSchema col4("decimal128val", DECIMAL128, true,
-                    NULL, NULL, ColumnStorageAttributes(),
+  ColumnSchema col4("decimal128val", DECIMAL128, true, false, false,
+                    nullptr, nullptr, ColumnStorageAttributes(),
                     ColumnTypeAttributes(38, 2));
 
   vector<ColumnSchema> cols = { col1, col2, col3, col4 };
@@ -266,17 +266,17 @@ TEST_F(TestSchema, TestSchemaWithDecimal) {
 // Test Schema::Equals respects decimal column attributes
 TEST_F(TestSchema, TestSchemaEqualsWithDecimal) {
   ColumnSchema col1("key", STRING);
-  ColumnSchema col_18_10("decimal64val", DECIMAL64, true,
-                         NULL, NULL, ColumnStorageAttributes(),
+  ColumnSchema col_18_10("decimal64val", DECIMAL64, true, false, false,
+                         nullptr, nullptr, ColumnStorageAttributes(),
                          ColumnTypeAttributes(18, 10));
-  ColumnSchema col_18_9("decimal64val", DECIMAL64, true,
-                        NULL, NULL, ColumnStorageAttributes(),
+  ColumnSchema col_18_9("decimal64val", DECIMAL64, true, false,false,
+                        nullptr, nullptr, ColumnStorageAttributes(),
                         ColumnTypeAttributes(18, 9));
-  ColumnSchema col_17_10("decimal64val", DECIMAL64, true,
-                         NULL, NULL, ColumnStorageAttributes(),
+  ColumnSchema col_17_10("decimal64val", DECIMAL64, true, false, false,
+                         nullptr, nullptr, ColumnStorageAttributes(),
                          ColumnTypeAttributes(17, 10));
-  ColumnSchema col_17_9("decimal64val", DECIMAL64, true,
-                        NULL, NULL, ColumnStorageAttributes(),
+  ColumnSchema col_17_9("decimal64val", DECIMAL64, true, false, false,
+                        nullptr, nullptr, ColumnStorageAttributes(),
                         ColumnTypeAttributes(17, 9));
 
   Schema schema_18_10({ col1, col_18_10 }, 1);
@@ -295,7 +295,7 @@ TEST_F(TestSchema, TestColumnSchemaEquals) {
   ColumnSchema col1("key", STRING);
   ColumnSchema col2("key1", STRING);
   ColumnSchema col3("key", STRING, true);
-  ColumnSchema col4("key", STRING, true, &default_str, &default_str);
+  ColumnSchema col4("key", STRING, true, false, false, &default_str, &default_str);
 
   ASSERT_TRUE(col1.Equals(col1));
   ASSERT_FALSE(col1.Equals(col2, ColumnSchema::COMPARE_NAME));
@@ -422,7 +422,7 @@ TEST_F(TestSchema, TestProjectMissingColumn) {
   Schema schema3({ ColumnSchema("val", UINT32), ColumnSchema("non_present", UINT32, true) }, 0);
   uint32_t default_value = 15;
   Schema schema4({ ColumnSchema("val", UINT32),
-                   ColumnSchema("non_present", UINT32, false, &default_value) },
+                   ColumnSchema("non_present", UINT32, false, false, false, &default_value) },
                  0);
 
   RowProjector row_projector(&schema1, &schema2);
@@ -492,7 +492,10 @@ TEST_F(TestSchema, TestGetMappedReadProjection) {
   const bool kReadDefault = false;
   Schema projection({ ColumnSchema("key", STRING),
                       ColumnSchema("deleted", IS_DELETED,
-                                   /*is_nullable=*/false, /*read_default=*/&kReadDefault) },
+                                   /*is_nullable=*/false,
+                                   /*is_immutable=*/false,
+                                   /*is_auto_incrementing=*/false,
+                                   /*read_default=*/&kReadDefault) },
                     1);
 
   Schema mapped;
@@ -520,6 +523,8 @@ TEST_F(TestSchema, TestGetMappedReadProjection) {
   Status s = nullable_projection.Reset({ ColumnSchema("key", STRING),
                                          ColumnSchema("deleted", IS_DELETED,
                                                       /*is_nullable=*/true,
+                                                      /*is_immutable=*/false,
+                                                      /*is_auto_incrementing=*/false,
                                                       /*read_default=*/&kReadDefault) },
                                        1);
   ASSERT_FALSE(s.ok());
@@ -529,6 +534,8 @@ TEST_F(TestSchema, TestGetMappedReadProjection) {
   s = no_default_projection.Reset({ ColumnSchema("key", STRING),
                                     ColumnSchema("deleted", IS_DELETED,
                                                  /*is_nullable=*/false,
+                                                 /*is_immutable=*/false,
+                                                 /*is_auto_incrementing*/false,
                                                  /*read_default=*/nullptr) },
                                   1);
   ASSERT_FALSE(s.ok());

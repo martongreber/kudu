@@ -24,10 +24,11 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
-#include <optional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
+#include <type_traits>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -48,6 +49,7 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/bitmap.h"
@@ -93,8 +95,14 @@ DEFINE_bool(create_table, true,
 DEFINE_int32(create_table_replication_factor, -1,
              "The replication factor of the destination table if the table will be created. "
              "By default, the replication factor of source table will be used.");
+DEFINE_string(create_table_hash_bucket_nums, "",
+              "The number of hash buckets in each hash dimension seperated by comma");
 DEFINE_bool(fill_cache, true,
             "Whether to fill block cache when scanning.");
+DEFINE_bool(fault_tolerant, false,
+            "Whether to make scans resumable at another tablet server if current server fails. "
+            "Fault-tolerant scans typically have lower throughput than non fault-tolerant scans, "
+            "but the results are returned in primary key order for a single tablet.");
 DEFINE_string(predicates, "",
               "Query predicates on columns. Unlike traditional SQL syntax, "
               "the scan tool's simple query predicates are represented in a "
@@ -162,11 +170,14 @@ bool ValidateWriteType(const char* flag_name,
 }
 
 constexpr const char* const kReplicaSelectionClosest = "closest";
+constexpr const char* const kReplicaSelectionFirst = "first";
 constexpr const char* const kReplicaSelectionLeader = "leader";
+
 bool ValidateReplicaSelection(const char* flag_name,
                               const string& flag_value) {
   static const vector<string> kReplicaSelections = {
     kReplicaSelectionClosest,
+    kReplicaSelectionFirst,
     kReplicaSelectionLeader,
   };
   return IsFlagValueAcceptable(flag_name, flag_value, kReplicaSelections);
@@ -428,11 +439,52 @@ Status CreateDstTableIfNeeded(const client::sp::shared_ptr<KuduTable>& src_table
       .num_replicas(num_replicas);
 
   // Add hash partition schema.
+  vector<int> hash_bucket_nums;
+  if (!partition_schema.hash_schema().empty()) {
+    vector<string> hash_bucket_nums_str = Split(FLAGS_create_table_hash_bucket_nums,
+                                                ",", strings::SkipEmpty());
+    // FLAGS_create_table_hash_bucket_nums is not defined, set it to -1 defaultly.
+    if (hash_bucket_nums_str.empty()) {
+      for (int i = 0; i < partition_schema.hash_schema().size(); i++) {
+        hash_bucket_nums.push_back(-1);
+      }
+    } else {
+      // If the --create_table_hash_bucket_nums flag is set, the number
+      // of comma-separated elements must be equal to the number of hash schema dimensions.
+      if (partition_schema.hash_schema().size() != hash_bucket_nums_str.size()) {
+        return Status::InvalidArgument("The count of hash bucket numbers must be equal to the "
+                                       "number of hash schema dimensions.");
+      }
+      for (int i = 0; i < hash_bucket_nums_str.size(); i++) {
+        int bucket_num = 0;
+        bool is_number = safe_strto32(hash_bucket_nums_str[i], &bucket_num);
+        if (!is_number) {
+          return Status::InvalidArgument(Substitute("'$0': cannot parse the number "
+                                                    "of hash buckets.",
+                                                    hash_bucket_nums_str[i]));
+        }
+        if (bucket_num < 2) {
+          return Status::InvalidArgument("The number of hash buckets must not be less than 2.");
+        }
+        hash_bucket_nums.push_back(bucket_num);
+      }
+    }
+  }
+
+  if (partition_schema.hash_schema().empty() &&
+      !FLAGS_create_table_hash_bucket_nums.empty()) {
+    return Status::InvalidArgument("There are no hash partitions defined in this table.");
+  }
+
+  int i = 0;
   for (const auto& hash_dimension : partition_schema.hash_schema()) {
+    int num_buckets = hash_bucket_nums[i] != -1 ? hash_bucket_nums[i] :
+                                                  hash_dimension.num_buckets;
     auto hash_columns = convert_column_ids_to_names(hash_dimension.column_ids);
     table_creator->add_hash_partitions(hash_columns,
-                                       hash_dimension.num_buckets,
+                                       num_buckets,
                                        hash_dimension.seed);
+    i++;
   }
 
   // Add range partition schema.
@@ -588,7 +640,7 @@ void TableScanner::SetReadMode(KuduScanner::ReadMode mode) {
 }
 
 Status TableScanner::SetReplicaSelection(const string& selection_str) {
-  KuduClient::ReplicaSelection selection;
+  KuduClient::ReplicaSelection selection = KuduClient::ReplicaSelection::CLOSEST_REPLICA;
   RETURN_NOT_OK(ParseReplicaSelection(selection_str, &selection));
   replica_selection_ = selection;
   return Status::OK();
@@ -624,6 +676,14 @@ Status TableScanner::StartWork(WorkType type) {
   }
   RETURN_NOT_OK(builder.SetSelection(replica_selection_));
   RETURN_NOT_OK(builder.SetTimeoutMillis(FLAGS_timeout_ms));
+  if (FLAGS_fault_tolerant) {
+    // TODO(yingchun): push down this judgement to ScanConfiguration::SetFaultTolerant
+    if (mode_ && *mode_ != KuduScanner::READ_AT_SNAPSHOT) {
+      return Status::InvalidArgument(Substitute("--fault_tolerant conflicts with "
+          "the non-READ_AT_SNAPSHOT read mode"));
+    }
+    RETURN_NOT_OK(builder.SetFaultTolerant());
+  }
 
   // Set projection if needed.
   if (type == WorkType::kScan) {
@@ -742,6 +802,8 @@ Status TableScanner::ParseReplicaSelection(
     *selection = KuduClient::ReplicaSelection::CLOSEST_REPLICA;
   } else if (iequals(kReplicaSelectionLeader, selection_str)) {
     *selection = KuduClient::ReplicaSelection::LEADER_ONLY;
+  } else if (iequals(kReplicaSelectionFirst, selection_str)) {
+    *selection = KuduClient::ReplicaSelection::FIRST_REPLICA;
   } else {
     return Status::InvalidArgument("invalid replica selection", selection_str);
   }

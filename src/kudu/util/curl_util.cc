@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <curl/curl.h>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/strings/substitute.h"
@@ -35,6 +36,10 @@
 using std::string;
 using std::vector;
 using strings::Substitute;
+
+DEFINE_string(trusted_certificate_file, "",
+              "Path to a PEM file that contains certificate(s) to be trusted when "
+              "Kudu acts as a client (e.g. when talking to a KMS service.");
 
 namespace kudu {
 
@@ -102,11 +107,39 @@ Status EasyCurl::FetchURL(const string& url, faststring* dst,
   return DoRequest(url, nullptr, dst, headers);
 }
 
+Status EasyCurl::FetchURL(const vector<string>& urls, faststring* dst,
+                          const vector<string>& headers) {
+  return DoRequest(urls, nullptr, dst, headers);
+}
+
 Status EasyCurl::PostToURL(const string& url,
                            const string& post_data,
                            faststring* dst,
                            const vector<string>& headers) {
   return DoRequest(url, &post_data, dst, headers);
+}
+
+Status EasyCurl::PostToURL(const vector<string>& urls,
+                           const string& post_data,
+                           faststring* dst,
+                           const vector<string>& headers) {
+  return DoRequest(urls, &post_data, dst, headers);
+}
+
+Status EasyCurl::DoRequest(const vector<string>& urls,
+                           const string* post_data,
+                           faststring* dst,
+                           const vector<string>& headers) {
+  DCHECK(!urls.empty());
+  Status s;
+  for (const auto& url : urls) {
+    s = DoRequest(url, post_data, dst, headers);
+    if (s.IsNetworkError() || s.IsTimedOut()) {
+      continue;
+    }
+    break;
+  }
+  return s;
 }
 
 Status EasyCurl::DoRequest(const string& url,
@@ -121,6 +154,9 @@ Status EasyCurl::DoRequest(const string& url,
   if (!verify_peer_) {
     CURL_RETURN_NOT_OK(curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0));
     CURL_RETURN_NOT_OK(curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0));
+  } else if (!FLAGS_trusted_certificate_file.empty()) {
+    CURL_RETURN_NOT_OK(curl_easy_setopt(curl_, CURLOPT_CAINFO,
+                                        FLAGS_trusted_certificate_file.c_str()));
   }
 
   switch (auth_type_) {

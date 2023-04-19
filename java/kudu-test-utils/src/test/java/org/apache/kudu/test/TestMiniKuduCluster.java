@@ -26,17 +26,24 @@ import static org.junit.Assert.fail;
 import java.io.IOException;
 import java.net.Socket;
 
+import com.google.protobuf.ByteString;
 import org.junit.Rule;
 import org.junit.Test;
 
+import org.apache.kudu.client.AsyncKuduClient;
+import org.apache.kudu.client.Client.AuthenticationCredentialsPB;
 import org.apache.kudu.client.HostAndPort;
 import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduClient.KuduClientBuilder;
 import org.apache.kudu.client.ListTablesResponse;
 import org.apache.kudu.client.TimeoutTracker;
+import org.apache.kudu.security.Token.JwtRawPB;
 import org.apache.kudu.test.cluster.FakeDNS;
 import org.apache.kudu.test.cluster.MiniKuduCluster;
+import org.apache.kudu.test.cluster.MiniKuduCluster.MiniKuduClusterBuilder;
 import org.apache.kudu.test.junit.RetryRule;
+import org.apache.kudu.tools.Tool.CreateClusterRequestPB.JwksOptionsPB;
+import org.apache.kudu.tools.Tool.CreateClusterRequestPB.MiniOidcOptionsPB;
 
 public class TestMiniKuduCluster {
 
@@ -46,6 +53,9 @@ public class TestMiniKuduCluster {
 
   @Rule
   public RetryRule retryRule = new RetryRule();
+
+  @Rule
+  public KuduTestHarness harness;
 
   @Test(timeout = 50000)
   public void test() throws Exception {
@@ -104,6 +114,36 @@ public class TestMiniKuduCluster {
         // Resuming master while it's not paused doesn't do anything.
         cluster.resumeTabletServer(tsHostPort);
       }
+    }
+  }
+
+  @Test(timeout = 50000)
+  public void testJwt() throws Exception {
+    try {
+      MiniKuduClusterBuilder clusterBuilder = new MiniKuduCluster.MiniKuduClusterBuilder()
+              .numMasterServers(NUM_MASTERS)
+              .numTabletServers(0)
+              .enableClientJwt()
+              .addJwks("account-id", true);
+
+      harness = new KuduTestHarness(clusterBuilder);
+      harness.before();
+      harness.startAllMasterServers();
+
+      String jwt = harness.createJwtFor("account-id", "subject", true);
+      assertNotNull(jwt);
+      AuthenticationCredentialsPB credentials = AuthenticationCredentialsPB.newBuilder()
+              .setJwt(JwtRawPB.newBuilder()
+                      .setJwtData(ByteString.copyFromUtf8(jwt))
+                      .build())
+              .build();
+
+      AsyncKuduClient c = harness.getAsyncClient();
+      c.importAuthenticationCredentials(credentials.toByteArray());
+      c.getTablesList();
+
+    } catch (Exception e) {
+      throw new RuntimeException(e);
     }
   }
 

@@ -57,6 +57,7 @@
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/kinit_context.h"
 #include "kudu/security/test/mini_kdc.h"
+#include "kudu/security/test/test_certs.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
@@ -512,28 +513,51 @@ void GetFullBinaryPath(string* binary) {
   (*binary) = JoinPathSegments(DirName(exe), *binary);
 }
 
+
 TEST_F(SecurityITest, TestJwtMiniCluster) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
   cluster_opts_.enable_kerberos = false;
   cluster_opts_.num_tablet_servers = 0;
   cluster_opts_.enable_client_jwt = true;
   MiniOidcOptions oidc_opts;
   const auto* const kValidAccount = "valid";
   const auto* const kInvalidAccount = "invalid";
+  const uint64_t kLifetimeMs = 5000;
   oidc_opts.account_ids = {
     { kValidAccount, true },
     { kInvalidAccount, false },
   };
+  oidc_opts.lifetime_ms = kLifetimeMs;
+
+  // Set up certificates for the JWKS server
+  string ca_certificate_file;
+  string private_key_file;
+  string certificate_file;
+  ASSERT_OK(kudu::security::CreateTestSSLCertWithChainSignedByRoot(GetTestDataDirectory(),
+                                                                   &certificate_file,
+                                                                   &private_key_file,
+                                                                   &ca_certificate_file));
+  // set the certs and private key for the jwks webserver
+  oidc_opts.private_key_file = private_key_file;
+  oidc_opts.server_certificate = certificate_file;
+  // set the ca_cert (jwks certificate verification is enabled by default)
+  cluster_opts_.extra_master_flags.push_back(Substitute("--trusted_certificate_file=$0",
+                                                        ca_certificate_file));
 
   cluster_opts_.mini_oidc_options = std::move(oidc_opts);
   ASSERT_OK(StartCluster());
   const auto* const kSubject = "kudu-user";
-  const auto configure_builder_for = [&] (const string& account_id, KuduClientBuilder* b) {
+  const auto configure_builder_for =
+      [&] (const string& account_id, KuduClientBuilder* b, const uint64_t delay_ms) {
     client::AuthenticationCredentialsPB pb;
     security::JwtRawPB jwt = security::JwtRawPB();
-    *jwt.mutable_jwt_data() = MiniOidc::CreateJwt(account_id, kSubject, true);
+    *jwt.mutable_jwt_data() = cluster_->oidc()->CreateJwt(account_id, kSubject, true);
     *pb.mutable_jwt() = std::move(jwt);
     string creds;
     CHECK(pb.SerializeToString(&creds));
+
+    SleepFor(MonoDelta::FromMilliseconds(delay_ms));
 
     for (auto i = 0; i < cluster_->num_masters(); ++i) {
       b->add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
@@ -545,7 +569,7 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
   {
     KuduClientBuilder valid_builder;
     shared_ptr<KuduClient> client;
-    configure_builder_for(kValidAccount, &valid_builder);
+    configure_builder_for(kValidAccount, &valid_builder, 0);
     ASSERT_OK(valid_builder.Build(&client));
     vector<string> tables;
     ASSERT_OK(client->ListTables(&tables));
@@ -553,10 +577,18 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
   {
     KuduClientBuilder invalid_builder;
     shared_ptr<KuduClient> client;
-    configure_builder_for(kInvalidAccount, &invalid_builder);
+    configure_builder_for(kInvalidAccount, &invalid_builder, 0);
     Status s = invalid_builder.Build(&client);
-    ASSERT_FALSE(s.ok()) << s.ToString();
+    ASSERT_TRUE(s.IsRuntimeError());
     ASSERT_STR_CONTAINS(s.ToString(), "FATAL_INVALID_JWT");
+  }
+  {
+    KuduClientBuilder timeout_builder;
+    shared_ptr<KuduClient> client;
+    configure_builder_for(kValidAccount, &timeout_builder, 3 * kLifetimeMs);
+    Status s = timeout_builder.Build(&client);
+    ASSERT_TRUE(s.IsRuntimeError());
+    ASSERT_STR_CONTAINS(s.ToString(), "token expired");
   }
   {
     KuduClientBuilder no_jwt_builder;
@@ -566,8 +598,118 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
     }
     no_jwt_builder.require_authentication(true);
     Status s = no_jwt_builder.Build(&client);
-    ASSERT_FALSE(s.ok()) << s.ToString();
+    ASSERT_TRUE(s. IsNotAuthorized());
     ASSERT_STR_CONTAINS(s.ToString(), "Not authorized");
+  }
+}
+
+TEST_F(SecurityITest, TestJwtMiniClusterWithInvalidCert) {
+  cluster_opts_.enable_kerberos = false;
+  cluster_opts_.num_tablet_servers = 0;
+  cluster_opts_.enable_client_jwt = true;
+  MiniOidcOptions oidc_opts;
+  const auto* const kValidAccount = "valid";
+  const uint64_t kLifetimeMs = 5000;
+  oidc_opts.account_ids = {
+    { kValidAccount, true }
+  };
+  oidc_opts.lifetime_ms = kLifetimeMs;
+  const auto* const kSubject = "kudu-user";
+
+  // Set up certificates for the JWKS server
+  string ca_certificate_file;
+  string private_key_file;
+  string certificate_file;
+
+  ASSERT_OK(kudu::security::CreateTestSSLExpiredCertWithChainSignedByRoot(GetTestDataDirectory(),
+                                                                   &certificate_file,
+                                                                   &private_key_file,
+                                                                   &ca_certificate_file));
+
+  // set the certs and private key for the jwks webserver
+  oidc_opts.private_key_file = private_key_file;
+  oidc_opts.server_certificate = certificate_file;
+  // set the ca_cert (jwks certificate verification is enabled by default)
+  cluster_opts_.extra_master_flags.push_back(Substitute("--trusted_certificate_file=$0",
+                                                        ca_certificate_file));
+
+  cluster_opts_.mini_oidc_options = std::move(oidc_opts);
+  ASSERT_OK(StartCluster());
+
+  {
+    KuduClientBuilder client_builder;
+    client::AuthenticationCredentialsPB pb;
+    security::JwtRawPB jwt = security::JwtRawPB();
+    *jwt.mutable_jwt_data() = cluster_->oidc()->CreateJwt(kValidAccount, kSubject, true);
+    *pb.mutable_jwt() = std::move(jwt);
+    string creds;
+    CHECK(pb.SerializeToString(&creds));
+
+    for (auto i = 0; i < cluster_->num_masters(); ++i) {
+      client_builder.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
+    }
+    client_builder.import_authentication_credentials(creds);
+    client_builder.require_authentication(true);
+
+    shared_ptr<KuduClient> client;
+
+    Status s = client_builder.Build(&client);
+    ASSERT_FALSE(s.ok());
+    ASSERT_TRUE(s.IsRuntimeError());
+    ASSERT_STR_CONTAINS(s.ToString(), "Error initializing JWT helper: Failed to load JWKS");
+  }
+}
+
+TEST_F(SecurityITest, TestJwtMiniClusterWithUntrustedCert) {
+  cluster_opts_.enable_kerberos = false;
+  cluster_opts_.num_tablet_servers = 0;
+  cluster_opts_.enable_client_jwt = true;
+  MiniOidcOptions oidc_opts;
+  const auto* const kValidAccount = "valid";
+  const uint64_t kLifetimeMs = 5000;
+  oidc_opts.account_ids = {
+    { kValidAccount, true }
+  };
+  oidc_opts.lifetime_ms = kLifetimeMs;
+  const auto* const kSubject = "kudu-user";
+
+  // Set up certificates for the JWKS server
+  string ca_certificate_file;
+  string private_key_file;
+  string certificate_file;
+  ASSERT_OK(kudu::security::CreateTestSSLCertWithChainSignedByRoot(GetTestDataDirectory(),
+                                                                   &certificate_file,
+                                                                   &private_key_file,
+                                                                   &ca_certificate_file));
+  // set the certs and private key for the jwks webserver
+  // jwks certificate verification is enabled by default, so we won't have to set it
+  oidc_opts.private_key_file = private_key_file;
+  oidc_opts.server_certificate = certificate_file;
+
+  cluster_opts_.mini_oidc_options = std::move(oidc_opts);
+  ASSERT_OK(StartCluster());
+
+  {
+    KuduClientBuilder client_builder;
+    client::AuthenticationCredentialsPB pb;
+    security::JwtRawPB jwt = security::JwtRawPB();
+    *jwt.mutable_jwt_data() = cluster_->oidc()->CreateJwt(kValidAccount, kSubject, true);
+    *pb.mutable_jwt() = std::move(jwt);
+    string creds;
+    CHECK(pb.SerializeToString(&creds));
+
+    for (auto i = 0; i < cluster_->num_masters(); ++i) {
+      client_builder.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
+    }
+    client_builder.import_authentication_credentials(creds);
+    client_builder.require_authentication(true);
+
+    shared_ptr<KuduClient> client;
+
+    Status s = client_builder.Build(&client);
+    ASSERT_FALSE(s.ok());
+    ASSERT_TRUE(s.IsRuntimeError());
+    ASSERT_STR_CONTAINS(s.ToString(), "Error initializing JWT helper: Failed to load JWKS");
   }
 }
 

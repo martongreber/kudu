@@ -82,6 +82,10 @@ namespace log {
 class LogAnchorRegistry;
 } // namespace log
 
+namespace tserver {
+class TabletServerTest_SetEncodedKeysWhenStartingUp_Test;
+} // namespace tserver
+
 namespace tablet {
 
 class AlterSchemaOpState;
@@ -129,6 +133,10 @@ class Tablet {
   // Upon completion, the tablet enters the kBootstrapping state.
   Status Open(const std::unordered_set<int64_t>& in_flight_txn_ids = std::unordered_set<int64_t>{},
               const std::unordered_set<int64_t>& txn_ids_with_mrs = std::unordered_set<int64_t>{});
+
+  // Update the auto incrementing counter of the tablet
+  // if the tablet has the auto incrementing column in the schema.
+  Status UpdateAutoIncrementingCounter(const RowSetVector& rowsets_opened);
 
   // Mark that the tablet has finished bootstrapping.
   // This transitions from kBootstrapping to kOpen state.
@@ -558,6 +566,7 @@ class Tablet {
   FRIEND_TEST(TestTabletStringKey, TestSplitKeyRangeWithNonOverlappingRowSets);
   FRIEND_TEST(TestTabletStringKey, TestSplitKeyRangeWithMinimumValueRowSet);
   FRIEND_TEST(TxnParticipantTest, TestFlushMultipleMRSs);
+  FRIEND_TEST(tserver::TabletServerTest, SetEncodedKeysWhenStartingUp);
 
   // Lifecycle states that a Tablet can be in. Legal state transitions for a
   // Tablet object:

@@ -84,6 +84,10 @@
 #include "kudu/util/subprocess.h"
 #include "kudu/util/test_util.h"
 
+namespace kudu {
+class JwtVerifier;
+}  // namespace kudu
+
 using kudu::client::internal::ConnectToClusterRpc;
 #if !defined(NO_CHRONY)
 using kudu::clock::MiniChronyd;
@@ -269,11 +273,16 @@ Status ExternalMiniCluster::Start() {
   gflags::FlagSaver saver;
   FLAGS_dns_addr_resolution_override = dns_overrides_;
 
-  std::shared_ptr<PerAccountKeyBasedJwtVerifier> jwt_verifier = nullptr;
+  std::shared_ptr<JwtVerifier> jwt_verifier = nullptr;
   if (opts_.enable_client_jwt) {
     oidc_.reset(new MiniOidc(opts_.mini_oidc_options));
+    // Set up certificates for the JWKS server
     RETURN_NOT_OK_PREPEND(oidc_->Start(), "Failed to start OIDC endpoints");
-    jwt_verifier = std::make_shared<PerAccountKeyBasedJwtVerifier>(oidc_->url());
+    jwt_verifier =
+        std::make_shared<PerAccountKeyBasedJwtVerifier>(oidc_->url(),
+                                                        true,
+                                                        opts_.mini_oidc_options.server_certificate);
+
   }
 
   RETURN_NOT_OK_PREPEND(

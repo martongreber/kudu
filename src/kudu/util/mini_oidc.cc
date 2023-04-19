@@ -16,12 +16,14 @@
 // under the License.
 #include "kudu/util/mini_oidc.h"
 
+#include <chrono>
 #include <functional>
 #include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
 #include <jwt-cpp/jwt.h>
 #include <jwt-cpp/traits/kazuho-picojson/defaults.h>
 #include <jwt-cpp/traits/kazuho-picojson/traits.h>
@@ -74,12 +76,12 @@ void OidcDiscoveryHandler(const Webserver::WebRequest& req,
     resp->status_code = HttpStatusCode::BadRequest;
     return;
   }
-  resp->output << Substitute(kDiscoveryFormat, *account_id,
-                             Substitute("$0/$1", jwks_server_url, *account_id));
+  resp->output << Substitute(
+      kDiscoveryFormat, *account_id, Substitute("$0/$1", jwks_server_url, *account_id));
   resp->status_code = HttpStatusCode::Ok;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 MiniOidc::MiniOidc(MiniOidcOptions options) : options_(std::move(options)) {
   if (options_.lifetime_ms == 0) {
@@ -99,44 +101,69 @@ Status MiniOidc::Start() {
   // we've been configured to server.
   WebserverOptions jwks_opts;
   jwks_opts.port = 0;
+  jwks_opts.bind_interface = "localhost";
+  jwks_opts.certificate_file = options_.server_certificate;
+  jwks_opts.private_key_file = options_.private_key_file;
+
   jwks_server_.reset(new Webserver(jwks_opts));
 
   for (const auto& [account_id, valid] : options_.account_ids) {
-    jwks_server_->RegisterPrerenderedPathHandler(Substitute("/jwks/$0", account_id), account_id,
-        [account_id = account_id, valid = valid] (const Webserver::WebRequest&  /*req*/,
-                                                  Webserver::PrerenderedWebResponse* resp) {
+    jwks_server_->RegisterPrerenderedPathHandler(
+        Substitute("/jwks/$0", account_id),
+        account_id,
+        [account_id = account_id, valid = valid](const Webserver::WebRequest&  /*req*/,
+                                                 Webserver::PrerenderedWebResponse* resp) {
           // NOTE: 'kKid1' points at a valid key, while 'kKid2' points at an
           // invalid key.
-          resp->output << Substitute(kJwksRsaFileFormat, kKid1, "RS256",
-              valid ? kRsaPubKeyJwkN : kRsaInvalidPubKeyJwkN,
-              kRsaPubKeyJwkE, kKid2, "RS256", kRsaInvalidPubKeyJwkN, kRsaPubKeyJwkE),
-          resp->status_code = HttpStatusCode::Ok;
+          resp->output << Substitute(kJwksRsaFileFormat, kKid1,
+                                     "RS256",
+                                     valid ? kRsaPubKeyJwkN : kRsaInvalidPubKeyJwkN,
+                                     kRsaPubKeyJwkE, kKid2,
+                                     "RS256",
+                                     kRsaInvalidPubKeyJwkN, kRsaPubKeyJwkE),
+              resp->status_code = HttpStatusCode::Ok;
         },
-        /*is_styled*/false, /*is_on_nav_bar*/false);
+        /*is_styled*/ false,
+        /*is_on_nav_bar*/ false);
   }
+  LOG(INFO) << "Starting JWKS server";
   RETURN_NOT_OK(jwks_server_->Start());
-  vector<Sockaddr> bound_addrs;
+  vector<Sockaddr> advertised_addrs;
   Sockaddr addr;
-  RETURN_NOT_OK(jwks_server_->GetBoundAddresses(&bound_addrs));
-  RETURN_NOT_OK(addr.ParseString(bound_addrs[0].host(), bound_addrs[0].port()));
-  const string jwks_url = Substitute("http://$0/jwks", addr.ToString());
+  RETURN_NOT_OK(jwks_server_->GetAdvertisedAddresses(&advertised_addrs));
+  // calling ParseString() to verify the address components
+  RETURN_NOT_OK(addr.ParseString(advertised_addrs[0].host(), advertised_addrs[0].port()));
+  string protocol = "https";
+  if (jwks_opts.certificate_file.empty() && jwks_opts.password_file.empty()) {
+    protocol = "http";
+  }
+
+  const string jwks_url = Substitute("$0://localhost:$1/jwks",
+                                     protocol,
+                                     advertised_addrs[0].port());
 
   // Now start the OIDC Discovery server that points to the JWKS endpoints.
   WebserverOptions oidc_opts;
   oidc_opts.port = 0;
+  oidc_opts.bind_interface = "localhost";
   oidc_server_.reset(new Webserver(oidc_opts));
   oidc_server_->RegisterPrerenderedPathHandler(
-      "/.well-known/openid-configuration", "openid-configuration",
+      "/.well-known/openid-configuration",
+      "openid-configuration",
       // Pass the 'accountId' query arguments to return a response that
       // points to the JWKS endpoint for the account.
-      [jwks_url] (const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+      [jwks_url](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
         OidcDiscoveryHandler(req, resp, jwks_url);
       },
-      /*is_styled*/false, /*is_on_nav_bar*/false);
+      /*is_styled*/ false,
+      /*is_on_nav_bar*/ false);
+
+  LOG(INFO) << "Starting OIDC Discovery server";
   RETURN_NOT_OK(oidc_server_->Start());
-  bound_addrs.clear();
-  RETURN_NOT_OK(oidc_server_->GetBoundAddresses(&bound_addrs));
-  RETURN_NOT_OK(addr.ParseString(bound_addrs[0].host(), bound_addrs[0].port()));
+  advertised_addrs.clear();
+  RETURN_NOT_OK(oidc_server_->GetAdvertisedAddresses(&advertised_addrs));
+  // calling ParseString() to verify the address components
+  RETURN_NOT_OK(addr.ParseString(advertised_addrs[0].host(), advertised_addrs[0].port()));
   oidc_url_ = Substitute("http://$0/.well-known/openid-configuration", addr.ToString());
   return Status::OK();
 }
@@ -151,13 +178,17 @@ void MiniOidc::Stop() {
 }
 
 string MiniOidc::CreateJwt(const string& account_id, const string& subject, bool is_valid) {
- return jwt::create()
-     .set_issuer(Substitute("auth0/$0", account_id))
-     .set_type("JWT")
-     .set_algorithm("RS256")
-     .set_key_id(is_valid ? kKid1 : kKid2)
-     .set_subject(subject)
-     .sign(jwt::algorithm::rs256(kRsaPubKeyPem, kRsaPrivKeyPem, "", ""));
+  auto lifetime = std::chrono::milliseconds(options_.lifetime_ms);
+
+  return jwt::create()
+      .set_issuer(Substitute("auth0/$0", account_id))
+      .set_type("JWT")
+      .set_algorithm("RS256")
+      .set_key_id(is_valid ? kKid1 : kKid2)
+      .set_subject(subject)
+      .set_not_before(std::chrono::system_clock::now())
+      .set_expires_at(std::chrono::system_clock::now() + lifetime)
+      .sign(jwt::algorithm::rs256(kRsaPubKeyPem, kRsaPrivKeyPem, "", ""));
 }
 
-} // namespace kudu
+}  // namespace kudu

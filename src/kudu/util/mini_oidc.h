@@ -39,6 +39,13 @@ struct MiniOidcOptions {
 
   // Maps account IDs to add to whether or not to create JWKS with invalid keys.
   std::unordered_map<std::string, bool> account_ids;
+
+  // String that contains the server_certificate that is used to establish secure
+  // https connection to the JWKS server.
+  std::string server_certificate;
+
+  // The private key belonging to the server certificate
+  std::string private_key_file;
 };
 
 // Serves the following endpoints for testing a cluster:
@@ -74,9 +81,9 @@ class MiniOidc {
 
   // Creates a JWT with the given `account_id` and `subject`. If `is_valid` is set to false, the
   // created token will be invalid.
-  static std::string CreateJwt(const std::string& account_id,
-                               const std::string& subject,
-                               bool is_valid);
+  std::string CreateJwt(const std::string& account_id,
+                        const std::string& subject,
+                        bool is_valid);
   const std::string& url() const {
     return oidc_url_;
   }

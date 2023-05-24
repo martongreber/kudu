@@ -55,6 +55,7 @@
 #include "kudu/ranger-kms/mini_ranger_kms.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/security/cert.h"
 #include "kudu/security/kinit_context.h"
 #include "kudu/security/test/mini_kdc.h"
 #include "kudu/security/test/test_certs.h"
@@ -66,11 +67,14 @@
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_service.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/curl_util.h"
 #include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/mini_oidc.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
@@ -80,6 +84,7 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+DECLARE_bool(jwt_client_require_trusted_tls_cert);
 DECLARE_string(local_ip_for_outbound_sockets);
 
 using kudu::client::KuduClient;
@@ -94,6 +99,8 @@ using kudu::client::sp::shared_ptr;
 using kudu::cluster::ExternalMiniCluster;
 using kudu::cluster::ExternalMiniClusterOptions;
 using kudu::rpc::Messenger;
+using kudu::security::CreateTestSSLCertWithChainSignedByRoot;
+using kudu::security::CreateTestSSLExpiredCertWithChainSignedByRoot;
 using std::get;
 using std::string;
 using std::tuple;
@@ -197,8 +204,25 @@ class SecurityITest : public KuduTest {
     return proxy.Checksum(req, &resp, &rpc);
   }
 
+  // Retrieve the cluster's IPKI certificate. Effectively, this waits until
+  // the catalog manager is initialized and has the IPKI CA ready to process
+  // requests to the /ipki-ca-cert HTTP endpoint. This also allows to have
+  // the master's TLS certificate used for RPC signed with the IPKI CA,
+  // so it will list the JWT authentication mechanism as available.
+  Status FetchClusterCACert(string* ca_cert_pem) {
+    int leader_idx;
+    RETURN_NOT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+    const auto& http_hp = cluster_->master(leader_idx)->bound_http_hostport();
+    string url = Substitute("http://$0/ipki-ca-cert", http_hp.ToString());
+    EasyCurl curl;
+    faststring dst;
+    auto res = curl.FetchURL(url, &dst);
+    *ca_cert_pem = dst.ToString();
+    return res;
+  }
+
  private:
-  std::shared_ptr<Messenger> NewMessengerOrDie() {
+  static std::shared_ptr<Messenger> NewMessengerOrDie() {
     std::shared_ptr<Messenger> messenger;
     CHECK_OK(rpc::MessengerBuilder("test-messenger")
              .set_num_reactors(1)
@@ -513,13 +537,13 @@ void GetFullBinaryPath(string* binary) {
   (*binary) = JoinPathSegments(DirName(exe), *binary);
 }
 
-
 TEST_F(SecurityITest, TestJwtMiniCluster) {
   SKIP_IF_SLOW_NOT_ALLOWED();
 
   cluster_opts_.enable_kerberos = false;
   cluster_opts_.num_tablet_servers = 0;
   cluster_opts_.enable_client_jwt = true;
+
   MiniOidcOptions oidc_opts;
   const auto* const kValidAccount = "valid";
   const auto* const kInvalidAccount = "invalid";
@@ -534,10 +558,10 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
   string ca_certificate_file;
   string private_key_file;
   string certificate_file;
-  ASSERT_OK(kudu::security::CreateTestSSLCertWithChainSignedByRoot(GetTestDataDirectory(),
-                                                                   &certificate_file,
-                                                                   &private_key_file,
-                                                                   &ca_certificate_file));
+  ASSERT_OK(CreateTestSSLCertWithChainSignedByRoot(GetTestDataDirectory(),
+                                                   &certificate_file,
+                                                   &private_key_file,
+                                                   &ca_certificate_file));
   // set the certs and private key for the jwks webserver
   oidc_opts.private_key_file = private_key_file;
   oidc_opts.server_certificate = certificate_file;
@@ -547,6 +571,13 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
 
   cluster_opts_.mini_oidc_options = std::move(oidc_opts);
   ASSERT_OK(StartCluster());
+
+  string cluster_cert_pem;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(FetchClusterCACert(&cluster_cert_pem));
+  });
+  ASSERT_FALSE(cluster_cert_pem.empty());
+
   const auto* const kSubject = "kudu-user";
   const auto configure_builder_for =
       [&] (const string& account_id, KuduClientBuilder* b, const uint64_t delay_ms) {
@@ -555,10 +586,12 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
     }
     b->jwt(cluster_->oidc()->CreateJwt(account_id, kSubject, true));
     b->require_authentication(true);
+    b->trusted_certificate(cluster_cert_pem);
     SleepFor(MonoDelta::FromMilliseconds(delay_ms));
   };
 
   {
+    SCOPED_TRACE("Valid JWT");
     KuduClientBuilder valid_builder;
     shared_ptr<KuduClient> client;
     configure_builder_for(kValidAccount, &valid_builder, 0);
@@ -567,6 +600,7 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
     ASSERT_OK(client->ListTables(&tables));
   }
   {
+    SCOPED_TRACE("Invalid JWT");
     KuduClientBuilder invalid_builder;
     shared_ptr<KuduClient> client;
     configure_builder_for(kInvalidAccount, &invalid_builder, 0);
@@ -575,6 +609,7 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
     ASSERT_STR_CONTAINS(s.ToString(), "FATAL_INVALID_JWT");
   }
   {
+    SCOPED_TRACE("Expired JWT");
     KuduClientBuilder timeout_builder;
     shared_ptr<KuduClient> client;
     configure_builder_for(kValidAccount, &timeout_builder, 3 * kLifetimeMs);
@@ -583,6 +618,7 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
     ASSERT_STR_CONTAINS(s.ToString(), "token expired");
   }
   {
+    SCOPED_TRACE("No JWT provided");
     KuduClientBuilder no_jwt_builder;
     shared_ptr<KuduClient> client;
     for (auto i = 0; i < cluster_->num_masters(); ++i) {
@@ -592,6 +628,43 @@ TEST_F(SecurityITest, TestJwtMiniCluster) {
     Status s = no_jwt_builder.Build(&client);
     ASSERT_TRUE(s. IsNotAuthorized()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(), "Not authorized");
+  }
+  {
+    SCOPED_TRACE("Valid JWT but client does not trust master's TLS cert");
+    KuduClientBuilder cb;
+    for (auto i = 0; i < cluster_->num_masters(); ++i) {
+      cb.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
+    }
+    cb.jwt(cluster_->oidc()->CreateJwt(kValidAccount, kSubject, true));
+    cb.require_authentication(true);
+
+    shared_ptr<KuduClient> client;
+    auto s = cb.Build(&client);
+    ASSERT_TRUE(s. IsNotAuthorized()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+        "client requires authentication, but server does not have");
+  }
+  {
+    SCOPED_TRACE("Valid JWT with relaxed requirements for server's TLS cert");
+    KuduClientBuilder cb;
+    for (auto i = 0; i < cluster_->num_masters(); ++i) {
+      cb.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
+    }
+    cb.jwt(cluster_->oidc()->CreateJwt(kValidAccount, kSubject, true));
+    cb.require_authentication(true);
+
+    // If not adding the CA certificate that Kudu RPC server certificates are
+    // signed with, in simplified test scenarios it's possible to relax the
+    // requirements at the client side of the Kudu RPC connection negotiation
+    // protocol. With --jwt_client_require_trusted_tls_cert=false, the client
+    // does not verify the server's TLS certificate before sending its JWT
+    // to the server for authentication.
+    FLAGS_jwt_client_require_trusted_tls_cert = false;
+
+    shared_ptr<KuduClient> client;
+    ASSERT_OK(cb.Build(&client));
+    vector<string> tables;
+    ASSERT_OK(client->ListTables(&tables));
   }
 }
 
@@ -610,13 +683,13 @@ TEST_F(SecurityITest, TestJwtMiniClusterWithInvalidCert) {
 
   // Set up certificates for the JWKS server
   string ca_certificate_file;
-  string private_key_file;
   string certificate_file;
-
-  ASSERT_OK(kudu::security::CreateTestSSLExpiredCertWithChainSignedByRoot(GetTestDataDirectory(),
-                                                                   &certificate_file,
-                                                                   &private_key_file,
-                                                                   &ca_certificate_file));
+  string private_key_file;
+  ASSERT_OK(CreateTestSSLExpiredCertWithChainSignedByRoot(
+      GetTestDataDirectory(),
+      &certificate_file,
+      &private_key_file,
+      &ca_certificate_file));
 
   // set the certs and private key for the jwks webserver
   oidc_opts.private_key_file = private_key_file;
@@ -628,11 +701,18 @@ TEST_F(SecurityITest, TestJwtMiniClusterWithInvalidCert) {
   cluster_opts_.mini_oidc_options = std::move(oidc_opts);
   ASSERT_OK(StartCluster());
 
+  string cluster_cert_pem;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(FetchClusterCACert(&cluster_cert_pem));
+  });
+  ASSERT_FALSE(cluster_cert_pem.empty());
+
   KuduClientBuilder client_builder;
   for (auto i = 0; i < cluster_->num_masters(); ++i) {
     client_builder.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
   }
   client_builder.jwt(cluster_->oidc()->CreateJwt(kValidAccount, kSubject, true));
+  client_builder.trusted_certificate(cluster_cert_pem);
   client_builder.require_authentication(true);
 
   shared_ptr<KuduClient> client;
@@ -658,10 +738,10 @@ TEST_F(SecurityITest, TestJwtMiniClusterWithUntrustedCert) {
   string ca_certificate_file;
   string private_key_file;
   string certificate_file;
-  ASSERT_OK(kudu::security::CreateTestSSLCertWithChainSignedByRoot(GetTestDataDirectory(),
-                                                                   &certificate_file,
-                                                                   &private_key_file,
-                                                                   &ca_certificate_file));
+  ASSERT_OK(CreateTestSSLCertWithChainSignedByRoot(GetTestDataDirectory(),
+                                                   &certificate_file,
+                                                   &private_key_file,
+                                                   &ca_certificate_file));
   // set the certs and private key for the jwks webserver
   // jwks certificate verification is enabled by default, so we won't have to set it
   oidc_opts.private_key_file = private_key_file;
@@ -670,11 +750,18 @@ TEST_F(SecurityITest, TestJwtMiniClusterWithUntrustedCert) {
   cluster_opts_.mini_oidc_options = std::move(oidc_opts);
   ASSERT_OK(StartCluster());
 
+  string cluster_cert_pem;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(FetchClusterCACert(&cluster_cert_pem));
+  });
+  ASSERT_FALSE(cluster_cert_pem.empty());
+
   KuduClientBuilder client_builder;
   for (auto i = 0; i < cluster_->num_masters(); ++i) {
     client_builder.add_master_server_addr(cluster_->master(i)->bound_rpc_addr().ToString());
   }
   client_builder.jwt(cluster_->oidc()->CreateJwt(kValidAccount, kSubject, true));
+  client_builder.trusted_certificate(cluster_cert_pem);
   client_builder.require_authentication(true);
 
   shared_ptr<KuduClient> client;
@@ -890,6 +977,95 @@ TEST_F(SecurityITest, TestEncryptionWithKMSIntegrationMultipleServers) {
   KuduClientBuilder b;
   ASSERT_OK(cluster_->CreateClient(&b, &client));
   SmokeTestCluster(client, /*transactional=*/false);
+}
+
+TEST_F(SecurityITest, IPKICACert) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  // Need to test the functionality for both leader and follower masters.
+  cluster_opts_.num_masters = 3;
+  // No need to involve tablet servers in this scenario.
+  cluster_opts_.num_tablet_servers = 0;
+
+  ASSERT_OK(StartCluster());
+
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+
+  string authn_creds;
+  ASSERT_OK(client->ExportAuthenticationCredentials(&authn_creds));
+  client::AuthenticationCredentialsPB pb;
+  ASSERT_TRUE(pb.ParseFromString(authn_creds));
+  ASSERT_EQ(1, pb.ca_cert_ders_size());
+
+  security::Cert ca_cert_client;
+  ASSERT_OK(ca_cert_client.FromString(pb.ca_cert_ders(0),
+                                      security::DataFormat::DER));
+  string ca_cert_client_pem;
+  ASSERT_OK(ca_cert_client.ToString(&ca_cert_client_pem,
+                                    security::DataFormat::PEM));
+
+  const auto fetch_ipki_ca = [c = cluster_.get()](int master_idx, string* out) {
+    const auto& http_hp = c->master(master_idx)->bound_http_hostport();
+    string url = Substitute("http://$0/ipki-ca-cert", http_hp.ToString());
+    EasyCurl curl;
+    faststring dst;
+    auto res = curl.FetchURL(url, &dst);
+    *out = dst.ToString();
+    return res;
+  };
+
+  int leader_master_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_master_idx));
+  string str;
+  ASSERT_OK(fetch_ipki_ca(leader_master_idx, &str));
+  security::Cert ca_cert;
+  ASSERT_OK(ca_cert.FromString(str, security::DataFormat::PEM));
+
+  // Using (string --> security::Cert --> string) conversion chain to compare
+  // canonical representations of the CA certificates in PEM format.
+  string ca_cert_str;
+  ASSERT_OK(ca_cert.ToString(&ca_cert_str, security::DataFormat::PEM));
+  ASSERT_EQ(ca_cert_client_pem, ca_cert_str);
+
+  const auto count_valid_certs = [&](size_t* res) {
+    size_t count = 0;
+    for (auto i = 0; i < cluster_->num_masters(); ++i) {
+      string str;
+      auto s = fetch_ipki_ca(i, &str);
+      ASSERT_TRUE(s.ok() || s.IsRemoteError());
+      if (s.IsRemoteError()) {
+        // If there wasn't a CA cert in the output, there should had been
+        // an error reported.
+        ASSERT_NE(string::npos, str.find("ERROR: "));
+        continue;
+      }
+      security::Cert ca_cert;
+      ASSERT_OK(ca_cert.FromString(str, security::DataFormat::PEM));
+
+      string ca_cert_str;
+      ASSERT_OK(ca_cert.ToString(&ca_cert_str, security::DataFormat::PEM));
+      ASSERT_EQ(ca_cert_client_pem, ca_cert_str);
+      ++count;
+    }
+    *res = count;
+  };
+
+  // The IPKI has been certainly initialized at leader master since the client
+  // was able to successfully connect to the cluster (see above).
+  {
+    size_t count = 0;
+    NO_FATALS(count_valid_certs(&count));
+    ASSERT_GE(count, 1);
+  }
+
+  // At some point, all the followers should have loaded the CA information
+  // generated by the leader master upon the very first startup.
+  ASSERT_EVENTUALLY([&] {
+    size_t count = 0;
+    NO_FATALS(count_valid_certs(&count));
+    ASSERT_EQ(cluster_opts_.num_masters, count);
+  });
 }
 
 class EncryptionPolicyTest :

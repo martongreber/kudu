@@ -30,6 +30,11 @@ from kudu.schema import (Schema,
 import kudu
 import datetime
 from pytz import utc
+try:
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+except ImportError:
+    from urllib2 import Request, HTTPError, urlopen
 
 
 class TestClient(KuduTestBase, CompatUnitTest):
@@ -896,16 +901,42 @@ class TestAuthAndEncription(KuduTestBase, CompatUnitTest):
 
 class TestJwt(KuduTestBase, CompatUnitTest):
     def test_jwt(self):
-        jwt = self.get_jwt(valid=True)
-        client = kudu.connect(self.master_hosts, self.master_ports,
-                              require_authentication=True, jwt=jwt)
+        certs=[]
+        for hp in self.master_http_hostports:
+            req = Request("http://{0}/ipki-ca-cert".format(hp))
+            try:
+                resp = urlopen(req)
+                certs.append(resp.read())
+                break
+            except HTTPError as e:
+                if e.code == 503:
+                    continue
+                else:
+                    raise
 
+        self.assertNotEqual(0, len(certs))
+
+        # A sub-case of valid JWT: the client should be able to successfully
+        # connect to the cluster.
+        jwt = self.get_jwt(valid=True)
+        client = kudu.connect(self.master_hosts,
+                              self.master_ports,
+                              require_authentication=True,
+                              jwt=jwt,
+                              trusted_certificates=certs)
+
+        # A sub-case of invalid JWT: the client should fail connecting to the
+        # cluster, and the error message should contain corresponding details
+        # on JWT authentication failure.
         jwt = self.get_jwt(valid=False)
         error_msg = ('FATAL_INVALID_JWT: Not authorized: JWT verification failed: ' +
         'failed to verify signature: VerifyFinal failed')
         with self.assertRaisesRegex(kudu.KuduBadStatus, error_msg):
-            client = kudu.connect(self.master_hosts, self.master_ports,
-                              require_authentication=True, jwt=jwt)
+            client = kudu.connect(self.master_hosts,
+                                  self.master_ports,
+                                  require_authentication=True,
+                                  jwt=jwt,
+                                  trusted_certificates=certs)
 
 class TestMonoDelta(CompatUnitTest):
 

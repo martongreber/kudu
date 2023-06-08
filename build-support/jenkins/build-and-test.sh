@@ -102,6 +102,9 @@
 #     By default this is set the PARALLEL described above.
 #     This value can be important to set on resource constrained machines
 #     running some of the more intense long running integration tests.
+#
+#  ENABLE_CPP_TESTS  Default: 1
+#     Enable running C++ tests.
 
 if [ "$KUDU_ALLOW_SKIPPED_TESTS" == "1" ]; then
   # If the commit only contains changes that do not impact the build or tests, exit immediately.
@@ -165,6 +168,7 @@ BUILD_GRADLE=${BUILD_GRADLE:-1}
 BUILD_PYTHON=${BUILD_PYTHON:-1}
 BUILD_PYTHON3=${BUILD_PYTHON3:-1}
 ERROR_ON_TEST_FAILURE=${ERROR_ON_TEST_FAILURE:-1}
+ENABLE_CPP_TESTS=${ENABLE_CPP_TESTS:-1}
 
 # Ensure that the test data directory is usable.
 mkdir -p "$TEST_TMPDIR"
@@ -495,40 +499,42 @@ TESTS_FAILED=0
 EXIT_STATUS=0
 FAILURES=""
 
-# If we're running distributed C++ tests, submit them asynchronously while
-# we run any local tests.
-if [ "$ENABLE_DIST_TEST" == "1" ]; then
-  echo
-  echo Submitting C++ distributed-test job.
-  echo ------------------------------------------------------------
-  # dist-test uses DIST_TEST_JOB_PATH to define where to output it's id file.
-  export DIST_TEST_JOB_PATH=$BUILD_ROOT/c-dist-test-job-id
-  rm -f $DIST_TEST_JOB_PATH
-  if ! $SOURCE_ROOT/build-support/dist_test.py --no-wait run ; then
-    EXIT_STATUS=1
-    FAILURES="$FAILURES"$'Could not submit C++ distributed test job\n'
+if [ "$ENABLE_CPP_TEST" == "1" ]; then
+  # If we're running distributed C++ tests, submit them asynchronously while
+  # we run any local tests.
+  if [ "$ENABLE_DIST_TEST" == "1" ]; then
+    echo
+    echo Submitting C++ distributed-test job.
+    echo ------------------------------------------------------------
+    # dist-test uses DIST_TEST_JOB_PATH to define where to output it's id file.
+    export DIST_TEST_JOB_PATH=$BUILD_ROOT/c-dist-test-job-id
+    rm -f $DIST_TEST_JOB_PATH
+    if ! $SOURCE_ROOT/build-support/dist_test.py --no-wait run ; then
+      EXIT_STATUS=1
+      FAILURES="$FAILURES"$'Could not submit C++ distributed test job\n'
+    fi
+    # Still need to run a few non-dist-test-capable tests locally.
+    EXTRA_TEST_FLAGS="$EXTRA_TEST_FLAGS -L no_dist_test"
   fi
-  # Still need to run a few non-dist-test-capable tests locally.
-  EXTRA_TEST_FLAGS="$EXTRA_TEST_FLAGS -L no_dist_test"
-fi
 
-if ! $THIRDPARTY_BIN/ctest -j$PARALLEL_TESTS $EXTRA_TEST_FLAGS ; then
-  TESTS_FAILED=1
-  FAILURES="$FAILURES"$'C++ tests failed\n'
-fi
+  if ! $THIRDPARTY_BIN/ctest -j$PARALLEL_TESTS $EXTRA_TEST_FLAGS ; then
+    TESTS_FAILED=1
+    FAILURES="$FAILURES"$'C++ tests failed\n'
+  fi
 
-if [ "$DO_COVERAGE" == "1" ]; then
-  echo
-  echo Generating coverage report...
-  echo ------------------------------------------------------------
-  if ! $THIRDPARTY_DIR/installed/common/bin/gcovr \
-      -r $SOURCE_ROOT \
-      --gcov-filter='.*src#kudu.*' \
-      --gcov-executable=$SOURCE_ROOT/build-support/llvm-gcov-wrapper \
-      --xml \
-      > $BUILD_ROOT/coverage.xml ; then
-    EXIT_STATUS=1
-    FAILURES="$FAILURES"$'Coverage report failed\n'
+  if [ "$DO_COVERAGE" == "1" ]; then
+    echo
+    echo Generating coverage report...
+    echo ------------------------------------------------------------
+    if ! $THIRDPARTY_DIR/installed/common/bin/gcovr \
+        -r $SOURCE_ROOT \
+        --gcov-filter='.*src#kudu.*' \
+        --gcov-executable=$SOURCE_ROOT/build-support/llvm-gcov-wrapper \
+        --xml \
+        > $BUILD_ROOT/coverage.xml ; then
+      EXIT_STATUS=1
+      FAILURES="$FAILURES"$'Coverage report failed\n'
+    fi
   fi
 fi
 
@@ -753,24 +759,26 @@ fi
 
 # If we submitted the tasks earlier, go fetch the results now
 if [ "$ENABLE_DIST_TEST" == "1" ]; then
-  echo
-  echo Fetching previously submitted C++ dist-test results...
-  echo ------------------------------------------------------------
-  C_DIST_TEST_ID=`cat $BUILD_ROOT/c-dist-test-job-id`
-  if ! $DIST_TEST_HOME/bin/client watch $C_DIST_TEST_ID ; then
-    TESTS_FAILED=1
-    FAILURES="$FAILURES"$'Distributed C++ tests failed\n'
+  if [ "$ENABLE_CPP_TESTS" == "1" ]; then
+    echo
+    echo Fetching previously submitted C++ dist-test results...
+    echo ------------------------------------------------------------
+    C_DIST_TEST_ID=`cat $BUILD_ROOT/c-dist-test-job-id`
+    if ! $DIST_TEST_HOME/bin/client watch $C_DIST_TEST_ID ; then
+      TESTS_FAILED=1
+      FAILURES="$FAILURES"$'Distributed C++ tests failed\n'
+    fi
+    DT_DIR=$TEST_LOGDIR/dist-test-out
+    rm -Rf $DT_DIR
+    $DIST_TEST_HOME/bin/client fetch --artifacts -d $DT_DIR $C_DIST_TEST_ID
+    # Fetching the artifacts expands each log into its own directory.
+    # Move them back into the main log directory
+    rm -f $DT_DIR/*zip
+    for arch_dir in $DT_DIR/* ; do
+      mv $arch_dir/build/$BUILD_TYPE_LOWER/test-logs/* $TEST_LOGDIR
+      rm -Rf $arch_dir
+    done
   fi
-  DT_DIR=$TEST_LOGDIR/dist-test-out
-  rm -Rf $DT_DIR
-  $DIST_TEST_HOME/bin/client fetch --artifacts -d $DT_DIR $C_DIST_TEST_ID
-  # Fetching the artifacts expands each log into its own directory.
-  # Move them back into the main log directory
-  rm -f $DT_DIR/*zip
-  for arch_dir in $DT_DIR/* ; do
-    mv $arch_dir/build/$BUILD_TYPE_LOWER/test-logs/* $TEST_LOGDIR
-    rm -Rf $arch_dir
-  done
 
   echo
   echo Fetching previously submitted Java dist-test results...

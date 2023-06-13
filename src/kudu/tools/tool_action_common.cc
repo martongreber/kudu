@@ -348,8 +348,15 @@ Status PrintDecodedWriteRequestPB(const string& indent,
   Arena arena(32 * 1024);
   RowOperationsPBDecoder dec(&write.row_operations(), &request_schema, &tablet_schema, &arena);
   vector<DecodedRowOperation> ops;
-  RETURN_NOT_OK(dec.DecodeOperations<DecoderMode::WRITE_OPS>(&ops));
-
+  if (write.has_auto_incrementing_column()) {
+    // Define auto_incrementing_counter and use it as in-out parameter during decoding of the ops
+    // in DecodeOperations().
+    int64_t auto_incrementing_counter =
+        write.auto_incrementing_column().auto_incrementing_counter();
+    RETURN_NOT_OK(dec.DecodeOperations<DecoderMode::WRITE_OPS>(&ops, &auto_incrementing_counter));
+  } else {
+    RETURN_NOT_OK(dec.DecodeOperations<DecoderMode::WRITE_OPS>(&ops));
+  }
   cout << indent << "Tablet: " << write.tablet_id() << endl;
   cout << indent << "RequestId: "
       << (request_id ? SecureShortDebugString(*request_id) : "None") << endl;
@@ -357,6 +364,10 @@ Status PrintDecodedWriteRequestPB(const string& indent,
        << ExternalConsistencyMode_Name(write.external_consistency_mode()) << endl;
   if (write.has_propagated_timestamp()) {
     cout << indent << "Propagated TS: " << write.propagated_timestamp() << endl;
+  }
+  if (write.has_auto_incrementing_column()) {
+    cout << indent << "Auto Incrementing Counter: "
+        << write.auto_incrementing_column().auto_incrementing_counter() << endl;
   }
 
   int i = 0;
@@ -568,6 +579,10 @@ Status GetServerStatus(const string& address, uint16_t default_port,
 Status GetReplicas(TabletServerServiceProxy* proxy,
                    vector<ListTabletsResponsePB::StatusAndSchemaPB>* replicas) {
   ListTabletsRequestPB req;
+  // Even with FLAGS_include_schema=false, don't set need_schema_info=false
+  // in the request. The reason is that the schema is still needed to decode
+  // the partition of each replica, and the partition information is pretty
+  // much always nice to have.
   req.set_need_schema_info(true);
   ListTabletsResponsePB resp;
   RpcController rpc;
@@ -940,7 +955,7 @@ Status GetKuduToolAbsolutePathSafe(string* path) {
   return Status::OK();
 }
 
-Status SetServerKey() {
+Status SetEncryptionKey() {
   if (FLAGS_instance_file.empty()) {
     return Status::OK();
   }
@@ -961,12 +976,13 @@ Status SetServerKey() {
       key_provider.reset(new DefaultKeyProvider());
     }
 
-    string server_key;
-    RETURN_NOT_OK(key_provider->DecryptServerKey(instance.server_key(),
-                                                instance.server_key_iv(),
-                                                instance.server_key_version(),
-                                                &server_key));
-    Env::Default()->SetEncryptionKey(reinterpret_cast<const uint8_t*>(a2b_hex(server_key).c_str()),
+    string decrypted_key;
+    RETURN_NOT_OK(key_provider->DecryptEncryptionKey(instance.server_key(),
+                                                     instance.server_key_iv(),
+                                                     instance.server_key_version(),
+                                                     &decrypted_key));
+    Env::Default()->SetEncryptionKey(reinterpret_cast<const uint8_t*>(
+                                       a2b_hex(decrypted_key).c_str()),
                                      key.length() * 4);
   }
 
@@ -1232,6 +1248,18 @@ Status LeaderMasterProxy::SyncRpc(
     const std::function<void(MasterServiceProxy*,
                              const master::ReplaceTabletRequestPB&,
                              master::ReplaceTabletResponsePB*,
+                             RpcController*,
+                             const ResponseCallback&)>& func,
+    std::vector<uint32_t> required_feature_flags);
+
+template
+Status LeaderMasterProxy::SyncRpc(
+    const master::ListInFlightTablesRequestPB& req,
+    master::ListInFlightTablesResponsePB* resp,
+    string func_name,
+    const std::function<void(MasterServiceProxy*,
+                             const master::ListInFlightTablesRequestPB&,
+                             master::ListInFlightTablesResponsePB*,
                              RpcController*,
                              const ResponseCallback&)>& func,
     std::vector<uint32_t> required_feature_flags);

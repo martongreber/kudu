@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -77,6 +78,7 @@ using kudu::client::KuduValue;
 using kudu::client::KuduWriteOperation;
 using kudu::iequals;
 using std::endl;
+using std::function;
 using std::map;
 using std::nullopt;
 using std::optional;
@@ -127,9 +129,12 @@ DEFINE_bool(report_scanner_stats, false,
 DEFINE_bool(show_values, false,
             "Whether to show values of scanned rows.");
 DEFINE_string(write_type, "insert",
-              "How data should be copied to the destination table. Valid values are 'insert', "
-              "'upsert' or the empty string. If the empty string, data will not be copied "
-              "(useful when --create_table=true).");
+              "Write operation type to use when populating the destination "
+              "table with the rows from the source table. Choose from "
+              "'insert', 'insert_ignore', 'upsert', 'upsert_ignore', or an "
+              "empty string. Empty string means the data isn't going to be "
+              "copied, which is useful with --create_table=true when just "
+              "creating the destination table without copying the data.");
 DEFINE_string(replica_selection, "CLOSEST",
               "Replica selection for scan operations. Acceptable values are: "
               "CLOSEST, LEADER (maps into KuduClient::CLOSEST_REPLICA and "
@@ -163,9 +168,20 @@ bool IsFlagValueAcceptable(const char* flag_name,
   return false;
 }
 
+constexpr const char* const kWriteTypeInsert = "insert";
+constexpr const char* const kWriteTypeInsertIgnore = "insert_ignore";
+constexpr const char* const kWriteTypeUpsert = "upsert";
+constexpr const char* const kWriteTypeUpsertIgnore = "upsert_ignore";
+
 bool ValidateWriteType(const char* flag_name,
                        const string& flag_value) {
-  static const vector<string> kWriteTypes = { "insert", "upsert", "" };
+  static const vector<string> kWriteTypes = {
+    "",
+    kWriteTypeInsert,
+    kWriteTypeInsertIgnore,
+    kWriteTypeUpsert,
+    kWriteTypeUpsertIgnore,
+  };
   return IsFlagValueAcceptable(flag_name, flag_value, kWriteTypes);
 }
 
@@ -533,7 +549,7 @@ Status CreateDstTableIfNeeded(const client::sp::shared_ptr<KuduTable>& src_table
   return Status::OK();
 }
 
-void CheckPendingErrors(const client::sp::shared_ptr<KuduSession>& session) {
+void CheckPendingErrors(KuduSession* session) {
   vector<KuduError*> errors;
   ElementDeleter d(&errors);
   session->GetPendingErrors(&errors, nullptr);
@@ -557,9 +573,9 @@ TableScanner::TableScanner(
   CHECK_OK(SetReplicaSelection(FLAGS_replica_selection));
 }
 
-Status TableScanner::ScanData(const std::vector<kudu::client::KuduScanToken*>& tokens,
-                              const std::function<void(const KuduScanBatch& batch)>& cb) {
-  for (auto token : tokens) {
+Status TableScanner::ScanData(const vector<KuduScanToken*>& tokens,
+                              const function<Status(const KuduScanBatch& batch)>& cb) {
+  for (const auto* token : tokens) {
     Stopwatch sw(Stopwatch::THIS_THREAD);
     sw.start();
 
@@ -577,7 +593,7 @@ Status TableScanner::ScanData(const std::vector<kudu::client::KuduScanToken*>& t
       count += batch.NumRows();
       total_count_ += batch.NumRows();
       ++next_batch_calls;
-      cb(batch);
+      RETURN_NOT_OK(cb(batch));
     }
     sw.stop();
 
@@ -598,6 +614,7 @@ Status TableScanner::ScanData(const std::vector<kudu::client::KuduScanToken*>& t
 }
 
 void TableScanner::ScanTask(const vector<KuduScanToken*>& tokens, Status* thread_status) {
+  DCHECK(thread_status);
   *thread_status = ScanData(tokens, [&](const KuduScanBatch& batch) {
     if (out_ && FLAGS_show_values) {
       MutexLock l(output_lock_);
@@ -606,29 +623,65 @@ void TableScanner::ScanTask(const vector<KuduScanToken*>& tokens, Status* thread
       }
       out_->flush();
     }
+    return Status::OK();
   });
 }
 
 void TableScanner::CopyTask(const vector<KuduScanToken*>& tokens, Status* thread_status) {
+#define TASK_RET_NOT_OK(s) do {   \
+    const Status& _s = (s);       \
+    if (PREDICT_FALSE(!_s.ok())) {\
+      *thread_status = _s;        \
+      return;                     \
+    }                             \
+  } while (0)
+
+  DCHECK(thread_status);
+  KuduWriteOperation::Type op_type;
+  const auto& op_type_str = FLAGS_write_type;
+  if (op_type_str == kWriteTypeInsert) {
+    op_type = KuduWriteOperation::INSERT;
+  } else if (op_type_str == kWriteTypeInsertIgnore) {
+    op_type = KuduWriteOperation::INSERT_IGNORE;
+  } else if (op_type_str == kWriteTypeUpsert) {
+    op_type = KuduWriteOperation::UPSERT;
+  } else if (op_type_str == kWriteTypeUpsertIgnore) {
+    op_type = KuduWriteOperation::UPSERT_IGNORE;
+  } else {
+    *thread_status = Status::InvalidArgument(Substitute(
+        "invalid write operation type: $0", op_type_str));
+    return;
+  }
+
   client::sp::shared_ptr<KuduTable> dst_table;
-  CHECK_OK((*dst_client_)->OpenTable(*dst_table_name_, &dst_table));
-  const KuduSchema& dst_table_schema = dst_table->schema();
+  TASK_RET_NOT_OK((*dst_client_)->OpenTable(*dst_table_name_, &dst_table));
 
   // One session per thread.
   client::sp::shared_ptr<KuduSession> session((*dst_client_)->NewSession());
-  CHECK_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
-  CHECK_OK(session->SetErrorBufferSpace(1024));
+  TASK_RET_NOT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
+  TASK_RET_NOT_OK(session->SetErrorBufferSpace(1024 * 1024));
   session->SetTimeoutMillis(FLAGS_timeout_ms);
 
-  *thread_status = ScanData(tokens, [&](const KuduScanBatch& batch) {
+  // The callback's lambda of ScanData() keeps references to the session and
+  // the destination table objects, making sure they are alive when the callback
+  // is invoked.
+  *thread_status = ScanData(tokens, [table = std::move(dst_table),
+                                     session = std::move(session),
+                                     op_type] (const KuduScanBatch& batch) {
+    auto* s_ptr = session.get();
+    auto* t_ptr = table.get();
     for (const auto& row : batch) {
-      CHECK_OK(AddRow(dst_table, dst_table_schema, row, session));
+      RETURN_NOT_OK(AddRow(s_ptr, t_ptr, row, op_type));
     }
-    CheckPendingErrors(session);
-    // Flush here to make sure all write operations have been sent,
-    // and all strings reference to batch are still valid.
-    CHECK_OK(session->Flush());
+    // Flush the session to make sure all write operations have been sent
+    // to the server. If any error happens, CheckPendingErrors() will report
+    // on them.
+    auto s = s_ptr->Flush();
+    CheckPendingErrors(s_ptr);
+    return s;
   });
+
+#undef TASK_RET_NOT_OK
 }
 
 void TableScanner::SetOutput(ostream* out) {
@@ -650,12 +703,12 @@ void TableScanner::SetScanBatchSize(int32_t scan_batch_size) {
   scan_batch_size_ = scan_batch_size;
 }
 
-Status TableScanner::StartWork(WorkType type) {
+Status TableScanner::StartWork(WorkType work_type) {
   client::sp::shared_ptr<KuduTable> src_table;
   RETURN_NOT_OK(client_->OpenTable(table_name_, &src_table));
 
   // Create destination table if needed.
-  if (type == WorkType::kCopy) {
+  if (work_type == WorkType::kCopy) {
     RETURN_NOT_OK(CreateDstTableIfNeeded(src_table, *dst_client_, *dst_table_name_));
     if (FLAGS_write_type.empty()) {
       // Create table only.
@@ -686,7 +739,7 @@ Status TableScanner::StartWork(WorkType type) {
   }
 
   // Set projection if needed.
-  if (type == WorkType::kScan) {
+  if (work_type == WorkType::kScan) {
     const auto project_all = FLAGS_columns == "*" || FLAGS_columns.empty();
     if (!project_all || FLAGS_row_count_only) {
       vector<string> projected_column_names;
@@ -697,6 +750,27 @@ Status TableScanner::StartWork(WorkType type) {
     }
   }
 
+  if (work_type == WorkType::kCopy) {
+    // If we are copying a table we do not want to scan the auto-incrementing column as it would be
+    // populated on the server side. This would avoid scanning an entire column of the table.
+    if (src_table->schema().GetAutoIncrementingColumnIndex() != -1) {
+      vector<string> projected_column_names;
+      for (int i = 0; i < src_table->schema().num_columns(); i++) {
+        if (src_table->schema().Column(i).name() == KuduSchema::GetAutoIncrementingColumnName()) {
+          continue;
+        }
+        projected_column_names.emplace_back(src_table->schema().Column(i).name());
+      }
+      RETURN_NOT_OK(builder.SetProjectedColumnNames(projected_column_names));
+    }
+    // Ensure both the source and destination table schemas are identical at this point.
+    client::sp::shared_ptr<KuduTable> dst_table;
+    RETURN_NOT_OK(dst_client_->get()->OpenTable(*dst_table_name_, &dst_table));
+    if (dst_table->schema() != src_table->schema()) {
+      Status::InvalidArgument("source and destination tables should have the same schema");
+    }
+  }
+
   // Set predicates.
   RETURN_NOT_OK(AddPredicates(src_table, &builder));
 
@@ -704,35 +778,36 @@ Status TableScanner::StartWork(WorkType type) {
   ElementDeleter deleter(&tokens);
   RETURN_NOT_OK(builder.Build(&tokens));
 
+  const int num_threads = FLAGS_num_threads;
+
   // Set tablet filter.
   const set<string>& tablet_id_filters = Split(FLAGS_tablets, ",", strings::SkipWhitespace());
   map<int, vector<KuduScanToken*>> thread_tokens;
   int i = 0;
   for (auto* token : tokens) {
     if (tablet_id_filters.empty() || ContainsKey(tablet_id_filters, token->tablet().id())) {
-      thread_tokens[i++ % FLAGS_num_threads].emplace_back(token);
+      thread_tokens[i++ % num_threads].emplace_back(token);
     }
   }
 
-  // Initialize statuses for each thread.
-  vector<Status> thread_statuses(FLAGS_num_threads);
-
   RETURN_NOT_OK(ThreadPoolBuilder("table_scan_pool")
-                  .set_max_threads(FLAGS_num_threads)
+                  .set_max_threads(num_threads)
                   .set_idle_timeout(MonoDelta::FromMilliseconds(1))
                   .Build(&thread_pool_));
 
-  Status end_status = Status::OK();
+  // Initialize statuses for each thread.
+  vector<Status> thread_statuses(num_threads);
+
   Stopwatch sw(Stopwatch::THIS_THREAD);
   sw.start();
-  for (i = 0; i < FLAGS_num_threads; ++i) {
+  for (i = 0; i < num_threads; ++i) {
     auto* t_tokens = &thread_tokens[i];
     auto* t_status = &thread_statuses[i];
-    if (type == WorkType::kScan) {
+    if (work_type == WorkType::kScan) {
       RETURN_NOT_OK(thread_pool_->Submit([this, t_tokens, t_status]()
                                          { this->ScanTask(*t_tokens, t_status); }));
     } else {
-      CHECK(type == WorkType::kCopy);
+      DCHECK(work_type == WorkType::kCopy);
       RETURN_NOT_OK(thread_pool_->Submit([this, t_tokens, t_status]()
                                          { this->CopyTask(*t_tokens, t_status); }));
     }
@@ -748,18 +823,20 @@ Status TableScanner::StartWork(WorkType type) {
         << " cost " << sw.elapsed().wall_seconds() << " seconds" << endl;
   }
 
-  for (i = 0; i < FLAGS_num_threads; ++i) {
-    if (!thread_statuses[i].ok()) {
+  const auto& operation = work_type == WorkType::kScan ? "Scanning" : "Copying";
+  Status result_status;
+  for (const auto& s : thread_statuses) {
+    if (!s.ok()) {
       if (out_) {
-        *out_ << "Scanning failed " << thread_statuses[i].ToString() << endl;
+        *out_ << operation << " failed: " << s.ToString() << endl;
       }
-      if (end_status.ok()) {
-        end_status = thread_statuses[i];
+      if (result_status.ok()) {
+        result_status = s;
       }
     }
   }
 
-  return end_status;
+  return result_status;
 }
 
 Status TableScanner::StartScan() {
@@ -773,23 +850,53 @@ Status TableScanner::StartCopy() {
   return StartWork(WorkType::kCopy);
 }
 
-Status TableScanner::AddRow(const client::sp::shared_ptr<KuduTable>& table,
-                            const KuduSchema& table_schema,
+Status TableScanner::AddRow(KuduSession* session,
+                            KuduTable* table,
                             const KuduScanBatch::RowPtr& src_row,
-                            const client::sp::shared_ptr<KuduSession>& session) {
+                            KuduWriteOperation::Type write_op_type) {
   unique_ptr<KuduWriteOperation> write_op;
-  if (FLAGS_write_type == "insert") {
-    write_op.reset(table->NewInsert());
-  } else if (FLAGS_write_type == "upsert") {
-    write_op.reset(table->NewUpsert());
-  } else {
-    LOG(FATAL) << Substitute("invalid write_type: $0", FLAGS_write_type);
+  switch (write_op_type) {
+    case KuduWriteOperation::INSERT:
+      write_op.reset(table->NewInsert());
+      break;
+    case KuduWriteOperation::INSERT_IGNORE:
+      write_op.reset(table->NewInsertIgnore());
+      break;
+    case KuduWriteOperation::UPSERT:
+      write_op.reset(table->NewUpsert());
+      break;
+    case KuduWriteOperation::UPSERT_IGNORE:
+      write_op.reset(table->NewUpsertIgnore());
+      break;
+    default:
+      return Status::InvalidArgument(
+          Substitute("unexpected op type: $0", write_op_type));
+      break;  // unreachable
   }
 
-  KuduPartialRow* dst_row = write_op->mutable_row();
-  size_t row_size = ContiguousRowHelper::row_size(*src_row.schema_);
-  memcpy(dst_row->row_data_, src_row.row_data_, row_size);
-  BitmapChangeBits(dst_row->isset_bitmap_, 0, table_schema.num_columns(), true);
+  // If the destination table has auto-incrementing column, we do not set it
+  // as we skip scanning the auto-incrementing column while scanning the source table.
+  auto* dst_row = write_op->mutable_row();
+  const int auto_incrementing_col_idx = table->schema().GetAutoIncrementingColumnIndex();
+  if (auto_incrementing_col_idx == Schema::kColumnNotFound) {
+    memcpy(dst_row->row_data_, src_row.row_data_,
+           ContiguousRowHelper::row_size(*src_row.schema_));
+    BitmapChangeBits(dst_row->isset_bitmap_, 0, table->schema().num_columns(), true);
+  } else {
+    int src_iterator = 0;
+    for (int dst_iterator = 0; dst_iterator < table->schema().num_columns(); dst_iterator++) {
+      if (auto_incrementing_col_idx != dst_iterator) {
+        if (src_row.IsNull(src_iterator)) {
+          RETURN_NOT_OK(dst_row->SetNull(dst_iterator));
+        } else {
+          RETURN_NOT_OK(dst_row->Set(dst_iterator, src_row.row_data_ +
+              src_row->schema_->column_offset(src_iterator)));
+        }
+        BitmapChange(dst_row->isset_bitmap_, dst_iterator, true);
+        src_iterator++;
+      }
+    }
+  }
 
   return session->Apply(write_op.release());
 }

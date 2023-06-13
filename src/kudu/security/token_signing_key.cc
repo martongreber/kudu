@@ -17,6 +17,7 @@
 
 #include "kudu/security/token_signing_key.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -28,6 +29,7 @@
 #include "kudu/util/openssl_util.h"
 #include "kudu/util/status.h"
 
+using kudu::security::PasswordCallback;
 using std::unique_ptr;
 using std::string;
 
@@ -57,9 +59,19 @@ bool TokenSigningPublicKey::VerifySignature(const SignedTokenPB& token) const {
 }
 
 TokenSigningPrivateKey::TokenSigningPrivateKey(
-    const TokenSigningPrivateKeyPB& pb)
+    const TokenSigningPrivateKeyPB& pb,
+    const string& password)
     : key_(new PrivateKey) {
-  CHECK_OK(key_->FromString(pb.rsa_key_der(), DataFormat::DER));
+  if (password.empty()) {
+    CHECK_OK(key_->FromString(pb.rsa_key_der(), DataFormat::DER));
+  } else {
+    CHECK_OK(key_->FromEncryptedString(pb.rsa_key_der(), DataFormat::DER,
+          [&](string* p) {
+            *p = password;
+            return Status::OK();
+          }
+    ));
+  }
   private_key_der_ = pb.rsa_key_der();
   key_seq_num_ = pb.key_seq_num();
   expire_time_ = pb.expire_unix_epoch_seconds();
@@ -70,11 +82,21 @@ TokenSigningPrivateKey::TokenSigningPrivateKey(
 }
 
 TokenSigningPrivateKey::TokenSigningPrivateKey(
-    int64_t key_seq_num, int64_t expire_time, unique_ptr<PrivateKey> key)
+    int64_t key_seq_num, int64_t expire_time, unique_ptr<PrivateKey> key,
+    const std::string& password)
     : key_(std::move(key)),
       key_seq_num_(key_seq_num),
       expire_time_(expire_time) {
-  CHECK_OK(key_->ToString(&private_key_der_, DataFormat::DER));
+  if (password.empty()) {
+    CHECK_OK(key_->ToString(&private_key_der_, DataFormat::DER));
+  } else {
+    CHECK_OK(key_->ToEncryptedString(&private_key_der_, DataFormat::DER,
+          [&](string* p){
+            *p = password;
+            return Status::OK();
+          }
+    ));
+  }
   PublicKey public_key;
   CHECK_OK(key_->GetPublicKey(&public_key));
   CHECK_OK(public_key.ToString(&public_key_der_, DataFormat::DER));

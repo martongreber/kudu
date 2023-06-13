@@ -40,6 +40,9 @@ class KuduTestBase(object):
     NUM_MASTER_SERVERS = 3
     NUM_TABLET_SERVERS = 3
 
+    valid_account_id = "valid_account_id"
+    invalid_account_id = "invalid_account_id"
+
     @classmethod
     def send_and_receive(cls, proc, request):
         binary_req = (json.dumps(request) + "\n").encode("utf-8")
@@ -60,6 +63,7 @@ class KuduTestBase(object):
 
         master_hosts = []
         master_ports = []
+        master_http_hostports = []
 
         # Start the mini-cluster control process.
         args = ["{0}/kudu".format(bin_path), "test", "mini_cluster"]
@@ -87,8 +91,20 @@ class KuduTestBase(object):
                    "extraMasterFlags" : [
                        "--default_num_replicas=1",
                        "--ipki_ca_key_size=2048",
-                       "--ipki_server_key_size=2048" ],
-                   "extraTserverFlags" : [ "--ipki_server_key_size=2048" ]}})
+                       "--ipki_server_key_size=2048",
+                       # TODO: once setting flags per unittest is implemented,
+                       # remove this line here and add it to the test:
+                       # 'test_soft_delete_and_recall_table_after_reserve_time'
+                       "--check_expired_table_interval_seconds=2" ],
+                   "extraTserverFlags" : [ "--ipki_server_key_size=2048" ],
+                   "mini_oidc_options" :
+                   { "expiration_time" : "300000",
+                     "jwks_options" :
+                     [{ "account_id" : cls.valid_account_id,
+                       "is_valid_key" : "true" },
+                       { "account_id" : cls.invalid_account_id,
+                       "is_valid_key" : "false" },
+                       ]}}})
         cls.send_and_receive(p, { "start_cluster" : {}})
 
         # Get information about the cluster's masters.
@@ -96,8 +112,11 @@ class KuduTestBase(object):
         for m in masters["getMasters"]["masters"]:
             master_hosts.append(m["boundRpcAddress"]["host"])
             master_ports.append(m["boundRpcAddress"]["port"])
+            master_http_hostports.append(
+                '{0}:{1}'.format(m["boundHttpAddress"]["host"],
+                                 m["boundHttpAddress"]["port"]))
 
-        return p, master_hosts, master_ports
+        return p, master_hosts, master_ports, master_http_hostports
 
     @classmethod
     def stop_cluster(cls):
@@ -108,7 +127,9 @@ class KuduTestBase(object):
 
     @classmethod
     def setUpClass(cls):
-        cls.cluster_proc, cls.master_hosts, cls.master_ports = cls.start_cluster()
+        cls.cluster_proc, cls.master_hosts, cls.master_ports, \
+                cls.master_http_hostports = cls.start_cluster()
+
         cls.client = kudu.connect(cls.master_hosts, cls.master_ports)
 
         cls.schema = cls.example_schema()
@@ -126,7 +147,7 @@ class KuduTestBase(object):
     @classmethod
     def example_schema(cls):
         builder = kudu.schema_builder()
-        builder.add_column('key', kudu.int32, nullable=False)
+        builder.add_column('key', kudu.int32, nullable=False, comment='key_comment')
         builder.add_column('int_val', kudu.int32)
         builder.add_column('string_val', kudu.string, default=None)
         builder.add_column('unixtime_micros_val', kudu.unixtime_micros)
@@ -137,3 +158,17 @@ class KuduTestBase(object):
     @classmethod
     def example_partitioning(cls):
         return Partitioning().set_range_partition_columns(['key'])
+
+    @classmethod
+    def get_jwt(cls, valid=True):
+        account_id = cls.valid_account_id
+        is_valid_key = valid
+        if not valid:
+            account_id = cls.invalid_account_id
+
+        resp = cls.send_and_receive(
+            cls.cluster_proc, { "create_jwt" : {
+                "account_id" : account_id,
+                "subject" : "test",
+                "is_valid_key" : is_valid_key}})
+        return resp['createJwt']['jwt']

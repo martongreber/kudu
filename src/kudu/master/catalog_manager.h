@@ -143,6 +143,11 @@ struct PersistentTabletInfo {
            pb.state() == SysTabletsEntryPB::DELETED;
   }
 
+  bool is_creating() const {
+    return pb.state() == SysTabletsEntryPB::CREATING ||
+           pb.state() == SysTabletsEntryPB::PREPARING;
+  }
+
   bool is_soft_deleted() const {
     return pb.state() == SysTabletsEntryPB::SOFT_DELETED;
   }
@@ -719,6 +724,10 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                         const security::TokenSigner* token_signer,
                         TableInfoMapType map_type = kAllTableType);
 
+  // List all the tables in the process of being created or altered.
+  Status ListInFlightTables(const ListInFlightTablesRequestPB* req,
+                            ListInFlightTablesResponsePB* resp);
+
   // Lists all the running tables. If 'user' is provided, only lists those that
   // the given user is authorized to see.
   Status ListTables(const ListTablesRequestPB* req,
@@ -928,6 +937,14 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Use for seach table with table name.
   scoped_refptr<TableInfo> FindTableWithNameUnlocked(const std::string& table_name,
                                                      TableInfoMapType map_type = kAllTableType);
+
+  void set_ipki_private_key_password(std::string ipki_private_key_password) {
+    ipki_private_key_password_ = std::move(ipki_private_key_password);
+  }
+
+  void set_tsk_private_key_password(std::string tsk_private_key_password) {
+    tsk_private_key_password_ = std::move(tsk_private_key_password);
+  }
 
  private:
   // These tests calls ElectedAsLeaderCb() directly.
@@ -1388,6 +1405,11 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   //
   // Always acquire this lock before state_lock_.
   RWMutex leader_lock_;
+
+  // Password for the encrypted IPKI and TSK private keys stored in the
+  // sys-catalog table.
+  std::string ipki_private_key_password_;
+  std::string tsk_private_key_password_;
 
   // Async operations are accessing some private methods
   // (TODO: this stuff should be deferred and done in the background thread)

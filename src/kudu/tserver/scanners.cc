@@ -65,8 +65,13 @@ DEFINE_int32(completed_scan_history_count, 10,
              "latest scans will be shown on the tablet server's scans dashboard.");
 TAG_FLAG(completed_scan_history_count, experimental);
 
-// TODO(kedeng) : Add flag to control the display of slow scans, and avoid full scanning
-//                affecting normal Kudu service without perception.
+DEFINE_bool(show_slow_scans, false,
+            "Whether to show slow scans on the /scans page of web or record it in the log. "
+            "Please note that once set to true, full table scans may occur, which may affect "
+            "the normal Kudu service unexpectedly.");
+TAG_FLAG(show_slow_scans, advanced);
+TAG_FLAG(show_slow_scans, runtime);
+
 DEFINE_int32(slow_scanner_threshold_ms, 60 * 1000L, // 1 minute
              "Number of milliseconds for the threshold of slow scan.");
 TAG_FLAG(slow_scanner_threshold_ms, advanced);
@@ -85,6 +90,13 @@ METRIC_DEFINE_gauge_size(server, active_scanners,
                          kudu::MetricUnit::kScanners,
                          "Number of scanners that are currently active",
                          kudu::MetricLevel::kInfo);
+
+METRIC_DEFINE_gauge_size(server, slow_scans,
+                         "Slow Scans",
+                         kudu::MetricUnit::kScanners,
+                         "Number of slow scanners that are defined by --slow_scanner_threshold_ms "
+                         "if --show_slow_scans set to 'true'.",
+                         kudu::MetricLevel::kWarn);
 
 using kudu::rpc::RemoteUser;
 using kudu::tablet::TabletReplica;
@@ -127,6 +139,9 @@ ScannerManager::ScannerManager(const scoped_refptr<MetricEntity>& metric_entity)
     metrics_.reset(new ScannerMetrics(metric_entity));
     METRIC_active_scanners.InstantiateFunctionGauge(
         metric_entity, [this]() { return this->CountActiveScanners(); })
+        ->AutoDetach(&metric_detacher_);
+    METRIC_slow_scans.InstantiateFunctionGauge(
+        metric_entity, [this]() { return this->CountSlowScans(); })
         ->AutoDetach(&metric_detacher_);
   }
   for (size_t i = 0; i < kNumScannerMapStripes; i++) {
@@ -171,7 +186,12 @@ void ScannerManager::RunCollectAndRemovalThread() {
       }
       shutdown_cv_.WaitFor(MonoDelta::FromMicroseconds(FLAGS_scanner_gc_check_interval_us));
     }
-    CollectSlowScanners();
+
+    if (FLAGS_show_slow_scans) {
+      // Control the collection of slow scans to avoid full scanning affecting normal Kudu
+      // service without perception.
+      CollectSlowScanners();
+    }
     RemoveExpiredScanners();
   }
 }
@@ -269,6 +289,25 @@ size_t ScannerManager::CountActiveScanners() const {
   return total;
 }
 
+size_t ScannerManager::CountSlowScans() const {
+  size_t total = 0;
+  const MonoTime now = MonoTime::Now();
+  const MonoDelta slow_threshold = MonoDelta::FromMilliseconds(FLAGS_slow_scanner_threshold_ms);
+  for (const auto* stripe : scanner_maps_) {
+    shared_lock<RWMutex> l(stripe->lock_);
+    for (const auto& it : stripe->scanners_by_id_) {
+      const SharedScanner& scanner = it.second;
+      const MonoTime start_time = scanner->start_time();
+      if (start_time + slow_threshold >= now) {
+        continue;
+      }
+      total++;
+    }
+  }
+
+  return total;
+}
+
 void ScannerManager::ListScanners(std::vector<SharedScanner>* scanners) const {
   for (const ScannerMapStripe* stripe : scanner_maps_) {
     shared_lock<RWMutex> l(stripe->lock_);
@@ -315,6 +354,12 @@ vector<SharedScanDescriptor> ScannerManager::ListScans() const {
 }
 
 vector<SharedScanDescriptor> ScannerManager::ListSlowScans() const {
+  vector<SharedScanDescriptor> ret;
+  if (!FLAGS_show_slow_scans) {
+    LOG(INFO) << "Slow scans show is disabled. Set --show_slow_scans to enable it.";
+    return ret;
+  }
+
   // Get all the scans first.
   unordered_map<string, SharedScanDescriptor> scans;
   {
@@ -324,7 +369,6 @@ vector<SharedScanDescriptor> ScannerManager::ListSlowScans() const {
     }
   }
 
-  vector<SharedScanDescriptor> ret;
   ret.reserve(scans.size());
   AppendValuesFromMap(scans, &ret);
 
@@ -357,7 +401,6 @@ void ScannerManager::CollectSlowScanners() {
 
       MonoDelta delta_time = now - start_time -
           MonoDelta::FromMilliseconds(slow_scanner_threshold);
-      // TODO(kedeng) : Add flag to control whether to print this log.
       LOG(INFO) << Substitute(
           "Slow scanner id: $0, of tablet $1, "
           "exceed the time threshold $2 ms for $3 ms.",

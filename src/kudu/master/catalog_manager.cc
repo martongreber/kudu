@@ -415,6 +415,12 @@ DEFINE_bool(require_new_spec_for_custom_hash_schema_range_bound, false,
 TAG_FLAG(require_new_spec_for_custom_hash_schema_range_bound, experimental);
 TAG_FLAG(require_new_spec_for_custom_hash_schema_range_bound, runtime);
 
+DEFINE_bool(allow_creating_under_replicated_tables, false,
+            "Whether to allow creating tablet when there are enough healthy tablet servers "
+            "to place just the majority of tablet replicas");
+TAG_FLAG(allow_creating_under_replicated_tables, experimental);
+TAG_FLAG(allow_creating_under_replicated_tables, hidden);
+
 DEFINE_uint32(default_deleted_table_reserve_seconds, 0,
               "Time in seconds to be reserved before purging a deleted table for the table "
               "from DeleteTable request. Value 0 means DeleteTable() works the regular way, "
@@ -1018,7 +1024,9 @@ CatalogManager::CatalogManager(Master* master)
       state_(kConstructed),
       leader_ready_term_(-1),
       hms_notification_log_event_id_(-1),
-      leader_lock_(RWMutex::Priority::PREFER_WRITING) {
+      leader_lock_(RWMutex::Priority::PREFER_WRITING),
+      ipki_private_key_password_(""),
+      tsk_private_key_password_("") {
   if (RangerAuthzProvider::IsEnabled()) {
     authz_provider_.reset(new RangerAuthzProvider(master_->fs_manager()->env(),
                                                   master_->metric_entity()));
@@ -1305,8 +1313,19 @@ Status CatalogManager::LoadCertAuthorityInfo(unique_ptr<PrivateKey>* key,
 
   unique_ptr<PrivateKey> ca_private_key(new PrivateKey);
   unique_ptr<Cert> ca_cert(new Cert);
-  RETURN_NOT_OK(ca_private_key->FromString(
-      info.private_key(), DataFormat::DER));
+  if (ipki_private_key_password_.empty()) {
+    RETURN_NOT_OK(ca_private_key->FromString(
+        info.private_key(), DataFormat::DER));
+  } else {
+    RETURN_NOT_OK_PREPEND(ca_private_key->FromEncryptedString(
+          info.private_key(), DataFormat::DER,
+          [&](string* password){
+            *password = ipki_private_key_password_;
+            return Status::OK();
+          }
+    ), "could not decrypt private key with the password returned by the configured command");
+  }
+
   RETURN_NOT_OK(ca_cert->FromString(
       info.certificate(), DataFormat::DER));
   // Extra sanity check.
@@ -1336,7 +1355,16 @@ Status CatalogManager::StoreCertAuthorityInfo(const PrivateKey& key,
   leader_lock_.AssertAcquiredForWriting();
 
   SysCertAuthorityEntryPB info;
-  RETURN_NOT_OK(key.ToString(info.mutable_private_key(), DataFormat::DER));
+  if (ipki_private_key_password_.empty()) {
+    RETURN_NOT_OK(key.ToString(info.mutable_private_key(), DataFormat::DER));
+  } else {
+    RETURN_NOT_OK(key.ToEncryptedString(info.mutable_private_key(), DataFormat::DER,
+          [&](string* password){
+            *password = ipki_private_key_password_;
+            return Status::OK();
+          }
+    ));
+  }
   RETURN_NOT_OK(cert.ToString(info.mutable_certificate(), DataFormat::DER));
   RETURN_NOT_OK(sys_catalog_->AddCertAuthorityEntry(info));
   LOG(INFO) << "Generated new certificate authority record";
@@ -3909,6 +3937,43 @@ Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
   return ExtraConfigPBToPBMap(l.data().pb.extra_config(), resp->mutable_extra_configs());
 }
 
+Status CatalogManager::ListInFlightTables(const ListInFlightTablesRequestPB* /*req*/,
+                                          ListInFlightTablesResponsePB* resp) {
+  for (const auto& table_entry : table_ids_map_) {
+    scoped_refptr<TableInfo> table = table_entry.second;
+    TableMetadataLock table_lock(table.get(), LockMode::READ);
+    if (table_lock.data().is_deleted()) {
+      continue;
+    }
+    vector<scoped_refptr<TabletInfo>> tablets;
+    table->GetAllTablets(&tablets);
+    uint32 num_tablets_in_flight = 0;
+    for (const auto& tablet : tablets) {
+      TabletMetadataLock tablet_lock(tablet.get(), LockMode::READ);
+      if (tablet_lock.data().is_creating()) {
+        num_tablets_in_flight++;
+      }
+    }
+    // Creating a table has 2 steps. The first step is to create the metadata
+    // of the table in the catalog manager and after that the status of the table
+    // will be 'RUNNING'. The second step is to create all replicas of the table
+    // asynchronously.
+    // The table is in the process of being created or altered when the number
+    // of in-flight tablets is not 0.
+    if (num_tablets_in_flight == 0) {
+      continue;
+    }
+
+    ListInFlightTablesResponsePB::TableInfo* table_info = resp->add_tables();
+    table_info->set_id(table->id());
+    table_info->set_name(table_lock.data().name());
+    table_info->set_num_tablets(tablets.size());
+    table_info->set_num_tablets_in_flight(num_tablets_in_flight);
+    table_info->set_state(table_lock.data().pb.state());
+  }
+  return Status::OK();
+}
+
 Status CatalogManager::ListTables(const ListTablesRequestPB* req,
                                   ListTablesResponsePB* resp,
                                   const optional<string>& user) {
@@ -5733,7 +5798,7 @@ Status CatalogManager::LoadTspkEntries(vector<TokenSigningPublicKeyPB>* keys) {
   RETURN_NOT_OK(sys_catalog_->VisitTskEntries(&loader));
   for (const auto& private_key : loader.entries()) {
     // Extract public parts of the loaded keys for the verifier.
-    TokenSigningPrivateKey tsk(private_key);
+    TokenSigningPrivateKey tsk(private_key, tsk_private_key_password_);
     TokenSigningPublicKeyPB key;
     tsk.ExportPublicKeyPB(&key);
     auto key_seq_num = key.key_seq_num();
@@ -5920,18 +5985,30 @@ Status CatalogManager::ProcessPendingAssignments(
     return Status::OK();
   }
 
-  // For those tablets which need to be created in this round, assign replicas.
   {
     TSDescriptorVector ts_descs;
     master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
     PlacementPolicy policy(std::move(ts_descs), &rng_);
-    for (auto& tablet : deferred.needs_create_rpc) {
+    auto it = deferred.needs_create_rpc.begin();
+    while (it != deferred.needs_create_rpc.end()) {
       // NOTE: if we fail to select replicas on the first pass (due to
       // insufficient Tablet Servers being online), we will still try
       // again unless the tablet/table creation is cancelled.
-      RETURN_NOT_OK_PREPEND(SelectReplicasForTablet(policy, tablet.get()),
-                            Substitute("error selecting replicas for tablet $0",
-                                       tablet->id()));
+      Status s = SelectReplicasForTablet(policy, (*it).get());
+      if (s.ok()) {
+        it++;
+      } else {
+        // The state of CREATING means the catalog manager has selected replicas for the tablet
+        // and waits for CreateTablet RPC finished. If selecting replicas for the tablet fails,
+        // it needs to recover the state to PREPARING, or its state will become CREATING later
+        // and waits for a long time(defined by FLAGS_tablet_creation_timeout_ms) to create a
+        // new tablet to replace it.
+        (*it)->mutable_metadata()->mutable_dirty()->set_state(
+            SysTabletsEntryPB::PREPARING, "Sending initial creation of tablet");
+        LOG(ERROR) << Substitute("Error selecting replicas for tablet $0, reason: $1",
+                                 (*it)->id(), s.ToString());
+        it = deferred.needs_create_rpc.erase(it);
+      }
     }
   }
 
@@ -5972,6 +6049,7 @@ Status CatalogManager::ProcessPendingAssignments(
       SendDeleteTabletRequest(tablet, l, l.data().pb.state_msg());
     }
   }
+
   // Send the CreateTablet() requests to the servers. This is asynchronous / non-blocking.
   for (const auto& tablet : deferred.needs_create_rpc) {
     TabletMetadataLock l(tablet.get(), LockMode::READ);
@@ -5984,14 +6062,30 @@ Status CatalogManager::SelectReplicasForTablet(const PlacementPolicy& policy,
                                                TabletInfo* tablet) {
   DCHECK(tablet);
   TableMetadataLock table_guard(tablet->table().get(), LockMode::READ);
-
   if (!table_guard.data().pb.IsInitialized()) {
     return Status::InvalidArgument(
         Substitute("TableInfo for tablet $0 is not initialized (aborted CreateTable attempt?)",
                    tablet->id()));
   }
 
-  const auto nreplicas = table_guard.data().pb.num_replicas();
+  int nreplicas = table_guard.data().pb.num_replicas();
+  // Try to place the majority of replicas for the tablet when the number of live
+  // tablet servers less than the required number of replicas.
+  if (policy.ts_num() < nreplicas &&
+      FLAGS_allow_creating_under_replicated_tables) {
+    // The Raft protocol requires at least (replication_factor / 2) + 1 live replicas
+    // to form a quorum.  Since Kudu places at most one replica of a tablet at one tablet
+    // server, it's necessary to have at least (replication_factor / 2) + 1 live tablet
+    // servers in a cluster to allow the tablet to serve read and write requests.
+    if (policy.ts_num() < consensus::MajoritySize(nreplicas)) {
+      return Status::InvalidArgument(
+          Substitute("need at least $0 out of $1 replicas to form a Raft quorum, "
+                     "but only $2 tablet servers are online",
+                     consensus::MajoritySize(nreplicas), policy.ts_num()));
+    }
+    nreplicas = policy.ts_num();
+  }
+
   if (policy.ts_num() < nreplicas) {
     return Status::InvalidArgument(
         Substitute("Not enough tablet servers are online for table '$0'. Need at least $1 "
@@ -6642,6 +6736,31 @@ Status CatalogManager::ValidateNumberReplicas(const string& normalized_table_nam
         num_ts_needed_for_rereplication, num_live_tservers);
   }
 
+  // Verify that the number of replicas isn't greater than the number of registered
+  // tablet servers in the cluster. This is to make sure the cluster can provide the
+  // expected HA guarantees when all tablet servers are online.  Essentially, this
+  // allows to be sure no tablet stays under-replicated for indefinite time when all
+  // the nodes of the cluster are online.
+  TSDescriptorVector registered_ts_descs;
+  master_->ts_manager()->GetAllDescriptors(&registered_ts_descs);
+  if (FLAGS_allow_creating_under_replicated_tables) {
+    if (num_replicas > registered_ts_descs.size()) {
+      return SetupError(Status::InvalidArgument(Substitute(
+          "not enough registered tablet servers to $0 a table with the requested replication "
+          "factor $1; $2 tablet servers are registered",
+          type == ValidateType::kCreateTable ? "create" : "alter",
+          num_replicas, registered_ts_descs.size())),
+                        resp, MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH);
+    }
+    if (num_live_tservers < consensus::MajoritySize(num_replicas)) {
+      return SetupError(Status::InvalidArgument(Substitute(
+          "not enough live tablet servers to $0 a table with the requested replication "
+          "factor $1; $2/$3 tablet servers are alive",
+          type == ValidateType::kCreateTable ? "create" : "alter",
+          num_replicas, num_live_tservers, registered_ts_descs.size())),
+                        resp, MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH);
+    }
+  }
   return Status::OK();
 }
 
@@ -6966,6 +7085,7 @@ INITTED_AND_LEADER_OR_RESPOND(CreateTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(DeleteTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(IsAlterTableDoneResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(IsCreateTableDoneResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(ListInFlightTablesResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(ListTablesResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(GetTableLocationsResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(GetTableSchemaResponsePB);

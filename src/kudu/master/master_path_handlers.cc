@@ -49,15 +49,18 @@
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
+#include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
+#include "kudu/master/master_cert_authority.h"
 #include "kudu/master/sys_catalog.h"
 #include "kudu/master/table_metrics.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
+#include "kudu/security/cert.h"
 #include "kudu/server/monitored_task.h"
 #include "kudu/server/rpc_server.h"
 #include "kudu/server/webui_util.h"
@@ -68,15 +71,15 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/string_case.h"
 #include "kudu/util/url-coding.h"
 #include "kudu/util/web_callback_registry.h"
 
-namespace kudu {
-
-using consensus::ConsensusStatePB;
-using consensus::RaftPeerPB;
+using kudu::consensus::ConsensusStatePB;
+using kudu::consensus::RaftPeerPB;
+using kudu::security::DataFormat;
 using std::array;
 using std::map;
 using std::ostringstream;
@@ -86,6 +89,7 @@ using std::string;
 using std::vector;
 using strings::Substitute;
 
+namespace kudu {
 namespace master {
 
 namespace {
@@ -601,6 +605,39 @@ void MasterPathHandlers::HandleMasters(const Webserver::WebRequest& /*req*/,
   }
 }
 
+void MasterPathHandlers::HandleIpkiCaCert(
+    DataFormat cert_format,
+    const Webserver::WebRequest& /*req*/,
+    Webserver::PrerenderedWebResponse* resp) {
+  ostringstream& out = resp->output;
+  if (!master_->catalog_manager()->IsInitialized()) {
+    resp->status_code = HttpStatusCode::ServiceUnavailable;
+    out << "ERROR: CatalogManager is not running";
+    return;
+  }
+  const auto* ca = master_->cert_authority();
+  if (!ca || !ca->IsInitialized()) {
+    resp->status_code = HttpStatusCode::ServiceUnavailable;
+    out << "ERROR: IPKI CA isn't initialized";
+    return;
+  }
+  const auto& cert = ca->ca_cert();
+  string cert_str;
+  if (auto s = cert.ToString(&cert_str, cert_format); !s.ok()) {
+    auto err = s.CloneAndPrepend(
+        Substitute("could not convert CA cert to $0 format",
+                   security::DataFormatToString(cert_format)));
+    LOG(ERROR) << err.ToString();
+    resp->status_code = HttpStatusCode::InternalServerError;
+    out << "ERROR: " << err.ToString();
+    return;
+  }
+  if (cert_format == DataFormat::PEM) {
+    RemoveExtraWhitespace(&cert_str);
+  }
+  out << cert_str;
+}
+
 namespace {
 
 // Visitor for the catalog table which dumps tables and tablets in a JSON format. This
@@ -789,8 +826,8 @@ void MasterPathHandlers::HandleDumpEntities(const Webserver::WebRequest& /*req*/
 }
 
 Status MasterPathHandlers::Register(Webserver* server) {
-  bool is_styled = true;
-  bool is_on_nav_bar = true;
+  constexpr const bool is_styled = true;
+  constexpr const bool is_on_nav_bar = true;
   server->RegisterPathHandler(
       "/tablet-servers", "Tablet Servers",
       [this](const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
@@ -815,6 +852,23 @@ Status MasterPathHandlers::Register(Webserver* server) {
         this->HandleMasters(req, resp);
       },
       is_styled, is_on_nav_bar);
+  server->RegisterPrerenderedPathHandler(
+      "/ipki-ca-cert", "IPKI CA certificate",
+      [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+        this->HandleIpkiCaCert(DataFormat::PEM, req, resp);
+      },
+      false /*is_styled*/, true /*is_on_nav_bar*/);
+  server->RegisterPrerenderedPathHandler(
+      "/ipki-ca-cert-pem", "IPKI CA certificate (PEM format)",
+      [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+        this->HandleIpkiCaCert(DataFormat::PEM, req, resp);
+      },
+      false /*is_styled*/, false /*is_on_nav_bar*/);
+  server->RegisterBinaryDataPathHandler(
+      "/ipki-ca-cert-der", "IPKI CA certificate (DER format)",
+      [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+        this->HandleIpkiCaCert(DataFormat::DER, req, resp);
+      });
   server->RegisterPrerenderedPathHandler(
       "/dump-entities", "Dump Entities",
       [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {

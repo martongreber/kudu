@@ -72,7 +72,7 @@ message CreateClusterRequestPB {
   // Options pertaining to a single JWKS.
   message JwksOptionsPB {
     optional string account_id = 1;
-    optional bool is_valid_key = 2;
+    optional bool is_valid_key = 2 [ default = true ];
   }
 
   message MiniOidcOptionsPB {
@@ -153,6 +153,9 @@ message DaemonInfoPB {
 
   // Daemon's bound RPC address.
   optional HostPortPB bound_rpc_address = 2;
+
+  // Bound address of the embedded web server.
+  optional HostPortPB bound_http_address = 3;
 }
 
 // Response to a GetMastersRequestPB.
@@ -223,6 +226,7 @@ message ControlShellResponsePB {
     GetMastersResponsePB get_masters = 2;
     GetTServersResponsePB get_tservers = 3;
     GetKDCEnvVarsResponsePB get_kdc_env_vars = 4;
+    CreateJwtResponsePB create_jwt = 5;
   }
 }
 
@@ -249,6 +253,7 @@ message ControlShellRequestPB {
     SetDaemonFlagRequestPB set_daemon_flag = 12;
     PauseDaemonRequestPB pause_daemon = 13;
     ResumeDaemonRequestPB resume_daemon = 14;
+    CreateJwtRequestPB create_jwt = 15;
   }
 }
 
@@ -543,12 +548,15 @@ message TablesInfoPB {
     optional int32 num_replicas = 3;
     optional uint64 live_row_count = 4;
     repeated TabletWithPartitionPB tablet_with_partition = 5;
+    optional uint32 num_tablets_in_flight = 6;
+    optional string state = 7;
+    optional bytes id = 8;
   }
 
   repeated TableInfoPB tables = 1;
 }
 
-message CreateJwtPB {
+message CreateJwtRequestPB {
   // The account ID with which a JWT will be created.
   optional string account_id = 1;
 
@@ -557,4 +565,8 @@ message CreateJwtPB {
 
   // Whether or not the returned token should supply a valid key ID.
   optional bool is_valid_key = 3;
+}
+
+message CreateJwtResponsePB {
+  optional string jwt = 1;
 }

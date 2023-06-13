@@ -43,6 +43,7 @@
 #include "kudu/tools/tool.pb.h"
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
+#include "kudu/util/mini_oidc.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/status.h"
@@ -179,6 +180,14 @@ Status ProcessRequest(const ControlShellRequestPB& req,
           opts.principal = cc.principal();
         }
       }
+      if (cc.has_mini_oidc_options()) {
+        opts.enable_client_jwt = true;
+        const auto& mini_oidc_opts = cc.mini_oidc_options();
+        for (const auto& jwks_opt : mini_oidc_opts.jwks_options()) {
+          opts.mini_oidc_options.account_ids.emplace(
+              jwks_opt.account_id(), jwks_opt.is_valid_key());
+        }
+      }
 
       cluster->reset(new ExternalMiniCluster(std::move(opts)));
       break;
@@ -244,11 +253,12 @@ Status ProcessRequest(const ControlShellRequestPB& req,
     {
       RETURN_NOT_OK(CheckClusterExists(*cluster));
       for (int i = 0; i < (*cluster)->num_masters(); i++) {
-        HostPortPB pb = HostPortToPB((*cluster)->master(i)->bound_rpc_hostport());
+        const auto* m = (*cluster)->master(i);
         DaemonInfoPB* info = resp->mutable_get_masters()->mutable_masters()->Add();
         info->mutable_id()->set_type(MASTER);
         info->mutable_id()->set_index(i);
-        *info->mutable_bound_rpc_address() = std::move(pb);
+        *info->mutable_bound_rpc_address() = HostPortToPB(m->bound_rpc_hostport());
+        *info->mutable_bound_http_address() = HostPortToPB(m->bound_http_hostport());
       }
       break;
     }
@@ -256,11 +266,12 @@ Status ProcessRequest(const ControlShellRequestPB& req,
     {
       RETURN_NOT_OK(CheckClusterExists(*cluster));
       for (int i = 0; i < (*cluster)->num_tablet_servers(); i++) {
-        HostPortPB pb = HostPortToPB((*cluster)->tablet_server(i)->bound_rpc_hostport());
+        const auto* ts = (*cluster)->tablet_server(i);
         DaemonInfoPB* info = resp->mutable_get_tservers()->mutable_tservers()->Add();
         info->mutable_id()->set_type(TSERVER);
         info->mutable_id()->set_index(i);
-        *info->mutable_bound_rpc_address() = std::move(pb);
+        *info->mutable_bound_rpc_address() = HostPortToPB(ts->bound_rpc_hostport());
+        *info->mutable_bound_http_address() = HostPortToPB(ts->bound_http_hostport());
       }
       break;
     }
@@ -339,6 +350,21 @@ Status ProcessRequest(const ControlShellRequestPB& req,
       RETURN_NOT_OK(FindDaemon(*cluster, id, &daemon, &kdc));
       DCHECK(daemon);
       RETURN_NOT_OK(daemon->Resume());
+      break;
+    }
+    case ControlShellRequestPB::kCreateJwt:
+    {
+      const auto& r = req.create_jwt();
+      if (!r.has_account_id() || !r.has_subject()) {
+        return Status::InvalidArgument("JWT creation requires account ID and subject");
+      }
+      RETURN_NOT_OK(CheckClusterExists(*cluster));
+      auto* oidc = (*cluster)->oidc();
+      if (!oidc) {
+        return Status::ConfigurationError("mini-cluster must be configured with MiniOidc");
+      }
+      auto jwt = oidc->CreateJwt(r.account_id(), r.subject(), r.is_valid_key());
+      *resp->mutable_create_jwt()->mutable_jwt() = jwt;
       break;
     }
     default:

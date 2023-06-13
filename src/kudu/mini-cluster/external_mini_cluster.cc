@@ -72,6 +72,8 @@
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/fault_injection.h"
+#include "kudu/util/jwt-util.h"
+#include "kudu/util/mini_oidc.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
@@ -81,6 +83,10 @@
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/subprocess.h"
 #include "kudu/util/test_util.h"
+
+namespace kudu {
+class JwtVerifier;
+}  // namespace kudu
 
 using kudu::client::internal::ConnectToClusterRpc;
 #if !defined(NO_CHRONY)
@@ -140,14 +146,12 @@ ExternalMiniClusterOptions::ExternalMiniClusterOptions()
       enable_encryption(FLAGS_encrypt_data_at_rest),
       logtostderr(true),
       start_process_timeout(MonoDelta::FromSeconds(70)),
-      rpc_negotiation_timeout(MonoDelta::FromSeconds(3))
+      rpc_negotiation_timeout(MonoDelta::FromSeconds(3)),
 #if !defined(NO_CHRONY)
-      ,
       num_ntp_servers(1),
-      ntp_config_mode(BuiltinNtpConfigMode::ALL_SERVERS)
+      ntp_config_mode(BuiltinNtpConfigMode::ALL_SERVERS),
 #endif // #if !defined(NO_CHRONY) ...
-{
-}
+      enable_client_jwt(false) {}
 
 ExternalMiniCluster::ExternalMiniCluster()
   : opts_(ExternalMiniClusterOptions()) {
@@ -269,12 +273,28 @@ Status ExternalMiniCluster::Start() {
   gflags::FlagSaver saver;
   FLAGS_dns_addr_resolution_override = dns_overrides_;
 
+  std::shared_ptr<JwtVerifier> jwt_verifier = nullptr;
+  if (opts_.enable_client_jwt) {
+    oidc_.reset(new MiniOidc(opts_.mini_oidc_options));
+    string jwks_url = "default.url";
+    if (opts_.start_jwks) {
+      RETURN_NOT_OK_PREPEND(oidc_->Start(), "Failed to start OIDC endpoints");
+      jwks_url = oidc_->jwks_url();
+    }
+    jwt_verifier =
+        std::make_shared<KeyBasedJwtVerifier>(jwks_url,
+                                              /* jwks_verify_server_certificate */ true,
+                                              opts_.mini_oidc_options.server_certificate);
+
+  }
+
   RETURN_NOT_OK_PREPEND(
       rpc::MessengerBuilder("minicluster-messenger")
           .set_num_reactors(1)
           .set_max_negotiation_threads(1)
           .set_rpc_negotiation_timeout_ms(opts_.rpc_negotiation_timeout.ToMilliseconds())
           .set_sasl_proto_name(opts_.principal)
+          .set_jwt_verifier(std::move(jwt_verifier))
           .Build(&messenger_),
       "Failed to start Messenger for minicluster");
 
@@ -586,7 +606,7 @@ Status ExternalMiniCluster::StartMasters() {
     scoped_refptr<ExternalMaster> peer;
     RETURN_NOT_OK(CreateMaster(master_rpc_addrs, i, &peer));
     RETURN_NOT_OK_PREPEND(peer->Start(), Substitute("Unable to start Master at index $0", i));
-    RETURN_NOT_OK(peer->SetServerKey());
+    RETURN_NOT_OK(peer->SetEncryptionKey());
     masters_.emplace_back(std::move(peer));
   }
   return Status::OK();
@@ -663,7 +683,7 @@ Status ExternalMiniCluster::AddTabletServer() {
   }
 
   RETURN_NOT_OK(ts->Start());
-  RETURN_NOT_OK(ts->SetServerKey());
+  RETURN_NOT_OK(ts->SetEncryptionKey());
   tablet_servers_.push_back(ts);
   return Status::OK();
 }
@@ -718,6 +738,11 @@ Status ExternalMiniCluster::CreateMaster(const vector<HostPort>& master_rpc_addr
                                   JoinPathSegments(cluster_root(),
                                                    "ranger-client")));
     flags.emplace_back("--trusted_user_acl=test-admin");
+  }
+  if (opts_.enable_client_jwt) {
+    flags.emplace_back("--enable_jwt_token_auth=true");
+    flags.emplace_back(Substitute("--jwks_url=$0",
+                       (opts_.start_jwks) ? oidc_->jwks_url() : "default.url"));
   }
   if (!opts_.master_alias_prefix.empty()) {
     flags.emplace_back(Substitute("--host_for_tests=$0.$1",
@@ -1349,17 +1374,17 @@ Env* ExternalDaemon::env() const {
   return Env::Default();
 }
 
-Status ExternalDaemon::SetServerKey() {
+Status ExternalDaemon::SetEncryptionKey() {
   string path = JoinPathSegments(this->wal_dir(), "instance");;
   LOG(INFO) << "Reading " << path;
   InstanceMetadataPB instance;
   RETURN_NOT_OK(pb_util::ReadPBContainerFromPath(env(), path, &instance, pb_util::NOT_SENSITIVE));
   if (!instance.server_key().empty()) {
     string key;
-    RETURN_NOT_OK(key_provider_->DecryptServerKey(instance.server_key(),
-                                                  instance.server_key_iv(),
-                                                  instance.server_key_version(),
-                                                  &key));
+    RETURN_NOT_OK(key_provider_->DecryptEncryptionKey(instance.server_key(),
+                                                      instance.server_key_iv(),
+                                                      instance.server_key_version(),
+                                                      &key));
     LOG(INFO) << "Setting key " << key;
     env()->SetEncryptionKey(reinterpret_cast<const uint8_t*>(a2b_hex(key).c_str()), key.size() * 4);
   }

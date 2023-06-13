@@ -47,6 +47,8 @@
 #include "kudu/common/row_changelist.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/row_operations.pb.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/rowblock_memory.h"
 #include "kudu/common/rowid.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
@@ -94,6 +96,7 @@
 #include "kudu/util/process_memory.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status_callback.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/throttler.h"
 #include "kudu/util/trace.h"
 #include "kudu/util/url-coding.h"
@@ -220,6 +223,15 @@ DEFINE_bool(rowset_compaction_ancient_delta_threshold_enabled, true,
 TAG_FLAG(rowset_compaction_ancient_delta_threshold_enabled, advanced);
 TAG_FLAG(rowset_compaction_ancient_delta_threshold_enabled, runtime);
 
+DEFINE_bool(enable_gc_deleted_rowsets_without_live_row_count, false,
+            "Whether to enable 'DeletedRowsetGCOp' for ancient, fully deleted "
+            "rowsets without live row count stats. This is used to release "
+            "the storage space of ancient, fully deleted rowsets generated "
+            "by Kudu clusters that do not have live row count stats. "
+            "If live row count feature is already supported in your kudu "
+            "cluster, just ignore this flag.");
+TAG_FLAG(enable_gc_deleted_rowsets_without_live_row_count, advanced);
+
 DECLARE_bool(enable_undo_delta_block_gc);
 DECLARE_uint32(rowset_compaction_estimate_min_deltas_size_mb);
 
@@ -303,7 +315,6 @@ GROUP_FLAG_VALIDATOR(rowset_compaction, &ValidateRowsetCompactionGuard);
 
 namespace kudu {
 
-class RowBlock;
 struct IteratorStats;
 
 namespace tablet {
@@ -430,8 +441,16 @@ Status Tablet::Open(const unordered_set<int64_t>& in_flight_txn_ids,
                              << s.ToString();
       return s;
     }
-
     rowsets_opened.emplace_back(std::move(rowset));
+  }
+
+  // Update the auto incrementing counter of the tablet from the data directories
+  if (schema()->has_auto_incrementing()) {
+    Status s = UpdateAutoIncrementingCounter(rowsets_opened);
+    if (!s.ok()) {
+      LOG_WITH_PREFIX(ERROR) << "Failed to update auto incrementing counter" << s.ToString();
+      return s;
+    }
   }
 
   {
@@ -478,6 +497,39 @@ Status Tablet::Open(const unordered_set<int64_t>& in_flight_txn_ids,
       return Status::IllegalState("Expected the Tablet to be initialized");
     }
     set_state_unlocked(kBootstrapping);
+  }
+  return Status::OK();
+}
+
+Status Tablet::UpdateAutoIncrementingCounter(const RowSetVector& rowsets_opened) {
+  LOG_TIMING(INFO, "fetching auto increment counter") {
+    for (const shared_ptr<RowSet>& rowset: rowsets_opened) {
+      RowIteratorOptions opts;
+      opts.projection = schema().get();
+      opts.include_deleted_rows = false;
+      // TODO(achennaka): Materialize only the auto incrementing column for better performance
+      unique_ptr<RowwiseIterator> iter;
+      RETURN_NOT_OK(rowset->NewRowIterator(opts, &iter));
+      RETURN_NOT_OK(iter->Init(nullptr));
+      // The default size of 32K should be a good start as it would be increased if needed.
+      RowBlockMemory mem;
+      RowBlock block(&iter->schema(), 512, &mem);
+      while (iter->HasNext()) {
+        mem.Reset();
+        RETURN_NOT_OK(iter->NextBlock(&block));
+        const size_t nrows = block.nrows();
+        for (size_t i = 0; i < nrows; ++i) {
+          if (!block.selection_vector()->IsRowSelected(i)) {
+            continue;
+          }
+          int64 counter = *reinterpret_cast<const int64 *>(block.row(i).cell_ptr(
+              schema()->auto_incrementing_col_idx()));
+          if (counter > auto_incrementing_counter_) {
+            auto_incrementing_counter_ = counter;
+          }
+        }
+      }
+    }
   }
   return Status::OK();
 }
@@ -1467,9 +1519,10 @@ Status Tablet::DoMajorDeltaCompaction(const vector<ColumnId>& col_ids,
 
 bool Tablet::GetTabletAncientHistoryMark(Timestamp* ancient_history_mark) const {
   int32_t tablet_history_max_age_sec = FLAGS_tablet_history_max_age_sec;
-  if (metadata_->extra_config() && metadata_->extra_config()->has_history_max_age_sec()) {
+  const auto& extra_config = metadata_->extra_config();
+  if (extra_config && extra_config->has_history_max_age_sec()) {
     // Override the global configuration with the configuration of the table
-    tablet_history_max_age_sec = metadata_->extra_config()->history_max_age_sec();
+    tablet_history_max_age_sec = extra_config->history_max_age_sec();
   }
   // We currently only support history GC through a fully-instantiated tablet
   // when using the HybridClock, since we can calculate the age of a mutation.
@@ -1577,8 +1630,8 @@ Status Tablet::FlushUnlocked() {
     for (const auto& old_mrs : old_mrss) {
       memory_footprint += old_mrs->memory_footprint();
     }
-    VLOG_WITH_PREFIX(1) << Substitute("Flush: entering stage 1 (old memrowset"
-                                      "already frozen for inserts). Memstore"
+    VLOG_WITH_PREFIX(1) << Substitute("Flush: entering stage 1 (old memrowset "
+                                      "already frozen for inserts). Memstore "
                                       "in-memory size: $0 bytes",
                                       memory_footprint);
   }
@@ -1835,8 +1888,9 @@ Status Tablet::PickRowSetsToCompact(RowSetsInCompaction *picked,
 }
 
 bool Tablet::disable_compaction() const {
-  if (metadata_->extra_config() && metadata_->extra_config()->has_disable_compaction()) {
-    return metadata_->extra_config()->disable_compaction();
+  const auto& extra_config = metadata_->extra_config();
+  if (extra_config && extra_config->has_disable_compaction()) {
+    return extra_config->disable_compaction();
   }
   return false;
 }
@@ -1881,7 +1935,8 @@ void Tablet::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
 
   // The deleted rowset GC operation relies on live rowset counting. If this
   // tablet doesn't support such counting, do not register the op.
-  if (metadata_->supports_live_row_count()) {
+  if (metadata_->supports_live_row_count()
+      || FLAGS_enable_gc_deleted_rowsets_without_live_row_count) {
     maintenance_ops.emplace_back(new DeletedRowsetGCOp(this));
     maint_mgr->RegisterOp(maintenance_ops.back().get());
   }

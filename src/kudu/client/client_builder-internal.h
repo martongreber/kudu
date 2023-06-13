@@ -39,11 +39,13 @@ class KuduClientBuilder::Data {
   MonoDelta default_rpc_timeout_;
   MonoDelta connection_negotiation_timeout_;
   std::string authn_creds_;
+  std::string jwt_;
   internal::ReplicaController::Visibility replica_visibility_;
   std::optional<int> num_reactors_;
   std::string sasl_protocol_name_;
   bool require_authentication_;
   EncryptionPolicy encryption_policy_;
+  std::vector<std::string> trusted_certs_pem_;
 
   DISALLOW_COPY_AND_ASSIGN(Data);
 };

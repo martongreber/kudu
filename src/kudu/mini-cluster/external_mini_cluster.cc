@@ -100,6 +100,8 @@ using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::RpcController;
 using kudu::security::DefaultKeyProvider;
 using kudu::server::ServerStatusPB;
+using kudu::server::GetFlagsRequestPB;
+using kudu::server::GetFlagsResponsePB;
 using kudu::tserver::ListTabletsRequestPB;
 using kudu::tserver::ListTabletsResponsePB;
 using kudu::tserver::TabletServerAdminServiceProxy;
@@ -1158,6 +1160,18 @@ Status ExternalMiniCluster::SetFlag(ExternalDaemon* daemon,
     return Status::RemoteError("failed to set flag",
                                SecureShortDebugString(resp));
   }
+  return Status::OK();
+}
+
+Status ExternalMiniCluster::GetFlags(ExternalDaemon* daemon,
+                                     const kudu::server::GetFlagsRequestPB& req,
+                                     kudu::server::GetFlagsResponsePB& resp) {
+  const auto& addr = daemon->bound_rpc_addr();
+  server::GenericServiceProxy proxy(messenger_, addr, addr.host());
+
+  rpc::RpcController controller;
+  controller.set_timeout(MonoDelta::FromSeconds(30));
+  RETURN_NOT_OK_PREPEND(proxy.GetFlags(req, &resp, &controller), "rpc failed");
   return Status::OK();
 }
 

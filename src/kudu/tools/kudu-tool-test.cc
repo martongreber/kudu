@@ -102,6 +102,7 @@
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/server/server_base.pb.h"
 #include "kudu/subprocess/subprocess_protocol.h"
 #include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -7793,6 +7794,20 @@ TEST_P(ControlShellToolTest, TestControlShell) {
     r->set_flag("rpc_negotiation_timeout_ms");
     r->set_value("5000");
     ASSERT_OK(SendReceive(req, &resp));
+  }
+
+  // Check value of flag.
+  {
+    ControlShellRequestPB req;
+    ControlShellResponsePB resp;
+    auto* r = req.mutable_get_daemon_flags();
+    *r->mutable_id() = tservers[0].id();
+    r->mutable_request()->add_flags("rpc_negotiation_timeout_ms");
+    ASSERT_OK(SendReceive(req, &resp));
+    ASSERT_TRUE(resp.has_get_daemon_flags());
+    ASSERT_EQ(1, resp.get_daemon_flags().flags().size());
+    ASSERT_EQ("rpc_negotiation_timeout_ms", resp.get_daemon_flags().flags()[0].name());
+    ASSERT_EQ("5000", resp.get_daemon_flags().flags()[0].value());
   }
 
   // Try to set a non-existent flag: this should fail.

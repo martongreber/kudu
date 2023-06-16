@@ -39,6 +39,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/security/test/mini_kdc.h"
+#include "kudu/server/server_base.pb.h"
 #include "kudu/subprocess/subprocess_protocol.h"
 #include "kudu/tools/tool.pb.h"
 #include "kudu/util/env.h"
@@ -316,6 +317,29 @@ Status ProcessRequest(const ControlShellRequestPB& req,
       RETURN_NOT_OK(FindDaemon(*cluster, id, &daemon, &kdc));
       DCHECK(daemon);
       RETURN_NOT_OK((*cluster)->SetFlag(daemon, r.flag(), r.value()));
+      break;
+    }
+    case ControlShellRequestPB::kGetDaemonFlags:
+    {
+      const auto& r = req.get_daemon_flags();
+      if (!r.has_id()) {
+        RETURN_NOT_OK(Status::InvalidArgument("missing process id"));
+      }
+      const auto& id = r.id();
+      if (id.type() == DaemonType::KDC) {
+        return Status::InvalidArgument("mini-KDC doesn't support GetFlags()");
+      }
+      if (!r.has_request()) {
+        return Status::InvalidArgument("missing request in GetDaemonFlags");
+      }
+
+      ExternalDaemon* daemon;
+      MiniKdc* kdc;
+      RETURN_NOT_OK(FindDaemon(*cluster, id, &daemon, &kdc));
+      DCHECK(daemon);
+      kudu::server::GetFlagsResponsePB server_resp;
+      RETURN_NOT_OK((*cluster)->GetFlags(daemon, r.request(), server_resp));
+      *resp->mutable_get_daemon_flags() = server_resp;
       break;
     }
     case ControlShellRequestPB::kPauseDaemon:

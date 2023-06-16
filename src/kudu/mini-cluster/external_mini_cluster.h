@@ -92,6 +92,8 @@ class MiniPostgres;
 
 namespace server {
 class ServerStatusPB;
+class GetFlagsRequestPB;
+class GetFlagsResponsePB;
 } // namespace server
 
 namespace tserver {
@@ -551,6 +553,11 @@ class ExternalMiniCluster : public MiniCluster {
   Status SetFlag(ExternalDaemon* daemon,
                  const std::string& flag,
                  const std::string& value) WARN_UNUSED_RESULT;
+
+  // Gets the flags on the given daemon, which must be running.
+  Status GetFlags(ExternalDaemon* daemon,
+                  const kudu::server::GetFlagsRequestPB& req,
+                  kudu::server::GetFlagsResponsePB& resp);
 
   // Enable Hive Metastore integration.
   // Overrides HMS integration options set by ExternalMiniClusterOptions.

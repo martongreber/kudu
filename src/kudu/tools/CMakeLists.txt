@@ -32,7 +32,8 @@ target_link_libraries(tool_proto
   kudu_common_proto
   protobuf
   tablet_proto
-  wire_protocol_proto)
+  wire_protocol_proto
+  server_base_proto)
 
 #######################################
 # kudu_tools_util

@@ -21,6 +21,7 @@ option java_package = "org.apache.kudu.tools";
 
 import "kudu/common/common.proto";
 import "kudu/common/wire_protocol.proto";
+import "kudu/server/server_base.proto";
 import "kudu/tablet/metadata.proto";
 import "kudu/tablet/tablet.proto";
 
@@ -205,6 +206,14 @@ message GetJwtServerResponsePB {
 // Gets information on each started tablet server.
 message GetJwtServerRequestPB {}
 
+// Retrieve the values of command line flags for a specific daemon.
+message GetDaemonFlagsRequestPB {
+  // The identifier of the daemon to sent the request to.
+  optional DaemonIdentifierPB id = 1;
+  // The actual request
+  optional kudu.server.GetFlagsRequestPB request = 2;
+}
+
 // Call SetFlag() on the specific daemon.
 message SetDaemonFlagRequestPB {
   // The identifier of the daemon to sent the request to.
@@ -227,6 +236,7 @@ message ControlShellResponsePB {
     GetTServersResponsePB get_tservers = 3;
     GetKDCEnvVarsResponsePB get_kdc_env_vars = 4;
     CreateJwtResponsePB create_jwt = 5;
+    kudu.server.GetFlagsResponsePB get_daemon_flags = 6;
   }
 }
 
@@ -254,6 +264,7 @@ message ControlShellRequestPB {
     PauseDaemonRequestPB pause_daemon = 13;
     ResumeDaemonRequestPB resume_daemon = 14;
     CreateJwtRequestPB create_jwt = 15;
+    GetDaemonFlagsRequestPB get_daemon_flags = 16;
   }
 }
 

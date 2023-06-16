@@ -310,8 +310,7 @@ Status Schema::Reset(vector<ColumnSchema> cols,
     if (col.name().empty()) {
       return Status::InvalidArgument("column names must be non-empty");
     }
-    if (col.name() == Schema::GetAutoIncrementingColumnName() &&
-        !col.is_auto_incrementing()) {
+    if (col.name() == Schema::GetAutoIncrementingColumnName() && !col.is_auto_incrementing()) {
       return Status::InvalidArgument(Substitute(
           "$0 is a reserved column name", Schema::GetAutoIncrementingColumnName()));
     }

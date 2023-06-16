@@ -39,8 +39,10 @@ import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
 import io.netty.util.Timeout;
 import io.netty.util.TimerTask;
+import org.apache.kudu.Schema;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
+import org.checkerframework.checker.units.qual.C;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -658,6 +660,13 @@ public class AsyncKuduSession implements SessionConfiguration {
     Preconditions.checkArgument(operation.getTable().getAsyncClient() == client,
         "Applied operations must be created from a KuduTable instance opened " +
         "from the same client that opened this KuduSession");
+    // We do not want to have auto-incrementing column set for INSERT operations.
+    if (operation.getRow().getSchema().hasAutoIncrementingColumn() &&
+            operation.getRow().isSet(Schema.getAutoIncrementingColumnName()) &&
+            operation.getChangeType() == Operation.ChangeType.INSERT) {
+      throw new IllegalArgumentException("Auto-Incrementing column should not " +
+              "be specified for INSERT operation");
+    }
     if (closed) {
       // Ideally this would be a precondition, but that may break existing
       // clients who have grown to rely on this unsafe behavior.

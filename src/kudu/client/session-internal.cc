@@ -352,6 +352,15 @@ Status CheckForNonUniquePrimaryKey(const KuduWriteOperation& op) {
   return Status::OK();
 }
 
+// Check if the auto-incrementing column is set for the write operation.
+Status CheckForAutoIncrementingColumn(const KuduWriteOperation& op) {
+  if (op.row().schema()->has_auto_incrementing() && op.row().IsAutoIncrementingColumnSet()) {
+    return Status::IllegalState("Auto-Incrementing column should not be "
+                                "specified for Insert operation");
+  }
+  return Status::OK();
+}
+
 // Check if the values for the non-nullable columns are present.
 Status CheckForNonNullableColumns(const KuduWriteOperation& op) {
   const auto& row = op.row();
@@ -365,16 +374,6 @@ Status CheckForNonNullableColumns(const KuduWriteOperation& op) {
           "non-nullable column '$0' is not set", schema->column(idx).name()),
           KUDU_REDACT(op.ToString()));
     }
-  }
-  return Status::OK();
-}
-
-Status CheckForAutoIncrementingColumn(const KuduWriteOperation& op) {
-  if (op.row().schema()->has_auto_incrementing()) {
-    return Status::IllegalState(
-        Substitute(
-            "this type of write operation is not supported on table with auto-incrementing column"),
-        KUDU_REDACT(op.ToString()));
   }
   return Status::OK();
 }
@@ -396,18 +395,11 @@ Status KuduSession::Data::ValidateWriteOperation(KuduWriteOperation* op) const {
   } else {
     RETURN_NOT_OK_ADD_ERROR(CheckForPrimaryKey, op, error_collector_);
   }
-  // TODO(martongreber): UPSERT and UPSERT IGNORE are not supported initially for tables
-  // with a non-unique primary key. We plan to add this later.
   switch (op->type()) {
     case KuduWriteOperation::INSERT:
-      RETURN_NOT_OK_ADD_ERROR(CheckForNonNullableColumns, op, error_collector_);
-      break;
+      RETURN_NOT_OK_ADD_ERROR(CheckForAutoIncrementingColumn, op, error_collector_);
     case KuduWriteOperation::UPSERT:
       RETURN_NOT_OK_ADD_ERROR(CheckForNonNullableColumns, op, error_collector_);
-      RETURN_NOT_OK_ADD_ERROR(CheckForAutoIncrementingColumn, op, error_collector_);
-      break;
-    case KuduWriteOperation::UPSERT_IGNORE:
-      RETURN_NOT_OK_ADD_ERROR(CheckForAutoIncrementingColumn, op, error_collector_);
       break;
     default:
       // Nothing else to validate for other types of write operations.

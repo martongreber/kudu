@@ -484,9 +484,6 @@ class TestClient(KuduTestBase, CompatUnitTest):
                 assert len(errors) == 1
                 assert message in repr(errors[0])
 
-            # TODO: Upsert should be rejected as of now. However the test segfaults: KUDU-3454
-            # TODO: Upsert ignore should be rejected. Once Python client supports upsert ignore.
-
             # With non-unique primary key, one can't use the tuple/list initialization for new
             # inserts. In this case, at the second position it would like to get an int64 (the type
             # of the auto-incrementing counter), therefore we get type error. (Specifying the

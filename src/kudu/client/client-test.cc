@@ -10102,43 +10102,6 @@ TEST_F(ClientTestAutoIncrementingColumn, AlterOperationNegatives) {
   }
 }
 
-TEST_F(ClientTestAutoIncrementingColumn, InsertOperationNegatives) {
-  const string kTableName = "insert_operation_negatives_auto_incrementing_column";
-  KuduSchemaBuilder b;
-  // Create a schema with non-unique PK, such that auto incrementing col is present.
-  b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->NonUniquePrimaryKey();
-  ASSERT_OK(b.Build(&schema_));
-
-  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
-  ASSERT_OK(table_creator->table_name(kTableName)
-            .schema(&schema_)
-            .add_hash_partitions({"key"}, 2)
-            .num_replicas(3)
-            .Create());
-
-  shared_ptr<KuduSession> session(client_->NewSession());
-  shared_ptr<KuduTable> table;
-  client_->OpenTable(kTableName, &table);
-
-  {
-    unique_ptr<KuduUpsert> op(table->NewUpsert());
-    auto* row = op->mutable_row();
-    ASSERT_OK(row->SetInt32("key", 1));
-    ASSERT_STR_CONTAINS(session->Apply(op.release()).ToString(),
-                        "Illegal state: this type of write operation is not supported on table "
-                        "with auto-incrementing column");
-  }
-
-  {
-    unique_ptr<KuduUpsertIgnore> op(table->NewUpsertIgnore());
-    auto* row = op->mutable_row();
-    ASSERT_OK(row->SetInt32("key", 1));
-    ASSERT_STR_CONTAINS(session->Apply(op.release()).ToString(),
-                        "Illegal state: this type of write operation is not supported on table "
-                        "with auto-incrementing column");
-  }
-}
-
 TEST_F(ClientTestAutoIncrementingColumn, CreateTableFeatureFlag) {
   FLAGS_master_support_auto_incrementing_column = false;
   const string kTableName = "create_table_with_auto_incrementing_column_feature_flag";

@@ -1252,6 +1252,61 @@ TEST_F(TestEnv, TestCreateFifo) {
   ASSERT_OK(env_->NewFifo(kFifo, &fifo));
 }
 
+class TestRubberDuck: public TestEnv {
+ public:
+  void SetUp() override {
+    SetEncryptionFlags(true);
+    FLAGS_encryption_key_length = 128;
+  }
+};
+
+TEST_F(TestRubberDuck, WriteFile){
+  const string kFolder = "/tmp/test_openssl";
+  const string kFile = JoinPathSegments(kFolder, "encrypted_file");
+  env_->CreateDir(kFolder);
+  env_->DeleteFile(kFile);
+  unique_ptr<RWFile> rw;
+  RWFileOptions opts;
+  opts.is_sensitive = true;
+  opts.mode = Env::OpenMode::MUST_CREATE;
+  ASSERT_OK(env_->NewRWFile(opts, kFile, &rw));
+  string kTestData = "hello";
+  ASSERT_OK(rw->Write(env_->GetEncryptionHeaderSize(), kTestData));
+
+  // Setup read parameters
+  constexpr size_t size = 5;
+  uint8_t scratch[size];
+  Slice result(scratch, size);
+  vector<Slice> results = { result };
+
+  // Reading back from the RWFile should succeed
+  ASSERT_OK(rw->ReadV(env_->GetEncryptionHeaderSize(), results));
+  ASSERT_EQ(result, "hello");
+  ASSERT_OK(rw->Close());
+
+}
+
+TEST_F(TestRubberDuck, ReadFile){
+  const string kFolder = "/tmp/test_openssl";
+  const string kFile = JoinPathSegments(kFolder, "encrypted_file");
+  unique_ptr<RWFile> rw;
+  RWFileOptions opts;
+  opts.is_sensitive = true;
+  opts.mode = Env::OpenMode::MUST_EXIST;
+  ASSERT_OK(env_->NewRWFile(opts, kFile, &rw));
+
+  // Setup read parameters
+  constexpr size_t size = 5;
+  uint8_t scratch[size];
+  Slice result(scratch, size);
+  vector<Slice> results = { result };
+
+  // Reading back from the RWFile should succeed
+  ASSERT_OK(rw->ReadV(env_->GetEncryptionHeaderSize(), results));
+  ASSERT_EQ(result, "hello");
+  ASSERT_OK(rw->Close());
+}
+
 class TestEncryptedEnv : public TestEnv, public ::testing::WithParamInterface<int> {
  public:
   void SetUp() override {

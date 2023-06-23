@@ -87,10 +87,15 @@ done
 # Build the java modules.
 pushd java
 # Note: We use install instead of publish because the CDP build publishes
-# the Jars that are installed to the local maven repo at the end of the build.
-./gradlew install -PskipSigning=true
+#       the JARs that are installed to the local maven repo at the end
+#       of the build.
+#
+# Note: skipFormat is added to avoid running 'scalafmt' because when building
+#       release bits, we are not interested in running tasks that a developer
+#       would run before pushing the changes into the repo.
+./gradlew install -PskipSigning=true -PskipFormat=true
 # Build again with Spark 2
-./gradlew install -PskipSigning=true -Pspark2
+./gradlew install -PskipSigning=true -PskipFormat=true -Pspark2
 popd
 
 # Build the `kudu-binary` jar.

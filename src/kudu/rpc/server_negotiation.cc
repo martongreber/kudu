@@ -206,7 +206,6 @@ Status ServerNegotiation::Negotiate() {
 
   // Wait until starting negotiation to check that the socket, tls_context, and
   // token_verifier are not null, since they do not need to be set for
-  // PreflightCheckGSSAPI.
   DCHECK(socket_);
   DCHECK(tls_context_);
   DCHECK(token_verifier_);
@@ -541,7 +540,14 @@ Status ServerNegotiation::HandleNegotiate(const NegotiatePB& request) {
     // message.
     negotiated_authn_ = AuthenticationType::TOKEN;
   } else if (ContainsKey(authn_types, AuthenticationType::JWT) &&
-             encryption_ != RpcEncryption::DISABLED) {
+             encryption_ != RpcEncryption::DISABLED &&
+             tls_context_->has_signed_cert()) {
+    // The client should send its JWT only to servers that it trusts because
+    // an untrusted server could be run by a malicious impostor who might steal
+    // the client's credentials. So, a benevolent server advertises its JWT
+    // authentication ability to clients only if it has a CA-signed TLS
+    // certificate that the client might verify against its bundle of trusted
+    // CA certificates.
     negotiated_authn_ = AuthenticationType::JWT;
   } else {
     // Otherwise we always can fallback to SASL.

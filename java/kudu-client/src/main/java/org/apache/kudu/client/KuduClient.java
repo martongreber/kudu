@@ -17,11 +17,13 @@
 
 package org.apache.kudu.client;
 
+import java.security.cert.CertificateException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executor;
 
 import com.google.common.base.Preconditions;
+import com.google.protobuf.ByteString;
 import com.stumbleupon.async.Deferred;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
@@ -464,6 +466,33 @@ public class KuduClient implements AutoCloseable {
   @InterfaceStability.Unstable
   public void importAuthenticationCredentials(byte[] authnData) {
     asyncClient.importAuthenticationCredentials(authnData);
+  }
+
+  /**
+   * Mark the given CA certificates (in DER format) as the trusted ones for the
+   * client. The provided list of certificates replaces any previously set ones.
+   *
+   * @param certificates list of certificates to trust (in DER format)
+   * @throws CertificateException if any of the specified certificates were invalid
+   */
+  @InterfaceStability.Unstable
+  public void trustedCertificates(List<ByteString> certificates) throws CertificateException {
+    asyncClient.trustedCertificates(certificates);
+  }
+
+  /**
+   * Set JWT (JSON Web Token) to authenticate the client to a server.
+   * <p>
+   * @note If {@link #importAuthenticationCredentials(byte[] authnData)} and
+   * this method are called on the same object, the JWT provided with this call
+   * overrides the corresponding JWT that comes as a part of the imported
+   * authentication credentials (if present).
+   *
+   * @param jwt The JSON web token to set.
+   */
+  @InterfaceStability.Unstable
+  public void jwt(String jwt) {
+    asyncClient.jwt(jwt);
   }
 
   /**

@@ -53,6 +53,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.client.Client.AuthenticationCredentialsPB;
+import org.apache.kudu.security.Token.JwtRawPB;
 import org.apache.kudu.security.Token.SignedTokenPB;
 import org.apache.kudu.security.Token.TokenPB;
 import org.apache.kudu.util.Pair;
@@ -72,6 +73,10 @@ class SecurityContext {
   @GuardedBy("this")
   @Nullable
   private SignedTokenPB authnToken;
+
+  @GuardedBy("this")
+  @Nullable
+  private JwtRawPB jsonWebToken;
 
   @GuardedBy("this")
   private String realUser;
@@ -273,6 +278,9 @@ class SecurityContext {
     if (authnToken != null) {
       pb.setAuthnToken(authnToken);
     }
+    if (jsonWebToken != null) {
+      pb.setJwt(jsonWebToken);
+    }
     pb.addAllCaCertDers(trustedCertDers);
     return pb.build().toByteArray();
   }
@@ -310,14 +318,28 @@ class SecurityContext {
       }
 
       LOG.debug("Importing authentication credentials with {} authn token, " +
-                "{} cert(s), and realUser={}",
+                "with {} JWT, {} cert(s), and realUser={}",
                 pb.hasAuthnToken() ? "one" : "no",
+                pb.hasJwt() ? "one" : "no",
                 pb.getCaCertDersCount(),
                 pb.hasRealUser() ? pb.getRealUser() : "<none>");
       if (pb.hasAuthnToken()) {
         authnToken = pb.getAuthnToken();
       }
-      trustCertificates(pb.getCaCertDersList());
+
+      // only trust ca certificates automatically if they were acquired with mutual trust of
+      // identities
+      if (!pb.hasJwt()) {
+        trustCertificates(pb.getCaCertDersList());
+      }
+
+      if (pb.hasJwt()) {
+        // Don't overwrite the JWT in the context if it's already set.
+        if (jsonWebToken == null || !jsonWebToken.hasJwtData() ||
+            (jsonWebToken.hasJwtData() && jsonWebToken.getJwtData().isEmpty())) {
+          jsonWebToken = pb.getJwt();
+        }
+      }
 
       if (pb.hasRealUser()) {
         realUser = pb.getRealUser();
@@ -335,12 +357,25 @@ class SecurityContext {
     return authnToken;
   }
 
+  @Nullable
+  public synchronized JwtRawPB getJsonWebToken() {
+    return jsonWebToken;
+  }
+
   /**
    * Set the token that we will use to authenticate to servers. Replaces any
    * prior token.
    */
   public synchronized void setAuthenticationToken(SignedTokenPB token) {
     authnToken = token;
+  }
+
+  /**
+   * Set the JWT that we will use to authenticate to the server. Replaces any
+   * prior JWT.
+   */
+  public synchronized void setJsonWebToken(JwtRawPB jwt) {
+    jsonWebToken = jwt;
   }
 
   /**

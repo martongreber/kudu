@@ -26,6 +26,10 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLConnection;
 import java.nio.file.Paths;
 import java.security.Security;
 import java.util.ArrayList;
@@ -34,7 +38,9 @@ import java.util.Map;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -50,7 +56,10 @@ import org.apache.kudu.test.TempDirUtils;
 import org.apache.kudu.tools.Tool.ControlShellRequestPB;
 import org.apache.kudu.tools.Tool.ControlShellResponsePB;
 import org.apache.kudu.tools.Tool.CreateClusterRequestPB;
+import org.apache.kudu.tools.Tool.CreateClusterRequestPB.JwksOptionsPB;
 import org.apache.kudu.tools.Tool.CreateClusterRequestPB.MiniKdcOptionsPB;
+import org.apache.kudu.tools.Tool.CreateClusterRequestPB.MiniOidcOptionsPB;
+import org.apache.kudu.tools.Tool.CreateJwtRequestPB;
 import org.apache.kudu.tools.Tool.DaemonIdentifierPB;
 import org.apache.kudu.tools.Tool.DaemonInfoPB;
 import org.apache.kudu.tools.Tool.GetKDCEnvVarsRequestPB;
@@ -93,6 +102,7 @@ public final class MiniKuduCluster implements AutoCloseable {
     DaemonIdentifierPB id;
     boolean isRunning;
     boolean isPaused;
+    String webServerAddress;
   }
 
   // Map of master addresses to daemon information.
@@ -113,6 +123,7 @@ public final class MiniKuduCluster implements AutoCloseable {
 
   private MiniKdcOptionsPB kdcOptionsPb;
   private final Common.HmsMode hmsMode;
+  private MiniOidcOptionsPB oidcOptionsPb;
 
   private MiniKuduCluster(boolean enableKerberos,
       int numMasters,
@@ -123,7 +134,8 @@ public final class MiniKuduCluster implements AutoCloseable {
       MiniKdcOptionsPB kdcOptionsPb,
       String clusterRoot,
       Common.HmsMode hmsMode,
-      String principal) {
+      String principal,
+      MiniOidcOptionsPB oidcOptionsPb) {
     this.enableKerberos = enableKerberos;
     this.numMasters = numMasters;
     this.numTservers = numTservers;
@@ -133,6 +145,7 @@ public final class MiniKuduCluster implements AutoCloseable {
     this.kdcOptionsPb = kdcOptionsPb;
     this.principal = principal;
     this.hmsMode = hmsMode;
+    this.oidcOptionsPb = oidcOptionsPb;
 
     if (clusterRoot == null) {
       // If a cluster root was not set, create a unique temp directory to use.
@@ -227,7 +240,8 @@ public final class MiniKuduCluster implements AutoCloseable {
         .addAllExtraTserverFlags(extraTserverFlags)
         .setMiniKdcOptions(kdcOptionsPb)
         .setClusterRoot(clusterRoot)
-        .setPrincipal(principal);
+        .setPrincipal(principal)
+        .setMiniOidcOptions(oidcOptionsPb);
 
     // Set up the location mapping command flag if there is location info.
     if (!locationInfo.isEmpty()) {
@@ -280,6 +294,8 @@ public final class MiniKuduCluster implements AutoCloseable {
       d.id = info.getId();
       d.isRunning = true;
       d.isPaused = false;
+      d.webServerAddress = String.join(":", info.getBoundHttpAddress().getHost(),
+                                       Integer.toString(info.getBoundHttpAddress().getPort()));
       masterServers.put(ProtobufHelper.hostAndPortFromPB(info.getBoundRpcAddress()), d);
     }
     resp = sendRequestToCluster(
@@ -291,15 +307,29 @@ public final class MiniKuduCluster implements AutoCloseable {
       d.id = info.getId();
       d.isRunning = true;
       d.isPaused = false;
+      d.webServerAddress = String.join(":", info.getBoundHttpAddress().getHost(),
+                                       Integer.toString(info.getBoundHttpAddress().getPort()));
       tabletServers.put(ProtobufHelper.hostAndPortFromPB(info.getBoundRpcAddress()), d);
     }
   }
 
   /**
-   * @return comma-separated list of master server addresses
+   * @return a comma-separated list of RPC addresses of all masters in the cluster
    */
   public String getMasterAddressesAsString() {
     return Joiner.on(',').join(masterServers.keySet());
+  }
+
+  /**
+   * @return a comma-separated list of webserver addresses of all masters in the cluster
+   */
+  public String getMasterWebServerAddressesAsString() {
+    List<String> addresses = new ArrayList<String>();
+    masterServers.forEach((hp, daemonInfo) -> {
+      addresses.add(daemonInfo.webServerAddress);
+    });
+
+    return Joiner.on(',').join(addresses);
   }
 
   /**
@@ -321,6 +351,18 @@ public final class MiniKuduCluster implements AutoCloseable {
    */
   public String getPrincipal() {
     return principal;
+  }
+
+  public String createJwtFor(String accountId, String subject, boolean isValid) throws IOException {
+    ControlShellResponsePB resp = sendRequestToCluster(ControlShellRequestPB.newBuilder()
+        .setCreateJwt(CreateJwtRequestPB
+            .newBuilder()
+            .setAccountId(accountId)
+            .setSubject(subject)
+            .setIsValidKey(isValid)
+            .build())
+        .build());
+    return resp.getCreateJwt().getJwt();
   }
 
   /**
@@ -662,6 +704,33 @@ public final class MiniKuduCluster implements AutoCloseable {
   }
 
   /**
+   * @return cluster's CA certificate in DER format or an empty array
+   */
+  public byte[] getCACertDer() throws IOException {
+    String masterHttpAddr = Iterables.get(Splitter.on(',')
+                                     .split(getMasterWebServerAddressesAsString()), 0);
+    URL url = new URL("http://" + masterHttpAddr + "/ipki-ca-cert-der");
+    HttpURLConnection connection = (HttpURLConnection)url.openConnection();
+    connection.setRequestMethod("GET");
+    connection.connect();
+
+    if (connection.getResponseCode() != 200) {
+      connection.disconnect();
+      return new byte[0];
+    }
+
+    InputStream urlData = connection.getInputStream();
+    int contentSize = connection.getContentLength();
+    byte[] data = new byte[contentSize];
+    int numBytesRead = urlData.read(data);
+    if (numBytesRead != contentSize) {
+      connection.disconnect();
+      return new byte[0];
+    }
+    return data;
+  }
+
+  /**
    * Helper runnable that receives stderr and logs it along with the process' identifier.
    */
   public static class ProcessInputStreamLogPrinterRunnable implements Runnable {
@@ -705,6 +774,7 @@ public final class MiniKuduCluster implements AutoCloseable {
     private String principal = "kudu";
 
     private MiniKdcOptionsPB.Builder kdcOptionsPb = MiniKdcOptionsPB.newBuilder();
+    private MiniOidcOptionsPB.Builder oidcOptionsPb = MiniOidcOptionsPB.newBuilder();
     private Common.HmsMode hmsMode = Common.HmsMode.NONE;
 
     public MiniKuduClusterBuilder numMasterServers(int numMasterServers) {
@@ -788,6 +858,15 @@ public final class MiniKuduCluster implements AutoCloseable {
       return this;
     }
 
+    public MiniKuduClusterBuilder addJwks(String accountId, boolean isValid) {
+      this.oidcOptionsPb.addJwksOptions(
+          JwksOptionsPB.newBuilder()
+              .setAccountId(accountId)
+              .setIsValidKey(isValid)
+              .build());
+      return this;
+    }
+
     /**
      * Builds and starts a new {@link MiniKuduCluster} using builder state.
      * @return the newly started {@link MiniKuduCluster}
@@ -798,7 +877,8 @@ public final class MiniKuduCluster implements AutoCloseable {
           new MiniKuduCluster(enableKerberos,
               numMasterServers, numTabletServers,
               extraTabletServerFlags, extraMasterServerFlags, locationInfo,
-              kdcOptionsPb.build(), clusterRoot, hmsMode, principal);
+              kdcOptionsPb.build(), clusterRoot, hmsMode, principal,
+              oidcOptionsPb.build());
       try {
         cluster.start();
       } catch (IOException e) {

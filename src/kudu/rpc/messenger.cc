@@ -45,7 +45,6 @@
 #include "kudu/rpc/service_if.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/token_verifier.h"
-#include "kudu/util/jwt.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
@@ -97,7 +96,6 @@ Status MessengerBuilder::Build(shared_ptr<Messenger>* msgr) {
                                  std::mem_fn(&Messenger::AllExternalReferencesDropped));
   if (jwt_verifier_) {
     new_msgr->jwt_verifier_ = std::move(jwt_verifier_);
-    RETURN_NOT_OK(new_msgr->mutable_jwt_verifier()->Init());
   }
   RETURN_NOT_OK(ParseTriState("--rpc_authentication",
                               rpc_authentication_,
@@ -123,12 +121,11 @@ Status MessengerBuilder::Build(shared_ptr<Messenger>* msgr) {
       } else {
         RETURN_NOT_OK(tls_context->LoadCertificateAndPasswordProtectedKey(
             rpc_certificate_file_, rpc_private_key_file_,
-            [&](){
-              string ret;
-              WARN_NOT_OK(security::GetPasswordFromShellCommand(
-                  rpc_private_key_password_cmd_, &ret),
+            [&](string* password){
+              RETURN_NOT_OK_PREPEND(security::GetPasswordFromShellCommand(
+                  rpc_private_key_password_cmd_, password),
                   "could not get RPC password from configured command");
-              return ret;
+              return Status::OK();
             }
         ));
       }

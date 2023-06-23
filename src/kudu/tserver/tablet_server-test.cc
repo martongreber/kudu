@@ -82,8 +82,11 @@
 #include "kudu/server/rpc_server.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
+#include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/rowset.h"
+#include "kudu/tablet/rowset_tree.h" // IWYU pragma: keep
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_metrics.h"
@@ -181,6 +184,7 @@ DECLARE_bool(enable_workload_score_for_perf_improvement_ops);
 DECLARE_bool(fail_dns_resolution);
 DECLARE_bool(rowset_metadata_store_keys);
 DECLARE_bool(scanner_unregister_on_invalid_seq_id);
+DECLARE_bool(show_slow_scans);
 DECLARE_double(cfile_inject_corruption);
 DECLARE_double(env_inject_eio);
 DECLARE_double(env_inject_full);
@@ -199,7 +203,9 @@ DECLARE_int32(metrics_retirement_age_ms);
 DECLARE_int32(rpc_service_queue_length);
 DECLARE_int32(scanner_batch_size_rows);
 DECLARE_int32(scanner_gc_check_interval_us);
+DECLARE_int32(scanner_inject_latency_on_each_batch_ms);
 DECLARE_int32(scanner_ttl_ms);
+DECLARE_int32(slow_scanner_threshold_ms);
 DECLARE_int32(tablet_bootstrap_inject_latency_ms);
 DECLARE_int32(tablet_inject_latency_on_apply_write_op_ms);
 DECLARE_int32(workload_stats_rate_collection_min_interval_ms);
@@ -226,16 +232,13 @@ METRIC_DECLARE_gauge_uint64(log_block_manager_containers);
 METRIC_DECLARE_gauge_size(active_scanners);
 METRIC_DECLARE_gauge_size(tablet_active_scanners);
 METRIC_DECLARE_gauge_size(num_rowsets_on_disk);
+METRIC_DECLARE_gauge_size(slow_scans);
 METRIC_DECLARE_histogram(flush_dms_duration);
 METRIC_DECLARE_histogram(op_apply_queue_length);
 METRIC_DECLARE_histogram(op_apply_queue_time);
 
 
 namespace kudu {
-
-namespace tablet {
-class RowSet;
-}
 
 namespace tserver {
 
@@ -559,6 +562,7 @@ TEST_F(TabletServerTest, TestWebPages) {
     // bugs in the past.
     ASSERT_STR_CONTAINS(buf.ToString(), "hybrid_clock_timestamp");
     ASSERT_STR_CONTAINS(buf.ToString(), "active_scanners");
+    ASSERT_STR_CONTAINS(buf.ToString(), "slow_scans");
     ASSERT_STR_CONTAINS(buf.ToString(), "threads_started");
     ASSERT_STR_CONTAINS(buf.ToString(), "code_cache_queries");
 #ifdef TCMALLOC_ENABLED
@@ -2283,6 +2287,55 @@ static const ReadMode kReadModes[] = {
 INSTANTIATE_TEST_SUITE_P(Params, ExpiredScannerParamTest,
                          testing::ValuesIn(kReadModes));
 
+class SlowScansParamTest :
+    public TabletServerTest,
+    public ::testing::WithParamInterface<ReadMode> {
+};
+
+TEST_P(SlowScansParamTest, Test) {
+  const ReadMode mode = GetParam();
+  // Slow scanners aren't shown by default.
+  ASSERT_FALSE(FLAGS_show_slow_scans);
+  FLAGS_show_slow_scans = true;
+  FLAGS_scanner_ttl_ms = 500;
+  // Create slow scan scenarios.
+  FLAGS_scanner_inject_latency_on_each_batch_ms = 50;
+  FLAGS_slow_scanner_threshold_ms = 1;
+
+  int num_rows = 10000;
+  InsertTestRowsDirect(0, num_rows);
+
+  // Instantiate slow scans metric.
+  ASSERT_TRUE(mini_server_->server()->metric_entity());
+  auto slow_scans = METRIC_slow_scans.InstantiateFunctionGauge(
+      mini_server_->server()->metric_entity(), [this]() {
+          return this->mini_server_->server()->scanner_manager()->CountSlowScans(); });
+
+  // Initially, there've been no scanners, so none is slow.
+  ASSERT_EQ(0, slow_scans->value());
+
+  ScanResponsePB resp;
+  NO_FATALS(OpenScannerWithAllColumns(&resp, mode));
+  ScanRequestPB req;
+  RpcController rpc;
+  req.set_scanner_id(resp.scanner_id());
+  req.set_call_seq_id(1);
+  resp.Clear();
+  ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
+  // The scanner should be slow after a while, which is defined by '--slow_scanner_threshold_ms'.
+  ASSERT_EQ(1, slow_scans->value());
+
+  // Make scanners expire quickly.
+  FLAGS_scanner_ttl_ms = 1;
+  // Ensure that the metrics have been updated now.
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_EQ(0, slow_scans->value());
+  });
+}
+
+INSTANTIATE_TEST_SUITE_P(Params, SlowScansParamTest,
+                         testing::ValuesIn(kReadModes));
+
 class ScanCorruptedDeltasParamTest :
     public TabletServerTest,
     public ::testing::WithParamInterface<ReadMode> {
@@ -2882,6 +2935,31 @@ TEST_F(TabletServerTest, TestConcurrentAccessToOneScanner) {
   ASSERT_EQ(total_rows, kNumRows);
 }
 
+// Test for a scan with query id in server side.
+TEST_F(TabletServerTest, TestScanWithQueryId) {
+  InsertTestRowsDirect(0, 100);
+
+  ScanRequestPB req;
+  NewScanRequestPB* scan = req.mutable_new_scan_request();
+  scan->set_tablet_id(kTabletId);
+  req.set_batch_size_bytes(0); // so it won't return data right away
+  ASSERT_OK(SchemaToColumnPBs(schema_, scan->mutable_projected_columns()));
+  req.set_query_id("query_id_for_test");
+
+  ScanResponsePB resp;
+  RpcController rpc;
+  // Send the call
+  {
+    SCOPED_TRACE(SecureDebugString(req));
+    ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+  vector<string> results;
+  NO_FATALS(
+    DrainScannerToStrings(resp.scanner_id(), schema_, &results));
+  ASSERT_EQ(100, results.size());
+}
 
 TEST_F(TabletServerTest, TestScanWithStringPredicates) {
   InsertTestRowsDirect(0, 100);
@@ -4529,6 +4607,98 @@ TEST_F(TabletServerTest, TestKeysInRowsetMetadataPreventStartupSeeks) {
   // bytes should be read by the BM if storing keys in the rowset metadata).
   restart_server_and_check_bytes_read(/*keys_in_rowset_meta=*/ false);
   restart_server_and_check_bytes_read(/*keys_in_rowset_meta=*/ true);
+}
+
+TEST_F(TabletServerTest, SetEncodedKeysWhenStartingUp) {
+  // Don't write the min/max keys to the rowset metadata.
+  // So we can test the min/max encoded key load and set
+  // it to the rowset metadata when restarting.
+  FLAGS_rowset_metadata_store_keys = false;
+  InsertTestRowsDirect(0, 100);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  // Disable the maintenance manager so we don't get any seeks from
+  // maintenance operations when we restart.
+  FLAGS_enable_maintenance_manager = false;
+  TabletSuperBlockPB superblock_pb;
+  tablet_replica_->tablet()->metadata()->ToSuperBlock(&superblock_pb);
+  // Make sure the min/max key do not exist in the rowset metadata.
+  for (int rowset_no = 0; rowset_no < superblock_pb.rowsets_size(); rowset_no++) {
+    RowSetDataPB* rowset_pb = superblock_pb.mutable_rowsets(rowset_no);
+    ASSERT_FALSE(rowset_pb->has_min_encoded_key());
+    ASSERT_FALSE(rowset_pb->has_max_encoded_key());
+  }
+  {
+    scoped_refptr<tablet::TabletComponents> comps;
+    tablet_replica_->tablet()->GetComponents(&comps);
+    for (const auto &rowset : comps->rowsets->all_rowsets()) {
+      ASSERT_FALSE(rowset->metadata()->has_encoded_keys());
+    }
+  }
+
+  // Used to record the min/max encoded key value in memory when we restart.
+  string min_key;
+  string max_key;
+
+  const auto restart_server_and_check_encoded_key = [&] (bool set_keys_during_restart,
+                                                         string* min_key,
+                                                         string* max_key) {
+    FLAGS_rowset_metadata_store_keys = set_keys_during_restart;
+    // Reset the replica to avoid any lingering references.
+    // Restart the server and wait for the tablet to bootstrap.
+    tablet_replica_.reset();
+    mini_server_->Shutdown();
+
+    ASSERT_OK(mini_server_->Restart());
+    ASSERT_OK(mini_server_->WaitStarted());
+
+    ASSERT_OK(mini_server_->server()->tablet_manager()->GetTabletReplica(kTabletId,
+                                                                         &tablet_replica_));
+    scoped_refptr<tablet::TabletComponents> comps;
+    tablet_replica_->tablet()->GetComponents(&comps);
+    if (!set_keys_during_restart) {
+      // We can get the encoded min/max value from the 'CFileSet'.
+      const auto& rowsets = comps->rowsets->all_rowsets();
+      ASSERT_EQ(1, rowsets.size());
+      auto const& rs = rowsets[0];
+      auto* dsr = down_cast<tablet::DiskRowSet*>(rs.get());
+      ASSERT_FALSE(dsr->base_data_->min_encoded_key_.empty());
+      ASSERT_FALSE(dsr->base_data_->max_encoded_key_.empty());
+      *min_key = dsr->base_data_->min_encoded_key_;
+      *max_key = dsr->base_data_->max_encoded_key_;
+    } else {
+      for (const auto &rowset : comps->rowsets->all_rowsets()) {
+        ASSERT_TRUE(rowset->metadata()->has_encoded_keys());
+        ASSERT_EQ(*min_key, rowset->metadata()->min_encoded_key());
+        ASSERT_EQ(*max_key, rowset->metadata()->max_encoded_key());
+      }
+    }
+
+    TabletSuperBlockPB superblock_pb;
+    tablet_replica_->tablet()->metadata()->ToSuperBlock(&superblock_pb);
+    for (int rowset_no = 0; rowset_no < superblock_pb.rowsets_size(); rowset_no++) {
+      RowSetDataPB* rowset_pb = superblock_pb.mutable_rowsets(rowset_no);
+      if (set_keys_during_restart) {
+        ASSERT_TRUE(rowset_pb->has_min_encoded_key());
+        ASSERT_TRUE(rowset_pb->has_max_encoded_key());
+        // The encoded key is same to the load.
+        ASSERT_EQ(*min_key, rowset_pb->min_encoded_key());
+        ASSERT_EQ(*max_key, rowset_pb->max_encoded_key());
+      } else {
+        // The encoded key doesn't exist without --rowset_metadata_store_keys set.
+        ASSERT_FALSE(rowset_pb->has_min_encoded_key());
+        ASSERT_FALSE(rowset_pb->has_max_encoded_key());
+      }
+    }
+  };
+
+  // Test both reading and not reading the keys from the rowset metadata,
+  // making sure we can get the encoded keys if we set the --rowset_metadata_store_keys
+  // flag.
+  restart_server_and_check_encoded_key(/*set_keys_during_restart=*/ false,
+                                       &min_key, &max_key);
+  restart_server_and_check_encoded_key(/*set_keys_during_restart=*/ true,
+                                       &min_key, &max_key);
 }
 
 // Test that each scanner can only be accessed by the user who created it.

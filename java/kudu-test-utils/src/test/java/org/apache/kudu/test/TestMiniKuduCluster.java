@@ -17,7 +17,9 @@
 
 package org.apache.kudu.test;
 
+import static org.apache.kudu.test.junit.AssertHelpers.assertEventuallyTrue;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -25,7 +27,9 @@ import static org.junit.Assert.fail;
 
 import java.io.IOException;
 import java.net.Socket;
+import java.util.Arrays;
 
+import com.google.protobuf.ByteString;
 import org.junit.Rule;
 import org.junit.Test;
 
@@ -36,6 +40,7 @@ import org.apache.kudu.client.ListTablesResponse;
 import org.apache.kudu.client.TimeoutTracker;
 import org.apache.kudu.test.cluster.FakeDNS;
 import org.apache.kudu.test.cluster.MiniKuduCluster;
+import org.apache.kudu.test.junit.AssertHelpers.BooleanExpression;
 import org.apache.kudu.test.junit.RetryRule;
 
 public class TestMiniKuduCluster {
@@ -46,6 +51,9 @@ public class TestMiniKuduCluster {
 
   @Rule
   public RetryRule retryRule = new RetryRule();
+
+  @Rule
+  public KuduTestHarness harness;
 
   @Test(timeout = 50000)
   public void test() throws Exception {
@@ -108,6 +116,36 @@ public class TestMiniKuduCluster {
   }
 
   @Test(timeout = 50000)
+  public void testJwtAuthn() throws Exception {
+    try (MiniKuduCluster cluster = createClusterForJwtTest();
+         KuduClient client = new KuduClientBuilder(cluster.getMasterAddressesAsString()).build()) {
+      // It may take some time for the catalog manager to initialize
+      // and have IPKI CA certificate ready.
+      assertEventuallyTrue(
+          "valid cluster IPKI CA certificate captured",
+          new BooleanExpression() {
+            @Override
+            public boolean get() throws Exception {
+              return cluster.getCACertDer().length != 0;
+            }
+          },
+          10000/*timeoutMillis*/);
+      byte[] caCert = cluster.getCACertDer();
+      assertNotEquals(0, caCert.length);
+
+      String jwt = cluster.createJwtFor("account-id", "kudu", true);
+      assertNotNull(jwt);
+      client.jwt(jwt);
+      client.trustedCertificates(Arrays.asList(ByteString.copyFrom(caCert)));
+
+      // A simple call to make sure the client can connect to the cluster.
+      // That assumes an RPC connection to the master has been successfully
+      // negotiated.
+      assertTrue(client.getTablesList().getTablesList().isEmpty());
+    }
+  }
+
+  @Test(timeout = 50000)
   public void testKerberos() throws Exception {
     FakeDNS.getInstance().install();
     try (MiniKuduCluster cluster = new MiniKuduCluster.MiniKuduClusterBuilder()
@@ -140,7 +178,7 @@ public class TestMiniKuduCluster {
    * @param testIsOpen true if we should want it to be open, false if we want it closed
    */
   private static void testHostPort(HostAndPort hp,
-                                   boolean testIsOpen) throws InterruptedException {
+      boolean testIsOpen) throws InterruptedException {
     TimeoutTracker tracker = new TimeoutTracker();
     while (tracker.getElapsedMillis() < SLEEP_TIME_MS) {
       try {
@@ -157,5 +195,18 @@ public class TestMiniKuduCluster {
       Thread.sleep(200);
     }
     fail("HostAndPort " + hp + " is still " + (testIsOpen ? "closed " : "open"));
+  }
+
+  private MiniKuduCluster createClusterForJwtTest() throws IOException {
+    return new MiniKuduCluster.MiniKuduClusterBuilder()
+        .numMasterServers(NUM_MASTERS)
+        .numTabletServers(0)
+        .addMasterServerFlag("--enable-jwt-token-auth")
+        .addMasterServerFlag("--rpc-trace-negotiation")
+        .addMasterServerFlag("--rpc-authentication=required")
+        .addMasterServerFlag("--rpc-encryption=required")
+        .enableKerberos()
+        .addJwks("account-id", true)
+        .build();
   }
 }

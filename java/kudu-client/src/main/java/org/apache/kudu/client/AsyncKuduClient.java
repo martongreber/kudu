@@ -75,11 +75,13 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.Common;
 import org.apache.kudu.Schema;
+import org.apache.kudu.client.Client.AuthenticationCredentialsPB;
 import org.apache.kudu.master.Master;
 import org.apache.kudu.master.Master.GetTableLocationsResponsePB;
 import org.apache.kudu.master.Master.TSInfoPB;
 import org.apache.kudu.master.Master.TableIdentifierPB;
 import org.apache.kudu.master.Master.TabletLocationsPB;
+import org.apache.kudu.security.Token;
 import org.apache.kudu.security.Token.SignedTokenPB;
 import org.apache.kudu.util.AsyncUtil;
 import org.apache.kudu.util.NetUtil;
@@ -1178,6 +1180,39 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
+   * Mark the given CA certificates (in DER format) as the trusted ones for the
+   * client. The provided list of certificates replaces any previously set ones.
+   *
+   * @param certificates list of certificates to trust (in DER format)
+   * @throws CertificateException if any of the specified certificates were invalid
+   */
+  @InterfaceStability.Unstable
+  public void trustedCertificates(List<ByteString> certificates) throws CertificateException {
+    securityContext.trustCertificates(certificates);
+  }
+
+  /**
+   * Set JWT (JSON Web Token) to authenticate the client to a server.
+   * <p>
+   * @note If {@link #importAuthenticationCredentials(byte[] authnData)} and
+   * this method are called on the same object, the JWT provided with this call
+   * overrides the corresponding JWT that comes as a part of the imported
+   * authentication credentials (if present).
+   *
+   * @param jwt The JSON web token to set.
+   */
+  @InterfaceStability.Unstable
+  public void jwt(String jwt) {
+    AuthenticationCredentialsPB credentials =
+        AuthenticationCredentialsPB.newBuilder()
+          .setJwt(Token.JwtRawPB.newBuilder()
+                  .setJwtData(ByteString.copyFromUtf8(jwt))
+                  .build())
+          .build();
+    securityContext.importAuthenticationCredentials(credentials.toByteArray());
+  }
+
+  /**
    * Get the timeout used for operations on sessions and scanners.
    * @return a timeout in milliseconds
    */
@@ -1926,7 +1961,8 @@ public class AsyncKuduClient implements AutoCloseable {
                 securityContext.setAuthenticationToken(resp.getConnectResponse().getAuthnToken());
               }
               List<ByteString> caCerts = resp.getConnectResponse().getCaCertDerList();
-              if (!caCerts.isEmpty()) {
+              if (!caCerts.isEmpty() && (securityContext.getJsonWebToken() == null ||
+                                         !securityContext.getJsonWebToken().hasJwtData())) {
                 try {
                   securityContext.trustCertificates(caCerts);
                 } catch (CertificateException e) {

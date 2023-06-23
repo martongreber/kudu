@@ -18,11 +18,13 @@
 
 from __future__ import division
 
-from kudu.compat import unittest
+from kudu.compat import CompatUnitTest
+from kudu.errors import KuduInvalidArgument
 import kudu
 
+from kudu.schema import Schema
 
-class TestSchema(unittest.TestCase):
+class TestSchema(CompatUnitTest):
 
     def setUp(self):
         self.columns = [('one', 'int32', False),
@@ -57,8 +59,10 @@ class TestSchema(unittest.TestCase):
         assert self.schema.primary_keys() == ['one', 'two']
 
     def test_getitem_boundschecking(self):
-        with self.assertRaises(IndexError):
-            self.schema[4]
+        idx = 4
+        error_msg = 'Column index {0} is not in range'.format(idx)
+        with self.assertRaisesRegex(IndexError, error_msg):
+            self.schema[idx]
 
     def test_getitem_wraparound(self):
         # wraparound
@@ -73,7 +77,8 @@ class TestSchema(unittest.TestCase):
 
         assert result.equals(expected)
 
-        with self.assertRaises(KeyError):
+        error_msg = 'not_found'
+        with self.assertRaisesRegex(KeyError, error_msg):
             self.schema['not_found']
 
     def test_schema_equals(self):
@@ -111,8 +116,10 @@ class TestSchema(unittest.TestCase):
         bar = builder.add_column('bar', 'string')
         bar.compression(kudu.COMPRESSION_ZLIB)
 
-        with self.assertRaises(ValueError):
-            bar = builder.add_column('qux', 'string', compression='unknown')
+        compression = 'unknown'
+        error_msg = 'Invalid compression type: {0}'.format(compression)
+        with self.assertRaisesRegex(ValueError, error_msg):
+            bar = builder.add_column('qux', 'string', compression=compression)
 
         builder.set_primary_keys(['key'])
         builder.build()
@@ -134,7 +141,8 @@ class TestSchema(unittest.TestCase):
         bar = builder.add_column('bar', 'string')
         bar.encoding(kudu.ENCODING_PLAIN)
 
-        with self.assertRaises(ValueError):
+        error_msg = 'Invalid encoding type'
+        with self.assertRaisesRegex(ValueError, error_msg):
             builder.add_column('qux', 'string', encoding='unknown')
 
         builder.set_primary_keys(['key'])
@@ -167,7 +175,8 @@ class TestSchema(unittest.TestCase):
          .primary_key()
          .nullable(False))
 
-        with self.assertRaises(kudu.KuduInvalidArgument):
+        error_msg = 'no precision provided for decimal column: key'
+        with self.assertRaisesRegex(kudu.KuduInvalidArgument, error_msg):
             builder.build()
 
     def test_precision_on_non_decimal_column(self):
@@ -179,7 +188,8 @@ class TestSchema(unittest.TestCase):
          .precision(9)
          .scale(2))
 
-        with self.assertRaises(kudu.KuduInvalidArgument):
+        error_msg = 'precision is not valid on a 2 column: key'
+        with self.assertRaisesRegex(kudu.KuduInvalidArgument, error_msg):
             builder.build()
 
     def test_date(self):
@@ -218,7 +228,8 @@ class TestSchema(unittest.TestCase):
          .primary_key()
          .nullable(False))
 
-        with self.assertRaises(kudu.KuduInvalidArgument):
+        error_msg = 'no length provided for VARCHAR column: key'
+        with self.assertRaisesRegex(kudu.KuduInvalidArgument, error_msg):
             builder.build()
 
     def test_varchar_invalid_length(self):
@@ -229,7 +240,8 @@ class TestSchema(unittest.TestCase):
          .length(0)
          .nullable(False))
 
-        with self.assertRaises(kudu.KuduInvalidArgument):
+        error_msg = 'length must be between 1 and 65535: key'
+        with self.assertRaisesRegex(kudu.KuduInvalidArgument, error_msg):
             builder.build()
 
     def test_length_on_non_varchar_column(self):
@@ -240,17 +252,20 @@ class TestSchema(unittest.TestCase):
          .nullable(False)
          .length(10))
 
-        with self.assertRaises(kudu.KuduInvalidArgument):
+        error_msg = 'no precision provided for decimal column: key'
+        with self.assertRaisesRegex(kudu.KuduInvalidArgument, error_msg):
             builder.build()
 
     def test_unsupported_col_spec_methods_for_create_table(self):
         builder = kudu.schema_builder()
         builder.add_column('test', 'int64').rename('test')
-        with self.assertRaises(kudu.KuduNotSupported):
+        error_msg = 'cannot rename a column during CreateTable: test'
+        with self.assertRaisesRegex(kudu.KuduNotSupported, error_msg):
             builder.build()
 
         builder.add_column('test', 'int64').remove_default()
-        with self.assertRaises(kudu.KuduNotSupported):
+        error_msg = 'cannot rename a column during CreateTable: test'
+        with self.assertRaisesRegex(kudu.KuduNotSupported, error_msg):
             builder.build()
 
     def test_set_column_spec_pk(self):
@@ -288,6 +303,241 @@ class TestSchema(unittest.TestCase):
 
         assert schema[3].nullable
         assert not schema[4].nullable
+
+    def test_mutable_immutable(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64', nullable=False)
+         .primary_key())
+
+        builder.add_column('data1', 'double').mutable(True)
+        builder.add_column('data2', 'double').mutable(False)
+
+        schema = builder.build()
+
+        assert schema[0].mutable
+        assert schema[1].mutable
+        assert not schema[2].mutable
+
+    def test_column_comment(self):
+        comment = "test_comment"
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64', nullable=False)
+         .primary_key()
+         .comment(comment))
+
+        builder.add_column('data1', 'double').nullable(True)
+        schema = builder.build()
+        assert isinstance(schema[0].comment, str)
+        assert len(schema[0].comment) > 0
+        assert schema[0].comment == comment
+        assert isinstance(schema[1].comment, str)
+        assert len(schema[1].comment) == 0
+
+    def test_auto_incrementing_column_name(self):
+        name = Schema.get_auto_incrementing_column_name()
+        assert isinstance(name, str)
+        assert len(name) > 0
+
+    def test_non_unique_primary_key(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False)
+         .non_unique_primary_key())
+        builder.add_column('data1', 'double')
+        schema = builder.build()
+        assert len(schema) == 3
+        assert len(schema.primary_keys()) == 2
+        assert Schema.get_auto_incrementing_column_name() in schema.primary_keys()
+
+    def test_set_non_unique_primary_keys(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False))
+        builder.add_column('data1', 'double')
+        builder.set_non_unique_primary_keys(['key'])
+        schema = builder.build()
+        assert len(schema) == 3
+        assert len(schema.primary_keys()) == 2
+        assert Schema.get_auto_incrementing_column_name() in schema.primary_keys()
+
+    def test_set_non_unique_primary_keys_wrong_order(self):
+        builder = kudu.schema_builder()
+        builder.add_column('key1', 'int64').nullable(False)
+        builder.add_column('key2', 'double').nullable(False)
+        builder.set_non_unique_primary_keys(['key2', 'key1'])
+        error_msg = 'primary key columns must be listed first in the schema: key'
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            schema = builder.build()
+
+    def test_set_non_unique_primary_keys_not_first(self):
+        builder = kudu.schema_builder()
+        builder.add_column('data1', 'double')
+        (builder.add_column('key', 'int64')
+         .nullable(False))
+        builder.set_non_unique_primary_keys(['key'])
+        error_msg = 'primary key columns must be listed first in the schema: key'
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            schema = builder.build()
+
+    def test_set_non_unique_primary_keys_same_name_twice(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False))
+        builder.add_column('data1', 'double')
+        builder.set_non_unique_primary_keys(['key', 'key'])
+        error_msg = 'primary key columns must be listed first in the schema: key'
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            schema = builder.build()
+
+    def test_unique_and_non_unique_primary_key_on_same_column(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False)
+         .primary_key()
+         .non_unique_primary_key())
+        builder.add_column('data1', 'double')
+        schema = builder.build()
+        assert len(schema) == 3
+        assert len(schema.primary_keys()) == 2
+        assert Schema.get_auto_incrementing_column_name() in schema.primary_keys()
+
+    def test_non_unique_and_unique_primary_key_on_same_column(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False)
+         .non_unique_primary_key()
+         .primary_key())
+        builder.add_column('data1', 'double')
+        schema = builder.build()
+        assert len(schema) == 2
+        assert len(schema.primary_keys()) == 1
+        assert Schema.get_auto_incrementing_column_name() not in schema.primary_keys()
+
+    def test_non_unique_primary_key_not_first(self):
+        builder = kudu.schema_builder()
+        builder.add_column('data1', 'int64')
+        (builder.add_column('key', 'double')
+         .nullable(False)
+         .non_unique_primary_key())
+        error_msg = 'primary key column must be the first column'
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            builder.build()
+
+    def test_unique_and_non_unique_primary_key_on_different_cols(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key1', 'double')
+         .nullable(False)
+         .primary_key())
+        (builder.add_column('key2', 'double')
+         .nullable(False)
+         .non_unique_primary_key())
+        error_msg = 'multiple columns specified for primary key: key1, key2'
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            builder.build()
+
+    def test_non_unique_and_unique_primary_key_on_different_cols(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key1', 'double')
+         .nullable(False)
+         .non_unique_primary_key())
+        (builder.add_column('key2', 'double')
+         .nullable(False)
+         .primary_key())
+        error_msg = 'multiple columns specified for primary key: key1, key2'
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            builder.build()
+
+    def test_multiple_non_unique_primary_keys(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key1', 'double')
+         .nullable(False)
+         .non_unique_primary_key())
+        (builder.add_column('key2', 'double')
+         .nullable(False)
+         .non_unique_primary_key())
+        error_msg = 'multiple columns specified for primary key: key1, key2'
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            builder.build()
+
+    def test_non_unique_primary_key_and_set_non_unique_primary_keys(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False)
+         .non_unique_primary_key())
+        builder.add_column('data1', 'double')
+        builder.set_non_unique_primary_keys(['key'])
+        error_msg = ('primary key specified by both SetNonUniquePrimaryKey\(\)'
+                     ' and on a specific column: key')
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            builder.build()
+
+    def test_primary_key_and_set_non_unique_primary_keys(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False)
+         .primary_key())
+        builder.add_column('data1', 'double')
+        builder.set_non_unique_primary_keys(['key'])
+        error_msg = ('primary key specified by both SetNonUniquePrimaryKey\(\)'
+                     ' and on a specific column: key')
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            builder.build()
+
+    def test_primary_key_and_set_primary_keys(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False)
+         .primary_key())
+        builder.add_column('data1', 'double')
+        builder.set_primary_keys(['key'])
+        error_msg = ('primary key specified by both SetPrimaryKey\(\)'
+                     ' and on a specific column: key')
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            builder.build()
+
+    def test_non_unique_primary_key_and_set_primary_keys(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False)
+         .non_unique_primary_key())
+        builder.add_column('data1', 'double')
+        builder.set_primary_keys(['key'])
+        error_msg = ('primary key specified by both SetPrimaryKey\(\)'
+                     ' and on a specific column: key')
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            builder.build()
+
+    def test_set_non_unique_and_set_unique_primary_key(self):
+        builder = kudu.schema_builder()
+        builder.add_column('key1', 'int64').nullable(False)
+        builder.add_column('key2', 'double').nullable(False)
+        builder.set_non_unique_primary_keys(['key1', 'key2'])
+        builder.set_primary_keys(['key1', 'key2'])
+        schema = builder.build()
+        assert len(schema) == 2
+        assert len(schema.primary_keys()) == 2
+        assert Schema.get_auto_incrementing_column_name() not in schema.primary_keys()
+
+    def test_set_unique_and_set_non_unique_primary_key(self):
+        builder = kudu.schema_builder()
+        builder.add_column('key1', 'int64').nullable(False)
+        builder.add_column('key2', 'double').nullable(False)
+        builder.set_primary_keys(['key1', 'key2'])
+        builder.set_non_unique_primary_keys(['key1', 'key2'])
+        schema = builder.build()
+        assert len(schema) == 3
+        assert len(schema.primary_keys()) == 3
+        assert Schema.get_auto_incrementing_column_name() in schema.primary_keys()
+
+    def test_reserved_column_name(self):
+        builder = kudu.schema_builder()
+        (builder.add_column('key', 'int64')
+         .nullable(False)
+         .primary_key())
+        builder.add_column(Schema.get_auto_incrementing_column_name(), 'double')
+        error_msg = 'auto_incrementing_id is a reserved column name'
+        with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+            builder.build()
 
     def test_default_value(self):
         pass

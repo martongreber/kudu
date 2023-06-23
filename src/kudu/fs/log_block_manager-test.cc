@@ -93,16 +93,18 @@ DECLARE_uint64(log_container_max_size);
 DECLARE_uint64(log_container_metadata_max_size);
 DECLARE_bool(log_container_metadata_runtime_compact);
 DECLARE_double(log_container_metadata_size_before_compact_ratio);
-DEFINE_int32(startup_benchmark_block_count_for_testing, 1000000,
-             "Block count to do startup benchmark.");
+DEFINE_int32(startup_benchmark_batch_count_for_testing, 1000,
+             "Batch operation (create and delete blocks) count to do startup benchmark.");
+DEFINE_int32(startup_benchmark_block_count_per_batch_for_testing, 1000,
+             "Block count of each batch operation to do startup benchmark.");
 DEFINE_int32(startup_benchmark_data_dir_count_for_testing, 8,
              "Data directories to do startup benchmark.");
 DEFINE_int32(startup_benchmark_reopen_times, 10,
              "Block manager reopen times.");
-DEFINE_int32(startup_benchmark_deleted_block_percentage, 90,
-             "Percentage of deleted blocks in containers.");
+DEFINE_double(startup_benchmark_deleted_block_percentage, 90.0,
+              "Percentage of deleted blocks in containers.");
 DEFINE_validator(startup_benchmark_deleted_block_percentage,
-                 [](const char* /*n*/, int32_t v) { return 0 <= v && v <= 100; });
+                 [](const char* /*n*/, double v) { return 0 <= v && v <= 100; });
 DECLARE_bool(encrypt_data_at_rest);
 
 // Block manager metrics.
@@ -146,9 +148,8 @@ class LogBlockManagerTest : public KuduTest, public ::testing::WithParamInterfac
 
  protected:
   LogBlockManager* CreateBlockManager(const scoped_refptr<MetricEntity>& metric_entity,
-                                      std::vector<std::string> test_data_dirs = {}) {
+                                      vector<string> test_data_dirs = {}) {
     PrepareDataDirs(&test_data_dirs);
-
     if (!dd_manager_) {
       // Ensure the directory manager is initialized.
       CHECK_OK(DataDirManager::CreateNewForTests(env_, test_data_dirs,
@@ -164,7 +165,7 @@ class LogBlockManagerTest : public KuduTest, public ::testing::WithParamInterfac
 
   Status ReopenBlockManager(const scoped_refptr<MetricEntity>& metric_entity = nullptr,
                             FsReport* report = nullptr,
-                            std::vector<std::string> test_data_dirs = {},
+                            vector<string> test_data_dirs = {},
                             bool force = false) {
     PrepareDataDirs(&test_data_dirs);
 
@@ -300,7 +301,8 @@ class LogBlockManagerTest : public KuduTest, public ::testing::WithParamInterfac
         break;
     }
   }
-  void PrepareDataDirs(std::vector<std::string>* test_data_dirs) {
+
+  void PrepareDataDirs(vector<string>* test_data_dirs) {
     if (test_data_dirs->empty()) {
       *test_data_dirs = { test_dir_ };
     }
@@ -444,8 +446,7 @@ TEST_P(LogBlockManagerTest, MetricsTest) {
     shared_ptr<BlockDeletionTransaction> deletion_transaction =
         bm_->NewDeletionTransaction();
     deletion_transaction->AddDeletedBlock(saved_id);
-    vector<BlockId> deleted;
-    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
     NO_FATALS(CheckLogMetrics(new_entity,
         { {9 * 1024, &METRIC_log_block_manager_bytes_under_management},
           {10, &METRIC_log_block_manager_blocks_under_management},
@@ -627,8 +628,7 @@ TEST_P(LogBlockManagerTest, TestReuseBlockIds) {
     for (const BlockId& b : block_ids) {
       deletion_transaction->AddDeletedBlock(b);
     }
-    vector<BlockId> deleted;
-    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
   }
 
   // Reset the block ID sequence and re-create new blocks which should reuse the same
@@ -737,8 +737,7 @@ TEST_P(LogBlockManagerTest, TestMetadataTruncation) {
     shared_ptr<BlockDeletionTransaction> deletion_transaction =
         bm_->NewDeletionTransaction();
     deletion_transaction->AddDeletedBlock(created_blocks[0]);
-    vector<BlockId> deleted;
-    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
   }
   ASSERT_OK(bm_->GetAllBlockIds(&block_ids));
   ASSERT_EQ(3, block_ids.size());
@@ -987,8 +986,7 @@ TEST_P(LogBlockManagerTest, TestContainerWithManyHoles) {
   for (int i = 0; i < ids.size(); i += 2) {
     deletion_transaction->AddDeletedBlock(ids[i]);
   }
-  vector<BlockId> deleted;
-  ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+  ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
 
   // Delete all of the blocks belonging to the interior node. If KUDU-1508
   // applies, this should corrupt the filesystem.
@@ -997,7 +995,7 @@ TEST_P(LogBlockManagerTest, TestContainerWithManyHoles) {
   for (int i = 1; i < last_interior_node_block_number; i += 2) {
     deletion_transaction->AddDeletedBlock(ids[i]);
   }
-  ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+  ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
 }
 
 TEST_P(LogBlockManagerTest, TestParseKernelRelease) {
@@ -1058,19 +1056,9 @@ TEST_P(LogBlockManagerTest, TestParseKernelRelease) {
 //    threads running a long time since last bootstrap)
 //
 // However it still can be used to micro-optimize the startup process.
-class LogBlockManagerStartupBenchmarkTest: public LogBlockManagerTest {};
-INSTANTIATE_TEST_SUITE_P(StartupBenchmarkSuite, LogBlockManagerStartupBenchmarkTest,
-                         ::testing::Values(false, true));
-
-TEST_P(LogBlockManagerStartupBenchmarkTest, StartupBenchmark) {
-  bool delete_blocks = GetParam();
-  std::vector<std::string> test_dirs;
-  for (int i = 0; i < FLAGS_startup_benchmark_data_dir_count_for_testing; ++i) {
-    test_dirs.emplace_back(test_dir_ + "/" + std::to_string(i));
-  }
-  // Re-open block manager to place data on multiple data directories.
-  ASSERT_OK(ReopenBlockManager(nullptr, nullptr, test_dirs, /* force= */ true));
-
+TEST_P(LogBlockManagerTest, StartupBenchmark) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  SetEncryptionFlags(GetParam());
   // Disable preflushing since this can slow down our writes. In particular,
   // since we write such small blocks in this test, each block will likely
   // begin on the same 4KB page as the prior one we wrote, and due to the
@@ -1080,46 +1068,70 @@ TEST_P(LogBlockManagerStartupBenchmarkTest, StartupBenchmark) {
   // See http://yoshinorimatsunobu.blogspot.com/2014/03/how-syncfilerange-really-works.html
   // for details.
   FLAGS_block_manager_preflush_control = "never";
-  const int kNumBlocks = AllowSlowTests() ? FLAGS_startup_benchmark_block_count_for_testing : 1000;
-
-  // Creates 'kNumBlocks' blocks with minimal data.
-  vector<BlockId> block_ids;
+  vector<string> test_dirs;
   {
-    unique_ptr<BlockCreationTransaction> transaction = bm_->NewCreationTransaction();
-    for (int i = 0; i < kNumBlocks; i++) {
-      unique_ptr<WritableBlock> block;
-      ASSERT_OK_FAST(bm_->CreateBlock(test_block_opts_, &block));
-      ASSERT_OK_FAST(block->Append("x"));
-      ASSERT_OK_FAST(block->Finalize());
-      block_ids.emplace_back(block->id());
-      transaction->AddCreatedBlock(std::move(block));
+    SCOPED_LOG_TIMING(INFO, "init environment");
+    for (int i = 0; i < FLAGS_startup_benchmark_data_dir_count_for_testing; ++i) {
+      test_dirs.emplace_back(test_dir_ + "/" + std::to_string(i));
     }
-    ASSERT_OK(transaction->CommitCreatedBlocks());
+    // Re-open block manager to place data on multiple data directories.
+    ASSERT_OK(ReopenBlockManager(nullptr, nullptr, test_dirs, /* force= */ true));
   }
 
-  if (delete_blocks) {
+  // Creates FLAGS_startup_benchmark_batch_count_for_testing *
+  //     FLAGS_startup_benchmark_block_count_per_batch_for_testing blocks with minimal data.
+  vector<BlockId> block_ids;
+  block_ids.reserve(FLAGS_startup_benchmark_batch_count_for_testing *
+                    FLAGS_startup_benchmark_block_count_per_batch_for_testing);
+  {
+    SCOPED_LOG_TIMING(INFO, "create blocks");
+    for (int i = 0; i < FLAGS_startup_benchmark_batch_count_for_testing; i++) {
+      unique_ptr<BlockCreationTransaction> transaction = bm_->NewCreationTransaction();
+      for (int j = 0; j < FLAGS_startup_benchmark_block_count_per_batch_for_testing; j++) {
+        unique_ptr<WritableBlock> block;
+        ASSERT_OK_FAST(bm_->CreateBlock(test_block_opts_, &block));
+        ASSERT_OK_FAST(block->Append("x"));
+        ASSERT_OK_FAST(block->Finalize());
+        block_ids.emplace_back(block->id());
+        transaction->AddCreatedBlock(std::move(block));
+      }
+      ASSERT_OK(transaction->CommitCreatedBlocks());
+    }
+  }
+
+  int to_delete_count = block_ids.size() * FLAGS_startup_benchmark_deleted_block_percentage / 100;
+  if (to_delete_count > 0) {
     std::mt19937 gen(SeedRandom());
     std::shuffle(block_ids.begin(), block_ids.end(), gen);
-    {
-      int to_delete_count =
-          block_ids.size() * FLAGS_startup_benchmark_deleted_block_percentage / 100;
+
+    SCOPED_LOG_TIMING(INFO, "delete blocks");
+    int j = 0;
+    for (int i = 0; i < FLAGS_startup_benchmark_batch_count_for_testing; i++) {
+      int to_delete_count_per_batch =
+          to_delete_count / FLAGS_startup_benchmark_batch_count_for_testing;
       shared_ptr<BlockDeletionTransaction> deletion_transaction =
           this->bm_->NewDeletionTransaction();
-      for (const BlockId& b : block_ids) {
-        deletion_transaction->AddDeletedBlock(b);
-        if (--to_delete_count <= 0) {
+      for (; j < block_ids.size(); j++) {
+        deletion_transaction->AddDeletedBlock(block_ids[j]);
+        if (--to_delete_count_per_batch <= 0) {
           break;
         }
       }
-      vector<BlockId> deleted;
-      ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+      ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
     }
   }
 
+  // The deleted blocks need to to be hole punched when shutdown block manager, this procedure may
+  // cost a very long time. We shutdown the block manager manually before restart it, then we can
+  // get a more accurate startup time.
+  {
+    SCOPED_LOG_TIMING(INFO, "shutdown block manager");
+    bm_.reset();
+  }
+
   for (int i = 0; i < FLAGS_startup_benchmark_reopen_times; i++) {
-    LOG_TIMING(INFO, "reopening block manager") {
-      ASSERT_OK(ReopenBlockManager(nullptr, nullptr, test_dirs));
-    }
+    SCOPED_LOG_TIMING(INFO, "reopening block manager");
+    ASSERT_OK(ReopenBlockManager(nullptr, nullptr, test_dirs));
   }
 }
 #endif
@@ -1299,8 +1311,7 @@ TEST_F(LogBlockManagerTest, TestContainerBlockLimitingByMetadataSizeWithCompacti
       }
       deletion_transaction->AddDeletedBlock(id);
     }
-    vector<BlockId> deleted;
-    RETURN_NOT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+    RETURN_NOT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
 
     return Status::OK();
   };
@@ -1432,8 +1443,7 @@ TEST_P(LogBlockManagerTest, TestMisalignedBlocksFuzz) {
         deletion_transaction->AddDeletedBlock(id);
       }
     }
-    vector<BlockId> deleted;
-    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
   }
 
   // Wait for the block manager to punch out all of the holes. It's easiest to
@@ -1745,8 +1755,7 @@ TEST_P(LogBlockManagerTest, TestDeleteDeadContainersAtStartup) {
     shared_ptr<BlockDeletionTransaction> deletion_transaction =
         this->bm_->NewDeletionTransaction();
     deletion_transaction->AddDeletedBlock(block_id);
-    vector<BlockId> deleted;
-    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
   }
   ASSERT_OK(ReopenBlockManager());
   ASSERT_FALSE(env_->FileExists(data_file_name));
@@ -1787,8 +1796,7 @@ TEST_P(LogBlockManagerTest, TestCompactFullContainerMetadataAtStartup) {
       shared_ptr<BlockDeletionTransaction> deletion_transaction =
           bm_->NewDeletionTransaction();
       deletion_transaction->AddDeletedBlock(id);
-      vector<BlockId> deleted;
-      ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+      ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
     }
     num_blocks_deleted++;
     FsReport report;
@@ -1847,8 +1855,7 @@ TEST_P(LogBlockManagerTest, TestDeleteFromContainerAfterMetadataCompaction) {
         block_ids.emplace_back(block->id());
       }
     }
-    vector<BlockId> deleted;
-    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
   }
 
   // Reopen the block manager. This will cause it to compact all of the metadata
@@ -1869,8 +1876,7 @@ TEST_P(LogBlockManagerTest, TestDeleteFromContainerAfterMetadataCompaction) {
     for (const BlockId &b : block_ids) {
       deletion_transaction->AddDeletedBlock(b);
     }
-    vector<BlockId> deleted;
-    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
   }
 
   // Reopen to make sure that the metadata can be properly loaded and
@@ -2162,12 +2168,11 @@ TEST_P(LogBlockManagerTest, TestDoNotDeleteFakeDeadContainer) {
 
     // Delete the bunch of blocks.
     {
-      vector<BlockId> deleted;
       shared_ptr<BlockDeletionTransaction> transaction = bm_->NewDeletionTransaction();
       for (const auto& e : blocks) {
         transaction->AddDeletedBlock(e);
       }
-      ASSERT_OK(transaction->CommitDeletedBlocks(&deleted));
+      ASSERT_OK(transaction->CommitDeletedBlocks(nullptr));
       transaction.reset();
       for (const auto& data_dir : dd_manager_->dirs()) {
         data_dir->WaitOnClosures();
@@ -2243,10 +2248,9 @@ TEST_P(LogBlockManagerTest, TestHalfPresentContainer) {
   };
 
   const auto DeleteBlock = [&] () {
-    vector<BlockId> deleted;
     shared_ptr<BlockDeletionTransaction> transaction = bm_->NewDeletionTransaction();
     transaction->AddDeletedBlock(block_id);
-    ASSERT_OK(transaction->CommitDeletedBlocks(&deleted));
+    ASSERT_OK(transaction->CommitDeletedBlocks(nullptr));
     transaction.reset();
     for (const auto& data_dir : dd_manager_->dirs()) {
       data_dir->WaitOnClosures();

@@ -146,8 +146,10 @@ DECLARE_int32(max_table_comment_length);
 DECLARE_int32(rpc_service_queue_length);
 DECLARE_int64(live_row_count_for_testing);
 DECLARE_int64(on_disk_size_for_testing);
+DECLARE_string(ipki_private_key_password_cmd);
 DECLARE_string(location_mapping_cmd);
 DECLARE_string(log_filename);
+DECLARE_string(tsk_private_key_password_cmd);
 DECLARE_string(webserver_doc_root);
 
 METRIC_DECLARE_histogram(handler_latency_kudu_master_MasterService_GetTableSchema);
@@ -3032,9 +3034,21 @@ TEST_F(MasterTest, TestConcurrentRenameAndDeleteOfSameTable) {
   ASSERT_TRUE(renamed ^ deleted);
 }
 
+class MasterWithEncryptedKeysTest : public MasterTest,
+                                    public ::testing::WithParamInterface<bool> {
+ public:
+  void SetUp() override {
+    if (GetParam()) {
+      FLAGS_ipki_private_key_password_cmd = "echo test";
+      FLAGS_tsk_private_key_password_cmd = "echo foo";
+    }
+    MasterTest::SetUp();
+  }
+};
+
 // Unit tests for the ConnectToMaster() RPC:
 // should issue authentication tokens and the master CA cert.
-TEST_F(MasterTest, TestConnectToMaster) {
+TEST_P(MasterWithEncryptedKeysTest, TestConnectToMaster) {
   ConnectToMasterRequestPB req;
   ConnectToMasterResponsePB resp;
   RpcController rpc;
@@ -3072,6 +3086,7 @@ TEST_F(MasterTest, TestConnectToMaster) {
   ASSERT_TRUE(!cluster_id.empty());
   ASSERT_EQ(cluster_id, resp.cluster_id());
 }
+INSTANTIATE_TEST_SUITE_P(SupportsEncryptedKeys, MasterWithEncryptedKeysTest, ::testing::Bool());
 
 TEST_F(MasterTest, TestConnectToMasterAndAssignLocation) {
   // Test first with a valid location mapping command.
@@ -3126,9 +3141,9 @@ TEST_F(MasterTest, TestConnectToMasterAndAssignLocation) {
   }
 }
 
-// Test that the master signs its on server certificate when it becomes the leader,
+// Test that the master signs its own server certificate when it becomes the leader,
 // and also that it loads TSKs into the messenger's verifier.
-TEST_F(MasterTest, TestSignOwnCertAndLoadTSKs) {
+TEST_P(MasterWithEncryptedKeysTest, TestSignOwnCertAndLoadTSKs) {
   ASSERT_EVENTUALLY([&]() {
       ASSERT_TRUE(master_->tls_context().has_signed_cert());
       ASSERT_GT(master_->messenger()->token_verifier().GetMaxKnownKeySequenceNumber(), -1);

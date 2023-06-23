@@ -173,7 +173,9 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         string& name()
         c_bool is_nullable()
         DataType type()
+        c_bool is_immutable()
         KuduColumnTypeAttributes type_attributes()
+        string& comment()
 
         c_bool Equals(KuduColumnSchema& other)
         void CopyFrom(KuduColumnSchema& other)
@@ -182,6 +184,9 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         KuduSchema()
         KuduSchema(const KuduSchema& schema)
         KuduSchema(vector[KuduColumnSchema]& columns, int key_columns)
+
+        @staticmethod
+        string GetAutoIncrementingColumnName()
 
         c_bool Equals(const KuduSchema& other)
         KuduColumnSchema Column(size_t idx)
@@ -201,8 +206,11 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
          KuduColumnSpec* BlockSize(int32_t block_size)
 
          KuduColumnSpec* PrimaryKey()
+         KuduColumnSpec* NonUniquePrimaryKey()
          KuduColumnSpec* NotNull()
          KuduColumnSpec* Nullable()
+         KuduColumnSpec* Immutable()
+         KuduColumnSpec* Mutable()
          KuduColumnSpec* Type(DataType type_)
 
          KuduColumnSpec* Precision(int8_t precision);
@@ -210,12 +218,14 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
          KuduColumnSpec* Length(uint16_t length);
 
          KuduColumnSpec* RenameTo(const string& new_name)
+         KuduColumnSpec* Comment(const string& comment)
 
 
     cdef cppclass KuduSchemaBuilder:
 
         KuduColumnSpec* AddColumn(string& name)
         KuduSchemaBuilder* SetPrimaryKey(vector[string]& key_col_names);
+        KuduSchemaBuilder* SetNonUniquePrimaryKey(vector[string]& key_col_names);
 
         Status Build(KuduSchema* schema)
 
@@ -548,6 +558,10 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
     cdef cppclass KuduClient:
 
         Status DeleteTable(const string& table_name)
+        Status SoftDeleteTable(const string& table_name)
+        Status SoftDeleteTable(const string& table_name, uint32_t reserve_seconds)
+        Status RecallTable(const string& table_id)
+        Status RecallTable(const string& table_id, const string& new_table_name)
         Status OpenTable(const string& table_name,
                          shared_ptr[KuduTable]* table)
         Status GetTableSchema(const string& table_name, KuduSchema* schema)
@@ -560,6 +574,8 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
         Status ListTables(vector[string]* tables)
         Status ListTables(vector[string]* tables, const string& filter)
+        Status ListSoftDeletedTables(vector[string]* tables)
+        Status ListSoftDeletedTables(vector[string]* tables, const string& filter)
 
         Status ListTabletServers(vector[KuduTabletServer*]* tablet_servers)
 
@@ -587,6 +603,10 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         KuduClientBuilder& require_authentication(c_bool require_authentication)
 
         KuduClientBuilder& encryption_policy(EncryptionPolicy encryption_policy)
+
+        KuduClientBuilder& jwt(const string& jwt)
+
+        KuduClientBuilder& trusted_certificate(const string& cert_pem)
 
         Status Build(shared_ptr[KuduClient]* client)
 

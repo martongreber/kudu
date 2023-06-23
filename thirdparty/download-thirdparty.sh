@@ -277,11 +277,12 @@ fetch_and_patch \
  "patch -p1 < $TP_DIR/patches/rapidjson-assertions-for-clang-warnings.patch" \
  "patch -p1 < $TP_DIR/patches/rapidjson-avoid-pointer-arithmetic-on-null-pointer.patch"
 
-SQUEASEL_PATCHLEVEL=0
+SQUEASEL_PATCHLEVEL=1
 fetch_and_patch \
  squeasel-${SQUEASEL_VERSION}.tar.gz \
  $SQUEASEL_SOURCE \
- $SQUEASEL_PATCHLEVEL
+ $SQUEASEL_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/squeasel-handle-openssl-errors.patch"
 
 MUSTACHE_PATCHLEVEL=0
 fetch_and_patch \
@@ -302,12 +303,13 @@ fetch_and_patch \
  $GCOVR_SOURCE \
  $GCOVR_PATCHLEVEL
 
-CURL_PATCHLEVEL=1
+CURL_PATCHLEVEL=2
 fetch_and_patch \
  curl-${CURL_VERSION}.tar.gz \
  $CURL_SOURCE \
  $CURL_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/curl-custom-openssl-library.patch" \
+ "patch -p1 < $TP_DIR/patches/curl-handle-openssl-errors.patch" \
  "autoreconf -fvi"
 
 CRCUTIL_PATCHLEVEL=0
@@ -329,12 +331,14 @@ fetch_and_patch \
  $PYTHON_SOURCE \
  $PYTHON_PATCHLEVEL
 
-LLVM_PATCHLEVEL=1
+LLVM_PATCHLEVEL=3
 fetch_and_patch \
  llvm-${LLVM_VERSION}-iwyu-${IWYU_VERSION}.src.tar.gz \
  $LLVM_SOURCE \
  $LLVM_PATCHLEVEL \
- "patch -p1 < $TP_DIR/patches/llvm-add-iwyu.patch"
+ "patch -p1 < $TP_DIR/patches/llvm-add-iwyu.patch" \
+ "patch -d projects -p1 < $TP_DIR/patches/llvm-remove-cyclades-inclusion-in-sanitizer.patch" \
+ "patch -p2 < $TP_DIR/patches/llvm-fix-missing-include.patch"
 
 LZ4_PATCHLEVEL=0
 fetch_and_patch \

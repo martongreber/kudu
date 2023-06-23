@@ -304,8 +304,24 @@ class KUDU_EXPORT KuduClientBuilder {
   /// @return Reference to the updated object.
   KuduClientBuilder& connection_negotiation_timeout(const MonoDelta& timeout);
 
+  /// Set JWT (JSON Web Token) to authenticate the client to a server.
+  ///
+  /// @note If both @c import_authentication_credentials and
+  ///   this method are called on the object, the JWT provided with this call
+  ///   overrides the corresponding JWT (if present) that comes as part of the
+  ///   imported authentication credentials.
+  ///
+  /// @param [in] jwt
+  ///   The JSON web token to set.
+  /// @return Reference to the updated object.
+  KuduClientBuilder& jwt(const std::string& jwt);
 
   /// Import serialized authentication credentials from another client.
+  ///
+  /// @note If both @c import_authentication_credentials and
+  ///   this method are called on the object, the JWT provided with this call
+  ///   overrides the corresponding JWT (if present) that comes as part of the
+  ///   imported authentication credentials.
   ///
   /// @param [in] authn_creds
   ///   The serialized authentication credentials, provided by a call to
@@ -313,6 +329,12 @@ class KUDU_EXPORT KuduClientBuilder {
   ///   @c KuduClient#exportAuthenticationCredentials in the Java client.
   /// @return Reference to the updated object.
   KuduClientBuilder& import_authentication_credentials(std::string authn_creds);
+
+  /// Add a trusted root CA certificate into the client's TLS certificate bundle.
+  ///
+  /// @param [in] cert_pem_str
+  ///   The trusted certificate to add, in PEM format.
+  KuduClientBuilder& trusted_certificate(const std::string& cert_pem);
 
   /// @brief Set the number of reactors for the RPC messenger.
   ///
@@ -2762,6 +2784,7 @@ class KUDU_EXPORT KuduScanner {
   ///   The table to perfrom scan. The given object must remain valid
   ///   for the lifetime of this scanner object.
   explicit KuduScanner(KuduTable* table);
+
   ~KuduScanner();
 
   /// Set the projection for the scanner using column names.
@@ -2796,6 +2819,27 @@ class KUDU_EXPORT KuduScanner {
   Status SetProjectedColumns(const std::vector<std::string>& col_names)
       WARN_UNUSED_RESULT
       ATTRIBUTE_DEPRECATED("use SetProjectedColumnNames() instead");
+
+  /// Set a query id for the scan to trace the whole scanning process.
+  /// Query id is posted by the user or generated automatically by the
+  /// client library code. It is used to trace the whole query process
+  /// for debugging.
+  ///
+  /// Example usage:
+  /// @code
+  ///   KuduScanner scanner(...);
+  ///   scanner.SetQueryId(query_id);
+  ///   scanner.Open();
+  ///   while (scanner.HasMoreRows()) {
+  ///     KuduScanBatch batch;
+  ///     scanner.NextBatch(&batch);
+  ///   }
+  /// @endcode
+  ///
+  /// @param [in] query_id
+  ///   A query id to identify a query.
+  /// @return Operation result status.
+  Status SetQueryId(const std::string& query_id);
 
   /// Add a predicate for the scan.
   ///
@@ -3153,10 +3197,12 @@ class KUDU_EXPORT KuduScanner {
   FRIEND_TEST(ClientTest, TestScanFaultTolerance);
   FRIEND_TEST(ClientTest, TestScanNoBlockCaching);
   FRIEND_TEST(ClientTest, TestScanTimeout);
+  FRIEND_TEST(ClientTest, TestScanWithQueryId);
   FRIEND_TEST(ClientTest, TestReadAtSnapshotNoTimestampSet);
   FRIEND_TEST(ConsistencyITest, TestSnapshotScanTimestampReuse);
   FRIEND_TEST(ScanTokenTest, TestScanTokens);
   FRIEND_TEST(ScanTokenTest, TestScanTokens_NonUniquePrimaryKey);
+  FRIEND_TEST(ScanTokenTest, TestScanTokensWithQueryId);
 
   // Owned.
   Data* data_;
@@ -3349,6 +3395,15 @@ class KUDU_EXPORT KuduScanTokenBuilder {
   ///   true, if table metadata should be included.
   /// @return Operation result status.
   Status IncludeTabletMetadata(bool include_metadata) WARN_UNUSED_RESULT;
+
+  /// Set a query id for the scan to trace the whole process.
+  /// Query id is set by the user or generated automatically.
+  /// It is used to trace the whole query process for for troubleshooting and debugging.
+  ///
+  /// @param [in] query_id
+  ///   A query id to identify a query.
+  /// @return Operation result status.
+  Status SetQueryId(const std::string& query_id);
 
   /// Build the set of scan tokens.
   ///

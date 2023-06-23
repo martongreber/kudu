@@ -129,6 +129,7 @@ using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
 using kudu::rpc::UserCredentials;
+using kudu::security::JwtRawPB;
 using kudu::tserver::ScanResponsePB;
 using std::map;
 using std::make_optional;
@@ -309,8 +310,18 @@ KuduClientBuilder& KuduClientBuilder::connection_negotiation_timeout(
   return *this;
 }
 
+KuduClientBuilder& KuduClientBuilder::jwt(const string& jwt) {
+  data_->jwt_ = jwt;
+  return *this;
+}
+
 KuduClientBuilder& KuduClientBuilder::import_authentication_credentials(string authn_creds) {
   data_->authn_creds_ = std::move(authn_creds);
+  return *this;
+}
+
+KuduClientBuilder& KuduClientBuilder::trusted_certificate(const string& cert_pem) {
+  data_->trusted_certs_pem_.emplace_back(cert_pem);
   return *this;
 }
 
@@ -396,14 +407,54 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
   RETURN_NOT_OK(builder.Build(&messenger));
   UserCredentials user_credentials;
 
-  // Parse and import the provided authn data, if any.
-  if (!data_->authn_creds_.empty()) {
-    RETURN_NOT_OK(ImportAuthnCreds(data_->authn_creds_, messenger.get(), &user_credentials));
+  // Parse and import the provided authn data, if any. Override the JWT portion
+  // of the imported authn credentials if the JWT was specified as well.
+  // If no serialized authn data was provided, use JWT if it's available.
+  if (!data_->authn_creds_.empty() || !data_->jwt_.empty()) {
+    string authn_creds;
+    if (!data_->authn_creds_.empty() && !data_->jwt_.empty()) {
+      // Merge the imported authn creds and the JWT: use data_->authn_creds_,
+      // but override its JWT portion with data_->jwt_.
+      AuthenticationCredentialsPB pb;
+      if (!pb.ParseFromString(data_->authn_creds_)) {
+        return Status::InvalidArgument("invalid authentication data");
+      }
+      if (pb.has_jwt()) {
+        JwtRawPB jwt_pb;
+        // Copying, not moving: Build() is supposed to be re-enterable.
+        *jwt_pb.mutable_jwt_data() = data_->jwt_;
+        *pb.mutable_jwt() = std::move(jwt_pb);
+      }
+      string creds;
+      if (!pb.SerializeToString(&creds)) {
+        return Status::RuntimeError("could not serialize authentication data");
+      }
+      authn_creds = std::move(creds);
+    } else if (!data_->jwt_.empty()) {
+      // Build authn creds with just the provided JWT.
+      JwtRawPB jwt_pb;
+      // Copying, not moving: Build() is supposed to be re-enterable.
+      *jwt_pb.mutable_jwt_data() = data_->jwt_;
+      AuthenticationCredentialsPB pb;
+      *pb.mutable_jwt() = std::move(jwt_pb);
+      if (!pb.SerializeToString(&authn_creds)) {
+        return Status::RuntimeError("could not serialize authentication data");
+      }
+    }
+    RETURN_NOT_OK(ImportAuthnCreds(
+        !authn_creds.empty() ? authn_creds : data_->authn_creds_,
+        messenger.get(),
+        &user_credentials));
   }
   if (!user_credentials.has_real_user()) {
     // If there are no authentication credentials, then set the real user to the
     // currently logged-in user.
     RETURN_NOT_OK(user_credentials.SetLoggedInRealUser());
+  }
+  for (const auto& cert_str : data_->trusted_certs_pem_) {
+    security::Cert cert;
+    RETURN_NOT_OK(cert.FromString(cert_str, security::DataFormat::PEM));
+    RETURN_NOT_OK(messenger->mutable_tls_context()->AddTrustedCertificate(cert));
   }
 
   shared_ptr<KuduClient> c(new KuduClient);
@@ -778,8 +829,7 @@ Status KuduClient::ExportAuthenticationCredentials(string* authn_creds) const {
   if (auto tok = data_->messenger_->authn_token(); tok) {
     pb.mutable_authn_token()->CopyFrom(*tok);
   }
-  auto jwt = data_->messenger_->jwt();
-  if (jwt) {
+  if (auto jwt = data_->messenger_->jwt(); jwt) {
     pb.mutable_jwt()->CopyFrom(*jwt);
   }
   pb.set_real_user(data_->user_credentials_.real_user());
@@ -1061,6 +1111,7 @@ Status KuduTableCreator::Create() {
       break;
     }
   }
+  bool has_auto_incrementing_column = data_->schema_->schema_->has_auto_incrementing();
 
   if (data_->table_type_) {
     req.set_table_type(*data_->table_type_);
@@ -1081,7 +1132,8 @@ Status KuduTableCreator::Create() {
                                          deadline,
                                          !data_->range_partitions_.empty(),
                                          has_range_with_custom_hash_schema,
-                                         has_immutable_column_schema),
+                                         has_immutable_column_schema,
+                                         has_auto_incrementing_column),
       Substitute("Error creating table $0 on the master", data_->table_name_));
   // Spin until the table is fully created, if requested.
   if (data_->wait_) {
@@ -1766,6 +1818,17 @@ Status KuduScanner::SetProjectedColumns(const vector<string>& col_names) {
   return SetProjectedColumnNames(col_names);
 }
 
+Status KuduScanner::SetQueryId(const string& query_id) {
+  if (data_->open_) {
+    return Status::IllegalState("Query id must be set before Open()");
+  }
+  if (query_id.empty()) {
+    return Status::InvalidArgument("Query id should not be empty");
+  }
+  data_->next_req_.set_query_id(query_id);
+  return Status::OK();
+}
+
 Status KuduScanner::SetProjectedColumnNames(const vector<string>& col_names) {
   if (data_->open_) {
     return Status::IllegalState("Projection must be set before Open()");
@@ -2012,6 +2075,11 @@ Status KuduScanner::Open() {
 
   MonoTime deadline = MonoTime::Now() + data_->configuration().timeout();
   set<string> blacklist;
+
+  if (data_->next_req_.query_id().empty()) {
+    static ObjectIdGenerator oid_generator;
+    data_->next_req_.set_query_id(oid_generator.Next());
+  }
 
   RETURN_NOT_OK(data_->OpenNextTablet(deadline, &blacklist));
 
@@ -2308,6 +2376,14 @@ Status KuduScanTokenBuilder::AddUpperBound(const KuduPartialRow& key) {
 
 Status KuduScanTokenBuilder::SetCacheBlocks(bool cache_blocks) {
   return data_->mutable_configuration()->SetCacheBlocks(cache_blocks);
+}
+
+Status KuduScanTokenBuilder::SetQueryId(const string& query_id) {
+  if (query_id.empty()) {
+    return Status::InvalidArgument("Query id should not be empty");
+  }
+  data_->SetQueryId(query_id);
+  return Status::OK();
 }
 
 Status KuduScanTokenBuilder::Build(vector<KuduScanToken*>* tokens) {

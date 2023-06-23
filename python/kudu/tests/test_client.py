@@ -16,19 +16,30 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from kudu.compat import unittest, long
+from kudu.compat import CompatUnitTest, long
 from kudu.tests.common import KuduTestBase
 from kudu.client import (Partitioning,
                          RangePartition,
                          ENCRYPTION_OPTIONAL,
                          ENCRYPTION_REQUIRED,
                          ENCRYPTION_REQUIRED_REMOTE)
+from kudu.errors import (KuduInvalidArgument,
+                         KuduBadStatus,
+                         KuduNotFound)
+from kudu.schema import (Schema,
+                         KuduValue)
 import kudu
 import datetime
+import time
 from pytz import utc
+try:
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+except ImportError:
+    from urllib2 import Request, HTTPError, urlopen
 
 
-class TestClient(KuduTestBase, unittest.TestCase):
+class TestClient(KuduTestBase, CompatUnitTest):
 
     def setUp(self):
         pass
@@ -88,6 +99,13 @@ class TestClient(KuduTestBase, unittest.TestCase):
         for name in to_create:
             self.client.delete_table(name)
 
+        self.client.create_table('foo4', schema, partitioning)
+        assert len(self.client.list_soft_deleted_tables()) == 0
+        self.client.soft_delete_table('foo4', 1000)
+        assert len(self.client.list_soft_deleted_tables()) == 1
+        # Force delete the table
+        self.client.soft_delete_table('foo4')
+
     def test_is_multimaster(self):
         assert self.client.is_multimaster
 
@@ -98,7 +116,8 @@ class TestClient(KuduTestBase, unittest.TestCase):
         assert not self.client.table_exists(name)
 
         # Should raise a more meaningful exception at some point
-        with self.assertRaises(kudu.KuduNotFound):
+        error_msg = 'the table does not exist: table_name: "{0}"'.format(name)
+        with self.assertRaisesRegex(kudu.KuduNotFound, error_msg):
             self.client.delete_table(name)
 
     def test_table_nonexistent(self):
@@ -228,6 +247,43 @@ class TestClient(KuduTestBase, unittest.TestCase):
             except:
                 pass
 
+    def test_create_table_with_auto_incrementing_column(self):
+        table_name = 'create_table_with_auto_incrementing_column'
+        try:
+            builder = kudu.schema_builder()
+            (builder.add_column('key', kudu.int32)
+            .nullable(False)
+            .non_unique_primary_key())
+            builder.add_column('data', kudu.string)
+            schema = builder.build()
+
+            self.client.create_table(
+                table_name, schema,
+                partitioning=Partitioning().add_hash_partitions(['key'], 2))
+
+            table = self.client.table(table_name)
+            session = self.client.new_session()
+            nrows = 10
+            for _ in range(nrows):
+                op = table.new_insert()
+                op['key'] = 1
+                op['data'] = 'text'
+                session.apply(op)
+
+            session.flush()
+
+            scanner = table.scanner()
+            results = scanner.open().read_all_tuples()
+            assert nrows == len(results)
+            for i in range(len(results)):
+                auto_incrementing_value = results[i][1]
+                assert auto_incrementing_value == i+1
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except:
+                pass
+
     def test_insert_nonexistent_field(self):
         table = self.client.table(self.ex_table)
         op = table.new_insert()
@@ -300,6 +356,155 @@ class TestClient(KuduTestBase, unittest.TestCase):
         scanner = table.scanner().open()
         assert len(scanner.read_all_tuples()) == 0
 
+    def test_insert_and_mutate_immutable_column(self):
+        table_name = 'insert_and_mutate_immutable_column'
+        try:
+            builder = kudu.schema_builder()
+            (builder.add_column('key', kudu.int32)
+            .nullable(False)
+            .primary_key())
+            builder.add_column('immutable_data', kudu.string).mutable(False)
+            builder.add_column('mutable_data', kudu.string).mutable(True)
+            schema = builder.build()
+
+            self.client.create_table(
+                table_name, schema,
+                partitioning=Partitioning().add_hash_partitions(['key'], 2))
+
+            table = self.client.table(table_name)
+            session = self.client.new_session()
+            op = table.new_insert()
+            op['key'] = 1
+            op['immutable_data'] = 'text'
+            op['mutable_data'] = 'text'
+            session.apply(op)
+            session.flush()
+
+            # Update the mutable columns
+            op = table.new_update()
+            op['key'] = 1
+            op['mutable_data'] = 'new_text'
+            session.apply(op)
+            session.flush()
+
+            # Update the immutable column
+            op = table.new_update()
+            op['key'] = 1
+            op['immutable_data'] = 'new_text'
+            session.apply(op)
+            try:
+                session.flush()
+            except KuduBadStatus:
+                message = 'Immutable: UPDATE not allowed for immutable column'
+                errors, overflow = session.get_pending_errors()
+                assert not overflow
+                assert len(errors) == 1
+                assert message in repr(errors[0])
+
+            # Update ignore on both mutable and immutable columns. The error is ignored.
+            op = table.new_update_ignore()
+            op['key'] = 1
+            op['immutable_data'] = 'new_text'
+            op['mutable_data'] = 'new_text'
+            session.apply(op)
+            session.flush()
+
+            # Update ignore the immutable column
+            op = table.new_update_ignore()
+            op['key'] = 1
+            op['immutable_data'] = 'new_text'
+            session.apply(op)
+            try:
+                session.flush()
+            except KuduBadStatus:
+                message = 'Invalid argument: No fields updated'
+                errors, overflow = session.get_pending_errors()
+                assert not overflow
+                assert len(errors) == 1
+                assert message in repr(errors[0])
+
+            # TODO: test upsert ignore, once it is supported by the Python client.
+
+            # Upsert the mutable columns
+            op = table.new_upsert()
+            op['key'] = 1
+            op['mutable_data'] = 'new_text'
+            session.apply(op)
+            session.flush()
+
+            # Upsert the immutable column
+            op = table.new_upsert()
+            op['key'] = 1
+            op['immutable_data'] = 'new_text'
+            session.apply(op)
+            try:
+                session.flush()
+            except KuduBadStatus:
+                message = 'Immutable: UPDATE not allowed for immutable column'
+                errors, overflow = session.get_pending_errors()
+                assert not overflow
+                assert len(errors) == 1
+                assert message in repr(errors[0])
+
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except:
+                pass
+
+    def test_insert_with_auto_incrementing_column(self):
+
+        table_name = 'test_insert_with_auto_incrementing_column'
+        try:
+            builder = kudu.schema_builder()
+            (builder.add_column('key', kudu.int32)
+            .nullable(False)
+            .non_unique_primary_key())
+            builder.add_column('data', kudu.string)
+            schema = builder.build()
+
+            self.client.create_table(
+                table_name, schema,
+                partitioning=Partitioning().add_hash_partitions(['key'], 2))
+
+            table = self.client.table(table_name)
+            session = self.client.new_session()
+
+            # Insert with auto incrementing column specified
+            op = table.new_insert()
+            op['key'] = 1
+            op[Schema.get_auto_incrementing_column_name()] = 1
+            session.apply(op)
+            try:
+                session.flush()
+            except KuduBadStatus:
+                message = 'is incorrectly set'
+                errors, overflow = session.get_pending_errors()
+                assert not overflow
+                assert len(errors) == 1
+                assert message in repr(errors[0])
+
+            # TODO: Upsert should be rejected as of now. However the test segfaults: KUDU-3454
+            # TODO: Upsert ignore should be rejected. Once Python client supports upsert ignore.
+
+            # With non-unique primary key, one can't use the tuple/list initialization for new
+            # inserts. In this case, at the second position it would like to get an int64 (the type
+            # of the auto-incrementing counter), therefore we get type error. (Specifying the
+            # auto-incremeintg counter is obviously rejected from the server side)
+            error_msg = 'an integer is required'
+            with self.assertRaisesRegex(TypeError, error_msg):
+                op = table.new_insert((1,'text'))
+
+            error_msg = 'an integer is required'
+            with self.assertRaisesRegex(TypeError, error_msg):
+                op = table.new_insert([1,'text'])
+
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except:
+                pass
+
     def test_failed_write_op(self):
         # Insert row
         table = self.client.table(self.ex_table)
@@ -346,9 +551,10 @@ class TestClient(KuduTestBase, unittest.TestCase):
         self.client.new_session(flush_mode='sync')
         self.client.new_session(flush_mode='background')
 
-        with self.assertRaises(ValueError):
-            self.client.new_session(flush_mode='foo')
-
+        flush_mode = 'foo'
+        error_msg = 'Invalid flush mode: {0}'.format(flush_mode)
+        with self.assertRaisesRegex(ValueError, error_msg):
+            self.client.new_session(flush_mode=flush_mode)
 
     def test_session_mutation_buffer_settings(self):
         self.client.new_session(flush_mode=kudu.FLUSH_AUTO_BACKGROUND,
@@ -366,16 +572,20 @@ class TestClient(KuduTestBase, unittest.TestCase):
     def test_session_mutation_buffer_errors(self):
         session = self.client.new_session(flush_mode=kudu.FLUSH_AUTO_BACKGROUND)
 
-        with self.assertRaises(OverflowError):
+        error_msg = 'can\'t convert negative value to unsigned int'
+        with self.assertRaisesRegex(OverflowError, error_msg):
             session.set_mutation_buffer_max_num(-1)
 
-        with self.assertRaises(kudu.errors.KuduInvalidArgument):
+        error_msg = '120: watermark must be between 0 and 100 inclusive'
+        with self.assertRaisesRegex(kudu.errors.KuduInvalidArgument, error_msg):
             session.set_mutation_buffer_flush_watermark(1.2)
 
-        with self.assertRaises(OverflowError):
+        error_msg = 'can\'t convert negative value to unsigned int'
+        with self.assertRaisesRegex(OverflowError, error_msg):
             session.set_mutation_buffer_flush_interval(-1)
 
-        with self.assertRaises(OverflowError):
+        error_msg = 'can\'t convert negative value to size_t'
+        with self.assertRaisesRegex(OverflowError, error_msg):
             session.set_mutation_buffer_space(-1)
 
     def test_connect_timeouts(self):
@@ -412,11 +622,13 @@ class TestClient(KuduTestBase, unittest.TestCase):
                 op[key[0]] = 'test'
 
         # Test incorrectly typed data
-        with self.assertRaises(TypeError):
+        error_msg = 'an integer is required'
+        with self.assertRaisesRegex(TypeError, error_msg):
             op['int_val'] = 'incorrect'
 
         # Test setting NULL in a not-null column
-        with self.assertRaises(kudu.errors.KuduInvalidArgument):
+        error_msg = 'column not nullable: key'
+        with self.assertRaisesRegex(kudu.errors.KuduInvalidArgument, error_msg):
             op['key'] = None
 
     def test_alter_table_rename(self):
@@ -474,6 +686,14 @@ class TestClient(KuduTestBase, unittest.TestCase):
             # Confirm column rename
             col = table['string_val_renamed']
 
+            # Check if existing comment can be altered, and new comment can be specified
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column('key').comment('new_key_comment')
+            alterer.alter_column('int_val').comment('int_val_comment')
+            table = alterer.alter()
+
+            assert table['key'].spec.comment == 'new_key_comment'
+            assert table['int_val'].spec.comment == 'int_val_comment'
         finally:
             self.client.delete_table('alter-column')
 
@@ -607,6 +827,75 @@ class TestClient(KuduTestBase, unittest.TestCase):
             except:
                 pass
 
+    def test_alter_table_auto_incrementing_column(self):
+        table_name = 'alter_table_with_auto_incrementing_column'
+        try:
+            builder = kudu.schema_builder()
+            (builder.add_column('key', kudu.int32)
+            .nullable(False)
+            .non_unique_primary_key())
+            schema = builder.build()
+
+            self.client.create_table(
+                table_name, schema,
+                partitioning=Partitioning().add_hash_partitions(['key'], 2))
+
+            col_name = Schema.get_auto_incrementing_column_name()
+            table = self.client.table(table_name)
+
+            # negatives
+            alterer = self.client.new_table_alterer(table)
+            alterer.drop_column(col_name)
+            error_msg = 'can\'t drop column: {0}'\
+                        .format(Schema.get_auto_incrementing_column_name())
+            with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+                alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.add_column(col_name)
+            error_msg = 'can\'t add a column with reserved name: {0}'\
+                        .format(Schema.get_auto_incrementing_column_name())
+            with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+                alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name, "new_column_name")
+            error_msg = 'can\'t change name for column: {0}'\
+                        .format(Schema.get_auto_incrementing_column_name())
+            with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+                alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).remove_default()
+            error_msg = 'can\'t change remove default for column: {0}'\
+                        .format(Schema.get_auto_incrementing_column_name())
+            with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+                alterer.alter()
+
+            # positives
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).block_size(1)
+            alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).encoding('plain')
+            alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).compression('none')
+            alterer.alter()
+
+            alterer = self.client.new_table_alterer(table)
+            alterer.alter_column(col_name).comment('new_comment')
+            alterer.alter()
+
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except:
+                pass
+
+class TestAuthAndEncription(KuduTestBase, CompatUnitTest):
     def test_require_encryption(self):
         client = kudu.connect(self.master_hosts, self.master_ports,
                               encryption_policy=ENCRYPTION_REQUIRED)
@@ -614,11 +903,51 @@ class TestClient(KuduTestBase, unittest.TestCase):
     def test_require_authn(self):
         # Kerberos is not enabled on the cluster, so requiring
         # authentication is expected to fail.
-        with self.assertRaises(kudu.KuduBadStatus):
+        error_msg = 'client requires authentication, but server does not have Kerberos enabled'
+        with self.assertRaisesRegex(kudu.KuduBadStatus, error_msg):
             client = kudu.connect(self.master_hosts, self.master_ports,
                      require_authentication=True)
 
-class TestMonoDelta(unittest.TestCase):
+class TestJwt(KuduTestBase, CompatUnitTest):
+    def test_jwt(self):
+        certs=[]
+        for hp in self.master_http_hostports:
+            req = Request("http://{0}/ipki-ca-cert".format(hp))
+            try:
+                resp = urlopen(req)
+                certs.append(resp.read())
+                break
+            except HTTPError as e:
+                if e.code == 503:
+                    continue
+                else:
+                    raise
+
+        self.assertNotEqual(0, len(certs))
+
+        # A sub-case of valid JWT: the client should be able to successfully
+        # connect to the cluster.
+        jwt = self.get_jwt(valid=True)
+        client = kudu.connect(self.master_hosts,
+                              self.master_ports,
+                              require_authentication=True,
+                              jwt=jwt,
+                              trusted_certificates=certs)
+
+        # A sub-case of invalid JWT: the client should fail connecting to the
+        # cluster, and the error message should contain corresponding details
+        # on JWT authentication failure.
+        jwt = self.get_jwt(valid=False)
+        error_msg = ('FATAL_INVALID_JWT: Not authorized: JWT verification failed: ' +
+        'failed to verify signature: VerifyFinal failed')
+        with self.assertRaisesRegex(kudu.KuduBadStatus, error_msg):
+            client = kudu.connect(self.master_hosts,
+                                  self.master_ports,
+                                  require_authentication=True,
+                                  jwt=jwt,
+                                  trusted_certificates=certs)
+
+class TestMonoDelta(CompatUnitTest):
 
     def test_empty_ctor(self):
         delta = kudu.TimeDelta()
@@ -639,3 +968,184 @@ class TestMonoDelta(unittest.TestCase):
 
         delta = kudu.timedelta(nanos=3500)
         assert delta.to_nanos() == 3500
+
+class TestSoftDelete(KuduTestBase, CompatUnitTest):
+
+    def setUp(self):
+        pass
+
+    def create_test_table(self, table_name, nrows):
+        self.client.create_table(table_name, self.schema, self.partitioning)
+        table = self.client.table(table_name)
+        session = self.client.new_session()
+
+        # Insert a few rows, and scan them back. This is to populate the MetaCache.
+        for i in range(nrows):
+            op = table.new_insert((i, 2, 'hello'))
+            session.apply(op)
+        session.flush()
+
+        scanner = table.scanner().open()
+        tuples = scanner.read_all_tuples()
+        assert len(tuples) == nrows
+
+    def test_soft_deleted_table_alter_operations(self):
+        try:
+            table_name = 'test_soft_deleted_table_alter_operations'
+            self.create_test_table(table_name, 10)
+            table = self.client.table(table_name)
+
+            # Soft-delete the table.
+            assert len(self.client.list_tables()) == 2
+            assert sorted(self.client.list_tables()) == sorted([self.ex_table, table_name])
+            assert len(self.client.list_soft_deleted_tables()) == 0
+            self.client.soft_delete_table(table_name, 600)
+
+            # Soft-deleted table is still visible
+            assert self.client.table_exists(table_name) == True
+
+            # The table has been moved into the soft_deleted list.
+            assert len(self.client.list_tables()) == 1
+            assert self.client.list_tables() == [self.ex_table]
+            assert len(self.client.list_soft_deleted_tables()) == 1
+            assert self.client.list_soft_deleted_tables() == [table_name]
+
+            # Altering a soft-deleted table is not allowed.
+            # Not allowed to rename.
+            alterer = self.client.new_table_alterer(table)
+            alterer.rename("new_table_name")
+            error_msg = 'soft_deleted table {0} should not be altered'.format(table_name)
+            with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+                alterer.alter()
+
+            # Not allowed to add column.
+            alterer = self.client.new_table_alterer(table)
+            alterer.add_column('new_column', type_='int64', default=0)
+            error_msg = 'soft_deleted table {0} should not be altered'.format(table_name)
+            with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+                alterer.alter()
+
+            # Not allowed to delete the soft-deleted table with new reserve_seconds value.
+            error_msg = 'soft_deleted table {0} should not be soft deleted again'.format(table_name)
+            with self.assertRaisesRegex(KuduInvalidArgument, error_msg):
+                self.client.soft_delete_table(table_name, 600)
+
+            # Not allowed to set extra configs.
+            # TODO: Once the Python client supports changing extra configs through table alterer,
+            # check that this can't be performed for soft-deleted table.
+
+            # It is not allowed to create a new table with the same name.
+            error_msg = 'table {0} already exists with id {1}'.format(table_name, table.id)
+            with self.assertRaisesRegex(KuduBadStatus, error_msg):
+                self.client.create_table(table_name, self.schema, self.partitioning)
+        finally:
+            try:
+                # Force delete the soft-deleted table.
+                self.client.delete_table(table_name)
+            except:
+                pass
+
+    def test_soft_delete_and_recall_table_positive(self):
+        try:
+            # Create and open the table before soft-deleting it.
+            table_name = "test_soft_delete_and_recall_table_positive"
+            nrows = 10
+            self.create_test_table(table_name, nrows)
+            table = self.client.table(table_name)
+            session = self.client.new_session()
+
+            # Remove the table. Perform sanity checks.
+            self.client.soft_delete_table(table_name, 600)
+            assert len(self.client.list_tables()) == 1
+            assert self.client.list_tables() == [self.ex_table]
+            assert len(self.client.list_soft_deleted_tables()) == 1
+            assert self.client.list_soft_deleted_tables() == [table_name]
+
+            # Read and write are allowed for soft-deleted table.
+            for i in range(nrows):
+                op = table.new_insert((i+nrows, 2, 'hello'))
+                session.apply(op)
+            session.flush()
+
+            scanner = table.scanner().open()
+            tuples = scanner.read_all_tuples()
+            assert len(tuples) == 2*nrows
+
+            # Recall and reopen table. Perform sanity checks.
+            self.client.recall_table(table.id)
+            assert len(self.client.list_tables()) == 2
+            assert sorted(self.client.list_tables()) == sorted([self.ex_table, table_name])
+            assert len(self.client.list_soft_deleted_tables()) == 0
+
+            # Check the data in the table.
+            scanner = table.scanner().open()
+            tuples = scanner.read_all_tuples()
+            assert len(tuples) == 2*nrows
+        finally:
+            try:
+                # Force delete the soft-deleted table.
+                self.client.delete_table(table_name)
+            except:
+                pass
+
+    def test_soft_delete_and_recall_table_with_new_name_positive(self):
+        try:
+            # Create and open the table before soft-deleting it.
+            table_name = "test_soft_delete_and_recall_table_with_new_name_positive"
+            nrows = 10
+            self.create_test_table(table_name, nrows)
+            table = self.client.table(table_name)
+
+            # Remove the table. Perform sanity checks.
+            self.client.soft_delete_table(table_name, 600)
+            assert len(self.client.list_tables()) == 1
+            assert self.client.list_tables() == [self.ex_table]
+            assert len(self.client.list_soft_deleted_tables()) == 1
+            assert self.client.list_soft_deleted_tables() == [table_name]
+
+            # Recall and reopen table. Perform sanity checks.
+            table_name = "new_table_name"
+            self.client.recall_table(table.id, table_name)
+            assert len(self.client.list_tables()) == 2
+            assert sorted(self.client.list_tables()) == sorted([self.ex_table, table_name])
+            assert len(self.client.list_soft_deleted_tables()) == 0
+
+            # Re-open the table. Check the data in the table.
+            table = self.client.table(table_name)
+            scanner = table.scanner().open()
+            tuples = scanner.read_all_tuples()
+            assert len(tuples) == nrows
+            assert table.name == table_name
+        finally:
+            try:
+                # Force delete the soft-deleted table.
+                self.client.delete_table(table_name)
+            except:
+                pass
+
+    def test_soft_delete_and_recall_table_after_reserve_time(self):
+        # Create and open the table before soft-deleting it.
+        table_name = "test_soft_delete_and_recall_table_after_reserve_time"
+        self.create_test_table(table_name, 10)
+
+        # Remove the table. Wait until the table is removed completely.
+        self.client.soft_delete_table(table_name, 1)
+        error_msg = 'the table does not exist'
+        table_exists = True
+        while table_exists:
+            try:
+                table = self.client.table(table_name)
+            except KuduNotFound as kudu_error:
+                assert error_msg in str(kudu_error)
+                table_exists = False
+            time.sleep(1)
+
+        # Try to recall the table.
+        error_msg = 'soft-deleted state false, expired state false, can\'t recall'
+        with self.assertRaisesRegex(KuduNotFound, error_msg):
+            self.client.recall_table(table.id)
+
+        # Perform sanity checks to validate that the table is removed entirely.
+        assert len(self.client.list_tables()) == 1
+        assert self.client.list_tables() == [self.ex_table]
+        assert len(self.client.list_soft_deleted_tables()) == 0

@@ -141,6 +141,8 @@
 #include "kudu/util/test_util.h"
 #include "kudu/util/url-coding.h"
 
+DECLARE_bool(allow_unsafe_replication_factor);
+DECLARE_bool(catalog_manager_check_ts_count_for_create_table);
 DECLARE_bool(enable_tablet_orphaned_block_deletion);
 DECLARE_bool(encrypt_data_at_rest);
 DECLARE_bool(disable_gflag_filter_logic_for_testing);
@@ -173,6 +175,7 @@ using kudu::client::KuduSchema;
 using kudu::client::KuduSchemaBuilder;
 using kudu::client::KuduSession;
 using kudu::client::KuduTable;
+using kudu::client::KuduTableAlterer;
 using kudu::client::KuduTableCreator;
 using kudu::client::KuduTableStatistics;
 using kudu::client::KuduValue;
@@ -514,10 +517,12 @@ class ToolTest : public KuduTest {
   }
 
   enum class TableCopyMode {
-    INSERT_TO_EXIST_TABLE = 0,
-    INSERT_TO_NOT_EXIST_TABLE = 1,
-    UPSERT_TO_EXIST_TABLE = 2,
+    INSERT_TO_EXISTING_TABLE = 0,
+    INSERT_TO_NEW_TABLE = 1,
+    UPSERT_TO_EXISTING_TABLE = 2,
     COPY_SCHEMA_ONLY = 3,
+    INSERT_IGNORE_TO_EXISTING_TABLE = 4,
+    UPSERT_IGNORE_TO_EXISTING_TABLE = 5,
   };
 
   struct RunCopyTableCheckArgs {
@@ -532,7 +537,7 @@ class ToolTest : public KuduTest {
   };
 
   void RunCopyTableCheck(const RunCopyTableCheckArgs& args) {
-    const string kDstTableName = "kudu.table.copy.to";
+    static constexpr const char* const kDstTableName = "kudu.table.copy.to";
 
     // Prepare command flags, create destination table and write some data if needed.
     string write_type;
@@ -541,24 +546,49 @@ class ToolTest : public KuduTest {
     ww.set_table_name(kDstTableName);
     ww.set_num_replicas(1);
     switch (args.mode) {
-      case TableCopyMode::INSERT_TO_EXIST_TABLE:
+      case TableCopyMode::INSERT_TO_EXISTING_TABLE:
         write_type = "insert";
         create_table = "false";
         // Create the dst table.
         ww.set_num_write_threads(0);
         ww.Setup();
         break;
-      case TableCopyMode::INSERT_TO_NOT_EXIST_TABLE:
+      case TableCopyMode::INSERT_IGNORE_TO_EXISTING_TABLE:
+        write_type = "insert_ignore";
+        create_table = "false";
+        // Create the dst table and write some data to it.
+        ww.set_write_pattern(TestWorkload::INSERT_SEQUENTIAL_ROWS);
+        ww.set_num_write_threads(1);
+        ww.Setup();
+        ww.Start();
+        ASSERT_EVENTUALLY([&]() {
+          ASSERT_GE(ww.rows_inserted(), 100);
+        });
+        ww.StopAndJoin();
+        break;
+      case TableCopyMode::INSERT_TO_NEW_TABLE:
         write_type = "insert";
         create_table = "true";
         break;
-      case TableCopyMode::UPSERT_TO_EXIST_TABLE:
+      case TableCopyMode::UPSERT_TO_EXISTING_TABLE:
         write_type = "upsert";
         create_table = "false";
         // Create the dst table and write some data to it.
         ww.set_write_pattern(TestWorkload::INSERT_SEQUENTIAL_ROWS);
         ww.set_num_write_threads(1);
-        ww.set_write_batch_size(1);
+        ww.Setup();
+        ww.Start();
+        ASSERT_EVENTUALLY([&]() {
+          ASSERT_GE(ww.rows_inserted(), 100);
+        });
+        ww.StopAndJoin();
+        break;
+      case TableCopyMode::UPSERT_IGNORE_TO_EXISTING_TABLE:
+        write_type = "upsert_ignore";
+        create_table = "false";
+        // Create the dst table and write some data to it.
+        ww.set_write_pattern(TestWorkload::INSERT_SEQUENTIAL_ROWS);
+        ww.set_num_write_threads(1);
         ww.Setup();
         ww.Start();
         ASSERT_EVENTUALLY([&]() {
@@ -628,7 +658,7 @@ class ToolTest : public KuduTest {
     }
 
     // Check schema equals when destination table is created automatically.
-    if (args.mode == TableCopyMode::INSERT_TO_NOT_EXIST_TABLE ||
+    if (args.mode == TableCopyMode::INSERT_TO_NEW_TABLE ||
         args.mode == TableCopyMode::COPY_SCHEMA_ONLY) {
       vector<string> src_schema;
       NO_FATALS(RunActionStdoutLines(
@@ -698,20 +728,26 @@ class ToolTest : public KuduTest {
       ASSERT_GE(dst_lines.size(), 1);
       ASSERT_STR_CONTAINS(*dst_lines.rbegin(), "Total count 0 ");
     } else {
-      // Rows scanned from source table can be found in destination table.
+      // Rows scanned from the source table can be found in the destination table.
       set<string> sorted_dst_lines(dst_lines.begin(), dst_lines.end());
-      for (auto src_line = src_lines.begin(); src_line != src_lines.end();) {
-        if (src_line->find("key") != string::npos) {
-          ASSERT_TRUE(ContainsKey(sorted_dst_lines, *src_line));
-          sorted_dst_lines.erase(*src_line);
+      for (auto src_line_it = src_lines.begin(); src_line_it != src_lines.end();) {
+        if (src_line_it->find("key") != string::npos) {
+          if (args.mode != TableCopyMode::INSERT_IGNORE_TO_EXISTING_TABLE) {
+            ASSERT_TRUE(ContainsKey(sorted_dst_lines, *src_line_it)) << *src_line_it;
+          }
+          sorted_dst_lines.erase(*src_line_it);
         }
-        src_line = src_lines.erase(src_line);
+        src_line_it = src_lines.erase(src_line_it);
       }
 
-      // Under all modes except UPSERT_TO_EXIST_TABLE, destination table is empty before
-      // copying, that means destination table should have no more rows than source table
-      // after copying.
-      if (args.mode != TableCopyMode::UPSERT_TO_EXIST_TABLE) {
+      // Under all modes except for UPSERT_TO_EXISTING_TABLE,
+      // INSERT_IGNORE_TO_EXISTING_TABLE, UPSERT_IGNORE_TO_EXISTING_TABLE,
+      // the destination table is empty before copying. That means the
+      // destination table should not have more rows than the source table
+      // after copying is complete.
+      if (args.mode != TableCopyMode::INSERT_IGNORE_TO_EXISTING_TABLE &&
+          args.mode != TableCopyMode::UPSERT_TO_EXISTING_TABLE &&
+          args.mode != TableCopyMode::UPSERT_IGNORE_TO_EXISTING_TABLE) {
         for (const auto& dst_line : sorted_dst_lines) {
           ASSERT_STR_NOT_CONTAINS(dst_line, "key");
         }
@@ -813,12 +849,15 @@ INSTANTIATE_TEST_SUITE_P(ToolTestKerberosParameterized, ToolTestKerberosParamete
 enum RunCopyTableCheckArgsType {
   kTestCopyTableDstTableExist,
   kTestCopyTableDstTableNotExist,
+  kTestCopyTableInsertIgnore,
   kTestCopyTableUpsert,
+  kTestCopyTableUpsertIgnore,
   kTestCopyTableSchemaOnly,
   kTestCopyTableComplexSchema,
   kTestCopyUnpartitionedTable,
   kTestCopyTablePredicates,
-  kTestCopyTableWithStringBounds
+  kTestCopyTableWithStringBounds,
+  kTestCopyTableAutoIncrementingColumn
 };
 // Subclass of ToolTest that allows running individual test cases with different parameters to run
 // 'kudu table copy' CLI tool.
@@ -829,9 +868,10 @@ class ToolTestCopyTableParameterized :
   void SetUp() override {
     test_case_ = GetParam();
     ExternalMiniClusterOptions opts;
-    if (test_case_ == kTestCopyTableSchemaOnly) {
-      // In kTestCopyTableSchemaOnly case, we may create table with RF=3,
-      // means 3 tservers needed at least.
+    if (test_case_ == kTestCopyTableSchemaOnly ||
+        test_case_ == kTestCopyTableAutoIncrementingColumn) {
+      // In kTestCopyTableSchemaOnly and kTestCopyTableAutoIncrementingColumn
+      // case, we may create table with RF=3, means 3 tservers needed at least.
       opts.num_tablet_servers = 3;
     }
     NO_FATALS(StartExternalMiniCluster(opts));
@@ -858,6 +898,10 @@ class ToolTestCopyTableParameterized :
       ww.set_schema(schema);
       ww.Setup();
       return;
+    } else if (test_case_ == kTestCopyTableAutoIncrementingColumn) {
+      KuduSchema schema;
+      ASSERT_OK(CreateAutoIncrementingTable(&schema));
+      ww.set_schema(schema);
     }
     ww.Setup();
     ww.Start();
@@ -879,16 +923,26 @@ class ToolTestCopyTableParameterized :
                                    1,
                                    total_rows_,
                                    kSimpleSchemaColumns,
-                                   TableCopyMode::INSERT_TO_EXIST_TABLE,
+                                   TableCopyMode::INSERT_TO_EXISTING_TABLE,
                                    -1 };
     switch (test_case_) {
       case kTestCopyTableDstTableExist:
         return { args };
       case kTestCopyTableDstTableNotExist:
-        args.mode = TableCopyMode::INSERT_TO_NOT_EXIST_TABLE;
+        args.mode = TableCopyMode::INSERT_TO_NEW_TABLE;
+        return { args };
+      case kTestCopyTableAutoIncrementingColumn:
+        args.mode = TableCopyMode::INSERT_TO_NEW_TABLE;
+        args.columns = kAutoIncrementingSchemaColumns;
+        return { args };
+      case kTestCopyTableInsertIgnore:
+        args.mode = TableCopyMode::INSERT_IGNORE_TO_EXISTING_TABLE;
         return { args };
       case kTestCopyTableUpsert:
-        args.mode = TableCopyMode::UPSERT_TO_EXIST_TABLE;
+        args.mode = TableCopyMode::UPSERT_TO_EXISTING_TABLE;
+        return { args };
+      case kTestCopyTableUpsertIgnore:
+        args.mode = TableCopyMode::UPSERT_IGNORE_TO_EXISTING_TABLE;
         return { args };
       case kTestCopyTableSchemaOnly: {
         args.mode = TableCopyMode::COPY_SCHEMA_ONLY;
@@ -911,7 +965,7 @@ class ToolTestCopyTableParameterized :
       }
       case kTestCopyTableComplexSchema: {
         args.columns = kComplexSchemaColumns;
-        args.mode = TableCopyMode::INSERT_TO_NOT_EXIST_TABLE;
+        args.mode = TableCopyMode::INSERT_TO_NEW_TABLE;
         vector<RunCopyTableCheckArgs> multi_args;
         {
           auto args_temp = args;
@@ -951,7 +1005,7 @@ class ToolTestCopyTableParameterized :
         return multi_args;
       }
       case kTestCopyUnpartitionedTable: {
-        args.mode = TableCopyMode::INSERT_TO_NOT_EXIST_TABLE;
+        args.mode = TableCopyMode::INSERT_TO_NEW_TABLE;
         vector<RunCopyTableCheckArgs> multi_args;
         {
           auto args_temp = args;
@@ -1145,6 +1199,23 @@ class ToolTestCopyTableParameterized :
         .Create();
   }
 
+  Status CreateAutoIncrementingTable(KuduSchema* schema) {
+    shared_ptr<KuduClient> client;
+    RETURN_NOT_OK(cluster_->CreateClient(nullptr, &client));
+    unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+    KuduSchemaBuilder b;
+    b.AddColumn("key")->Type(client::KuduColumnSchema::INT32)->NotNull()->NonUniquePrimaryKey();
+    b.AddColumn("int_val")->Type(client::KuduColumnSchema::INT32);
+    b.AddColumn("string_val")->Type(client::KuduColumnSchema::STRING)->Nullable();
+    RETURN_NOT_OK(b.Build(schema));
+
+    return table_creator->table_name(kTableName)
+        .schema(schema)
+        .set_range_partition_columns({})
+        .num_replicas(3)
+        .Create();
+  }
+
   void InsertOneRowWithNullCell() {
     shared_ptr<KuduClient> client;
     ASSERT_OK(cluster_->CreateClient(nullptr, &client));
@@ -1162,12 +1233,15 @@ class ToolTestCopyTableParameterized :
 
   static const char kTableName[];
   static const char kSimpleSchemaColumns[];
+  static const char kAutoIncrementingSchemaColumns[];
   static const char kComplexSchemaColumns[];
   int test_case_ = 0;
   int64_t total_rows_ = 0;
 };
 const char ToolTestCopyTableParameterized::kTableName[] = "ToolTestCopyTableParameterized";
 const char ToolTestCopyTableParameterized::kSimpleSchemaColumns[] = "key,int_val,string_val";
+const char ToolTestCopyTableParameterized::kAutoIncrementingSchemaColumns[]
+    = "key,int_val,string_val";
 const char ToolTestCopyTableParameterized::kComplexSchemaColumns[]
     = "key_hash0,key_hash1,key_hash2,key_range,int8_val,int16_val,int32_val,int64_val,"
       "timestamp_val,string_val,bool_val,float_val,double_val,binary_val,decimal_val";
@@ -1176,12 +1250,15 @@ INSTANTIATE_TEST_SUITE_P(CopyTableParameterized,
                          ToolTestCopyTableParameterized,
                          ::testing::Values(kTestCopyTableDstTableExist,
                                            kTestCopyTableDstTableNotExist,
+                                           kTestCopyTableInsertIgnore,
                                            kTestCopyTableUpsert,
+                                           kTestCopyTableUpsertIgnore,
                                            kTestCopyTableSchemaOnly,
                                            kTestCopyTableComplexSchema,
                                            kTestCopyUnpartitionedTable,
                                            kTestCopyTablePredicates,
-                                           kTestCopyTableWithStringBounds));
+                                           kTestCopyTableWithStringBounds,
+                                           kTestCopyTableAutoIncrementingColumn));
 
 void ToolTest::StartExternalMiniCluster(ExternalMiniClusterOptions opts) {
   cluster_.reset(new ExternalMiniCluster(std::move(opts)));
@@ -1473,6 +1550,7 @@ TEST_F(ToolTest, TestModeHelp) {
         "drop_range_partition.*Drop a range partition of table",
         "get_extra_configs.*Get the extra configuration properties for a table",
         "list.*List tables",
+        "list_in_flight.*List tables in flight",
         "locate_row.*Locate which tablet a row belongs to",
         "recall.*Recall a deleted but still reserved table",
         "rename_column.*Rename a column",
@@ -2385,6 +2463,8 @@ TEST_F(ToolTest, TestWalDump) {
       ASSERT_STR_MATCHES(stdout, "Header:");
       ASSERT_STR_MATCHES(stdout, "1\\.1@1");
       ASSERT_STR_MATCHES(stdout, "this is a test insert");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id");
       ASSERT_STR_NOT_MATCHES(stdout, "t<truncated>");
       ASSERT_STR_NOT_MATCHES(stdout, "row_operations \\{");
       ASSERT_STR_MATCHES(stdout, "Footer:");
@@ -2396,6 +2476,8 @@ TEST_F(ToolTest, TestWalDump) {
       SCOPED_TRACE(stdout);
       ASSERT_STR_MATCHES(stdout, "Header:");
       ASSERT_STR_NOT_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id");
       ASSERT_STR_NOT_MATCHES(stdout, "this is a test insert");
       ASSERT_STR_NOT_MATCHES(stdout, "t<truncated>");
       ASSERT_STR_NOT_MATCHES(stdout, "row_operations \\{");
@@ -2407,6 +2489,8 @@ TEST_F(ToolTest, TestWalDump) {
       SCOPED_TRACE(stdout);
       ASSERT_STR_MATCHES(stdout, "Header:");
       ASSERT_STR_NOT_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id");
       ASSERT_STR_MATCHES(stdout, "this is a test insert");
       ASSERT_STR_NOT_MATCHES(stdout, "t<truncated>");
       ASSERT_STR_MATCHES(stdout, "row_operations \\{");
@@ -2418,6 +2502,8 @@ TEST_F(ToolTest, TestWalDump) {
       SCOPED_TRACE(stdout);
       ASSERT_STR_MATCHES(stdout, "Header:");
       ASSERT_STR_NOT_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id");
       ASSERT_STR_NOT_MATCHES(stdout, "this is a test insert");
       ASSERT_STR_MATCHES(stdout, "t<truncated>");
       ASSERT_STR_MATCHES(stdout, "row_operations \\{");
@@ -2429,6 +2515,8 @@ TEST_F(ToolTest, TestWalDump) {
       SCOPED_TRACE(stdout);
       ASSERT_STR_MATCHES(stdout, "Header:");
       ASSERT_STR_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id");
       ASSERT_STR_NOT_MATCHES(stdout, "this is a test insert");
       ASSERT_STR_NOT_MATCHES(stdout, "t<truncated>");
       ASSERT_STR_NOT_MATCHES(stdout, "row_operations \\{");
@@ -2440,6 +2528,8 @@ TEST_F(ToolTest, TestWalDump) {
       SCOPED_TRACE(stdout);
       ASSERT_STR_NOT_MATCHES(stdout, "Header:");
       ASSERT_STR_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id");
       ASSERT_STR_MATCHES(stdout, "this is a test insert");
       ASSERT_STR_NOT_MATCHES(stdout, "row_operations \\{");
       ASSERT_STR_NOT_MATCHES(stdout, "Footer:");
@@ -2664,6 +2754,141 @@ TEST_F(ToolTest, TestWalDumpWithAlterSchema) {
       ASSERT_STR_MATCHES(stdout, kAddColumnName1);
       ASSERT_STR_MATCHES(stdout, kAddColumnName1Message);
       ASSERT_STR_MATCHES(stdout, kAddColumnName2Message);
+      ASSERT_STR_NOT_MATCHES(stdout, "row_operations \\{");
+      ASSERT_STR_NOT_MATCHES(stdout, "Footer:");
+    }
+  }
+}
+
+TEST_F(ToolTest, TestWalDumpWithAutoIncrementingColumn) {
+  const string kTestDir = GetTestPath("test");
+  const string kTestTablet = "ffffffffffffffffffffffffffffffff";
+  const client::KuduSchema kSchema(GetAutoIncrementingTestSchema());
+  const Schema schema = client::KuduSchema::ToSchema(kSchema);
+  const Schema schema_with_id = SchemaBuilder(client::KuduSchema::ToSchema(kSchema)).Build();
+
+  FsManager fs(env_, FsManagerOpts(kTestDir));
+  ASSERT_OK(fs.CreateInitialFileSystemLayout());
+  ASSERT_OK(fs.Open());
+
+  {
+    scoped_refptr<Log> log;
+    ASSERT_OK(Log::Open(LogOptions(),
+                        &fs,
+                        /*file_cache*/nullptr,
+                        kTestTablet,
+                        schema_with_id,
+                        /*schema_version*/0,
+                        /*metric_entity*/nullptr,
+                        &log));
+
+    OpId opid = consensus::MakeOpId(1, 1);
+    ReplicateRefPtr replicate =
+        consensus::make_scoped_refptr_replicate(new ReplicateMsg());
+    replicate->get()->set_op_type(consensus::WRITE_OP);
+    replicate->get()->mutable_id()->CopyFrom(opid);
+    replicate->get()->set_timestamp(1);
+    WriteRequestPB* write = replicate->get()->mutable_write_request();
+    write->mutable_auto_incrementing_column()->set_auto_incrementing_counter(0x5a);
+    ASSERT_OK(SchemaToPB(schema, write->mutable_schema()));
+    AddTestRowToPB(RowOperationsPB::INSERT, schema,
+                   opid.index(),
+                   0,
+                   "this is a test insert",
+                   write->mutable_row_operations());
+    AddTestRowToPB(RowOperationsPB::INSERT, schema,
+                   opid.index(),
+                   0,
+                   "this is a test insert",
+                   write->mutable_row_operations());
+    write->set_tablet_id(kTestTablet);
+    Synchronizer s;
+    ASSERT_OK(log->AsyncAppendReplicates({ replicate }, s.AsStatusCallback()));
+    ASSERT_OK(s.Wait());
+  }
+
+  string wal_path = fs.GetWalSegmentFileName(kTestTablet, 1);
+  string encryption_args;
+  if (env_->IsEncryptionEnabled()) {
+    encryption_args = GetEncryptionArgs() + " --instance_file=" +
+        fs.GetInstanceMetadataPath(kTestDir);
+  }
+  string stdout;
+  for (const auto& args : { Substitute("wal dump $0 $1", wal_path, encryption_args),
+                            Substitute("local_replica dump wals --fs_wal_dir=$0 $1 $2",
+                                       kTestDir, kTestTablet, encryption_args)
+  }) {
+    SCOPED_TRACE(args);
+    {
+      NO_FATALS(RunActionStdoutString(Substitute("$0 --print_entries=true",
+                                                 args), &stdout));
+      SCOPED_TRACE(stdout);
+      ASSERT_STR_MATCHES(stdout, "Header:");
+      ASSERT_STR_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_MATCHES(stdout, "Auto Incrementing Counter: 90");
+      ASSERT_STR_MATCHES(stdout, "auto_incrementing_id=91");
+      ASSERT_STR_MATCHES(stdout, "auto_incrementing_id=92");
+      ASSERT_STR_NOT_MATCHES(stdout, "t<truncated>");
+      ASSERT_STR_NOT_MATCHES(stdout, "row_operations \\{");
+      ASSERT_STR_MATCHES(stdout, "Footer:");
+    }
+    {
+      NO_FATALS(RunActionStdoutString(Substitute("$0 --print_entries=false",
+                                                 args), &stdout));
+      SCOPED_TRACE(stdout);
+      ASSERT_STR_MATCHES(stdout, "Header:");
+      ASSERT_STR_NOT_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id=");
+      ASSERT_STR_NOT_MATCHES(stdout, "t<truncated>");
+      ASSERT_STR_NOT_MATCHES(stdout, "row_operations \\{");
+      ASSERT_STR_MATCHES(stdout, "Footer:");
+    }
+    {
+      NO_FATALS(RunActionStdoutString(Substitute("$0 --print_entries=pb",
+                                                 args), &stdout));
+      SCOPED_TRACE(stdout);
+      ASSERT_STR_MATCHES(stdout, "Header:");
+      ASSERT_STR_NOT_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id=");
+      ASSERT_STR_NOT_MATCHES(stdout, "t<truncated>");
+      ASSERT_STR_MATCHES(stdout, "row_operations \\{");
+      ASSERT_STR_MATCHES(stdout, "Footer:");
+    }
+    {
+      NO_FATALS(RunActionStdoutString(Substitute(
+          "$0 --print_entries=pb --truncate_data=1", args), &stdout));
+      SCOPED_TRACE(stdout);
+      ASSERT_STR_MATCHES(stdout, "Header:");
+      ASSERT_STR_NOT_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id=");
+      ASSERT_STR_MATCHES(stdout, "t<truncated>");
+      ASSERT_STR_MATCHES(stdout, "row_operations \\{");
+      ASSERT_STR_MATCHES(stdout, "Footer:");
+    }
+    {
+      NO_FATALS(RunActionStdoutString(Substitute(
+          "$0 --print_entries=id", args), &stdout));
+      SCOPED_TRACE(stdout);
+      ASSERT_STR_MATCHES(stdout, "Header:");
+      ASSERT_STR_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_NOT_MATCHES(stdout, "Auto Incrementing Counter");
+      ASSERT_STR_NOT_MATCHES(stdout, "auto_incrementing_id=");
+      ASSERT_STR_NOT_MATCHES(stdout, "t<truncated>");
+      ASSERT_STR_NOT_MATCHES(stdout, "row_operations \\{");
+      ASSERT_STR_MATCHES(stdout, "Footer:");
+    }
+    {
+      NO_FATALS(RunActionStdoutString(Substitute(
+          "$0 --print_meta=false", args), &stdout));
+      SCOPED_TRACE(stdout);
+      ASSERT_STR_NOT_MATCHES(stdout, "Header:");
+      ASSERT_STR_MATCHES(stdout, "1\\.1@1");
+      ASSERT_STR_MATCHES(stdout, "Auto Incrementing Counter: 90");
+      ASSERT_STR_MATCHES(stdout, "auto_incrementing_id=91");
+      ASSERT_STR_MATCHES(stdout, "auto_incrementing_id=92");
       ASSERT_STR_NOT_MATCHES(stdout, "row_operations \\{");
       ASSERT_STR_NOT_MATCHES(stdout, "Footer:");
     }
@@ -3535,6 +3760,49 @@ TEST_F(ToolTest, TestLoadgenAutoGenTablePartitioning) {
   expected_tablets += 4;
   ASSERT_OK(RunKuduTool(args));
   ASSERT_OK(WaitForNumTabletsOnTS(ts, expected_tablets, kTimeout));
+}
+
+TEST_F(ToolTest, TestLoadgenAutoIncrementingColumn) {
+  shared_ptr<KuduClient> client;
+  const string kTableName = "loadgen_auto_incrementing";
+  NO_FATALS(StartExternalMiniCluster());
+
+  // Create a table with auto-incrementing column and a single tablet
+  // for simplicity in the test case.
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+  KuduSchemaBuilder b;
+  b.AddColumn("key")->Type(client::KuduColumnSchema::INT32)->NotNull()->NonUniquePrimaryKey();
+  b.AddColumn("int_val")->Type(client::KuduColumnSchema::INT32);
+  KuduSchema schema;
+  ASSERT_OK(b.Build(&schema));
+  ASSERT_OK(table_creator->table_name(kTableName)
+            .schema(&schema)
+            .set_range_partition_columns({})
+            .num_replicas(1)
+            .Create());
+
+  // Insert data into the table with perf loadgen tool
+  constexpr int kNumRows = 100;
+  NO_FATALS(RunTool(
+      Substitute("perf loadgen $0 -table_name=$1 -num_threads=1 "
+                 "-num_rows_per_thread=$2",
+                 cluster_->master()->bound_rpc_addr().ToString(),
+                 kTableName, kNumRows)));
+
+  // Scan the data back and validate
+  vector<string> lines;
+  NO_FATALS(RunActionStdoutLines(
+      Substitute("table scan $0 $1 -num_threads=1",
+                 cluster_->master()->bound_rpc_addr().ToString(),
+                 kTableName),
+      &lines));
+
+  ASSERT_EQ(kNumRows + 1, lines.size());
+  for (int i = 0; i < kNumRows; i++) {
+    ASSERT_STR_CONTAINS(lines[i], Substitute("int32 key=$0, int64 auto_incrementing_id=$1,"
+                                             " int32 int_val", i, i+1));
+  }
 }
 
 // Run the loadgen with txn-related options.
@@ -4829,7 +5097,10 @@ TEST_F(ToolTest, TestTserverListLocationNotAssigned) {
 }
 
 TEST_F(ToolTest, TestTServerListState) {
-  NO_FATALS(StartExternalMiniCluster());
+  constexpr const int kTServerNum = 3;
+  ExternalMiniClusterOptions options;
+  options.num_tablet_servers = kTServerNum;
+  NO_FATALS(StartExternalMiniCluster(options));
   string master_addr = cluster_->master()->bound_rpc_addr().ToString();
   const string ts_uuid = cluster_->tablet_server(0)->uuid();
 
@@ -4837,15 +5108,17 @@ TEST_F(ToolTest, TestTServerListState) {
   NO_FATALS(RunActionStdoutNone(Substitute("tserver state enter_maintenance $0 $1",
                                            master_addr, ts_uuid)));
 
-  // If the state isn't requested, we shouldn't see any.
   string out;
   NO_FATALS(RunActionStdoutString(
-        Substitute("tserver list $0 --columns=uuid --format=csv", master_addr), &out));
-  ASSERT_STR_NOT_CONTAINS(out, Substitute("$0,$1", ts_uuid, "MAINTENANCE_MODE"));
+        Substitute("tserver list $0 --columns=uuid,state --format=csv", master_addr), &out));
+
+  for (int i = 1; i < kTServerNum; i++) {
+    // If a ts isn't requested, we shouldn't see its maintenance state.
+    const string ts_uuid_noop = cluster_->tablet_server(i)->uuid();
+    ASSERT_STR_NOT_CONTAINS(out, Substitute("$0,$1", ts_uuid_noop, "MAINTENANCE_MODE"));
+  }
 
   // If it is requested, we should see the state.
-  NO_FATALS(RunActionStdoutString(
-        Substitute("tserver list $0 --columns=uuid,state --format=csv", master_addr), &out));
   ASSERT_STR_CONTAINS(out, Substitute("$0,$1", ts_uuid, "MAINTENANCE_MODE"));
 
   // Ksck should show a table showing the state.
@@ -9167,6 +9440,183 @@ TEST_P(SetFlagForAllTest, TestSetFlagForAll) {
       &stdout, &stderr, nullptr, nullptr);
   ASSERT_TRUE(s.IsRuntimeError());
   ASSERT_STR_CONTAINS(stderr, "result: NO_SUCH_FLAG");
+}
+
+class ListInFlightTablesTest :
+    public ToolTest,
+    public ::testing::WithParamInterface<string> {
+};
+
+static vector<string> TableListFormats() {
+  return { "pretty", "json", "json_compact" };
+}
+
+INSTANTIATE_TEST_SUITE_P(, ListInFlightTablesTest,
+                         ::testing::ValuesIn(TableListFormats()));
+
+TEST_P(ListInFlightTablesTest, TestListInFlightTables) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  constexpr const char* const kDeleteTableName = "NeedDeleteTable";
+  constexpr const char* const kAddNewPartitionTableName = "AddNewPartitionTable";
+  constexpr const char* const kNotEnoughTServersTableName = "NoEnoughTServersTable";
+  constexpr int kNumReplicas = 3;
+  constexpr int kNumTabletServers = 3;
+
+  FLAGS_allow_unsafe_replication_factor = true;
+  FLAGS_catalog_manager_check_ts_count_for_create_table = false;
+  // Set a short timeout that masters consider a tserver dead.
+  FLAGS_tserver_unresponsive_timeout_ms = 3000;
+  // Start the cluster.
+  InternalMiniClusterOptions opts;
+  opts.num_tablet_servers = kNumTabletServers;
+  NO_FATALS(StartMiniCluster(std::move(opts)));
+
+  // Get a kudu client.
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(mini_cluster_->CreateClient(nullptr, &client));
+
+  // Generate a schema.
+  KuduSchemaBuilder schema_builder;
+  schema_builder.AddColumn("key")
+      ->Type(client::KuduColumnSchema::INT32)
+      ->NotNull()
+      ->PrimaryKey();
+  KuduSchema schema;
+  ASSERT_OK(schema_builder.Build(&schema));
+
+  auto create_table_func = [&](const string& table_name, int replica_num) -> Status {
+    unique_ptr<client::KuduTableCreator> table_creator(client->NewTableCreator());
+    return table_creator->table_name(table_name)
+                  .schema(&schema)
+                  .set_range_partition_columns({ "key" })
+                  .num_replicas(replica_num)
+                  .Create();
+  };
+  // Create a table and delete it to prove this CLI command will not list deleted tables.
+  {
+    ASSERT_OK(create_table_func(kDeleteTableName, kNumReplicas));
+    ASSERT_OK(client->DeleteTable(kDeleteTableName));
+  }
+
+  // Create a table.
+  {
+    unique_ptr<KuduPartialRow> lower_bound(schema.NewRow());
+    ASSERT_OK(lower_bound->SetInt32("key", 0));
+    unique_ptr<KuduPartialRow> upper_bound(schema.NewRow());
+    ASSERT_OK(upper_bound->SetInt32("key", 1));
+    unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+    ASSERT_OK(table_creator->table_name(kAddNewPartitionTableName)
+             .schema(&schema)
+             .set_range_partition_columns({ "key" })
+             .add_range_partition(lower_bound.release(), upper_bound.release())
+             .num_replicas(kNumReplicas)
+             .Create());
+  }
+
+  // Shutdown one tablet server.
+  mini_cluster_->mini_tablet_server(0)->Shutdown();
+  // Wait the tablet server to be registered as unavailable in catalog manager.
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(mini_cluster_->mini_master(0)->master()->ts_manager()->GetLiveCount(), 2);
+  });
+
+  // Create a table without enough healthy tablet servers.
+  // It will timeout.
+  {
+    // Add a table with 3 replicas.
+    Status s = create_table_func(kNotEnoughTServersTableName, kNumReplicas);
+    ASSERT_STR_CONTAINS(s.ToString(), "Timed out waiting for Table Creation");
+    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
+  }
+
+  // Add a new partition without enough healthy tablet servers.
+  // It will timeout.
+  {
+    unique_ptr<KuduPartialRow> lower_bound(schema.NewRow());
+    ASSERT_OK(lower_bound->SetInt32("key", 1));
+    unique_ptr<KuduPartialRow> upper_bound(schema.NewRow());
+    ASSERT_OK(upper_bound->SetInt32("key", 2));
+    KuduTableCreator::RangePartitionBound bound_type = KuduTableCreator::INCLUSIVE_BOUND;
+    unique_ptr<KuduTableAlterer> table_alterer(client->NewTableAlterer(kAddNewPartitionTableName));
+    table_alterer->AddRangePartition(lower_bound.release(), upper_bound.release(),
+                                     bound_type, bound_type);
+    Status s = table_alterer->Alter();
+    ASSERT_STR_CONTAINS(s.ToString(), "Timed out: Timed out waiting for AlterTable");
+    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
+  }
+
+  string stdout;
+  NO_FATALS(RunActionStdoutString(
+      Substitute("table list_in_flight $0 "
+                 "--list_table_output_format=$1",
+                 GetMasterAddrsStr(), GetParam()),
+      &stdout));
+  ASSERT_STR_CONTAINS(stdout, kNotEnoughTServersTableName);
+  ASSERT_STR_CONTAINS(stdout, kAddNewPartitionTableName);
+
+  if (GetParam() == "pretty") {
+    vector<string> results = Split(stdout, "\n", strings::SkipEmpty());
+    // Only contains 2 tables kNotEnoughTServersTableName and kAddNewPartitionTableName.
+    ASSERT_EQ(2, results.size());
+    for (const string& res : results) {
+      if (res.find(kNotEnoughTServersTableName) != std::string::npos) {
+        ASSERT_STR_CONTAINS(res, "num_tablets:1 num_tablets_in_flight:1 state:RUNNING");
+      } else if (res.find(kAddNewPartitionTableName) != std::string::npos) {
+        ASSERT_STR_CONTAINS(res, "num_tablets:2 num_tablets_in_flight:1 state:ALTERING");
+      } else {
+        FAIL() << "Found unexpected table";
+      }
+    }
+  } else if (GetParam() == "json") {
+    ASSERT_STR_CONTAINS(stdout,
+        "\"name\": \"NoEnoughTServersTable\",\n            "
+        "\"num_tablets\": 1,\n            "
+        "\"num_tablets_in_flight\": 1,\n            "
+        "\"state\": \"RUNNING\"");
+    ASSERT_STR_CONTAINS(stdout,
+        "\"name\": \"AddNewPartitionTable\",\n            "
+        "\"num_tablets\": 2,\n            "
+        "\"num_tablets_in_flight\": 1,\n            "
+        "\"state\": \"ALTERING\"");
+  } else if (GetParam() == "json_compact") {
+    rapidjson::Document doc;
+    doc.Parse<0>(stdout.c_str());
+    ASSERT_EQ(2, doc["tables"].Size());
+    const rapidjson::Value& items = doc["tables"];
+    for (int i = 0; i < items.Size(); i++) {
+      if (items[i]["name"].GetString() == string(kNotEnoughTServersTableName)) {
+        ASSERT_EQ(1, items[i]["num_tablets"].GetInt());
+        ASSERT_EQ(1, items[i]["num_tablets_in_flight"].GetInt());
+        EXPECT_STREQ("RUNNING", items[i]["state"].GetString());
+      } else if (items[i]["name"].GetString() == string(kAddNewPartitionTableName)) {
+        ASSERT_EQ(2, items[i]["num_tablets"].GetInt());
+        ASSERT_EQ(1, items[i]["num_tablets_in_flight"].GetInt());
+        EXPECT_STREQ("ALTERING", items[i]["state"].GetString());
+      } else {
+        FAIL() << "Contain an unknown table";
+      }
+    }
+  } else {
+    FAIL() << "unexpected table list format" << GetParam();
+  }
+
+  // Restart the stopped tablet server.
+  ASSERT_OK(mini_cluster_->mini_tablet_server(0)->Restart());
+  ASSERT_EVENTUALLY([&] {
+    string out;
+    string err;
+    Status s =
+        RunActionStdoutStderrString(Substitute("cluster ksck $0", GetMasterAddrsStr()),
+                                    &out, &err);
+    ASSERT_TRUE(s.ok()) << s.ToString() << ", err:\n" << err << ", out:\n" << out;
+    // Wait until there aren't in-flight tablets (i.e. tablets in progress of being created).
+    out.clear();
+    NO_FATALS(RunActionStdoutString(
+        Substitute("table list_in_flight $0", GetMasterAddrsStr()),
+        &out));
+    ASSERT_TRUE(out.empty()) << out;
+  });
 }
 
 } // namespace tools

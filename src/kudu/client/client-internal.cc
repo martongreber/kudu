@@ -18,6 +18,7 @@
 #include "kudu/client/client-internal.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -188,17 +189,22 @@ KuduClient::Data::~Data() {
 
 namespace {
 
-// This random integer is used when making any random choice for replica
-// selection. It is static to provide a deterministic selection for any given
-// process and therefore also better cache affinity while ensuring that we can
+// This utility function returns an integer used when making any random choice
+// for replica selection. It has the sematics of a per-process constant to
+// provide deterministic selection for any given process that creates Kudu
+// clients and therefore also better cache affinity while ensuring that we can
 // still benefit from spreading the load across replicas for other processes
 // and applications.
-int InitRandomSelectionInt() {
-  std::random_device rdev;
-  std::mt19937 gen(rdev());
-  return gen();
+uint32_t GetReplicaRandomSelection() {
+  // Initialization of function-local statics is guaranteed to occur only once
+  // even when called from multiple threads, and may be more efficient than
+  // the equivalent code using std::call_once [1].
+  //
+  // [1] 'Notes' section at https://en.cppreference.com/w/cpp/thread/call_once
+  static const uint32_t kRandomSelection =
+      std::mt19937 {std::random_device {}()}();
+  return kRandomSelection;
 }
-static const int kRandomSelectionInt = InitRandomSelectionInt();
 
 } // anonymous namespace
 
@@ -267,12 +273,13 @@ RemoteTabletServer* KuduClient::Data::SelectTServer(
           same_location.push_back(rts);
         }
       }
+      static const size_t kRandomSelection = GetReplicaRandomSelection();
       if (!local.empty()) {
-        ret = local[kRandomSelectionInt % local.size()];
+        ret = local[kRandomSelection % local.size()];
       } else if (!same_location.empty()) {
-        ret = same_location[kRandomSelectionInt % same_location.size()];
+        ret = same_location[kRandomSelection % same_location.size()];
       } else if (!filtered.empty()) {
-        ret = filtered[kRandomSelectionInt % filtered.size()];
+        ret = filtered[kRandomSelection % filtered.size()];
       }
       break;
     }
@@ -319,7 +326,8 @@ Status KuduClient::Data::CreateTable(KuduClient* client,
                                      const MonoTime& deadline,
                                      bool has_range_partition_bounds,
                                      bool has_range_specific_hash_schema,
-                                     bool has_immutable_column_schema) {
+                                     bool has_immutable_column_schema,
+                                     bool has_auto_incrementing_column) {
   vector<uint32_t> features;
   if (has_range_partition_bounds) {
     features.push_back(MasterFeatures::RANGE_PARTITION_BOUNDS);
@@ -329,6 +337,9 @@ Status KuduClient::Data::CreateTable(KuduClient* client,
   }
   if (has_immutable_column_schema) {
     features.push_back(MasterFeatures::IMMUTABLE_COLUMN_ATTRIBUTE);
+  }
+  if (has_auto_incrementing_column) {
+    features.push_back(MasterFeatures::AUTO_INCREMENTING_COLUMN);
   }
   Synchronizer sync;
   AsyncLeaderMasterRpc<CreateTableRequestPB, CreateTableResponsePB> rpc(

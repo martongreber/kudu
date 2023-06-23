@@ -528,6 +528,9 @@ Status GenerateRowData(Generator* key_gen, Generator* value_gen, KuduPartialRow*
   // when perform DELETE operations.
   Generator* gen = key_gen;
   for (size_t idx = 0; idx < gen_column_count; ++idx) {
+    if (columns[idx].is_auto_incrementing()) {
+      continue;
+    }
     if (idx == row->schema()->num_key_columns()) {
       gen = value_gen;
     }
@@ -956,7 +959,7 @@ Status TabletScan(const RunnerContext& context) {
   //
   // Note: we need a read-write FsManager because bootstrapping will do
   // destructive things (e.g. rename the tablet's WAL segment directory).
-  FsManager fs(Env::Default(), FsManagerOpts());
+  FsManager fs(Env::Default());
   RETURN_NOT_OK(fs.Open());
 
   scoped_refptr<TabletMetadata> tmeta;

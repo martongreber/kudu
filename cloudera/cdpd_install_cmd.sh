@@ -90,15 +90,16 @@ pushd java
 #       the JARs that are installed to the local maven repo at the end
 #       of the build.
 #
-# Note: skipFormat is added to avoid running 'scalafmt' because when building
-#       release bits, we are not interested in running tasks that a developer
-#       would run before pushing the changes into the repo.
+# Note: PskipCodeStyleChecks is added to avoid running 'scalafmt' and other
+#       code style checks: when building release bits, we are not interested
+#       in running tasks that a developer would run in their local workspace
+#       before pushing the changes into the source repository.
 #
 # CDPD-57812: enable debug logging for gradle builds for the RCA of gradle
 #             builds hanging intermittently (this is a temporary change)
-./gradlew install -PskipSigning=true -PskipFormat=true -d
+./gradlew install -PskipSigning=true -PskipCodeStyleChecks=true -d
 # Build again with Spark 2
-./gradlew install -PskipSigning=true -PskipFormat=true -Pspark2 -d
+./gradlew install -PskipSigning=true -PskipCodeStyleChecks=true -Pspark2 -d
 popd
 
 # Build the `kudu-binary` jar.

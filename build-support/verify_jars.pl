@@ -78,6 +78,7 @@ chomp(my @jars = `find . -type f -name \*.jar |
                          grep -v javadoc\.jar |
                          grep -v unshaded\.jar |
                          grep -v buildSrc.jar |
+                         grep -v '.gradle/vcs' |
                          grep -v gradle-wrapper.jar |
                          # Ignored because it's test only and unpublished.
                          grep -v kudu-jepsen.*\.jar |

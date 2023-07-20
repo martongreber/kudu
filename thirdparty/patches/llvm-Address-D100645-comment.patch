@@ -1,0 +1,16 @@
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
+index 2b10bdd37293a7..7ff48c35851ebc 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp
+@@ -180,10 +180,9 @@ void SetAlternateSignalStack() {
+   // TODO(glider): the mapped stack should have the MAP_STACK flag in the
+   // future. It is not required by man 2 sigaltstack now (they're using
+   // malloc()).
+-  void *base = MmapOrDie(GetAltStackSize(), __func__);
+-  altstack.ss_sp = (char*) base;
+-  altstack.ss_flags = 0;
+   altstack.ss_size = GetAltStackSize();
++  altstack.ss_sp = (char *)MmapOrDie(altstack.ss_size, __func__);
++  altstack.ss_flags = 0;
+   CHECK_EQ(0, sigaltstack(&altstack, nullptr));
+ }

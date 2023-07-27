@@ -18,18 +18,17 @@
 package org.apache.kudu.test;
 
 import static org.apache.kudu.test.junit.AssertHelpers.assertEventuallyTrue;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.Assert.*;
 
 import java.io.IOException;
 import java.net.Socket;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 import com.google.protobuf.ByteString;
+import org.apache.kudu.server.ServerBase;
+import org.eclipse.jetty.util.ArrayUtil;
 import org.junit.Rule;
 import org.junit.Test;
 
@@ -114,6 +113,20 @@ public class TestMiniKuduCluster {
       }
     }
   }
+
+  @Test(timeout = 50000)
+  public void getDaemonFlagTest() throws Exception {
+    try (MiniKuduCluster cluster = new MiniKuduCluster.MiniKuduClusterBuilder()
+            .numMasterServers(NUM_MASTERS)
+            .numTabletServers(NUM_TABLET_SERVERS)
+            .build()) {
+      List<MiniKuduCluster.Flag> flags = new ArrayList<>();
+      flags = cluster.getMasterFlags(cluster.getMasterServers().get(0));
+      assertNotEquals(flags.size(), 0);
+      assertThat()
+    }
+  }
+
 
   @Test(timeout = 50000)
   public void testJwtAuthn() throws Exception {

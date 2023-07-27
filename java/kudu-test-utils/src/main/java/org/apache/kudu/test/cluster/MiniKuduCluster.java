@@ -27,9 +27,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
-import java.net.MalformedURLException;
 import java.net.URL;
-import java.net.URLConnection;
 import java.nio.file.Paths;
 import java.security.Security;
 import java.util.ArrayList;
@@ -43,6 +41,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import org.apache.kudu.server.ServerBase;
+import org.apache.kudu.tools.Tool;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 import org.slf4j.Logger;
@@ -103,6 +103,13 @@ public final class MiniKuduCluster implements AutoCloseable {
     boolean isRunning;
     boolean isPaused;
     String webServerAddress;
+  }
+
+  public static class Flag {
+   String name;
+   String value;
+   ImmutableList<String> tags;
+   boolean isDefaultvalue;
   }
 
   // Map of master addresses to daemon information.
@@ -582,6 +589,32 @@ public final class MiniKuduCluster implements AutoCloseable {
             .setValue(value)
             .build())
         .build());
+  }
+
+  public List<Flag> getMasterFlags(HostAndPort hp)
+          throws IOException {
+    DaemonInfo d = getMasterServer(hp);
+    List<Flag> flags = new ArrayList<>();
+    LOG.info("Getting flags for master at {}", hp);
+    ControlShellResponsePB resp = sendRequestToCluster(ControlShellRequestPB.newBuilder()
+        .setGetDaemonFlags(
+                Tool.GetDaemonFlagsRequestPB.newBuilder()
+                        .setId(d.id)
+                        .setRequest(ServerBase.GetFlagsRequestPB.newBuilder()
+                                .setAllFlags(true)
+                                .build())
+                        .build())
+        .build());
+    for (ServerBase.GetFlagsResponsePB.Flag flag: resp.getGetDaemonFlags().getFlagsList()) {
+      Flag f = new Flag();
+      f.name = flag.getName();
+      f.value = flag.getValue();
+      f.tags = ImmutableList.copyOf(flag.getTagsList());
+      f.isDefaultvalue = flag.getIsDefaultValue();
+
+      flags.add(f);
+    }
+    return flags;
   }
 
   /**

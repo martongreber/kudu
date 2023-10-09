@@ -8,7 +8,7 @@ Run Kudu examples and have easy access to the logs and the Chromium traces!
 ## Requirements
 * if OS == macOS
     * iTerm: https://iterm2.com/downloads.html
-* Python: currently tested with 3.8
+* Python: currently tested up to 3.8
 * Jupyter notebook: https://jupyter.org/install
 * Kudu built and Python client working (basically to run the Python client example)
 
@@ -29,6 +29,7 @@ Run Kudu examples and have easy access to the logs and the Chromium traces!
                 * first 3 are the master traces
                 * last 3 are the tserver traces
 5. Iterate on the Python example
+    * The notebook uses the Python example, this is beeing executed in the notebook.
     * Feel free to implement own experiments, or just strip down the Python example to observer specific events e.g.: table creation, row insertion ... Don't forget to adjust the log level accordingly:
         ```
         --master-flags "--v 2" \

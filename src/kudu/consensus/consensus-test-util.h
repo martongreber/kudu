@@ -62,6 +62,8 @@
 namespace kudu {
 namespace consensus {
 
+  constexpr int kTermDivisor = 7;
+
 inline std::unique_ptr<ReplicateMsg> CreateDummyReplicate(int64_t term,
                                                           int64_t index,
                                                           const Timestamp& timestamp,
@@ -106,6 +108,14 @@ inline void AppendReplicateMessagesToQueue(
     CHECK_OK(queue->AppendOperation(make_scoped_refptr_replicate(
         CreateDummyReplicate(term, index, clock->Now(), payload_size).release())));
   }
+}
+
+OpId MakeOpIdForIndex(int index) {
+  return MakeOpId(index / 7, index);
+}
+
+std::string OpIdStrForIndex(int index) {
+  return OpIdToString(MakeOpIdForIndex(index));
 }
 
 // Builds a configuration of 'num' voters.

@@ -81,6 +81,8 @@ static const char* kLeaderUuid = "peer-0";
 static const char* kPeerUuid = "peer-1";
 static const char* kTestTablet = "test-tablet";
 
+constexpr int kNumMessages = 100;
+
 class ConsensusQueueTest : public KuduTest {
  public:
   ConsensusQueueTest()
@@ -425,7 +427,7 @@ TEST_F(ConsensusQueueTest, TestStartTrackingAfterStart) {
   bool send_more_immediately = false;
 
   // Peer already has some messages, last one being 7.50
-  OpId last_received = MakeOpId(7, 50);
+  OpId last_received = MakeOpIdForIndex(kNumMessages / 2);
   OpId last_received_current_leader = MinimumOpId();
 
   UpdatePeerWatermarkToOp(&request, &response, last_received,
@@ -437,9 +439,9 @@ TEST_F(ConsensusQueueTest, TestStartTrackingAfterStart) {
   bool needs_tablet_copy;
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_tablet_copy));
   ASSERT_FALSE(needs_tablet_copy);
-  ASSERT_EQ(50, request.ops_size());
+  ASSERT_EQ(kNumMessages / 2, request.ops_size());
 
-  SetLastReceivedAndLastCommitted(&response, request.ops(49).id());
+  SetLastReceivedAndLastCommitted(&response, request.ops((kNumMessages / 2) - 1).id());
   send_more_immediately = queue_->ResponseFromPeer(response.responder_uuid(), response);
   ASSERT_FALSE(send_more_immediately) << "Queue still had requests pending";
 
@@ -529,10 +531,10 @@ TEST_F(ConsensusQueueTest, TestGetPagedMessages) {
 
 TEST_F(ConsensusQueueTest, TestPeersDontAckBeyondWatermarks) {
   queue_->SetLeaderMode(kMinimumOpIdIndex, kMinimumTerm, BuildRaftConfigPBForTests(3));
-  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, 100);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, kNumMessages);
 
   // Wait for the local peer to append all messages
-  WaitForLocalPeerToAckIndex(100);
+  WaitForLocalPeerToAckIndex(kNumMessages);
 
   ASSERT_EQ(queue_->GetMajorityReplicatedIndexForTests(), 0);
   // Since we're tracking a single peer still this should have moved the all
@@ -541,7 +543,7 @@ TEST_F(ConsensusQueueTest, TestPeersDontAckBeyondWatermarks) {
 
   // Start to track the peer after the queue has some messages in it
   // at a point that is halfway through the current messages in the queue.
-  OpId first_msg = MakeOpId(7, 50);
+  OpId first_msg = MakeOpIdForIndex(kNumMessages / 2);
 
   ConsensusRequestPB request;
   ConsensusResponsePB response;
@@ -1126,6 +1128,38 @@ TEST_F(ConsensusQueueTest, TestFollowerCommittedIndexAndMetrics) {
   // Emulate the leader appending up to index 15. The num_ops_behind_leader should jump to 5.
   queue_->UpdateLastIndexAppendedToLeader(15);
   ASSERT_EQ(5, queue_->metrics_.num_ops_behind_leader->value());
+}
+
+TEST_F(ConsensusQueueTest, TestReadReplicatedMessages) {
+  // queue_->Init(MinimumOpId());
+  queue_->SetLeaderMode(kMinimumOpIdIndex, MinimumOpId().term(), BuildRaftConfigPBForTests(2));
+  AppendReplicateMessagesToQueue(queue_.get(), clock_.get(), 1, 100);
+
+  // Wait for the local peer to append all messages.
+  WaitForLocalPeerToAckIndex(100);
+
+  ConsensusResponsePB response;
+  response.set_responder_uuid(kLeaderUuid);
+  bool more_pending = false;
+
+  int last_committed_index = 100 - 20;
+  // Peer already has some messages, last one being index last_committed_index.
+  SetLastReceivedAndLastCommitted(&response, MakeOpIdForIndex(last_committed_index));
+  more_pending = queue_->ResponseFromPeer(response.responder_uuid(), response);
+  ASSERT_TRUE(more_pending);
+
+  //   send_more_immediately = queue_->ResponseFromPeer(response.responder_uuid(), response);
+  // ASSERT_FALSE(send_more_immediately) << "Queue still had requests pending";
+
+  std::vector<ReplicateRefPtr> msgs;
+  ASSERT_OK(queue_->ReadReplicatedMessages(MakeOpIdForIndex(0), &msgs));
+  ASSERT_EQ(last_committed_index, msgs.size());
+  msgs.clear();
+
+  // Read from some index > 0
+  int start = 10;
+  ASSERT_OK(queue_->ReadReplicatedMessages(MakeOpIdForIndex(start), &msgs));
+  ASSERT_EQ(last_committed_index - start, msgs.size());
 }
 
 // Unit test for the PeerMessageQueue::PeerHealthStatus() method.

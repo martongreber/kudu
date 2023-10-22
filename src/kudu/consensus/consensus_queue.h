@@ -216,7 +216,7 @@ class PeerMessageQueue {
   void SetNonLeaderMode(const RaftConfigPB& active_config);
 
   // Makes the queue track this peer.
-  void TrackPeer(const RaftPeerPB& peer_pb);
+  TrackedPeer* TrackPeer(const RaftPeerPB& peer_pb);
 
   // Makes the queue untrack this peer.
   void UntrackPeer(const std::string& uuid);
@@ -369,6 +369,9 @@ class PeerMessageQueue {
   void BeginWatchForSuccessor(const std::optional<std::string>& successor_uuid);
   void EndWatchForSuccessor();
 
+  // Read replicated log records starting from the OpId immediately after last_op_id.
+  Status ReadReplicatedMessages(const OpId& last_op_id, std::vector<ReplicateRefPtr> *msgs);
+
  private:
   FRIEND_TEST(ConsensusQueueTest, TestQueueAdvancesCommittedIndex);
   FRIEND_TEST(ConsensusQueueTest, TestQueueMovesWatermarksBackward);
@@ -516,7 +519,7 @@ class PeerMessageQueue {
   // 'preceding_first_op_in_queue_' if the queue is empty.
   const OpId& GetLastOp() const;
 
-  void TrackPeerUnlocked(const RaftPeerPB& peer_pb);
+  TrackedPeer* TrackPeerUnlocked(const RaftPeerPB& peer_pb);
 
   void UntrackPeerUnlocked(const std::string& uuid);
 
@@ -547,6 +550,13 @@ class PeerMessageQueue {
                              ReplicaTypes replica_types,
                              const TrackedPeer* who_caused);
 
+  Status ReadFromLogCache(int64_t from_index,
+                          int64_t to_index,
+                          int max_batch_size,
+                          const std::string& peer_uuid,
+                          std::vector<ReplicateRefPtr>* messages,
+                          OpId* preceding_id);
+
   std::vector<PeerMessageQueueObserver*> observers_;
 
   // The pool token which executes observer notifications.
@@ -558,6 +568,7 @@ class PeerMessageQueue {
 
   // PB containing identifying information about the local peer.
   const RaftPeerPB local_peer_pb_;
+  const std::string local_peer_uuid_;
 
   // The id of the tablet.
   const std::string tablet_id_;
@@ -566,6 +577,8 @@ class PeerMessageQueue {
 
   // The currently tracked peers.
   PeersMap peers_map_;
+  TrackedPeer* local_peer_ = nullptr;
+
   mutable simple_spinlock queue_lock_; // TODO(todd): rename
 
   bool successor_watch_in_progress_;

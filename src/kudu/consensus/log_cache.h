@@ -87,6 +87,16 @@ class LogCache {
                  std::vector<ReplicateRefPtr>* messages,
                  OpId* preceding_op);
 
+  // Same as above but also includes a 'to_op_index' parameter which will be used to limit results
+  // until 'to_op_index' (inclusive).
+  //
+  // If 'to_op_index' is 0, then all operations after 'after_op_index' will be included.
+  Status ReadOps(int64_t after_op_index,
+                         int64_t to_op_index,
+                         int max_size_bytes,
+                         std::vector<ReplicateRefPtr>* messages,
+                         OpId* preceding_op);
+
   // Append the operations into the log and the cache.
   // When the messages have completed writing into the on-disk log, fires 'callback'.
   //

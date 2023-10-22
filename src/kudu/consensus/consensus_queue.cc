@@ -187,6 +187,8 @@ PeerMessageQueue::PeerMessageQueue(const scoped_refptr<MetricEntity>& metric_ent
     : raft_pool_observers_token_(std::move(raft_pool_observers_token)),
       server_quiescing_(server_quiescing),
       local_peer_pb_(std::move(local_peer_pb)),
+      local_peer_uuid_(local_peer_pb_.has_permanent_uuid() ? local_peer_pb_.permanent_uuid()
+                                                           : string()),
       tablet_id_(std::move(tablet_id)),
       successor_watch_in_progress_(false),
       log_cache_(metric_entity, std::move(log), local_peer_pb_.permanent_uuid(), tablet_id_),
@@ -210,6 +212,7 @@ PeerMessageQueue::PeerMessageQueue(const scoped_refptr<MetricEntity>& metric_ent
   queue_state_.state = kQueueOpen;
   // TODO(mpercy): Merge LogCache::Init() with its constructor.
   log_cache_.Init(queue_state_.last_appended);
+  local_peer_ = TrackPeer(local_peer_pb_);
 }
 
 void PeerMessageQueue::SetLeaderMode(int64_t committed_index,
@@ -260,12 +263,12 @@ void PeerMessageQueue::SetNonLeaderMode(const RaftConfigPB& active_config) {
   time_manager_->SetNonLeaderMode();
 }
 
-void PeerMessageQueue::TrackPeer(const RaftPeerPB& peer_pb) {
+PeerMessageQueue::TrackedPeer* PeerMessageQueue::TrackPeer(const RaftPeerPB& peer_pb) {
   std::lock_guard<simple_spinlock> lock(queue_lock_);
-  TrackPeerUnlocked(peer_pb);
+  return TrackPeerUnlocked(peer_pb);
 }
 
-void PeerMessageQueue::TrackPeerUnlocked(const RaftPeerPB& peer_pb) {
+PeerMessageQueue::TrackedPeer* PeerMessageQueue::TrackPeerUnlocked(const RaftPeerPB& peer_pb) {
   CHECK(!peer_pb.permanent_uuid().empty()) << SecureShortDebugString(peer_pb);
   CHECK(peer_pb.has_member_type()) << SecureShortDebugString(peer_pb);
   DCHECK(queue_lock_.is_locked());
@@ -288,6 +291,7 @@ void PeerMessageQueue::TrackPeerUnlocked(const RaftPeerPB& peer_pb) {
   // We don't know how far back this peer is, so set the all replicated watermark to
   // 0. We'll advance it when we know how far along the peer is.
   queue_state_.all_replicated_index = 0;
+  return tracked_peer;
 }
 
 void PeerMessageQueue::UntrackPeer(const string& uuid) {
@@ -642,13 +646,14 @@ HealthReportPB::HealthStatus PeerMessageQueue::PeerHealthStatus(const TrackedPee
 
 Status PeerMessageQueue::RequestForPeer(const string& uuid,
                                         ConsensusRequestPB* request,
-                                        vector<ReplicateRefPtr>* msg_refs,
+                                        std::vector<ReplicateRefPtr>* msg_refs,
                                         bool* needs_tablet_copy) {
   // Maintain a thread-safe copy of necessary members.
   OpId preceding_id;
   int64_t current_term;
   TrackedPeer peer_copy;
   MonoDelta unreachable_time;
+  int64_t next_index;
   {
     std::lock_guard<simple_spinlock> lock(queue_lock_);
     DCHECK_EQ(queue_state_.state, kQueueOpen);
@@ -674,6 +679,8 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
     request->set_last_idx_appended_to_leader(queue_state_.last_appended.index());
     request->set_caller_term(current_term);
     unreachable_time = MonoTime::Now() - peer_copy.last_communication_time;
+
+    next_index = peer->next_index;
   }
 
   // Always trigger a health status update check at the end of this function.
@@ -714,14 +721,11 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
     // We grab requests from the log starting at the last_received point.
 
     // The batch of messages to send to the peer.
-    vector<ReplicateRefPtr> messages;
+    std::vector<ReplicateRefPtr> messages;
     int64_t max_batch_size = FLAGS_consensus_max_batch_size_bytes - request->ByteSizeLong();
-
-    // We try to get the follower's next_index from our log.
-    Status s = log_cache_.ReadOps(peer_copy.next_index - 1,
-                                  max_batch_size,
-                                  &messages,
-                                  &preceding_id);
+    int64_t to_index = 0;
+    Status s = ReadFromLogCache(next_index - 1, to_index, max_batch_size, uuid,
+                                    &messages, &preceding_id);
 
     // Inject failure to simulate follower falling behind and the leader has GC'ed its logs.
     if (PREDICT_FALSE(fault_injection::MaybeTrue(FLAGS_consensus_fail_log_read_ops))) {
@@ -934,6 +938,70 @@ void PeerMessageQueue::BeginWatchForSuccessor(
 void PeerMessageQueue::EndWatchForSuccessor() {
   std::lock_guard<simple_spinlock> l(queue_lock_);
   successor_watch_in_progress_ = false;
+}
+
+Status PeerMessageQueue::ReadFromLogCache(int64_t from_index,
+                                          int64_t to_index,
+                                          int max_batch_size,
+                                          const std::string& peer_uuid,
+                                          std::vector<ReplicateRefPtr>* messages,
+                                          OpId* preceding_id) {
+  DCHECK_LT(FLAGS_consensus_max_batch_size_bytes + 1024, FLAGS_rpc_max_message_size);
+
+  // We try to get the follower's next_index from our log.
+  // Note this is not using "term" and needs to change
+  Status s = log_cache_.ReadOps(from_index,
+                                to_index,
+                                max_batch_size,
+                                messages,
+                                preceding_id);
+  if (PREDICT_FALSE(!s.ok())) {
+    if (PREDICT_TRUE(s.IsNotFound())) {
+      return s;
+    } else if (s.IsIncomplete()) {
+      // IsIncomplete() means that we tried to read beyond the head of the log (in the future).
+      // KUDU-1078 points to a fix of this log spew issue that we've ported. This should not
+      // happen under normal circumstances.
+      LOG_WITH_PREFIX_UNLOCKED(ERROR) << "Error trying to read ahead of the log "
+                                      << "while preparing peer request: "
+                                      << s.ToString() << ". Destination peer: "
+                                      << peer_uuid;
+      return s;
+    } else {
+      LOG_WITH_PREFIX_UNLOCKED(FATAL) << "Error reading the log while preparing peer request: "
+                                      << s.ToString() << ". Destination peer: "
+                                      << peer_uuid;
+      return s;
+    }
+  }
+  return s;
+}
+
+Status PeerMessageQueue::ReadReplicatedMessages(const OpId& last_op_id, std::vector<ReplicateRefPtr>* msgs) {
+  // The batch of messages read from cache.
+  std::vector<ReplicateRefPtr> messages;
+  OpId preceding_id;
+
+
+  if (last_op_id.index() >= local_peer_->last_known_committed_index) {
+    // Nothing to read
+    return Status::OK();
+  }
+
+  Status s = ReadFromLogCache(last_op_id.index(), local_peer_->last_known_committed_index,
+                              FLAGS_consensus_max_batch_size_bytes,
+                              local_peer_uuid_, &messages, &preceding_id);
+  if (PREDICT_FALSE(!s.ok())) {
+    if (PREDICT_TRUE(s.IsNotFound())) {
+      string msg = Substitute("The logs from index $0 have been garbage collected and cannot be read "
+                          "($1)", last_op_id.index(), s.ToString());
+      LOG_WITH_PREFIX_UNLOCKED(INFO) << msg;
+    }
+    return s;
+  }
+
+  msgs->swap(messages);
+  return s;
 }
 
 void PeerMessageQueue::UpdateFollowerWatermarks(int64_t committed_index,

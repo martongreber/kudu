@@ -17,6 +17,7 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <iosfwd>
@@ -322,6 +323,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // 'type' argument) that the Consensus implementation knows about.
   // Returns std::nullopt if RaftConsensus was not properly initialized.
   std::optional<OpId> GetLastOpId(OpIdType type);
+
+  Status ReadReplicatedMessages(const OpId& from, std::vector<ReplicateRefPtr>* msgs);
 
   // Returns the current Raft role of this instance.
   RaftPeerPB::Role role() const;

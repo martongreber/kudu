@@ -57,6 +57,12 @@ message CDCErrorPB {
 
     // Tablet not running
     TABLET_NOT_RUNNING = 6;
+
+    // Tablet server not the leader of requested tablet
+    NOT_LEADER = 7;
+
+    // Tablet server not running
+    NOT_RUNNING = 8;
   }
 
   // The error code.

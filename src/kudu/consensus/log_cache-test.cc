@@ -75,6 +75,10 @@ namespace consensus {
 static const char* kPeerUuid = "leader";
 static const char* kTestTablet = "test-tablet";
 
+constexpr int kNumMessages = 100;
+constexpr int kMessageIndex1 = 60;
+constexpr int kMessageIndex2 = 80;
+
 class LogCacheTest : public KuduTest {
  public:
   LogCacheTest()
@@ -125,7 +129,7 @@ class LogCacheTest : public KuduTest {
                                         size_t payload_size = 0) {
 
     for (int64_t cur_index = first; cur_index < first + count; cur_index++) {
-      int64_t term = cur_index / 7;
+      int64_t term = cur_index / kTermDivisor;
       int64_t index = cur_index;
       vector<ReplicateRefPtr> msgs;
       msgs.push_back(make_scoped_refptr_replicate(
@@ -150,40 +154,55 @@ class LogCacheTest : public KuduTest {
 TEST_F(LogCacheTest, TestAppendAndGetMessages) {
   ASSERT_EQ(0, cache_->metrics_.log_cache_num_ops->value());
   ASSERT_EQ(0, cache_->metrics_.log_cache_size->value());
-  ASSERT_OK(AppendReplicateMessagesToCache(1, 100));
-  ASSERT_EQ(100, cache_->metrics_.log_cache_num_ops->value());
-  ASSERT_GE(cache_->metrics_.log_cache_size->value(), 500);
+  ASSERT_OK(AppendReplicateMessagesToCache(1, kNumMessages));
+  ASSERT_EQ(kNumMessages, cache_->metrics_.log_cache_num_ops->value());
+  ASSERT_GE(cache_->metrics_.log_cache_size->value(), 5 * kNumMessages);
   log_->WaitUntilAllFlushed();
 
   vector<ReplicateRefPtr> messages;
   OpId preceding;
   ASSERT_OK(cache_->ReadOps(0, 8 * 1024 * 1024, &messages, &preceding));
-  EXPECT_EQ(100, messages.size());
-  EXPECT_EQ("0.0", OpIdToString(preceding));
+  EXPECT_EQ(kNumMessages, messages.size());
+  EXPECT_EQ(OpIdStrForIndex(0), OpIdToString(preceding));
 
   // Get starting in the middle of the cache.
   messages.clear();
-  ASSERT_OK(cache_->ReadOps(70, 8 * 1024 * 1024, &messages, &preceding));
-  EXPECT_EQ(30, messages.size());
-  EXPECT_EQ("10.70", OpIdToString(preceding));
-  EXPECT_EQ("10.71", OpIdToString(messages[0]->get()->id()));
+  ASSERT_OK(cache_->ReadOps(kMessageIndex1, 8 * 1024 * 1024, &messages, &preceding));
+  EXPECT_EQ(kNumMessages - kMessageIndex1, messages.size());
+  EXPECT_EQ(OpIdStrForIndex(kMessageIndex1), OpIdToString(preceding));
+  EXPECT_EQ(OpIdStrForIndex(kMessageIndex1 + 1), OpIdToString(messages[0]->get()->id()));
 
   // Get at the end of the cache
   messages.clear();
-  ASSERT_OK(cache_->ReadOps(100, 8 * 1024 * 1024, &messages, &preceding));
+  ASSERT_OK(cache_->ReadOps(kNumMessages, 8 * 1024 * 1024, &messages, &preceding));
   EXPECT_EQ(0, messages.size());
-  EXPECT_EQ("14.100", OpIdToString(preceding));
+  EXPECT_EQ(OpIdStrForIndex(kNumMessages), OpIdToString(preceding));
+
+  // Get messages from the beginning until some point in the middle of the cache.
+  messages.clear();
+  ASSERT_OK(cache_->ReadOps(0, kMessageIndex1, 8 * 1024 * 1024, &messages, &preceding));
+  EXPECT_EQ(kMessageIndex1, messages.size());
+  EXPECT_EQ(OpIdStrForIndex(0), OpIdToString(preceding));
+  EXPECT_EQ(OpIdStrForIndex(1), OpIdToString(messages[0]->get()->id()));
+
+  // Get messages from some point in the middle of the cache until another point.
+  messages.clear();
+  ASSERT_OK(cache_->ReadOps(kMessageIndex1, kMessageIndex2, 8 * 1024 * 1024, &messages, &preceding));
+  EXPECT_EQ(kMessageIndex2 - kMessageIndex1, messages.size());
+  EXPECT_EQ(OpIdStrForIndex(kMessageIndex1), OpIdToString(preceding));
+  EXPECT_EQ(OpIdStrForIndex(kMessageIndex1 + 1), OpIdToString(messages[0]->get()->id()));
 
   // Evict some and verify that the eviction took effect.
-  cache_->EvictThroughOp(50);
-  ASSERT_EQ(50, cache_->metrics_.log_cache_num_ops->value());
+  cache_->EvictThroughOp(kNumMessages / 2);
+  ASSERT_EQ(kNumMessages / 2, cache_->metrics_.log_cache_num_ops->value());
 
   // Can still read data that was evicted, since it got written through.
   messages.clear();
-  ASSERT_OK(cache_->ReadOps(20, 8 * 1024 * 1024, &messages, &preceding));
-  EXPECT_EQ(80, messages.size());
-  EXPECT_EQ("2.20", OpIdToString(preceding));
-  EXPECT_EQ("3.21", OpIdToString(messages[0]->get()->id()));
+  int start = (kNumMessages / 2) - 10;
+  ASSERT_OK(cache_->ReadOps(start, 8 * 1024 * 1024, &messages, &preceding));
+  EXPECT_EQ(kNumMessages - start, messages.size());
+  EXPECT_EQ(OpIdStrForIndex(start), OpIdToString(preceding));
+  EXPECT_EQ(OpIdStrForIndex(start + 1), OpIdToString(messages[0]->get()->id()));
 }
 
 

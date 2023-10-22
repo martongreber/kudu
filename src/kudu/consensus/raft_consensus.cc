@@ -2802,6 +2802,10 @@ optional<OpId> RaftConsensus::GetLastOpId(OpIdType type) {
   return GetLastOpIdUnlocked(type);
 }
 
+Status RaftConsensus::ReadReplicatedMessages(const OpId& from, std::vector<ReplicateRefPtr>* msgs) {
+  return queue_->ReadReplicatedMessages(from, msgs);
+}
+
 optional<OpId> RaftConsensus::GetLastOpIdUnlocked(OpIdType type) {
   // Return early if this method is called on an instance of RaftConsensus that
   // has not yet been started, failed during Init(), or failed during Start().

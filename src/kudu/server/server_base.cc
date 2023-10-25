@@ -99,10 +99,6 @@
 #include "kudu/util/user.h"
 #include "kudu/util/version_info.h"
 
-namespace kudu {
-class JwtVerifier;
-}  // namespace kudu
-
 DEFINE_int32(num_reactor_threads, 4, "Number of libev reactor threads to start.");
 TAG_FLAG(num_reactor_threads, advanced);
 
@@ -735,6 +731,19 @@ Status ServerBase::Init() {
 
   InitSpinLockContentionProfiling();
 
+  // Get the FQDN of the node where the server is running. If fetching of the
+  // FQDN fails, it attempts to set the 'hostname_' field to the local hostname.
+  string hostname;
+  if (auto s = GetFQDN(&hostname); !s.ok()) {
+    const auto& msg = Substitute("could not determine host FQDN: $0", s.ToString());
+    if (hostname.empty()) {
+      LOG(ERROR) << msg;
+      return s;
+    }
+    LOG(WARNING) << msg;
+  }
+  DCHECK(!hostname.empty());
+
   RETURN_NOT_OK(security::InitKerberosForServer(FLAGS_principal, FLAGS_keytab_file));
   RETURN_NOT_OK(file_cache_->Init());
 
@@ -804,21 +813,6 @@ Status ServerBase::Init() {
 
   // Create the Messenger.
   rpc::MessengerBuilder builder(name_);
-  shared_ptr<JwtVerifier> jwt_verifier = nullptr;
-  if (FLAGS_enable_jwt_token_auth) {
-    if (!FLAGS_jwks_url.empty()) {
-      jwt_verifier =
-          std::make_shared<KeyBasedJwtVerifier>(FLAGS_jwks_url,
-                                                FLAGS_jwks_verify_server_certificate,
-                                                FLAGS_trusted_certificate_file);
-    } else if (!FLAGS_jwks_file_path.empty()) {
-      jwt_verifier =
-          std::make_shared<KeyBasedJwtVerifier>(FLAGS_jwks_file_path);
-    } else {
-      LOG(WARNING) << Substitute("JWT authentication enabled, but neither 'jwks_url' or "
-          "'jwks_file_path' are set!");
-    }
-  }
   builder.set_num_reactors(FLAGS_num_reactor_threads)
          .set_min_negotiation_threads(FLAGS_min_negotiation_threads)
          .set_max_negotiation_threads(FLAGS_max_negotiation_threads)
@@ -834,8 +828,8 @@ Status ServerBase::Init() {
          .set_epki_cert_key_files(FLAGS_rpc_certificate_file, FLAGS_rpc_private_key_file)
          .set_epki_certificate_authority_file(FLAGS_rpc_ca_certificate_file)
          .set_epki_private_password_key_cmd(FLAGS_rpc_private_key_password_cmd)
-         .set_jwt_verifier(std::move(jwt_verifier))
          .set_keytab_file(FLAGS_keytab_file)
+         .set_hostname(hostname)
          .enable_inbound_tls();
 
   if (options_.rpc_opts.rpc_reuseport) {
@@ -846,6 +840,21 @@ Status ServerBase::Init() {
     string service_name;
     RETURN_NOT_OK(security::MapPrincipalToLocalName(FLAGS_principal, &service_name));
     builder.set_sasl_proto_name(service_name);
+  }
+
+  if (FLAGS_enable_jwt_token_auth) {
+    if (!FLAGS_jwks_url.empty()) {
+      builder.set_jwt_verifier(std::make_shared<KeyBasedJwtVerifier>(
+          FLAGS_jwks_url,
+          FLAGS_jwks_verify_server_certificate,
+          FLAGS_trusted_certificate_file));
+    } else if (!FLAGS_jwks_file_path.empty()) {
+      builder.set_jwt_verifier(std::make_shared<KeyBasedJwtVerifier>(
+          FLAGS_jwks_file_path));
+    } else {
+      LOG(WARNING) << Substitute("JWT authentication enabled, but neither "
+                                 "'jwks_url' nor 'jwks_file_path' is set");
+    }
   }
 
   RETURN_NOT_OK(builder.Build(&messenger_));
@@ -1147,12 +1156,10 @@ std::string ServerBase::FooterHtml() const {
 Status ServerBase::Start() {
   GenerateInstanceID();
 
+  DCHECK(!fs_manager_->uuid().empty());
   metric_entity_->SetAttribute("uuid", fs_manager_->uuid());
-  // Get the FQDN. If that fails server_hostname will have either the local hostname
-  // (if GetHostname() succeeds) or still be empty (if GetHostname() fails)
-  string server_hostname = "";
-  WARN_NOT_OK(GetFQDN(&server_hostname), "could not determine host FQDN");
-  metric_entity_->SetAttribute("hostname", server_hostname);
+  DCHECK(!messenger_->hostname().empty());
+  metric_entity_->SetAttribute("hostname", messenger_->hostname());
 
   RETURN_NOT_OK(RegisterService(
       unique_ptr<rpc::ServiceIf>(new GenericServiceImpl(this))));

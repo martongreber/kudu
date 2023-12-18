@@ -37,3 +37,8 @@ gem 'html-proofer'
 
 gem 'fileutils'
 gem 'date'
+
+# With Ruby versions 3.0 and above webrick
+# is no longer included in the standard library by default.
+# https://www.ruby-lang.org/en/news/2020/12/25/ruby-3-0-0-released/
+gem 'webrick'

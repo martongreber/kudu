@@ -96,6 +96,10 @@ static const char* const kEncryptionTenantID = "00000000000000000000000000000000
 
 static const uint64_t kTestBeganAtMicros = Env::Default()->NowMicros();
 
+static const char* const kContentTypeTextPlain = "text/plain";
+static const char* const kContentTypeTextHtml = "text/html";
+static const char* const kContentTypeApplicationOctet = "application/octet-stream";
+
 // Global which production code can check to see if it is running
 // in a GTest environment (assuming the test binary links in this module,
 // which is typically a good assumption).
@@ -651,5 +655,65 @@ Status FindHomeDir(const string& name, const string& bin_dir, string* home_dir) 
   *home_dir = dir;
   return Status::OK();
 }
+
+std::unordered_map<std::string, std::string> GetCommonWebserverEndpoints() {
+  return {{"logs", kContentTypeTextHtml},
+          {"varz", kContentTypeTextHtml},
+          {"config", kContentTypeTextHtml},
+          {"memz", kContentTypeTextHtml},
+          {"mem-trackers", kContentTypeTextHtml},
+          {"stacks", kContentTypeTextPlain},
+          {"version", kContentTypeTextPlain},
+          {"healthz", kContentTypeTextPlain},
+          {"metrics", kContentTypeTextPlain},
+          {"jsonmetricz", kContentTypeTextPlain},
+          {"metrics_prometheus", kContentTypeTextPlain},
+          {"rpcz", kContentTypeTextPlain},
+          {"startup", kContentTypeTextHtml},
+          {"pprof/cmdline", kContentTypeTextPlain},
+          {"pprof/heap", kContentTypeTextPlain},
+          {"pprof/growth", kContentTypeTextPlain},
+          {"pprof/profile", kContentTypeTextPlain},
+          {"pprof/symbol", kContentTypeTextPlain},
+          {"pprof/contention", kContentTypeTextPlain},
+          {"tracing/json/begin_monitoring", kContentTypeTextPlain},
+          {"tracing/json/end_monitoring", kContentTypeTextPlain},
+          {"tracing/json/capture_monitoring", kContentTypeTextPlain},
+          {"tracing/json/get_monitoring_status", kContentTypeTextPlain},
+          {"tracing/json/categories", kContentTypeTextPlain},
+          {"tracing/json/begin_recording", kContentTypeTextPlain},
+          {"tracing/json/get_buffer_percent_full", kContentTypeTextPlain},
+          {"tracing/json/end_recording", kContentTypeTextPlain},
+          {"tracing/json/end_recording_compressed", kContentTypeTextPlain},
+          {"tracing/json/simple_dump", kContentTypeTextPlain}};
+}
+
+// Add necessary query params to get 200 response in tests.
+std::unordered_map<std::string, std::string> GetTServerWebserverEndpoints(
+    const std::string& tablet_id) {
+  return {{"scans", kContentTypeTextHtml},
+          {"tablets", kContentTypeTextHtml},
+          {strings::Substitute("tablet?id=$0", tablet_id), kContentTypeTextHtml},
+          {"transactions", kContentTypeTextHtml},
+          {strings::Substitute("tablet-rowsetlayout-svg?id=$0", tablet_id), kContentTypeTextHtml},
+          {strings::Substitute("tablet-consensus-status?id=$0", tablet_id), kContentTypeTextHtml},
+          {strings::Substitute("log-anchors?id=$0", tablet_id), kContentTypeTextHtml},
+          {"dashboards", kContentTypeTextHtml},
+          {"maintenance-manager", kContentTypeTextHtml}};
+}
+
+// Add necessary query params to get 200 response in tests.
+std::unordered_map<std::string, std::string> GetMasterWebserverEndpoints(
+    const std::string& table_id) {
+  return {{"tablet-servers", kContentTypeTextHtml},
+          {"tables", kContentTypeTextHtml},
+          {strings::Substitute("table?id=$0", table_id), kContentTypeTextHtml},
+          {"masters", kContentTypeTextHtml},
+          {"ipki-ca-cert", kContentTypeTextPlain},
+          {"ipki-ca-cert-pem", kContentTypeTextPlain},
+          {"ipki-ca-cert-der", kContentTypeApplicationOctet},
+          {"dump-entities", kContentTypeTextPlain}};
+}
+
 
 } // namespace kudu

@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #include <gtest/gtest.h>
 
@@ -200,6 +201,12 @@ Status WaitForUdpBindAtPort(const std::vector<std::string>& addresses,
 Status FindHomeDir(const std::string& name,
                    const std::string& bin_dir,
                    std::string* home_dir) WARN_UNUSED_RESULT;
+
+std::unordered_map<std::string, std::string> GetCommonWebserverEndpoints();
+std::unordered_map<std::string, std::string> GetTServerWebserverEndpoints(
+    const std::string& tablet_id);
+std::unordered_map<std::string, std::string> GetMasterWebserverEndpoints(
+    const std::string& table_id);
 
 } // namespace kudu
 #endif

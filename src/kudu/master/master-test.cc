@@ -3798,5 +3798,47 @@ TEST_F(MasterTest, TestMastersListedInDumpEndpoints) {
   ASSERT_NE("", master["start_time"].GetString());
 }
 
+TEST_F(MasterTest, TestMasterContentTypeHeaders) {
+  // /pprof endpoints take longer to finish.
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  // Create a table with one partition for the '/table?id=' endpoint.
+  constexpr const char* const kTableName = "testtb";
+  const Schema kTableSchema({ColumnSchema("key", INT32),
+                             ColumnSchema("val", INT32)}, 2);
+  FLAGS_default_num_replicas = 1;
+  KuduPartialRow a_lower(&kTableSchema);
+  KuduPartialRow a_upper(&kTableSchema);
+  ASSERT_OK(a_lower.SetInt32("key", 0));
+  ASSERT_OK(a_upper.SetInt32("key", 100));
+  CreateTableResponsePB create_table_resp;
+  ASSERT_OK(CreateTable(
+      kTableName, kTableSchema, nullopt, nullopt, nullopt, {}, {{a_lower, a_upper}},
+      {}, {{{"key"}, 2, 0}}, &create_table_resp));
+  std::string table_id = create_table_resp.table_id();
+
+  // Get all the endpoints to be tested.
+  std::unordered_map<std::string, std::string> endpoint_type_map;
+  for (const auto& endpoint_pair : GetCommonWebserverEndpoints()) {
+    endpoint_type_map.insert(endpoint_pair);
+  }
+  for (const auto& endpoint_pair : GetMasterWebserverEndpoints(table_id)) {
+    endpoint_type_map.insert(endpoint_pair);
+  }
+
+  EasyCurl c;
+  c.set_return_headers(true);
+  faststring buf;
+  string addr = Substitute("http://$0", mini_master_->bound_http_addr().ToString());
+
+  // Check that all the endpoints have the defined Content-Type headers.
+  for (const auto& [endpoint, type] : endpoint_type_map) {
+    LOG(INFO) << Substitute("Checking endpoint '/$0' for Content-Type header", endpoint);
+    ASSERT_OK(c.FetchURL(Substitute("$0/$1", addr, endpoint), &buf));
+    std::string expected_content_type = Substitute("Content-Type: $0", type);
+    ASSERT_STR_CONTAINS(buf.ToString(), expected_content_type);
+  }
+}
+
 } // namespace master
 } // namespace kudu

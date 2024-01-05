@@ -30,6 +30,7 @@
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/monotime.h"
 
 #define SKIP_IF_SLOW_NOT_ALLOWED() do { \
@@ -201,6 +202,66 @@ Status WaitForUdpBindAtPort(const std::vector<std::string>& addresses,
 Status FindHomeDir(const std::string& name,
                    const std::string& bin_dir,
                    std::string* home_dir) WARN_UNUSED_RESULT;
+
+inline std::unordered_map<std::string, std::string> GetCommonWebserverEndpoints() {
+  return {{"logs", "text/html"},
+          {"varz", "text/html"},
+          {"config", "text/html"},
+          {"memz", "text/html"},
+          {"mem-trackers", "text/html"},
+          {"stacks", "text/plain"},
+          {"version", "text/plain"},
+          {"healthz", "text/plain"},
+          {"metrics", "application/json"},
+          {"jsonmetricz", "application/json"},
+          {"metrics_prometheus", "text/plain"},
+          {"rpcz", "application/json"},
+          {"startup", "text/html"},
+          {"pprof/cmdline", "text/plain"},
+          {"pprof/heap", "text/plain"},
+          {"pprof/growth", "text/plain"},
+          {"pprof/profile", "text/plain"},
+          {"pprof/symbol", "text/plain"},
+          {"pprof/contention", "text/plain"},
+          {"tracing/json/begin_monitoring", "application/json"},
+          {"tracing/json/end_monitoring", "application/json"},
+          {"tracing/json/capture_monitoring", "application/json"},
+          {"tracing/json/get_monitoring_status", "application/json"},
+          {"tracing/json/categories", "application/json"},
+          {"tracing/json/begin_recording", "application/json"},
+          {"tracing/json/get_buffer_percent_full", "application/json"},
+          {"tracing/json/end_recording", "application/json"},
+          {"tracing/json/end_recording_compressed", "application/json"},
+          {"tracing/json/simple_dump", "application/json"}};
+}
+
+// Add necessary query params to get 200 response in tests.
+inline std::unordered_map<std::string, std::string> GetTServerWebserverEndpoints(
+    const std::string& tablet_id) {
+  return {{"scans", "text/html"},
+          {"tablets", "text/html"},
+          {strings::Substitute("tablet?id=$0", tablet_id), "text/html"},
+          {"transactions", "text/html"},
+          {strings::Substitute("tablet-rowsetlayout-svg?id=$0", tablet_id), "text/html"},
+          {strings::Substitute("tablet-consensus-status?id=$0", tablet_id), "text/html"},
+          {strings::Substitute("log-anchors?id=$0", tablet_id), "text/html"},
+          {"dashboards", "text/html"},
+          {"maintenance-manager", "text/html"}};
+}
+
+// Add necessary query params to get 200 response in tests.
+inline std::unordered_map<std::string, std::string> GetMasterWebserverEndpoints(
+    const std::string& table_id) {
+  using strings::Substitute;
+  return {{"tablet-servers", "text/html"},
+          {"tables", "text/html"},
+          {strings::Substitute("table?id=$0", table_id), "text/html"},
+          {"masters", "text/html"},
+          {"ipki-ca-cert", "text/plain"},
+          {"ipki-ca-cert-pem", "text/plain"},
+          {"ipki-ca-cert-der", "application/octet-stream"},
+          {"dump-entities", "text/plain"}};
+}
 
 } // namespace kudu
 #endif

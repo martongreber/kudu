@@ -441,27 +441,27 @@ static void ConfigurationHandler(const Webserver::WebRequest& /* req */,
   FillTimeSourceConfigs(output);
 }
 void AddPreInitializedDefaultPathHandlers(Webserver* webserver) {
-  bool styled = true;
+  StyleMode style_mode = StyleMode::STYLED;
   bool on_nav_bar = true;
-  webserver->RegisterPathHandler("/logs", "Logs", LogsHandler, styled, on_nav_bar);
-  webserver->RegisterPrerenderedPathHandler("/varz", "Flags", FlagsHandler, styled, on_nav_bar);
+  webserver->RegisterPathHandler("/logs", "Logs", LogsHandler, style_mode, on_nav_bar);
+  webserver->RegisterPrerenderedPathHandler("/varz", "Flags", FlagsHandler, style_mode, on_nav_bar);
   webserver->RegisterPathHandler("/config", "Configuration", ConfigurationHandler,
-                                 styled, on_nav_bar);
+                                 style_mode, on_nav_bar);
   webserver->RegisterPrerenderedPathHandler("/memz", "Memory (total)", MemUsageHandler,
-                                            styled, on_nav_bar);
+                                            style_mode, on_nav_bar);
   webserver->RegisterPrerenderedPathHandler("/mem-trackers", "Memory (detail)", MemTrackersHandler,
-                                            styled, on_nav_bar);
+                                            style_mode, on_nav_bar);
 }
 
 void AddPostInitializedDefaultPathHandlers(Webserver* webserver) {
   webserver->RegisterPrerenderedPathHandler("/stacks", "Stacks", StacksHandler,
-                                            /*is_styled=*/false,
+                                            StyleMode::UNSTYLED,
                                             /*is_on_nav_bar=*/true);
   webserver->RegisterPrerenderedPathHandler("/version", "VersionInfo", VersionInfoHandler,
-                                            /*is_styled=*/false,
+                                            StyleMode::UNSTYLED,
                                             /*is_on_nav_bar*/false);
   webserver->RegisterPrerenderedPathHandler("/healthz", "Health", HealthHandler,
-                                            /*is_styled=*/false,
+                                            StyleMode::UNSTYLED,
                                             /*is_on_nav_bar=*/true);
   AddPprofPathHandlers(webserver);
 }
@@ -531,16 +531,13 @@ void RegisterMetricsJsonHandler(Webserver* webserver, const MetricRegistry* cons
                             Webserver::PrerenderedWebResponse* resp) {
     WriteMetricsAsJson(metrics, req, resp);
   };
-  bool not_styled = false;
   bool not_on_nav_bar = false;
   bool is_on_nav_bar = true;
-  webserver->RegisterPrerenderedPathHandler("/metrics", "JSON Metrics", callback,
-                                            not_styled, is_on_nav_bar);
+  webserver->RegisterJsonPathHandler("/metrics", "JSON Metrics", callback, is_on_nav_bar);
 
   // The old name -- this is preserved for compatibility with older releases of
   // monitoring software which expects the old name.
-  webserver->RegisterPrerenderedPathHandler("/jsonmetricz", "Metrics", callback,
-                                            not_styled, not_on_nav_bar);
+  webserver->RegisterJsonPathHandler("/jsonmetricz", "Metrics", callback, not_on_nav_bar);
 }
 
 void RegisterMetricsPrometheusHandler(Webserver* webserver, const MetricRegistry* const metrics) {
@@ -548,10 +545,10 @@ void RegisterMetricsPrometheusHandler(Webserver* webserver, const MetricRegistry
                             Webserver::PrerenderedWebResponse* resp) {
     WriteMetricsAsPrometheus(metrics, req, resp);
   };
-  constexpr bool not_styled = false;
+  constexpr StyleMode style_mode = StyleMode::UNSTYLED;
   constexpr bool is_on_nav_bar = true;
   webserver->RegisterPrerenderedPathHandler("/metrics_prometheus", "Prometheus Metrics", callback,
-                                            not_styled, is_on_nav_bar);
+                                            style_mode, is_on_nav_bar);
 }
 
 } // namespace kudu

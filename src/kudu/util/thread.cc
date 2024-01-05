@@ -33,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -335,7 +336,7 @@ Status ThreadMgr::StartInstrumentation(const scoped_refptr<MetricEntity>& metric
                                       WebCallbackRegistry::WebResponse* resp) {
           this->ThreadPathHandler(req, resp);
         },
-        /* is_styled= */ true,
+        StyleMode::STYLED,
         /* is_on_nav_bar= */ true);
   }
   return Status::OK();

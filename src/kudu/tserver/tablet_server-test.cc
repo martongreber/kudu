@@ -34,6 +34,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -617,6 +618,34 @@ TEST_F(TabletServerTest, TestWebPages) {
   // only exists on Linux.
   ASSERT_STR_CONTAINS(buf.ToString(), "tablet_server-test");
 #endif
+}
+
+TEST_F(TabletServerTest, TestTabletServerContentTypeHeaders) {
+  // /pprof endpoints take longer to finish.
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  // Get all the endpoints to be tested.
+  std::unordered_map<std::string, std::string> endpoint_type_map;
+  for (const auto& endpoint_pair : GetCommonWebserverEndpoints()) {
+    endpoint_type_map.insert(endpoint_pair);
+  }
+  for (const auto& endpoint_pair : GetTServerWebserverEndpoints(kTabletId)) {
+    endpoint_type_map.insert(endpoint_pair);
+  }
+
+  EasyCurl c;
+  c.set_return_headers(true);
+  faststring buf;
+  string addr = Substitute("http://$0", mini_server_->bound_http_addr().ToString());
+
+  // Check that all the endpoints have the defined Content-Type headers.
+  for (const auto& [endpoint, type] : endpoint_type_map) {
+    LOG(INFO) << Substitute("Checking tablet server endpoint '/$0' for Content-Type header",
+                            endpoint);
+    ASSERT_OK(c.FetchURL(Substitute("$0/$1", addr, endpoint), &buf));
+    std::string expected_content_type = Substitute("Content-Type: $0", type);
+    ASSERT_STR_CONTAINS(buf.ToString(), expected_content_type);
+  }
 }
 
 // Ensure that when a replica is in a failed / shutdown state, it returns an

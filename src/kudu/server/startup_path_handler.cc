@@ -119,14 +119,14 @@ void StartupPathHandler::Startup(const Webserver::WebRequest& /*req*/,
 }
 
 void StartupPathHandler::RegisterStartupPathHandler(Webserver *webserver) {
-  bool styled = true;
+  StyleMode style_mode = StyleMode::STYLED;
   bool on_nav_bar = true;
   webserver->RegisterPathHandler("/startup", "Startup",
                                  [this](const Webserver::WebRequest& req,
                                         Webserver::WebResponse* resp) {
                                           this->Startup(req, resp);
                                         },
-                                 styled, on_nav_bar);
+                                 style_mode, on_nav_bar);
 }
 
 void StartupPathHandler::set_is_tablet_server(bool is_tablet_server) {

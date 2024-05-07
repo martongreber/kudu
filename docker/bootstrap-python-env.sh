@@ -26,10 +26,11 @@
 set -xe
 set -o pipefail
 
+PYTHON_VERSION=$(python --version 2>&1 | cut -d' ' -f2)
+PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d'.' -f1)
+PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d'.' -f2)
+
 function install_python_packages() {
-  PYTHON_VERSION=$(python --version 2>&1 | cut -d' ' -f2)
-  PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d'.' -f1)
-  PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d'.' -f2)
 
   # We use get-pip.py to bootstrap pip outside of system packages.
   # This prevents issues with the platform package manager knowing
@@ -43,7 +44,7 @@ function install_python_packages() {
     # so we need to use the version specific one.
     curl https://bootstrap.pypa.io/pip/3.6/get-pip.py | python
   else
-    # Use a stable version of pip that works with Python 2 and 3.
+    # Use a stable version of pip that works with Python >3.6.
     curl https://bootstrap.pypa.io/get-pip.py | python - "pip < 20.3.4"
   fi
   pip install --upgrade \
@@ -95,7 +96,10 @@ elif [[ -f "/usr/bin/apt-get" ]]; then
 
   # Install python development packages.
   # g++ is required to check for int128 support in setup.py.
-  apt-get install -y --no-install-recommends g++ python-dev
+  apt-get install -y --no-install-recommends g++ \
+    python$PYTHON_MAJOR.$PYTHON_MINOR-dev \
+    python$PYTHON_MAJOR.$PYTHON_MINOR-distutils
+
   install_python_packages
 
   # Reduce the image size by cleaning up after the install.

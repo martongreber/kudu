@@ -17,25 +17,15 @@
 
 package org.apache.kudu.examples;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
-import org.apache.kudu.client.AlterTableOptions;
-import org.apache.kudu.client.CreateTableOptions;
-import org.apache.kudu.client.Insert;
-import org.apache.kudu.client.KuduClient;
-import org.apache.kudu.client.KuduException;
-import org.apache.kudu.client.KuduPredicate;
+import org.apache.kudu.client.*;
 import org.apache.kudu.client.KuduPredicate.ComparisonOp;
-import org.apache.kudu.client.KuduScanner;
-import org.apache.kudu.client.KuduSession;
-import org.apache.kudu.client.KuduTable;
-import org.apache.kudu.client.PartialRow;
-import org.apache.kudu.client.RowResult;
-import org.apache.kudu.client.RowResultIterator;
 import org.apache.kudu.client.SessionConfiguration.FlushMode;
 
 /*
@@ -48,7 +38,7 @@ import org.apache.kudu.client.SessionConfiguration.FlushMode;
  */
 public class Example {
   private static final Double DEFAULT_DOUBLE = 12.345;
-  private static final String KUDU_MASTERS = System.getProperty("kuduMasters", "localhost:7051");
+  private static final String KUDU_MASTERS = System.getProperty("kuduMasters", "localhost:8764");
 
   static void createExampleTable(KuduClient client, String tableName)  throws KuduException {
     // Set up a simple schema.
@@ -125,7 +115,7 @@ public class Example {
     List<String> projectColumns = new ArrayList<>(2);
     projectColumns.add("key");
     projectColumns.add("value");
-    projectColumns.add("added");
+//    projectColumns.add("added");
     int lowerBound = 0;
     KuduPredicate lowerPred = KuduPredicate.newComparisonPredicate(
         schema.getColumn("key"),
@@ -153,11 +143,7 @@ public class Example {
         RowResult result = results.next();
         if (result.isNull("value")) {
           nullCount++;
-        }
-        double added = result.getDouble("added");
-        if (added != DEFAULT_DOUBLE) {
-          throw new RuntimeException("expected added=" + DEFAULT_DOUBLE +
-              " but got added= " + added);
+        } else {
         }
         resultCount++;
       }
@@ -186,17 +172,85 @@ public class Example {
     try {
       createExampleTable(client, tableName);
 
-      int numRows = 150;
-      insertRows(client, tableName, numRows);
+      KuduTable table = client.openTable(tableName);
+      KuduSession session = client.newSession();
+      session.setFlushMode(FlushMode.AUTO_FLUSH_BACKGROUND);
+      for (int i = 0; i < 10; i++) {
+        Insert insert = table.newInsert();
+        PartialRow row = insert.getRow();
+        row.addInt("key", i);
+        row.addString("value", "value " + i);
+        session.apply(insert);
+      }
+      session.flush();
 
-      // Alter the table, adding a column with a default value.
-      // Note: after altering the table, the table needs to be re-opened.
-      AlterTableOptions ato = new AlterTableOptions();
-      ato.addColumn("added", org.apache.kudu.Type.DOUBLE, DEFAULT_DOUBLE);
-      client.alterTable(tableName, ato);
-      System.out.println("Altered the table");
 
-      scanTableAndCheckResults(client, tableName, numRows);
+      long startHT = client.getLastPropagatedTimestamp() + 1;
+
+      for (int i = 10; i < 20; i++) {
+        Insert insert = table.newInsert();
+        PartialRow row = insert.getRow();
+        row.addInt("key", i);
+        row.addString("value", "value " + i);
+        session.apply(insert);
+      }
+      {
+        Update update = table.newUpdate();
+        PartialRow row = update.getRow();
+        row.addInt("key", 0);
+        row.addString("value", "modified!");
+        session.apply(update);
+      }
+      {
+        Delete delete = table.newDelete();
+        PartialRow row = delete.getRow();
+        row.addInt("key", 1);
+        session.apply(delete);
+      }
+
+      session.flush();
+
+      long endHT = client.getLastPropagatedTimestamp() + 1;
+
+      // full scan
+      {
+        System.out.println("Full scan");
+        List<KuduScanToken> tokens = client.newScanTokenBuilder(table)
+                .build();
+        List<RowResult> results = new ArrayList<>();
+        for (KuduScanToken token : tokens) {
+          KuduScanner scanner = KuduScanToken.deserializeIntoScanner(token.serialize(), client);
+
+
+          for (RowResult row : scanner) {
+            System.out.println("key: " + row.getInt("key") + ", value: " + row.getString("value"));
+          }
+        }
+      }
+
+      {
+        System.out.println("Diff scan");
+        // Diff scan the time range.
+        // Pass through the scan token API to ensure serialization of tokens works too.
+        List<KuduScanToken> tokens = client.newScanTokenBuilder(table)
+                .diffScan(startHT, endHT)
+                .build();
+        List<RowResult> results = new ArrayList<>();
+        for (KuduScanToken token : tokens) {
+          KuduScanner scanner = KuduScanToken.deserializeIntoScanner(token.serialize(), client);
+
+          for (RowResult row : scanner) {
+            System.out.println("key: " + row.getInt("key") + ", value: " + row.getString("value") + ", is_deleted: " + row.isDeleted());
+          }
+        }
+      }
+
+
+
+
+
+
+
     } catch (Exception e) {
       e.printStackTrace();
     } finally {

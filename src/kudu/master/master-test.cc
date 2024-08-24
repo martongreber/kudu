@@ -237,6 +237,15 @@ class MasterTest : public KuduTest {
 
   Status RecallTable(const string& table_id);
 
+  // Helper method to register a fake tablet server with the master
+  Status RegisterFakeTabletServer(const string& uuid,
+                                  const string& hostname,
+                                  uint32_t rpc_port,
+                                  uint32_t http_port);
+
+  // Helper method to fetch and parse service discovery response
+  Status FetchPrometheusSDResponse(rapidjson::Document* doc);
+
   shared_ptr<Messenger> client_messenger_;
   unique_ptr<MiniMaster> mini_master_;
   Master* master_;
@@ -390,6 +399,50 @@ void MasterTest::DoListAllTables(ListTablesResponsePB* resp) {
 static void MakeHostPortPB(const string& host, uint32_t port, HostPortPB* pb) {
   pb->set_host(host);
   pb->set_port(port);
+}
+
+Status MasterTest::RegisterFakeTabletServer(const string& uuid,
+                                            const string& hostname,
+                                            uint32_t rpc_port,
+                                            uint32_t http_port) {
+  TSToMasterCommonPB common;
+  common.mutable_ts_instance()->set_permanent_uuid(uuid);
+  common.mutable_ts_instance()->set_instance_seqno(1);
+
+  ServerRegistrationPB fake_reg;
+  MakeHostPortPB(hostname, rpc_port, fake_reg.add_rpc_addresses());
+  MakeHostPortPB(hostname, http_port, fake_reg.add_http_addresses());
+  fake_reg.set_software_version(VersionInfo::GetVersionInfo());
+  fake_reg.set_start_time(10000);
+
+  ReplicaManagementInfoPB rmi;
+  rmi.set_replacement_scheme(ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION);
+
+  TSHeartbeatRequestPB req;
+  TSHeartbeatResponsePB resp;
+  RpcController rpc;
+  req.mutable_common()->CopyFrom(common);
+  req.mutable_registration()->CopyFrom(fake_reg);
+  req.mutable_replica_management_info()->CopyFrom(rmi);
+
+  RETURN_NOT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  return Status::OK();
+}
+
+Status MasterTest::FetchPrometheusSDResponse(rapidjson::Document* doc) {
+  EasyCurl c;
+  faststring buf;
+  string addr = Substitute("http://$0/prometheus-sd", mini_master_->bound_http_addr().ToString());
+  RETURN_NOT_OK(c.FetchURL(addr, &buf));
+
+  doc->Parse<0>(buf.ToString().c_str());
+  if (doc->HasParseError()) {
+    return Status::InvalidArgument("Failed to parse JSON response");
+  }
+  return Status::OK();
 }
 
 TEST_F(MasterTest, TestPingServer) {
@@ -3902,6 +3955,71 @@ TEST_F(MasterTest, PrometheusMetricsLevelFiltering) {
     // There should be metrics only of the 'warn' level.
     ASSERT_STR_MATCHES(str, "rpcs_queue_overflow ");  // level: warn
   }
+}
+
+TEST_F(MasterTest, TestPrometheusServiceDiscoveryEndpoint) {
+  ASSERT_OK(RegisterFakeTabletServer("my-ts-uuid", "localhost", 1000, 2000));
+
+  rapidjson::Document doc;
+  ASSERT_OK(FetchPrometheusSDResponse(&doc));
+
+  ASSERT_EQ(2, doc.Size());
+  ASSERT_EQ(1, doc[0]["targets"].Size());
+  ASSERT_EQ("Kudu", doc[0]["labels"]["job"]);
+  ASSERT_EQ("masters", doc[0]["labels"]["group"]);
+  ASSERT_EQ("http", doc[0]["labels"]["__scheme__"]);
+
+  ASSERT_EQ(1, doc[1]["targets"].Size());
+  ASSERT_EQ("Kudu", doc[1]["labels"]["job"]);
+  ASSERT_EQ("tservers", doc[1]["labels"]["group"]);
+  ASSERT_EQ("http", doc[1]["labels"]["__scheme__"]);
+}
+
+TEST_F(MasterTest, TestPrometheusServiceDiscoveryWithLocation) {
+  const string kLocationScript = JoinPathSegments(GetTestExecutableDirectory(),
+                                                   "testdata/assign-location.py");
+  FLAGS_location_mapping_cmd = Substitute("$0 --map /rack1:1 --map /rack2:1",
+                                          kLocationScript);
+
+  // Restart master to enable location mapping
+  mini_master_->Shutdown();
+  ASSERT_OK(mini_master_->Restart());
+
+  ASSERT_OK(RegisterFakeTabletServer("ts-rack1", "test-host1", 1000, 2000));
+  ASSERT_OK(RegisterFakeTabletServer("ts-rack2", "test-host2", 1001, 2001));
+
+  rapidjson::Document doc;
+  ASSERT_OK(FetchPrometheusSDResponse(&doc));
+
+  // Should have 3 target groups: 1 for masters, 2 for tablet servers (one per rack)
+  ASSERT_EQ(3, doc.Size());
+
+  ASSERT_EQ("masters", doc[0]["labels"]["group"]);
+  ASSERT_EQ("http", doc[0]["labels"]["__scheme__"]);
+
+  // Next two should be tablet servers with different locations
+  // Order might vary, so we need to find them by location
+  bool found_rack1 = false, found_rack2 = false;
+
+  for (int i = 1; i < 3; i++) {
+    ASSERT_EQ("tservers", doc[i]["labels"]["group"]);
+    ASSERT_TRUE(doc[i]["labels"].HasMember("location"));
+    ASSERT_EQ("http", doc[i]["labels"]["__scheme__"]);
+
+    string location = doc[i]["labels"]["location"].GetString();
+    if (location == "/rack1") {
+      found_rack1 = true;
+      ASSERT_STR_CONTAINS(doc[i]["targets"][0].GetString(), "test-host1:2000");
+    } else if (location == "/rack2") {
+      found_rack2 = true;
+      ASSERT_STR_CONTAINS(doc[i]["targets"][0].GetString(), "test-host2:2001");
+    } else {
+      FAIL() << "Unexpected location: " << location;
+    }
+  }
+
+  ASSERT_TRUE(found_rack1) << "Did not find tablet server in /rack1";
+  ASSERT_TRUE(found_rack2) << "Did not find tablet server in /rack2";
 }
 
 } // namespace master

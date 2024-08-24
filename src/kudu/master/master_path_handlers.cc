@@ -872,6 +872,131 @@ void MasterPathHandlers::HandleDumpEntities(const Webserver::WebRequest& /*req*/
   jw.EndObject();
 }
 
+namespace {
+
+void WriteEmptyPrometheusSDResponse(ostringstream* output) {
+  JsonWriter jw(output, JsonWriter::COMPACT);
+  jw.StartArray();
+  jw.EndArray();
+}
+
+void WritePrometheusSDTargetGroup(JsonWriter* jw,
+                                  const string& group_name,
+                                  const string& target,
+                                  const string& cluster_id,
+                                  const string& scheme,
+                                  const string& location = "") {
+  jw->StartObject();
+
+  jw->String("targets");
+  jw->StartArray();
+  jw->String(target);
+  jw->EndArray();
+
+  jw->String("labels");
+  jw->StartObject();
+  jw->String("job");
+  jw->String("Kudu");
+  jw->String("group");
+  jw->String(group_name);
+  jw->String("cluster_id");
+  jw->String(cluster_id);
+  if (!location.empty()) {
+    jw->String("location");
+    jw->String(location);
+  }
+  jw->String("__scheme__");
+  jw->String(scheme);
+  jw->EndObject();
+
+  jw->EndObject();
+}
+
+} // anonymous namespace
+
+Status MasterPathHandlers::CollectPrometheusSDData(
+    PrometheusSDData* data) const {
+  vector<ServerEntryPB> masters;
+  RETURN_NOT_OK(master_->ListMasters(&masters, /*use_external_addr=*/false));
+
+  for (const auto& master : masters) {
+    if (data->cluster_id.empty() && !master.cluster_id().empty()) {
+      data->cluster_id = master.cluster_id();
+    }
+
+    if (!data->is_https_enabled && master.registration().https_enabled()) {
+      data->is_https_enabled = true;
+    }
+
+    for (const auto& host_port : master.registration().http_addresses()) {
+      data->master_addresses.push_back(
+          Substitute("$0:$1", host_port.host(), host_port.port()));
+    }
+  }
+
+  vector<shared_ptr<TSDescriptor>> descs;
+  master_->ts_manager()->GetAllDescriptors(&descs);
+
+  for (const auto& desc : descs) {
+    ServerRegistrationPB reg;
+    if (auto s = desc->GetRegistration(&reg); PREDICT_FALSE(!s.ok())) {
+      LOG(WARNING) << s.ToString();
+      continue;
+    }
+    if (reg.http_addresses().empty()) {
+      LOG(WARNING) << "Tablet server " << desc->permanent_uuid()
+                   << " has no HTTP addresses, skipping from Prometheus service discovery";
+      continue;
+    }
+
+    data->tserver_targets.emplace_back(
+        Substitute("$0:$1", reg.http_addresses(0).host(), reg.http_addresses(0).port()),
+        desc->location().value_or("n/a"));
+  }
+
+  return Status::OK();
+}
+
+void MasterPathHandlers::HandlePrometheusSD(const Webserver::WebRequest& req,
+                                            Webserver::PrerenderedWebResponse* resp) {
+  ostringstream* output = &resp->output;
+
+  if (!master_->catalog_manager()->IsInitialized()) {
+    LOG(WARNING) << "CatalogManager is not running";
+    WriteEmptyPrometheusSDResponse(output);
+    return;
+  }
+
+  PrometheusSDData data;
+  if (auto s = CollectPrometheusSDData(&data); !s.ok()) {
+    LOG(WARNING) << s.ToString();
+    WriteEmptyPrometheusSDResponse(output);
+    return;
+  }
+
+    // Create Prometheus service discovery JSON
+  JsonWriter jw(output, JsonWriter::COMPACT);
+
+  jw.StartArray();
+
+  for (const auto& target : data.master_addresses) {
+    WritePrometheusSDTargetGroup(&jw, "masters",
+                                 target,
+                                 data.cluster_id,
+                                 data.is_https_enabled ? "https" : "http");
+  }
+
+  for (const auto& target : data.tserver_targets) {
+    WritePrometheusSDTargetGroup(&jw, "tservers",
+                                 target.first,
+                                 data.cluster_id,
+                                 data.is_https_enabled ? "https" : "http",
+                                 target.second);
+  }
+
+  jw.EndArray();
+}
+
 Status MasterPathHandlers::Register(Webserver* server) {
   constexpr const bool is_on_nav_bar = true;
   server->RegisterPathHandler(
@@ -919,6 +1044,12 @@ Status MasterPathHandlers::Register(Webserver* server) {
       "/dump-entities", "Dump Entities",
       [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
         this->HandleDumpEntities(req, resp);
+      },
+      false /*is_on_nav_bar*/);
+  server->RegisterJsonPathHandler(
+      "/prometheus-sd", "Prometheus SD",
+      [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+        this->HandlePrometheusSD(req, resp);
       },
       false /*is_on_nav_bar*/);
   return Status::OK();

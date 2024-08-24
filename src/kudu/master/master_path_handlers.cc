@@ -872,6 +872,154 @@ void MasterPathHandlers::HandleDumpEntities(const Webserver::WebRequest& /*req*/
   jw.EndObject();
 }
 
+namespace {
+
+void WriteEmptyPrometheusSDResponse(ostringstream* output) {
+  JsonWriter jw(output, JsonWriter::COMPACT);
+  jw.StartArray();
+  jw.EndArray();
+}
+
+void WritePrometheusSDTargetGroup(JsonWriter* jw,
+                                  const string& group_name,
+                                  const string& target,
+                                  const string& cluster_id,
+                                  const string& scheme,
+                                  const string& location) {
+  DCHECK(!group_name.empty());
+  DCHECK(!target.empty());
+  DCHECK(!cluster_id.empty());
+  DCHECK(!scheme.empty());
+  DCHECK(!location.empty());
+
+  jw->StartObject();
+
+  jw->String("targets");
+  jw->StartArray();
+  jw->String(target);
+  jw->EndArray();
+
+  jw->String("labels");
+  jw->StartObject();
+  jw->String("job");
+  jw->String("Kudu");
+  jw->String("group");
+  jw->String(group_name);
+  jw->String("cluster_id");
+  jw->String(cluster_id);
+  jw->String("location");
+  jw->String(location);
+  jw->String("__scheme__");
+  jw->String(scheme);
+  jw->EndObject();
+
+  jw->EndObject();
+}
+
+} // anonymous namespace
+
+Status MasterPathHandlers::CollectPrometheusSDData(PrometheusSDData* data) const {
+  vector<ServerEntryPB> masters;
+  RETURN_NOT_OK(master_->ListMasters(&masters, /*use_external_addr=*/false));
+
+  for (const auto& master : masters) {
+    if (data->cluster_id.empty() && !master.cluster_id().empty()) {
+      data->cluster_id = master.cluster_id();
+    }
+
+    if (!data->is_https_enabled && master.registration().https_enabled()) {
+      data->is_https_enabled = true;
+    }
+
+    for (const auto& host_port : master.registration().http_addresses()) {
+      data->master_targets.emplace_back(PrometheusSDData::ServerTarget{
+          Substitute("$0:$1", host_port.host(), host_port.port()), "n/a"});
+    }
+  }
+
+  vector<shared_ptr<TSDescriptor>> descs;
+  master_->ts_manager()->GetAllDescriptors(&descs);
+
+  for (const auto& desc : descs) {
+    ServerRegistrationPB reg;
+    if (auto s = desc->GetRegistration(&reg); PREDICT_FALSE(!s.ok())) {
+      LOG(WARNING) << s.ToString();
+      continue;
+    }
+    if (reg.http_addresses().empty()) {
+      LOG(WARNING) << Substitute(
+          "Tablet server $0 has no HTTP addresses, excluding from Prometheus service discovery",
+          desc->permanent_uuid());
+      continue;
+    }
+
+    data->tserver_targets.emplace_back(PrometheusSDData::ServerTarget{
+        Substitute("$0:$1", reg.http_addresses(0).host(), reg.http_addresses(0).port()),
+        desc->location().value_or("n/a"),
+    });
+  }
+
+  return Status::OK();
+}
+
+void MasterPathHandlers::HandlePrometheusSD(const Webserver::WebRequest& req,
+                                            Webserver::PrerenderedWebResponse* resp) {
+  ostringstream* output = &resp->output;
+
+  auto refresh_interval_it = req.request_headers.find("X-Prometheus-Refresh-Interval-Seconds");
+  if (refresh_interval_it != req.request_headers.end()) {
+    VLOG(1) << Substitute("Prometheus service discovery refresh interval: $0 seconds",
+                          refresh_interval_it->second);
+  }
+
+  // TODO(mgreber): Consider implementing a grace period after catalog manager
+  // initialization to allow time for tablet servers to register before
+  // including them in service discovery responses.
+  if (!master_->catalog_manager()->IsInitialized()) {
+    LOG(WARNING) << "CatalogManager is not running";
+    resp->status_code = HttpStatusCode::ServiceUnavailable;
+    return;
+  }
+
+  if (master_->catalog_manager()->GetClusterId().empty()) {
+    LOG(WARNING) << "Cluster ID not yet initialized";
+    resp->status_code = HttpStatusCode::ServiceUnavailable;
+    return;
+  }
+
+  PrometheusSDData data;
+  if (auto s = CollectPrometheusSDData(&data); !s.ok()) {
+    LOG(WARNING) << s.ToString();
+    WriteEmptyPrometheusSDResponse(output);
+    return;
+  }
+
+  // Create Prometheus service discovery JSON
+  JsonWriter jw(output, JsonWriter::COMPACT);
+
+  jw.StartArray();
+
+  for (const auto& target : data.master_targets) {
+    WritePrometheusSDTargetGroup(&jw,
+                                 "masters",
+                                 target.address,
+                                 data.cluster_id,
+                                 data.is_https_enabled ? "https" : "http",
+                                 target.location);
+  }
+
+  for (const auto& target : data.tserver_targets) {
+    WritePrometheusSDTargetGroup(&jw,
+                                 "tservers",
+                                 target.address,
+                                 data.cluster_id,
+                                 data.is_https_enabled ? "https" : "http",
+                                 target.location);
+  }
+
+  jw.EndArray();
+}
+
 Status MasterPathHandlers::Register(Webserver* server) {
   constexpr const bool is_on_nav_bar = true;
   server->RegisterPathHandler(
@@ -919,6 +1067,12 @@ Status MasterPathHandlers::Register(Webserver* server) {
       "/dump-entities", "Dump Entities",
       [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
         this->HandleDumpEntities(req, resp);
+      },
+      false /*is_on_nav_bar*/);
+  server->RegisterJsonPathHandler(
+      "/prometheus-sd", "Prometheus SD",
+      [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+        this->HandlePrometheusSD(req, resp);
       },
       false /*is_on_nav_bar*/);
   return Status::OK();

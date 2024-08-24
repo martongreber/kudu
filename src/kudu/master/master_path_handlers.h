@@ -18,6 +18,7 @@
 
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "kudu/gutil/macros.h"
 #include "kudu/server/webserver.h"
@@ -44,6 +45,19 @@ class MasterPathHandlers {
   Status Register(Webserver* server);
 
  private:
+  // Helper struct for Prometheus service discovery data
+  struct PrometheusSDData {
+    struct ServerTarget {
+      std::string address;
+      std::string location;
+    };
+
+    bool is_https_enabled = false;
+    std::string cluster_id;
+    std::vector<ServerTarget> master_targets;
+    std::vector<ServerTarget> tserver_targets;
+  };
+
   void HandleTabletServers(const Webserver::WebRequest& req,
                            Webserver::WebResponse* resp);
   void HandleCatalogManager(const Webserver::WebRequest& req,
@@ -57,6 +71,11 @@ class MasterPathHandlers {
                         Webserver::PrerenderedWebResponse* resp);
   void HandleDumpEntities(const Webserver::WebRequest& req,
                           Webserver::PrerenderedWebResponse* resp);
+  void HandlePrometheusSD(const Webserver::WebRequest& req,
+                          Webserver::PrerenderedWebResponse* resp);
+
+  // Collects data needed for Prometheus service discovery
+  Status CollectPrometheusSDData(PrometheusSDData* data) const;
 
   // Returns a pair (text, target) given a tserver's TSDescriptor and a tablet id.
   // - text is the http host and port for the tserver, if available, or the tserver's uuid.

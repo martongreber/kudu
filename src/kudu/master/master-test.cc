@@ -72,6 +72,7 @@
 #include "kudu/master/sys_catalog.h"
 #include "kudu/master/table_metrics.h"
 #include "kudu/master/ts_manager.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/tls_context.h"
@@ -106,6 +107,8 @@ class TSDescriptor;
 }  // namespace master
 }  // namespace kudu
 
+using kudu::cluster::InternalMiniCluster;
+using kudu::cluster::InternalMiniClusterOptions;
 using kudu::consensus::ReplicaManagementInfoPB;
 using kudu::itest::GetClusterId;
 using kudu::pb_util::SecureDebugString;
@@ -113,6 +116,7 @@ using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
+using rapidjson::Document;
 using std::accumulate;
 using std::nullopt;
 using std::optional;
@@ -236,6 +240,15 @@ class MasterTest : public KuduTest {
   Status SoftDelete(const string& table_name, uint32 reserve_seconds);
 
   Status RecallTable(const string& table_id);
+
+  // Helper method to register a fake tablet server with the master
+  Status RegisterFakeTabletServer(const string& uuid,
+                                  const string& hostname,
+                                  uint32_t rpc_port,
+                                  uint32_t http_port);
+
+  // Helper method to fetch and parse service discovery response
+  Status FetchPrometheusSDResponse(Document* doc);
 
   shared_ptr<Messenger> client_messenger_;
   unique_ptr<MiniMaster> mini_master_;
@@ -390,6 +403,50 @@ void MasterTest::DoListAllTables(ListTablesResponsePB* resp) {
 static void MakeHostPortPB(const string& host, uint32_t port, HostPortPB* pb) {
   pb->set_host(host);
   pb->set_port(port);
+}
+
+Status MasterTest::RegisterFakeTabletServer(const string& uuid,
+                                            const string& hostname,
+                                            uint32_t rpc_port,
+                                            uint32_t http_port) {
+  TSToMasterCommonPB common;
+  common.mutable_ts_instance()->set_permanent_uuid(uuid);
+  common.mutable_ts_instance()->set_instance_seqno(1);
+
+  ServerRegistrationPB fake_reg;
+  MakeHostPortPB(hostname, rpc_port, fake_reg.add_rpc_addresses());
+  MakeHostPortPB(hostname, http_port, fake_reg.add_http_addresses());
+  fake_reg.set_software_version(VersionInfo::GetVersionInfo());
+  fake_reg.set_start_time(10000);
+
+  ReplicaManagementInfoPB rmi;
+  rmi.set_replacement_scheme(ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION);
+
+  TSHeartbeatRequestPB req;
+  TSHeartbeatResponsePB resp;
+  RpcController rpc;
+  req.mutable_common()->CopyFrom(common);
+  req.mutable_registration()->CopyFrom(fake_reg);
+  req.mutable_replica_management_info()->CopyFrom(rmi);
+
+  RETURN_NOT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  return Status::OK();
+}
+
+Status MasterTest::FetchPrometheusSDResponse(Document* doc) {
+  EasyCurl c;
+  faststring buf;
+  string addr = Substitute("http://$0/prometheus-sd", mini_master_->bound_http_addr().ToString());
+  RETURN_NOT_OK(c.FetchURL(addr, &buf));
+
+  doc->Parse<0>(buf.ToString().c_str());
+  if (doc->HasParseError()) {
+    return Status::InvalidArgument("Failed to parse JSON response");
+  }
+  return Status::OK();
 }
 
 TEST_F(MasterTest, TestPingServer) {
@@ -3901,6 +3958,207 @@ TEST_F(MasterTest, PrometheusMetricsLevelFiltering) {
     ASSERT_STR_NOT_MATCHES(str, "threads_running ");  // level: info
     // There should be metrics only of the 'warn' level.
     ASSERT_STR_MATCHES(str, "rpcs_queue_overflow ");  // level: warn
+  }
+}
+
+// Test that the Prometheus service discovery endpoint returns proper target groups
+// for masters and tservers with all expected fields (job, group, scheme, cluster_id, location).
+TEST_F(MasterTest, TestPrometheusServiceDiscoveryEndpoint) {
+  ASSERT_OK(RegisterFakeTabletServer("my-ts-uuid", "localhost", 1000, 2000));
+
+  Document doc;
+  ASSERT_OK(FetchPrometheusSDResponse(&doc));
+
+  ASSERT_EQ(2, doc.Size());
+
+  // Check masters target group
+  ASSERT_EQ(1, doc[0]["targets"].Size());
+  ASSERT_EQ("Kudu", doc[0]["labels"]["job"]);
+  ASSERT_EQ("masters", doc[0]["labels"]["group"]);
+  ASSERT_EQ("http", doc[0]["labels"]["__scheme__"]);
+  ASSERT_TRUE(doc[0]["labels"].HasMember("cluster_id"));
+  ASSERT_FALSE(string(doc[0]["labels"]["cluster_id"].GetString()).empty());
+  // Masters should have location "n/a" since location mapping is not implemented for masters
+  ASSERT_EQ("n/a", doc[0]["labels"]["location"]);
+  // Check that the target address is the master's HTTP address
+  ASSERT_STR_CONTAINS(doc[0]["targets"][0].GetString(),
+                      mini_master_->bound_http_addr().ToString());
+
+  // Check tservers target group
+  ASSERT_EQ(1, doc[1]["targets"].Size());
+  ASSERT_EQ("Kudu", doc[1]["labels"]["job"]);
+  ASSERT_EQ("tservers", doc[1]["labels"]["group"]);
+  ASSERT_EQ("http", doc[1]["labels"]["__scheme__"]);
+  ASSERT_TRUE(doc[1]["labels"].HasMember("cluster_id"));
+  ASSERT_FALSE(string(doc[1]["labels"]["cluster_id"].GetString()).empty());
+  // Tservers should have location "n/a" since no location mapping is configured
+  ASSERT_EQ("n/a", doc[1]["labels"]["location"]);
+  // Check that the target address is the tserver's HTTP address
+  ASSERT_STR_CONTAINS(doc[1]["targets"][0].GetString(), "localhost:2000");
+
+  // Both groups should have the same cluster_id
+  ASSERT_EQ(string(doc[0]["labels"]["cluster_id"].GetString()),
+            string(doc[1]["labels"]["cluster_id"].GetString()));
+}
+
+// Test that the Prometheus service discovery endpoint correctly includes location
+// information for masters and tablet servers when location mapping is configured and enabled.
+TEST_F(MasterTest, TestPrometheusServiceDiscoveryWithLocation) {
+  const string kLocationScript =
+      JoinPathSegments(GetTestExecutableDirectory(), "testdata/assign-location.py");
+  FLAGS_location_mapping_cmd = Substitute("$0 --map /rack1:1 --map /rack2:1", kLocationScript);
+
+  // Restart master to enable location mapping
+  mini_master_->Shutdown();
+  ASSERT_OK(mini_master_->Restart());
+
+  ASSERT_OK(RegisterFakeTabletServer("ts-rack1", "test-host1", 1000, 2000));
+  ASSERT_OK(RegisterFakeTabletServer("ts-rack2", "test-host2", 1001, 2001));
+
+  Document doc;
+  ASSERT_OK(FetchPrometheusSDResponse(&doc));
+
+  // Should have 3 target groups: 1 for masters (location "n/a"),
+  // 2 for tablet servers.
+  ASSERT_EQ(3, doc.Size());
+
+  ASSERT_EQ("masters", doc[0]["labels"]["group"]);
+  ASSERT_EQ("http", doc[0]["labels"]["__scheme__"]);
+  // Masters should have location "n/a" since location mapping is not implemented for masters
+  ASSERT_EQ("n/a", doc[0]["labels"]["location"]);
+
+  // Next two should be tablet servers with different locations
+  // Order might vary, so we need to find them by location
+  bool found_rack1 = false;
+  bool found_rack2 = false;
+
+  for (int i = 1; i < 3; i++) {
+    ASSERT_EQ("tservers", doc[i]["labels"]["group"]);
+    ASSERT_TRUE(doc[i]["labels"].HasMember("location"));
+    ASSERT_EQ("http", doc[i]["labels"]["__scheme__"]);
+
+    string location = doc[i]["labels"]["location"].GetString();
+    if (location == "/rack1") {
+      found_rack1 = true;
+      ASSERT_STR_CONTAINS(doc[i]["targets"][0].GetString(), "test-host1:2000");
+    } else if (location == "/rack2") {
+      found_rack2 = true;
+      ASSERT_STR_CONTAINS(doc[i]["targets"][0].GetString(), "test-host2:2001");
+    } else {
+      FAIL() << "Unexpected location: " << location;
+    }
+  }
+
+  ASSERT_TRUE(found_rack1) << "Did not find tablet server in /rack1";
+  ASSERT_TRUE(found_rack2) << "Did not find tablet server in /rack2";
+}
+
+// Test that the Prometheus service discovery endpoint returns HTTP 503 Service Unavailable
+// when the catalog manager is not ready.
+TEST_F(MasterTest, PrometheusServiceDiscoveryWhenCatalogManagerNotReady) {
+  const string addr =
+      Substitute("http://$0/prometheus-sd", mini_master_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+
+  {
+    ASSERT_OK(c.FetchURL(addr, &buf));
+    ASSERT_STR_CONTAINS(buf.ToString(), "masters");
+    ASSERT_STR_CONTAINS(buf.ToString(), "targets");
+  }
+
+  {
+    CatalogManager::ScopedCatalogManagerNotReadyForTests disabler(master_->catalog_manager());
+
+    Status s = c.FetchURL(addr, &buf);
+    // This should return HTTP 503 Service Unavailable due to catalog manager not being ready
+    ASSERT_TRUE(s.ToString().find("HTTP 503") != string::npos)
+        << "Expected HTTP 503 Service Unavailable, got: " << s.ToString();
+  }
+
+  {
+    ASSERT_OK(c.FetchURL(addr, &buf));
+    ASSERT_STR_CONTAINS(buf.ToString(), "masters");
+    ASSERT_STR_CONTAINS(buf.ToString(), "targets");
+  }
+}
+
+// Test that the Prometheus service discovery endpoint behaves correctly when master
+// is not the leader (returns empty array) vs when it is the leader (returns data).
+TEST_F(MasterTest, PrometheusServiceDiscoveryLeaderVsFollower) {
+  const string addr =
+      Substitute("http://$0/prometheus-sd", mini_master_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+
+  {
+    ASSERT_OK(c.FetchURL(addr, &buf));
+    ASSERT_STR_CONTAINS(buf.ToString(), "masters");
+    ASSERT_STR_CONTAINS(buf.ToString(), "targets");
+  }
+
+  {
+    CatalogManager::ScopedLeaderDisablerForTests disabler(master_->catalog_manager());
+
+    ASSERT_OK(c.FetchURL(addr, &buf));
+    ASSERT_EQ("[]", buf.ToString());
+  }
+
+  {
+    ASSERT_OK(c.FetchURL(addr, &buf));
+    ASSERT_STR_CONTAINS(buf.ToString(), "masters");
+    ASSERT_STR_CONTAINS(buf.ToString(), "targets");
+  }
+}
+
+class MultiMasterPrometheusSDTest : public KuduTest {
+ public:
+  void SetUp() override {
+    KuduTest::SetUp();
+
+    InternalMiniClusterOptions opts;
+    opts.num_masters = 3;
+    cluster_.reset(new InternalMiniCluster(env_, opts));
+    ASSERT_OK(cluster_->Start());
+  }
+
+  void TearDown() override {
+    if (cluster_) {
+      cluster_->Shutdown();
+    }
+    KuduTest::TearDown();
+  }
+
+ protected:
+  unique_ptr<InternalMiniCluster> cluster_;
+};
+
+// Test that the Prometheus service discovery endpoint returns non-empty response
+// from the leader master and empty responses from follower masters in a
+// multi-master setup.
+TEST_F(MultiMasterPrometheusSDTest, LeaderVsFollowerResponses) {
+  EasyCurl c;
+  faststring buf;
+
+  int leader_idx = -1;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+
+  for (int i = 0; i < cluster_->num_masters(); i++) {
+    const string addr = Substitute("http://$0/prometheus-sd",
+                                   cluster_->mini_master(i)->bound_http_addr().ToString());
+
+    ASSERT_OK(c.FetchURL(addr, &buf));
+    const string response = buf.ToString();
+
+    if (i == leader_idx) {
+      // Leader master should return non-empty response with service discovery data
+      ASSERT_NE("[]", response) << "Leader master " << i << " returned empty response";
+      ASSERT_STR_CONTAINS(response, "masters");
+      ASSERT_STR_CONTAINS(response, "targets");
+    } else {
+      // Follower masters should return empty array
+      ASSERT_EQ("[]", response) << "Follower master " << i << " returned non-empty response";
+    }
   }
 }
 

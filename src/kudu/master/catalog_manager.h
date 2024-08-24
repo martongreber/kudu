@@ -994,6 +994,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   FRIEND_TEST(MasterTest, TestShutdownDuringTableVisit);
   FRIEND_TEST(MasterTest, TestGetTableLocationsDuringRepeatedTableVisit);
   FRIEND_TEST(kudu::AuthzTokenTest, TestSingleMasterUnavailable);
+  // This test uses ScopedCatalogManagerNotReadyForTests.
+  FRIEND_TEST(MasterTest, PrometheusServiceDiscoveryWhenCatalogManagerNotReady);
 
   // This test calls VisitTablesAndTablets() directly.
   FRIEND_TEST(kudu::CreateTableStressTest, TestConcurrentCreateTableAndReloadMetadata);
@@ -1458,6 +1460,29 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   };
 
   static const char* StateToString(State state);
+
+  // Temporarily makes the catalog manager appear "not ready" by changing its
+  // state. Only for tests!
+  class ScopedCatalogManagerNotReadyForTests {
+   public:
+    explicit ScopedCatalogManagerNotReadyForTests(CatalogManager* catalog)
+        : catalog_(catalog) {
+      std::lock_guard l(catalog_->state_lock_);
+      old_state_ = catalog_->state_;
+      catalog_->state_ = kStarting;
+    }
+
+    virtual ~ScopedCatalogManagerNotReadyForTests() {
+      std::lock_guard l(catalog_->state_lock_);
+      catalog_->state_ = old_state_;
+    }
+
+   private:
+    CatalogManager* catalog_;
+    State old_state_;
+
+    DISALLOW_COPY_AND_ASSIGN(ScopedCatalogManagerNotReadyForTests);
+  };
 
   // Lock protecting state_, leader_ready_term_
   mutable simple_spinlock state_lock_;

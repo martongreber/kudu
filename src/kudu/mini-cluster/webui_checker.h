@@ -42,6 +42,7 @@ class PeriodicWebUIChecker {
                            "/masters",
                            "/mem-trackers",
                            "/metrics",
+                           "/prometheus-sd",
                            "/stacks",
                            "/startup",
                            "/tables",

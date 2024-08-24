@@ -46,10 +46,10 @@ struct MiniPrometheusOptions {
   std::string metrics_path = "/metrics_prometheus";
 
   // How frequently Prometheus scrapes discovered targets.
-  std::string scrape_interval = "1s";
+  std::string scrape_interval = "2s";
 
   // How frequently Prometheus refreshes the HTTP SD target lists.
-  std::string sd_refresh_interval = "1s";
+  std::string sd_refresh_interval = "2s";
 };
 
 class MiniPrometheus {

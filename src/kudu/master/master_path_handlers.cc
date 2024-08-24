@@ -872,6 +872,92 @@ void MasterPathHandlers::HandleDumpEntities(const Webserver::WebRequest& /*req*/
   jw.EndObject();
 }
 
+void MasterPathHandlers::HandlePrometheusServiceDiscovery(const Webserver::WebRequest& /*req*/,
+                                                          Webserver::PrerenderedWebResponse* resp) {
+  ostringstream* output = &resp->output;
+  if (!master_->catalog_manager()->IsInitialized()) {
+    Status s = Status::ServiceUnavailable("CatalogManager is not running");
+    JsonError(s, output);
+    LOG(WARNING) << s.ToString();
+    return;
+  }
+
+  // Collect master addresses
+  vector<ServerEntryPB> masters;
+  auto s = master_->ListMasters(&masters, /*use_external_addr=*/false);
+  if (PREDICT_FALSE(!s.ok())) {
+    JsonError(s, output);
+    LOG(WARNING) << s.ToString();
+    return;
+  }
+  vector<string> master_addresses;
+  for (const auto& master : masters) {
+    for (const HostPortPB& host_port : master.registration().http_addresses()) {
+      master_addresses.push_back(Substitute("$0:$1", host_port.host(), host_port.port()));
+    }
+  }
+
+  // Collect tserver addresses
+  vector<shared_ptr<TSDescriptor>> descs;
+  master_->ts_manager()->GetAllDescriptors(&descs);
+
+  vector<string> tserver_addresses;
+  for (const auto& desc : descs) {
+    ServerRegistrationPB reg;
+    if (auto s = desc->GetRegistration(&reg); PREDICT_FALSE(!s.ok())) {
+      LOG(WARNING) << s.ToString();
+      continue;
+    }
+    if (!reg.http_addresses().empty()) {
+      tserver_addresses.push_back(
+          Substitute("$0:$1", reg.http_addresses(0).host(), reg.http_addresses(0).port()));
+    }
+  }
+
+  // Create Prometheus service discovery JSON.
+  // The format definition can be found on the Prometheus website:
+  // https://prometheus.io/docs/prometheus/latest/http_sd/#http_sd-format
+
+  JsonWriter jw(output, JsonWriter::COMPACT);
+  JsonDumper d(&jw);
+
+  jw.StartArray();
+
+  jw.StartObject();
+  jw.String("targets");
+  jw.StartArray();
+  for (const auto& master_address : master_addresses) {
+    jw.String(master_address);
+  }
+  jw.EndArray();
+  jw.String("labels");
+  jw.StartObject();
+  jw.String("job");
+  jw.String("Kudu");
+  jw.String("group");
+  jw.String("masters");
+  jw.EndObject();
+  jw.EndObject();
+
+  jw.StartObject();
+  jw.String("targets");
+  jw.StartArray();
+  for (const auto& tserver_address : tserver_addresses) {
+    jw.String(tserver_address);
+  }
+  jw.EndArray();
+  jw.String("labels");
+  jw.StartObject();
+  jw.String("job");
+  jw.String("Kudu");
+  jw.String("group");
+  jw.String("tservers");
+  jw.EndObject();
+  jw.EndObject();
+
+  jw.EndArray();
+}
+
 Status MasterPathHandlers::Register(Webserver* server) {
   constexpr const bool is_on_nav_bar = true;
   server->RegisterPathHandler(
@@ -919,6 +1005,12 @@ Status MasterPathHandlers::Register(Webserver* server) {
       "/dump-entities", "Dump Entities",
       [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
         this->HandleDumpEntities(req, resp);
+      },
+      false /*is_on_nav_bar*/);
+  server->RegisterJsonPathHandler(
+      "/prometheus-sd", "Prometheus SD",
+      [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+        this->HandlePrometheusServiceDiscovery(req, resp);
       },
       false /*is_on_nav_bar*/);
   return Status::OK();

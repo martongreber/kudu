@@ -3904,5 +3904,51 @@ TEST_F(MasterTest, PrometheusMetricsLevelFiltering) {
   }
 }
 
+TEST_F(MasterTest, TestPrometheusServiceDiscoveryEndpoint) {
+
+  // Register fake TS.
+  {
+    const char* const kTsUUID = "my-ts-uuid";
+
+    TSToMasterCommonPB common;
+    common.mutable_ts_instance()->set_permanent_uuid(kTsUUID);
+    common.mutable_ts_instance()->set_instance_seqno(1);
+
+    ServerRegistrationPB fake_reg;
+    MakeHostPortPB("localhost", 1000, fake_reg.add_rpc_addresses());
+    MakeHostPortPB("localhost", 2000, fake_reg.add_http_addresses());
+    fake_reg.set_software_version(VersionInfo::GetVersionInfo());
+    fake_reg.set_start_time(10000);
+
+    ReplicaManagementInfoPB rmi;
+    rmi.set_replacement_scheme(ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION);
+
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  EasyCurl c;
+  faststring buf;
+  string addr = Substitute("http://$0", mini_master_->bound_http_addr().ToString());
+  ASSERT_OK(c.FetchURL(Substitute("$0/prometheus-sd", addr), &buf));
+  rapidjson::Document doc;
+  doc.Parse<0>(buf.ToString().c_str());
+
+  ASSERT_EQ(2, doc.Size());
+  ASSERT_EQ(1, doc[0]["targets"].Size());
+  ASSERT_EQ("Kudu", doc[0]["labels"]["job"]);
+  ASSERT_EQ("masters", doc[0]["labels"]["group"]);
+
+  ASSERT_EQ(1, doc[1]["targets"].Size());
+  ASSERT_EQ("Kudu", doc[1]["labels"]["job"]);
+  ASSERT_EQ("tservers", doc[1]["labels"]["group"]);
+}
+
 } // namespace master
 } // namespace kudu

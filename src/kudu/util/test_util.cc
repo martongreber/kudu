@@ -719,7 +719,8 @@ const unordered_map<string, string>& GetMasterWebserverEndpoints(const string& t
       {"ipki-ca-cert", kContentTypeTextPlain},
       {"ipki-ca-cert-pem", kContentTypeTextPlain},
       {"ipki-ca-cert-der", kContentTypeApplicationOctet},
-      {"dump-entities", kContentTypeApplicationJson}};
+      {"dump-entities", kContentTypeApplicationJson},
+      {"prometheus-sd", kContentTypeApplicationJson}};
   return master_endpoints;
 }
 

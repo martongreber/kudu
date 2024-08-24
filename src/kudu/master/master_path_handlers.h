@@ -57,6 +57,8 @@ class MasterPathHandlers {
                         Webserver::PrerenderedWebResponse* resp);
   void HandleDumpEntities(const Webserver::WebRequest& req,
                           Webserver::PrerenderedWebResponse* resp);
+  void HandlePrometheusServiceDiscovery(const Webserver::WebRequest& req,
+                                        Webserver::PrerenderedWebResponse* resp);
 
   // Returns a pair (text, target) given a tserver's TSDescriptor and a tablet id.
   // - text is the http host and port for the tserver, if available, or the tserver's uuid.

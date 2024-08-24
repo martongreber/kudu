@@ -645,6 +645,33 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
     DISALLOW_COPY_AND_ASSIGN(ScopedLeaderDisablerForTests);
   };
 
+  // Temporarily makes the catalog manager appear "not ready" by changing its state. Only for tests!
+  class ScopedCatalogManagerNotReadyForTests {
+   public:
+    explicit ScopedCatalogManagerNotReadyForTests(CatalogManager* catalog)
+        : catalog_(catalog) {
+      std::lock_guard l(catalog_->state_lock_);
+      old_state_ = static_cast<int>(catalog_->state_);
+      // Set to kStarting (value 1) to make catalog manager appear not ready
+      catalog_->state_ = static_cast<State>(1);
+    }
+
+    virtual ~ScopedCatalogManagerNotReadyForTests() {
+      std::lock_guard l(catalog_->state_lock_);
+      // Restore the original state using static_cast back to State enum
+      catalog_->state_ = static_cast<State>(old_state_);
+    }
+
+   private:
+    CatalogManager* catalog_;
+    // Store as int since we can't access private State enum
+    int old_state_;
+
+    DISALLOW_COPY_AND_ASSIGN(ScopedCatalogManagerNotReadyForTests);
+  };
+
+
+
   explicit CatalogManager(Master *master);
   virtual ~CatalogManager();
 

@@ -58,6 +58,7 @@ class PeriodicWebUIChecker {
                            "/tablets",
                            "/threadz",
                            "/threadz?group=all",
+                           "/prometheus-sd"
                        });
 
   ~PeriodicWebUIChecker();

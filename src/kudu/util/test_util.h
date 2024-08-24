@@ -31,7 +31,6 @@
 
 #include <gtest/gtest.h>
 
-#include "kudu/gutil/port.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 

@@ -28,7 +28,7 @@
   <name>Kudu Java Client Examples</name>
 
   <properties>
-    <kudu-version>1.17.0</kudu-version>
+    <kudu-version>1.18.0-SNAPSHOT</kudu-version>
   </properties>
 
   <build>
@@ -94,13 +94,13 @@
       <scope>test</scope>
     </dependency>
 
-    <dependency>
+    <!-- <dependency>
       <groupId>org.apache.kudu</groupId>
       <artifactId>kudu-binary</artifactId>
       <version>${kudu-version}</version>
       <scope>test</scope>
       <classifier>${os.detected.classifier}</classifier>
-    </dependency>
+    </dependency> -->
 
     <dependency>
       <groupId>junit</groupId>

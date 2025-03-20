@@ -45,17 +45,47 @@
     return;                                                       \
   }
 
+using kudu::consensus::RaftPeerPB;
 using google::protobuf::util::JsonParseOptions;
 using google::protobuf::util::JsonStringToMessage;
 using std::optional;
 using std::ostringstream;
 using std::string;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
 namespace master {
 
 RestCatalogPathHandlers::~RestCatalogPathHandlers() {}
+
+
+// TODO: i've just copied this from master pathhandlers, need to think about code duplication.
+Status RestCatalogPathHandlers::GetLeaderMasterHttpAddr(string* leader_http_addr) const {
+  // TODO(aserbin): update this to work with proxied RPCs
+  vector<ServerEntryPB> masters;
+  RETURN_NOT_OK_PREPEND(master_->ListMasters(&masters,
+                                             /*use_external_addr=*/false),
+                        "unable to list masters");
+  for (const auto& master : masters) {
+    if (master.has_error()) {
+      continue;
+    }
+    if (master.role() != RaftPeerPB::LEADER) {
+      continue;
+    }
+    const ServerRegistrationPB& reg = master.registration();
+    if (reg.http_addresses().empty()) {
+      return Status::NotFound("leader master has no http address");
+    }
+    *leader_http_addr = Substitute("$0://$1:$2",
+                                   reg.https_enabled() ? "https" : "http",
+                                   reg.http_addresses(0).host(),
+                                   reg.http_addresses(0).port());
+    return Status::OK();
+  }
+  return Status::NotFound("no leader master known to this master");
+}
 
 void RestCatalogPathHandlers::HandleApiTableEndpoint(const Webserver::WebRequest& req,
                                                      Webserver::PrerenderedWebResponse* resp) {
@@ -94,8 +124,26 @@ void RestCatalogPathHandlers::HandleApiTablesEndpoint(const Webserver::WebReques
                                                       Webserver::PrerenderedWebResponse* resp) {
   ostringstream* output = &resp->output;
 
+
   if (req.request_method == "GET") {
     CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+
+    // TODO: just copy pasted it here.
+    // Probably best to figure out a clever way to add this to all the places
+    // sidenote, since we need the path here, and we know the branches of the implemented functions
+    // we might also think about the swagger generation as we have all the info here.
+    if (!l.leader_status().ok()) {
+      // request came to a non-leader master
+      // respond 307 reason: preserves request method
+      resp->status_code = HttpStatusCode::TemporaryRedirect;
+      // fill in 'Location' header with the same path but with the leader master host:port.
+      string leader_http_addr;
+      Status s = GetLeaderMasterHttpAddr(&leader_http_addr);
+      resp->response_headers["Location"] = Substitute("$0/$1", leader_http_addr, "/api/v1/tables");
+
+      return;
+    }
+
     HandleGetTables(output, req, &resp->status_code);
   } else if (req.request_method == "POST") {
     CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());

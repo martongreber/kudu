@@ -65,7 +65,7 @@ class RestCatalogPathHandlers {
 
   // Print a JSON object representing a table to 'output'.
   void PrintTableObject(std::ostringstream* output, const std::string& table_id);
-
+  Status GetLeaderMasterHttpAddr(std::string* leader_http_addr) const;
   Master* master_;
   DISALLOW_COPY_AND_ASSIGN(RestCatalogPathHandlers);
 };

@@ -138,6 +138,9 @@ EasyCurl::EasyCurl()
   static_assert(kErrBufSize >= CURL_ERROR_SIZE, "kErrBufSize is too small");
   const auto code = curl_easy_setopt(curl_, CURLOPT_ERRORBUFFER, errbuf_);
   CHECK_EQ(CURLE_OK, code);
+  // TODO create proper setter for this
+  const auto code2 = curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L);  // Follow redirects (-L equivalent)
+  CHECK_EQ(CURLE_OK, code2);
 }
 
 EasyCurl::~EasyCurl() {

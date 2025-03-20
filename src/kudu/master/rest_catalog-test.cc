@@ -526,5 +526,78 @@ TEST_F(RestCatalogTest, TestPutTableEndpointChangeOwner) {
   ASSERT_EQ(table->owner(), "new_owner");
 }
 
+class RestCatalogMultiMasterTest : public RestCatalogTestBase {
+  public:
+   void SetUp() override {
+     KuduTest::SetUp();
+     // Set REST endpoint flag to true
+     FLAGS_enable_rest_api = true;
+
+    InternalMiniClusterOptions opts_ = InternalMiniClusterOptions();
+    opts_.num_masters = 3;
+     // Configure the mini-cluster
+     cluster_.reset(new InternalMiniCluster(env_, opts_));
+ 
+     // Start the cluster
+     ASSERT_OK(cluster_->Start());
+    KuduClientBuilder client_builder;
+    ASSERT_OK(cluster_->CreateClient(&client_builder, &client_));
+
+   }
+ 
+   static int FindColumnId(string const &schema_json) {
+     vector<string> matches;
+     static KuduRegex re("\\{\"id\":([0-9]+),\"name\":\"key\"", 1);
+     if (!re.Match(schema_json, &matches)) {
+       return -1;
+     }
+     return std::stoi(matches[0]);
+   }
+ 
+   static string ConstructTableSchema(int column_id, bool is_there_new_column = false) {
+     string columns = Substitute(
+         "{\"id\":$0,\"name\":\"key\",\"type\":\"INT32\",\"is_key\":"
+         "true,\"is_nullable\":false,\"encoding\":\"AUTO_ENCODING\",\"compression\":"
+         "\"DEFAULT_COMPRESSION\",\"cfile_block_size\":0,\"immutable\":false},{\"id\":"
+         "$1,\"name\":\"int_val\",\"type\":\"INT32\",\"is_key\":false,\"is_nullable\":"
+         "false,\"encoding\":\"AUTO_ENCODING\",\"compression\":\"DEFAULT_COMPRESSION\","
+         "\"cfile_block_size\":0,\"immutable\":false}",
+         column_id,
+         column_id + 1);
+     if (is_there_new_column) {
+       string column_id_2_str = std::to_string(column_id + 2);
+       string new_column = Substitute(
+           ",{\"id\":$0,\"name\":\"new_column\",\"type\":\"STRING\",\"is_key\":false,"
+           "\"is_nullable\":true,\"encoding\":\"AUTO_ENCODING\",\"compression\":"
+           "\"DEFAULT_COMPRESSION\",\"cfile_block_size\":0,\"immutable\":false}",
+           column_id_2_str);
+       columns += new_column;
+     }
+     return Substitute("{\"columns\":[$0]}", columns);
+   }
+ 
+  protected:
+   unique_ptr<InternalMiniCluster> cluster_;
+   const std::string kTablePartitionSchema = "{\"range_schema\":{\"columns\":[{\"id\":10}]}}";
+   const std::string kTablePartitionSchemaColumnIdZero =
+       "{\"range_schema\":{\"columns\":[{\"id\":0}]}}";
+ };
+
+ TEST_F(RestCatalogMultiMasterTest, TestGetTablesOneTable) {
+  ASSERT_OK(CreateTestTable());
+  for (int i = 0; i < cluster_->num_masters(); i++) {
+    EasyCurl c;
+    c.set_verbose(true);
+    faststring buf;
+    ASSERT_OK(c.FetchURL(
+        Substitute("http://$0/api/v1/tables", cluster_->mini_master(i)->bound_http_addr().ToString()),
+        &buf));
+    string table_id = GetTableId("test_table");
+    ASSERT_STR_CONTAINS(
+        buf.ToString(),
+        Substitute("{\"tables\":[{\"table_id\":\"$0\",\"table_name\":\"test_table\"}]}", table_id));
+  }
+}
+
 }  // namespace master
 }  // namespace kudu

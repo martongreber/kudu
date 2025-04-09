@@ -71,13 +71,13 @@ class SpnegoRestCatalogTest : public RestCatalogTestBase {
 
     auto opts = InternalMiniClusterOptions();
     opts.bind_mode = BindMode::LOOPBACK;
+    opts.num_masters = 3;
 
     cluster_.reset(new InternalMiniCluster(env_, opts));
 
     ASSERT_OK(cluster_->Start());
-    ASSERT_OK(KuduClientBuilder()
-                  .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr().ToString())
-                  .Build(&client_));
+    KuduClientBuilder client_builder;
+    ASSERT_OK(cluster_->CreateClient(&client_builder, &client_));
   }
 
  protected:
@@ -86,6 +86,27 @@ class SpnegoRestCatalogTest : public RestCatalogTestBase {
 
   Status CreateTestTableAsAlice() { return CreateTestTable("alice@KRBTEST.COM"); }
 };
+
+
+TEST_F(SpnegoRestCatalogTest, TestGetTablesOneTableMultiMaster) {
+  ASSERT_OK(kdc_->Kinit("alice"));
+  ASSERT_OK(CreateTestTableAsAlice());
+  EasyCurl c;
+  faststring buf;
+  c.set_auth(CurlAuthType::SPNEGO);
+  for (int i = 0; i < cluster_->num_masters(); i++) {
+    EasyCurl c;
+    c.set_verbose(true);
+    faststring buf;
+    ASSERT_OK(c.FetchURL(
+        Substitute("http://$0/api/v1/tables", cluster_->mini_master(i)->bound_http_addr().ToString()),
+        &buf));
+    string table_id = GetTableId("test_table");
+    ASSERT_STR_CONTAINS(
+        buf.ToString(),
+        Substitute("{\"tables\":[{\"table_id\":\"$0\",\"table_name\":\"test_table\"}]}", table_id));
+  }
+}
 
 TEST_F(SpnegoRestCatalogTest, TestGetTablesOneTable) {
   ASSERT_OK(kdc_->Kinit("alice"));

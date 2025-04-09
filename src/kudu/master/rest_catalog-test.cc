@@ -583,7 +583,7 @@ class RestCatalogMultiMasterTest : public RestCatalogTestBase {
        "{\"range_schema\":{\"columns\":[{\"id\":0}]}}";
  };
 
- TEST_F(RestCatalogMultiMasterTest, TestGetTablesOneTable) {
+ TEST_F(RestCatalogMultiMasterTest, TestGetTablesOneTableMultiMaster) {
   ASSERT_OK(CreateTestTable());
   for (int i = 0; i < cluster_->num_masters(); i++) {
     EasyCurl c;

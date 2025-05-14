@@ -23,6 +23,12 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
  */
 public class ReplicationEnvProvider {
 
+  private final ReplicationJobConfig jobConfig;
+
+  ReplicationEnvProvider(ReplicationJobConfig jobConfig) {
+    this.jobConfig = jobConfig;
+  }
+
   /**
    * Builds and configures the {@link StreamExecutionEnvironment} for the replication job.
    *

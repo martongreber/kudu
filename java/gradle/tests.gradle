@@ -96,3 +96,11 @@ tasks.withType(Test) {
     outputs.upToDateWhen { false }
   }
 }
+
+task coverageTest(type: Test) {
+    description = 'Runs tests for coverage collection with ignored failures'
+    group = 'verification'
+
+    // Ignore test failures to ensure coverage data is collected
+    ignoreFailures = true
+}

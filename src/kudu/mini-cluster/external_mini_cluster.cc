@@ -1473,18 +1473,46 @@ Status ExternalDaemon::CreateKerberosConfig(MiniKdc* kdc,
                                             const string& bind_host,
                                             vector<string>* flags,
                                             map<string, string>* env_vars) {
-  string spn = principal_base + "/" + bind_host;
-  string ktpath;
-  RETURN_NOT_OK_PREPEND(kdc->CreateServiceKeytab(spn, &ktpath),
-                        "could not create keytab");
-  *env_vars = kdc->GetEnvVars();
-  *flags =  {
-      Substitute("--keytab_file=$0", ktpath),
-      Substitute("--principal=$0", spn),
-      "--rpc_authentication=required",
-      "--superuser_acl=test-admin",
-      "--user_acl=test-user",
-  };
+  // ---------------------------------------------------------------------------
+  // 1. Create ONE keytab file that contains **both** the RPC (kudu/host)
+  //    and the HTTP (HTTP/host) service principals.  This mirrors production
+  //    where a single kudu.keytab holds both entries.
+  // ---------------------------------------------------------------------------
+  const string kt_name = principal_base;            // e.g. "kudu"
+  const string spn       = Substitute("$0/$1", principal_base, bind_host);
+  const string http_spn  = Substitute("HTTP/$0",    bind_host);
+  string kt_path;
+
+  // First create/add the RPC principal, which also creates the keytab file.
+  RETURN_NOT_OK_PREPEND(
+      kdc->CreateServiceKeytabWithName(spn, kt_name, &kt_path),
+      "could not create keytab with RPC principal");
+
+  // Add the HTTP principal into the *same* keytab file so the Web UI can
+  // authenticate via SPNEGO.
+  RETURN_NOT_OK_PREPEND(
+      kdc->CreateServiceKeytabWithName(http_spn, kt_name, &kt_path),
+      "could not add HTTP principal to keytab");
+
+  // ---------------------------------------------------------------------------
+  // 2. Propagate the KDC's environment variables (krb5.conf, kdc.conf, etc.).
+  // ---------------------------------------------------------------------------
+  const auto kdc_env = kdc->GetEnvVars();
+  env_vars->insert(kdc_env.begin(), kdc_env.end());
+
+  // ---------------------------------------------------------------------------
+  // 3. Append Kerberos‑related gflags so the daemon knows where to find the
+  //    credentials and what level of SASL protection to enforce.
+  // ---------------------------------------------------------------------------
+  flags->emplace_back(Substitute("--keytab_file=$0", kt_path));
+  flags->emplace_back(Substitute("--principal=$0",   spn));
+  flags->emplace_back("--rpc_authentication=required");
+  flags->emplace_back("--superuser_acl=test-admin");
+  flags->emplace_back("--user_acl=test-user");
+
+  // Enable SPNEGO on the Web UI and point it at the same keytab.
+  flags->emplace_back("--webserver_require_spnego=true");
+  flags->emplace_back(Substitute("--spnego_keytab_file=$0", kt_path));
 
   return Status::OK();
 }

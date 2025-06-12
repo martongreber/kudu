@@ -94,6 +94,7 @@ ADD_KUDU_TEST(log-rolling-itest)
 ADD_KUDU_TEST(maintenance_mode-itest NUM_SHARDS 8 PROCESSORS 4
   DATA_FILES ../scripts/assign-location.py)
 ADD_KUDU_TEST(master_authz-itest RUN_SERIAL true NUM_SHARDS 8 PROCESSORS 4)
+ADD_KUDU_TEST(spnego_webui-itest)
 ADD_KUDU_TEST(master_cert_authority-itest PROCESSORS 2)
 ADD_KUDU_TEST(master_failover-itest NUM_SHARDS 4 PROCESSORS 3)
 ADD_KUDU_TEST_DEPENDENCIES(master_failover-itest

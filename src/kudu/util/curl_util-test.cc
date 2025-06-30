@@ -38,7 +38,7 @@ TEST(CurlUtilTest, TestTimeout) {
   EasyCurl curl;
   faststring dst;
   curl.set_timeout(MonoDelta::FromMilliseconds(1));
-  Status s = curl.FetchURL("http://not_exist_host:12345", &dst);
+  Status s = curl.FetchURL("http://notexist.host:12345", &dst);
   ASSERT_TRUE(s.IsTimedOut());
 }
 

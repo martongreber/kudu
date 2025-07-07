@@ -1012,7 +1012,7 @@ Status MasterPathHandlers::Register(Webserver* server) {
       [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
         this->HandlePrometheusServiceDiscovery(req, resp);
       },
-      false /*is_on_nav_bar*/);
+      false /*is_on_nav_bar*/, true /*skip_auth*/);
   return Status::OK();
 }
 

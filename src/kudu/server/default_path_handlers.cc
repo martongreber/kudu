@@ -465,7 +465,8 @@ void AddPostInitializedDefaultPathHandlers(Webserver* webserver) {
                                             /*is_on_nav_bar*/false);
   webserver->RegisterPrerenderedPathHandler("/healthz", "Health", HealthHandler,
                                             StyleMode::UNSTYLED,
-                                            /*is_on_nav_bar=*/true);
+                                            /*is_on_nav_bar=*/true,
+                                            /*skip_auth=*/true);
   AddPprofPathHandlers(webserver);
 }
 

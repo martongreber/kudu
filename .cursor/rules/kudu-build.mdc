@@ -1,0 +1,27 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+this project is apache kudu
+the cpp part lives in src/kudu
+
+we buidl the project in the following part
+cd build/debug
+ninja
+
+if the cmake project is not initialized
+cd build/debug
+../../thirdparty/installed/common/bin/cmake -GNinja ../..
+ninja
+
+always ask if you need build help
+
+
+we also have a java project inside that is the kudu java client
+it is under java/
+java related questions would most likely target this folder.
+the java project is built as follows:
+cd java
+./gradlew assemble
+

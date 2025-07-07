@@ -737,6 +737,28 @@ TEST_F(AuthnWebserverTest, TestUnauthenticatedRequestWithoutClientAuth) {
   EXPECT_EQ("Must authenticate with SPNEGO.", buf_.ToString());
 }
 
+TEST_F(AuthnWebserverTest, TestSkipAuthEndpointBypassesSpnego) {
+  // Register a handler that skips authentication
+  server_->RegisterPrerenderedPathHandler(
+      "/skip-auth", "SkipAuthTest", Handler, StyleMode::UNSTYLED, false, true);
+  
+  // Without kinit, regular endpoints should fail
+  curl_.set_auth(CurlAuthType::SPNEGO);
+  Status s = curl_.FetchURL(Substitute("$0/authn", url_), &buf_);
+  EXPECT_EQ("Remote error: HTTP 401", s.ToString());
+  
+  // But skip-auth endpoints should succeed without authentication
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/skip-auth", url_), &buf_));
+  ASSERT_EQ(buf_.ToString(), "");  // Handler returns empty authenticated principal
+}
+
+TEST_F(AuthnWebserverTest, TestHealthzEndpointSkipsAuth) {
+  // The healthz endpoint should be accessible without authentication
+  // even when SPNEGO is enabled
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/healthz", url_), &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "OK");
+}
+
 #endif
 
 namespace {

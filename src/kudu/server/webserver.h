@@ -71,28 +71,34 @@ class Webserver : public WebCallbackRegistry {
   // If 'style_mode' is StyleMode::STYLED, the page will be styled and include a header and footer.
   // If 'is_on_nav_bar' is true, a link to the page will be placed on the navbar
   // in the header of styled pages. The link text is given by 'alias'.
+  // If 'skip_auth' is true, this endpoint will bypass SPNEGO authentication even when
+  // --webserver_require_spnego is enabled.
   void RegisterPathHandler(const std::string& path, const std::string& alias,
                            const PathHandlerCallback& callback,
-                           StyleMode style_mode, bool is_on_nav_bar) override;
+                           StyleMode style_mode, bool is_on_nav_bar,
+                           bool skip_auth = false) override;
 
   // Register a route 'path'. See the RegisterPathHandler for details.
   void RegisterPrerenderedPathHandler(const std::string& path, const std::string& alias,
                                       const PrerenderedPathHandlerCallback& callback,
                                       StyleMode style_mode,
-                                      bool is_on_nav_bar) override;
+                                      bool is_on_nav_bar,
+                                      bool skip_auth = false) override;
 
   // Register route 'path' for application/octet-stream (binary data) responses.
   void RegisterBinaryDataPathHandler(
       const std::string& path,
       const std::string& alias,
-      const PrerenderedPathHandlerCallback& callback) override;
+      const PrerenderedPathHandlerCallback& callback,
+      bool skip_auth = false) override;
 
   // Register route 'path' for application/json responses.
   void RegisterJsonPathHandler(
       const std::string& path,
       const std::string& alias,
       const PrerenderedPathHandlerCallback& callback,
-      bool is_on_nav_bar) override;
+      bool is_on_nav_bar,
+      bool skip_auth = false) override;
 
   // Change the footer HTML to be displayed at the bottom of all styled web pages.
   void set_footer_html(const std::string& html);
@@ -114,16 +120,18 @@ class Webserver : public WebCallbackRegistry {
   class PathHandler {
    public:
     PathHandler(StyleMode style_mode, bool is_on_nav_bar, std::string alias,
-                PrerenderedPathHandlerCallback callback)
+                PrerenderedPathHandlerCallback callback, bool skip_auth = false)
         : style_mode_(style_mode),
           is_on_nav_bar_(is_on_nav_bar),
           alias_(std::move(alias)),
-          callback_(std::move(callback)) {}
+          callback_(std::move(callback)),
+          skip_auth_(skip_auth) {}
 
     StyleMode style_mode() const { return style_mode_; }
     bool is_on_nav_bar() const { return is_on_nav_bar_; }
     const std::string& alias() const { return alias_; }
     const PrerenderedPathHandlerCallback& callback() const { return callback_; }
+    bool skip_auth() const { return skip_auth_; }
 
    private:
     // The style mode controls how the page is rendered, and what content-type header is used.
@@ -137,6 +145,10 @@ class Webserver : public WebCallbackRegistry {
 
     // Callback to render output for this page.
     PrerenderedPathHandlerCallback callback_;
+
+    // If true, this endpoint will bypass SPNEGO authentication even when
+    // --webserver_require_spnego is enabled.
+    const bool skip_auth_;
   };
 
   // Add any necessary Knox-related variables to 'json' based on the headers in 'args'.

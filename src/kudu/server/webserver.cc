@@ -561,52 +561,13 @@ sq_callback_result_t Webserver::BeginRequestCallback(
     return SQ_CONTINUE_HANDLING;
   }
 
-  // The last SPNEGO step in a successful authentication may include a response
-  // header (e.g. when using mutual authentication).
-  PrerenderedWebResponse resp;
-  if (opts_.require_spnego) {
-    const char* authz_header = sq_get_header(connection, "Authorization");
-    string authn_princ;
-    Status s = RunSpnegoStep(authz_header, &resp.response_headers, &authn_princ);
-    if (s.IsIncomplete()) {
-      resp.output << "Must authenticate with SPNEGO.";
-      resp.status_code = HttpStatusCode::AuthenticationRequired;
-      SendResponse(connection, &resp);
-      return SQ_HANDLED_OK;
-    }
-    if (s.ok() && authn_princ.empty()) {
-      s = Status::RuntimeError("SPNEGO indicated complete, but got empty principal");
-      // Crash in debug builds, but fall through to treating as an error 500 in
-      // release.
-      LOG(DFATAL) << "Got no authenticated principal for SPNEGO-authenticated "
-                  << " connection from "
-                  << GetRemoteAddress(request_info).ToString()
-                  << ": " << s.ToString();
-    }
-    if (!s.ok()) {
-      LOG(WARNING) << "Failed to authenticate request from "
-                   << GetRemoteAddress(request_info).ToString()
-                   << " via SPNEGO: " << s.ToString();
-      resp.output << s.ToString();
-      resp.status_code = s.IsNotAuthorized() ?
-                           HttpStatusCode::AuthenticationRequired :
-                           HttpStatusCode::InternalServerError;
-      SendResponse(connection, &resp);
-      return SQ_HANDLED_OK;
-    }
-
-    if (opts_.spnego_post_authn_callback) {
-      opts_.spnego_post_authn_callback(authn_princ);
-    }
-
-    request_info->remote_user = strdup(authn_princ.c_str());
-  }
-
+  // Find the handler first to check if it has skip_auth enabled
   PathHandler* handler = nullptr;
   std::unordered_map<std::string, std::string> path_params;
   {
     bool has_non_ascii = ContainsNonAscii(request_info->uri);
     if (has_non_ascii) {
+      PrerenderedWebResponse resp;
       resp.output << "Path contains non-ASCII characters";
       resp.status_code = HttpStatusCode::BadRequest;
       SendResponse(connection, &resp);
@@ -618,6 +579,7 @@ sq_callback_result_t Webserver::BeginRequestCallback(
     if (it == path_handlers_.end()) {
       std::vector<std::string> uri_segments = SplitPath(request_info->uri);
       if (uri_segments.empty()) {
+        PrerenderedWebResponse resp;
         resp.output << "Invalid path";
         resp.status_code = HttpStatusCode::BadRequest;
         SendResponse(connection, &resp);
@@ -656,6 +618,7 @@ sq_callback_result_t Webserver::BeginRequestCallback(
           // authentication response header here?
           return SQ_CONTINUE_HANDLING;
         }
+        PrerenderedWebResponse resp;
         resp.output << Substitute("No handler for URI $0\r\n\r\n", request_info->uri);
         resp.status_code = HttpStatusCode::NotFound;
         SendResponse(connection, &resp);
@@ -664,6 +627,48 @@ sq_callback_result_t Webserver::BeginRequestCallback(
     } else {
       handler = it->second;
     }
+  }
+
+  // The last SPNEGO step in a successful authentication may include a response
+  // header (e.g. when using mutual authentication).
+  PrerenderedWebResponse resp;
+  // Check if SPNEGO is required and if this handler doesn't skip authentication
+  if (opts_.require_spnego && !handler->skip_auth()) {
+    const char* authz_header = sq_get_header(connection, "Authorization");
+    string authn_princ;
+    Status s = RunSpnegoStep(authz_header, &resp.response_headers, &authn_princ);
+    if (s.IsIncomplete()) {
+      resp.output << "Must authenticate with SPNEGO.";
+      resp.status_code = HttpStatusCode::AuthenticationRequired;
+      SendResponse(connection, &resp);
+      return SQ_HANDLED_OK;
+    }
+    if (s.ok() && authn_princ.empty()) {
+      s = Status::RuntimeError("SPNEGO indicated complete, but got empty principal");
+      // Crash in debug builds, but fall through to treating as an error 500 in
+      // release.
+      LOG(DFATAL) << "Got no authenticated principal for SPNEGO-authenticated "
+                  << " connection from "
+                  << GetRemoteAddress(request_info).ToString()
+                  << ": " << s.ToString();
+    }
+    if (!s.ok()) {
+      LOG(WARNING) << "Failed to authenticate request from "
+                   << GetRemoteAddress(request_info).ToString()
+                   << " via SPNEGO: " << s.ToString();
+      resp.output << s.ToString();
+      resp.status_code = s.IsNotAuthorized() ?
+                           HttpStatusCode::AuthenticationRequired :
+                           HttpStatusCode::InternalServerError;
+      SendResponse(connection, &resp);
+      return SQ_HANDLED_OK;
+    }
+
+    if (opts_.spnego_post_authn_callback) {
+      opts_.spnego_post_authn_callback(authn_princ);
+    }
+
+    request_info->remote_user = strdup(authn_princ.c_str());
   }
 
   return RunPathHandler(*handler, connection, request_info, &resp, path_params);
@@ -925,7 +930,8 @@ string Webserver::MustachePartialTag(const string& path) {
 }
 
 void Webserver::RegisterPathHandler(const string& path, const string& alias,
-    const PathHandlerCallback& callback, StyleMode style_mode, bool is_on_nav_bar) {
+    const PathHandlerCallback& callback, StyleMode style_mode, bool is_on_nav_bar,
+    bool skip_auth) {
   string render_path = (path == "/") ? "/home" : path;
   auto wrapped_cb = [=](const WebRequest& req, PrerenderedWebResponse* rendered_resp) {
     WebResponse resp;
@@ -941,36 +947,41 @@ void Webserver::RegisterPathHandler(const string& path, const string& alias,
       rendered_resp->output.rdbuf()->swap(*out.rdbuf());
     }
   };
-  RegisterPrerenderedPathHandler(path, alias, wrapped_cb, style_mode, is_on_nav_bar);
+  RegisterPrerenderedPathHandler(path, alias, wrapped_cb, style_mode, is_on_nav_bar, skip_auth);
 }
 
 void Webserver::RegisterPrerenderedPathHandler(const string& path, const string& alias,
-    const PrerenderedPathHandlerCallback& callback, StyleMode style_mode, bool is_on_nav_bar) {
+    const PrerenderedPathHandlerCallback& callback, StyleMode style_mode, bool is_on_nav_bar,
+    bool skip_auth) {
   std::lock_guard l(lock_);
-  InsertOrDie(&path_handlers_, path, new PathHandler(style_mode, is_on_nav_bar, alias, callback));
+  InsertOrDie(&path_handlers_, path, new PathHandler(style_mode, is_on_nav_bar, alias, callback, skip_auth));
 }
 
 void Webserver::RegisterBinaryDataPathHandler(
     const string& path,
     const string& alias,
-    const PrerenderedPathHandlerCallback& callback) {
+    const PrerenderedPathHandlerCallback& callback,
+    bool skip_auth) {
   std::lock_guard l(lock_);
   InsertOrDie(&path_handlers_, path, new PathHandler(StyleMode::BINARY,
                                                      false /*is_on_nav_bar*/,
                                                      alias,
-                                                     callback));
+                                                     callback,
+                                                     skip_auth));
 }
 
 void Webserver::RegisterJsonPathHandler(
     const string& path,
     const string& alias,
     const PrerenderedPathHandlerCallback& callback,
-    bool is_on_nav_bar) {
+    bool is_on_nav_bar,
+    bool skip_auth) {
   std::lock_guard l(lock_);
   InsertOrDie(&path_handlers_, path, new PathHandler(StyleMode::JSON,
                                                      is_on_nav_bar,
                                                      alias,
-                                                     callback));
+                                                     callback,
+                                                     skip_auth));
 }
 
 bool Webserver::MustacheTemplateAvailable(const string& path) const {

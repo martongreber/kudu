@@ -128,43 +128,39 @@ class WebCallbackRegistry {
 
   virtual ~WebCallbackRegistry() = default;
 
-  // Register a callback for a URL path. Path should not include the
-  // http://hostname/ prefix. If style_mode is StyleMode::STYLED, the page is meant to be for
-  // people to look at and is styled.  If false, it is meant to be for machines to
-  // scrape.  If is_on_nav_bar is true,  a link to this page is
-  // printed in the navigation bar at the top of each debug page. Otherwise the
-  // link does not appear, and the page is rendered without HTML headers and
-  // footers.
-  // The first registration's choice of style_mode overrides all
-  // subsequent registrations for that URL.
-  // For each call to RegisterPathHandler(), the file $KUDU_HOME/www<path>.mustache
-  // should exist.
+  // Register a route 'path' to be rendered via template.
+  // The appropriate template to use is determined by 'path'.
+  // If 'style_mode' is StyleMode::STYLED, the page will be styled and include a header and footer.
+  // If 'is_on_nav_bar' is true, a link to the page will be placed on the navbar
+  // in the header of styled pages. The link text is given by 'alias'.
+  // If 'skip_auth' is true, this endpoint will bypass SPNEGO authentication even when
+  // --webserver_require_spnego is enabled.
   virtual void RegisterPathHandler(const std::string& path, const std::string& alias,
                                    const PathHandlerCallback& callback,
-                                   StyleMode style_mode, bool is_on_nav_bar) = 0;
+                                   StyleMode style_mode, bool is_on_nav_bar,
+                                   bool skip_auth = false) = 0;
 
-  // Same as RegisterPathHandler(), except that callback produces prerendered HTML.
-  // Use RegisterPathHandler() with a mustache template instead.
+  // Register a route 'path'. See the RegisterPathHandler for details.
   virtual void RegisterPrerenderedPathHandler(const std::string& path, const std::string& alias,
                                               const PrerenderedPathHandlerCallback& callback,
                                               StyleMode style_mode,
-                                              bool is_on_nav_bar) = 0;
+                                              bool is_on_nav_bar,
+                                              bool skip_auth = false) = 0;
 
-  // Register a callback for a URL path that returns binary data, a.k.a. octet
-  // stream. Such a path is not supposed to be exposed on the navigation bar
-  // of the Web UI, and the data is sent as-is with the HTTP response with no
-  // rendering assumed.
+  // Register route 'path' for application/octet-stream (binary data) responses.
   virtual void RegisterBinaryDataPathHandler(
       const std::string& path,
       const std::string& alias,
-      const PrerenderedPathHandlerCallback& callback) = 0;
+      const PrerenderedPathHandlerCallback& callback,
+      bool skip_auth = false) = 0;
 
-  // Register a callback for a URL path that returns JSON.
+  // Register route 'path' for application/json responses.
   virtual void RegisterJsonPathHandler(
       const std::string& path,
       const std::string& alias,
       const PrerenderedPathHandlerCallback& callback,
-      bool is_on_nav_bar) = 0;
+      bool is_on_nav_bar,
+      bool skip_auth = false) = 0;
 
   // Returns true if 'req' was proxied via Knox, false otherwise.
   static bool IsProxiedViaKnox(const WebRequest& req);

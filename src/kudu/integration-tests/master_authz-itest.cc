@@ -30,6 +30,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/util/curl_util.h"
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
@@ -327,6 +328,7 @@ class MasterAuthzITestHarness {
     // authorized.
     opts.extra_master_flags.emplace_back("--trusted_user_acl=impala");
     opts.extra_master_flags.emplace_back("--user_acl=test-user,impala,alice");
+    opts.enable_rest_api = true;
     SetUpExternalMiniServiceOpts(&opts);
     return opts;
   }
@@ -735,6 +737,23 @@ INSTANTIATE_TEST_SUITE_P(AuthzProviders, MasterAuthzITest,
     [] (const testing::TestParamInfo<MasterAuthzITest::ParamType>& info) {
       return HarnessEnumToString(info.param);
     });
+
+TEST_P(MasterAuthzITest, TestListTablesIsolationBetweenUsersWithRestApi) {
+  NO_FATALS(this->GrantCreateTablePrivilege({kDatabaseName}));
+  NO_FATALS(this->GrantAllTablePrivilege({kDatabaseName, "test_table"}));
+  ASSERT_OK(CreateKuduTable(kDatabaseName, "test_table"));
+  ASSERT_OK(cluster_->kdc()->Kinit(kTestUser));
+  EasyCurl c;
+  faststring buf;
+  c.set_auth(CurlAuthType::SPNEGO);
+  ASSERT_OK(c.FetchURL(
+      Substitute("http://$0/api/v1/tables", cluster_->master()->bound_http_hostport().ToString()),
+      &buf));
+
+  LOG(INFO) << "API response:";
+  LOG(INFO) << buf.ToString();
+}
+
 
 // Test that creation of the transaction status table foregoes fine-grained
 // authorization.

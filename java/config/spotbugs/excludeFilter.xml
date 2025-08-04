@@ -375,4 +375,17 @@
         <Class name="org.apache.kudu.test.cluster.FakeDNS"/>
         <Bug pattern="DP_DO_INSIDE_DO_PRIVILEGED" />
     </Match>
+
+    <!-- kudu-replication exclusions -->
+    <Match>
+        <!-- Reflection is used to access private fields for metrics exposure.
+             This is acceptable in a controlled wrapper context.
+             SerialVersionUID is not needed as the original Flink source classes
+             also don't define it, and these are wrapper classes. -->
+        <Class name="~org\.apache\.kudu\.replication\.wrappedsource\..*"/>
+        <Or>
+            <Bug pattern="DP_DO_INSIDE_DO_PRIVILEGED" />
+            <Bug pattern="SE_NO_SERIALVERSIONID" />
+        </Or>
+    </Match>
 </FindBugsFilter>

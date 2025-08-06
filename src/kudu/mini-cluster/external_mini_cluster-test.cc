@@ -20,6 +20,7 @@
 #include <iosfwd>
 #include <memory>
 #include <ostream>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -30,6 +31,7 @@
 #include <gtest/gtest.h>
 
 #include "kudu/common/common.pb.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h" // IWYU pragma: keep
 #include "kudu/hms/hms_client.h"
@@ -43,7 +45,10 @@
 #include "kudu/util/test_util.h"
 #include "kudu/util/curl_util.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/jsonreader.h"
+#include "kudu/util/mini_prometheus.h"
 
+using std::set;
 using std::string;
 using std::tuple;
 using std::unique_ptr;
@@ -368,6 +373,135 @@ TEST_P(ExternalMiniClusterTest, TestRestApiSpnegoConnectionThroughCurl) {
     ASSERT_OK(curl.FetchURL(
         Substitute("$0/api/v1/tables", cluster.master(0)->bound_http_hostport().ToString()), &buf));
   }
+}
+
+TEST_F(ExternalMiniClusterTest, TestPrometheusIntegration) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  ExternalMiniClusterOptions opts;
+  opts.enable_prometheus = true;
+  opts.num_masters = 2;
+  opts.num_tablet_servers = 3;
+
+  ExternalMiniCluster cluster(opts);
+  ASSERT_OK(cluster.Start());
+
+  // Verify Prometheus is running
+  ASSERT_NE(nullptr, cluster.prometheus());
+  ASSERT_TRUE(cluster.prometheus()->IsRunning());
+  
+  LOG(INFO) << "Prometheus is running on: " << cluster.prometheus()->web_url();
+  
+  // Wait a bit for Prometheus to fully start up and discover targets
+  SleepFor(MonoDelta::FromSeconds(8));
+
+  EasyCurl curl;
+  faststring buf;
+  
+  // First verify that our metrics endpoints are accessible
+  LOG(INFO) << "Verifying that Kudu metrics endpoints are accessible...";
+  for (int i = 0; i < cluster.num_masters(); i++) {
+    const string metrics_url = Substitute("http://$0/metrics", 
+                                         cluster.master(i)->bound_http_hostport().ToString());
+    buf.clear();
+    Status s = curl.FetchURL(metrics_url, &buf);
+    LOG(INFO) << "Master " << i << " metrics at " << metrics_url << ": " 
+              << (s.ok() ? "OK" : s.ToString()) << " (" << buf.size() << " bytes)";
+    ASSERT_OK(s);
+  }
+  
+  for (int i = 0; i < cluster.num_tablet_servers(); i++) {
+    const string metrics_url = Substitute("http://$0/metrics", 
+                                         cluster.tablet_server(i)->bound_http_hostport().ToString());
+    buf.clear();
+    Status s = curl.FetchURL(metrics_url, &buf);
+    LOG(INFO) << "Tablet server " << i << " metrics at " << metrics_url << ": " 
+              << (s.ok() ? "OK" : s.ToString()) << " (" << buf.size() << " bytes)";
+    ASSERT_OK(s);
+  }
+  
+  // Test Prometheus API - verify that our Kudu services are registered as targets
+  const string targets_url = Substitute("$0/api/v1/targets", cluster.prometheus()->web_url());
+  ASSERT_OK(curl.FetchURL(targets_url, &buf));
+  const string targets_response = buf.ToString();
+  
+  LOG(INFO) << "Prometheus targets API response length: " << targets_response.size();
+  LOG(INFO) << "Full Prometheus targets response: " << targets_response;
+  
+  // Parse the JSON response
+  JsonReader reader(targets_response);
+  ASSERT_OK(reader.Init());
+  
+  // Verify the response status is success
+  string status;
+  ASSERT_OK(reader.ExtractString(reader.root(), "status", &status));
+  ASSERT_EQ("success", status);
+  
+  // Extract the data.activeTargets array
+  const rapidjson::Value* data;
+  ASSERT_OK(reader.ExtractObject(reader.root(), "data", &data));
+  
+  vector<const rapidjson::Value*> active_targets;
+  ASSERT_OK(reader.ExtractObjectArray(data, "activeTargets", &active_targets));
+  
+  // Build expected target set (all masters and tablet servers)
+  std::set<string> expected_targets;
+  for (int i = 0; i < cluster.num_masters(); i++) {
+    expected_targets.insert(cluster.master(i)->bound_http_hostport().ToString());
+  }
+  for (int i = 0; i < cluster.num_tablet_servers(); i++) {
+    expected_targets.insert(cluster.tablet_server(i)->bound_http_hostport().ToString());
+  }
+  
+  LOG(INFO) << "Expected " << expected_targets.size() << " targets, found " 
+            << active_targets.size() << " active targets in Prometheus";
+  
+  // Verify each target in the Prometheus response
+  std::set<string> found_targets;
+  for (const auto* target : active_targets) {
+    // Extract the discoveredLabels.__address__ field which contains the target address
+    const rapidjson::Value* discovered_labels;
+    ASSERT_OK(reader.ExtractObject(target, "discoveredLabels", &discovered_labels));
+    
+    string target_address;
+    ASSERT_OK(reader.ExtractString(discovered_labels, "__address__", &target_address));
+    
+    found_targets.insert(target_address);
+    
+    // Extract health status
+    string health;
+    ASSERT_OK(reader.ExtractString(target, "health", &health));
+    
+    LOG(INFO) << "Found Prometheus target: " << target_address << " with health: " << health;
+    
+    // Verify this target is one of our expected Kudu services
+    ASSERT_TRUE(expected_targets.count(target_address) > 0) 
+        << "Unexpected target found in Prometheus: " << target_address;
+  }
+  
+  // Verify we found all expected targets
+  ASSERT_EQ(expected_targets.size(), found_targets.size()) 
+      << "Expected targets: " << JoinStrings(vector<string>(expected_targets.begin(), expected_targets.end()), ", ") 
+      << ", Found targets: " << JoinStrings(vector<string>(found_targets.begin(), found_targets.end()), ", ");
+  
+  for (const string& expected_target : expected_targets) {
+    ASSERT_TRUE(found_targets.count(expected_target) > 0) 
+        << "Expected target not found in Prometheus: " << expected_target;
+  }
+  
+  // Also verify that the metrics endpoints are accessible from our side
+  for (const string& target : expected_targets) {
+    const string metrics_url = Substitute("http://$0/metrics", target);
+    buf.clear();
+    ASSERT_OK(curl.FetchURL(metrics_url, &buf));
+    ASSERT_GT(buf.size(), 0) << "Metrics endpoint not accessible: " << metrics_url;
+    
+    // Verify it contains some expected Kudu metrics
+    const string metrics_content = buf.ToString();
+    ASSERT_STR_CONTAINS(metrics_content, "kudu_") << "No Kudu metrics found at: " << metrics_url;
+  }
+
+  LOG(INFO) << "Prometheus integration test completed successfully";
 }
 
 } // namespace cluster

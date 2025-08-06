@@ -1238,3 +1238,12 @@ build_rocksdb() {
   make -j$PARALLEL install
   popd
 }
+
+build_prometheus() {
+  # Prometheus is a pre-built binary, so we just need to copy it to the install location
+  mkdir -p $PREFIX/bin
+  cp $PROMETHEUS_SOURCE/prometheus $PREFIX/bin/
+  chmod +x $PREFIX/bin/prometheus
+  
+  echo "Installed Prometheus binary to $PREFIX/bin/prometheus"
+}

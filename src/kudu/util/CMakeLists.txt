@@ -398,6 +398,18 @@ target_link_libraries(kudu_jwt_util
   kudu_util)
 
 #######################################
+# mini_prometheus
+#######################################
+# The mini_prometheus is used only for tests.
+if (KUDU_CLI_TEST_TOOL_ENABLED)
+  add_library(mini_prometheus mini_prometheus.cc)
+  target_link_libraries(mini_prometheus
+    gutil
+    kudu_test_util
+    kudu_util)
+endif()
+
+#######################################
 # mini_oidc
 #######################################
 # The mini_oidc is used only for tests.
@@ -697,6 +709,15 @@ if(NOT NO_TESTS)
       rocksdb
       snappy)
   endif()
+endif()
+
+#######################################
+# mini_prometheus-test
+#######################################
+ADD_KUDU_TEST(mini_prometheus-test)
+if(NOT NO_TESTS)
+  target_link_libraries(mini_prometheus-test
+    mini_prometheus)
 endif()
 
 #######################################

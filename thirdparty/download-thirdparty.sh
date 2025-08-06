@@ -505,6 +505,20 @@ fetch_and_patch \
  $ROCKSDB_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/rocksdb-gcc13.patch"
 
+# Download pre-built Prometheus binary from GitHub releases
+if [ ! -d $PROMETHEUS_SOURCE ]; then
+  PROMETHEUS_ARCHIVE="prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+  PROMETHEUS_URL_PREFIX="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}"
+
+  # The archive extracts to prometheus-VERSION.linux-amd64, but we want prometheus-VERSION
+  PROMETHEUS_EXTRACTED_DIR="$TP_SOURCE_DIR/prometheus-${PROMETHEUS_VERSION}.linux-amd64"
+  
+  fetch_and_expand $PROMETHEUS_ARCHIVE $PROMETHEUS_EXTRACTED_DIR $PROMETHEUS_URL_PREFIX
+  
+  # Rename to the expected directory name
+  mv "$PROMETHEUS_EXTRACTED_DIR" "$PROMETHEUS_SOURCE"
+fi
+
 echo "---------------"
 echo "Thirdparty dependencies downloaded successfully"
 

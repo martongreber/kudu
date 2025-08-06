@@ -43,6 +43,7 @@ if (KUDU_CLI_TEST_TOOL_ENABLED)
     mini_hms
     mini_kdc
     mini_oidc
+    mini_prometheus
     mini_ranger
     mini_ranger_kms
     server_base_proto

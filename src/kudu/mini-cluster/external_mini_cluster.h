@@ -47,6 +47,7 @@
 namespace kudu {
 
 class Env;
+class MiniPrometheus;
 class NodeInstancePB;
 class Sockaddr;
 class Subprocess;
@@ -338,6 +339,13 @@ struct ExternalMiniClusterOptions {
   //
   // Default: false
   bool enable_rest_api;
+
+  // If true, start a Prometheus server as part of this ExternalMiniCluster.
+  // The Prometheus server will be configured to scrape metrics from all
+  // masters and tablet servers in the cluster.
+  //
+  // Default: false.
+  bool enable_prometheus;
 };
 
 // A mini-cluster made up of subprocesses running each of the daemons
@@ -462,6 +470,10 @@ class ExternalMiniCluster : public MiniCluster {
 
   MiniOidc* oidc() const {
     return oidc_.get();
+  }
+
+  MiniPrometheus* prometheus() const {
+    return prometheus_.get();
   }
 
   const std::string& cluster_root() const {
@@ -654,6 +666,7 @@ class ExternalMiniCluster : public MiniCluster {
   std::unique_ptr<security::KeyProvider> key_provider_;
   std::unique_ptr<rangerkms::MiniRangerKMS> ranger_kms_;
   std::unique_ptr<MiniOidc> oidc_;
+  std::unique_ptr<MiniPrometheus> prometheus_;
 
   std::shared_ptr<rpc::Messenger> messenger_;
 

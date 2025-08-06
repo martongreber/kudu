@@ -110,7 +110,8 @@ else
       "ranger")       F_RANGER=1 ;;
       "jwt-cpp")      F_JWT_CPP=1 ;;
       "ranger-kms")   F_RANGER_KMS=1 ;;
-      "rocksdb")      F_ROCKSDB=1 ;;
+"rocksdb")      F_ROCKSDB=1 ;;
+"prometheus")   F_PROMETHEUS=1 ;;
       *)              echo "Unknown module: $arg"; exit 1 ;;
     esac
   done
@@ -304,6 +305,10 @@ if [ -n "$F_COMMON" -o -n "$F_RANGER_KMS" ]; then
   # Symlink conf.dist to conf
   ln -nsf $PREFIX/opt/ranger-kms/ews/webapp/WEB-INF/classes/conf.dist \
   $PREFIX/opt/ranger-kms/ews/webapp/WEB-INF/classes/conf
+fi
+
+if [ -n "$F_COMMON" -o -n "$F_PROMETHEUS" ]; then
+  build_prometheus
 fi
 
 ### Build C dependencies without instrumentation

@@ -76,6 +76,7 @@
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/jwt-util.h"
 #include "kudu/util/mini_oidc.h"
+#include "kudu/util/mini_prometheus.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/sockaddr.h"
@@ -160,7 +161,8 @@ ExternalMiniClusterOptions::ExternalMiniClusterOptions()
 #endif // #if !defined(NO_CHRONY) ...
       enable_client_jwt(false),
       start_jwks(true),
-      enable_rest_api(false) {}
+      enable_rest_api(false),
+      enable_prometheus(false) {}
 
 ExternalMiniCluster::ExternalMiniCluster()
   : opts_(ExternalMiniClusterOptions()) {
@@ -467,6 +469,33 @@ Status ExternalMiniCluster::Start() {
   RETURN_NOT_OK(WaitForTabletServerCount(
                   opts_.num_tablet_servers,
                   MonoDelta::FromSeconds(kTabletServerRegistrationTimeoutSeconds)));
+
+  if (opts_.enable_prometheus) {
+    prometheus_.reset(new MiniPrometheus());
+    
+    // Collect metrics endpoints from all masters and tablet servers
+    vector<string> scrape_targets;
+    
+    // Add masters
+    for (const auto& master : masters_) {
+      if (master) {
+        scrape_targets.push_back(master->bound_http_hostport().ToString());
+      }
+    }
+    
+    // Add tablet servers
+    for (const auto& ts : tablet_servers_) {
+      if (ts) {
+        scrape_targets.push_back(ts->bound_http_hostport().ToString());
+      }
+    }
+    
+    LOG(INFO) << "Starting Prometheus to scrape " << scrape_targets.size() << " targets: "
+              << JoinStrings(scrape_targets, ", ");
+    
+    RETURN_NOT_OK_PREPEND(prometheus_->Start(scrape_targets),
+                          "Failed to start Prometheus");
+  }
 
   return Status::OK();
 }

@@ -27,6 +27,7 @@ import java.util.Arrays;
 import java.util.BitSet;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.Objects;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -1926,4 +1927,62 @@ public class PartialRow {
     }
     return size;
   }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (!(o instanceof PartialRow)) {
+      return false;
+    }
+    PartialRow that = (PartialRow) o;
+
+    if (!Objects.equals(schema, that.schema)) {
+      return false;
+    }
+    if (!Objects.equals(columnsBitSet, that.columnsBitSet)) {
+      return false;
+    }
+    if (!Objects.equals(nullsBitSet, that.nullsBitSet)) {
+      return false;
+    }
+
+    // Compare actual values for each set column using getObject()
+    // Note: Both rows have identical columnsBitSet (verified above)
+    for (int i = 0; i < schema.getColumnCount(); i++) {
+      // Skip columns not set in either row (since columnsBitSets are identical)
+      if (!columnsBitSet.get(i)) {
+        continue;
+      }
+
+      Object thisValue = getObject(i);
+      Object otherValue = that.getObject(i);
+
+      if (!Objects.equals(thisValue, otherValue)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  @Override
+  public int hashCode() {
+    int result = Objects.hash(schema, columnsBitSet, nullsBitSet);
+
+    // Hash values for each set column using getObject()
+    for (int i = 0; i < schema.getColumnCount(); i++) {
+      if (!columnsBitSet.get(i)) {
+        continue;
+      }
+
+      Object value = getObject(i);
+      result = 31 * result + Objects.hashCode(value);
+    }
+
+    return result;
+  }
+
+
 }

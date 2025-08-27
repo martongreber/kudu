@@ -20,10 +20,10 @@ package org.apache.kudu.backup
 import java.math.BigDecimal
 import java.sql.Date
 import java.util
+import java.util.Base64
 
 import com.google.protobuf.ByteString
 import com.google.protobuf.StringValue
-import org.apache.commons.net.util.Base64
 import org.apache.kudu.backup.Backup._
 import org.apache.kudu.ColumnSchema.ColumnSchemaBuilder
 import org.apache.kudu.ColumnSchema.CompressionAlgorithm
@@ -348,7 +348,7 @@ object TableMetadata {
       case Type.STRING =>
         value.asInstanceOf[String]
       case Type.BINARY =>
-        Base64.encodeBase64String(value.asInstanceOf[Array[Byte]])
+        Base64.getEncoder.encodeToString(value.asInstanceOf[Array[Byte]])
       case Type.DECIMAL =>
         value
           .asInstanceOf[BigDecimal]
@@ -371,7 +371,7 @@ object TableMetadata {
       case Type.DOUBLE => value.toDouble
       case Type.VARCHAR => value
       case Type.STRING => value
-      case Type.BINARY => Base64.decodeBase64(value)
+      case Type.BINARY => Base64.getDecoder.decode(value)
       case Type.DECIMAL => new BigDecimal(value) // TODO: Explicitly pass scale
       case Type.DATE => Date.valueOf(value)
       case _ =>

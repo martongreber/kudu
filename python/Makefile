@@ -10,6 +10,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+.PHONY: all build requirements test test-examples clean
+
 build:
 	python setup.py build_ext --inplace
 
@@ -36,3 +38,6 @@ clean:
 	rm -f kudu/schema.cpp
 	rm -f kudu/config.pxi
 	rm -f kudu/version.py
+
+install:
+	python setup.py install

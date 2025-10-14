@@ -73,7 +73,7 @@ class RestCatalogTest : public RestCatalogTestBase {
     // Set webserver doc root to enable swagger UI and static file serving
     string bin_path;
     ASSERT_OK(Env::Default()->GetExecutablePath(&bin_path));
-    FLAGS_webserver_doc_root = JoinPathSegments(DirName(bin_path), "../../../www");
+    FLAGS_webserver_doc_root = JoinPathSegments(DirName(bin_path), "testdata/www");
 
     // Configure the mini-cluster
     cluster_.reset(new InternalMiniCluster(env_, InternalMiniClusterOptions()));

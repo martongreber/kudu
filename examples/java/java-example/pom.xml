@@ -105,6 +105,7 @@
   <profiles>
     <!-- Profile to include kudu-binary JAR for running tests with packaged mini-cluster binaries.
          Activated by default. Disable with -DuseLocalKuduBin=true when using locally built Kudu. -->
+    <!-- TODO(achennaka): Update the below with the next Kudu release -->
     <profile>
       <id>kudu-binary</id>
       <activation>

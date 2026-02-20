@@ -233,6 +233,18 @@ class CompletionFlag {
 //    (D,E,F): tracer thread exchanges 'kNotInUse' back into queued_to_tid in
 //             RevokeSigData().
 struct SignalData {
+  SignalData() : stack(nullptr) {
+    // Explicitly initialize with an atomic store rather than relying on the
+    // in-class initializer. The std::atomic<T> constructor (in libstdc++) emits
+    // a plain non-atomic write to the underlying _M_i storage. When paired with
+    // the atomic compare_exchange_strong in HandleStackTraceSignal(), that plain
+    // write races with the CAS and is flagged by TSAN as a data race (mixing
+    // non-atomic and atomic accesses to the same memory location is UB per the
+    // C++ standard). Using store() here ensures the initialization is itself
+    // an atomic operation and is correctly visible to the signal handler.
+    queued_to_tid.store(kNotInUse, std::memory_order_relaxed);
+  }
+
   // The actual destination for the stack trace collected from the target thread.
   StackTrace* stack;
 
@@ -240,7 +252,7 @@ struct SignalData {
   static const int kDumpStarted = -1;
   // Either one of the above constants, or if the dumper thread
   // is waiting on a response, the tid that it is waiting on.
-  std::atomic<int64_t> queued_to_tid { kNotInUse };
+  std::atomic<int64_t> queued_to_tid;
 
   // Signaled when the target thread has successfully collected its stack.
   // The dumper thread waits for this to become true.
@@ -274,7 +286,10 @@ void HandleStackTraceSignal(int /*signum*/, siginfo_t* info, void* /*ucontext*/)
   // If we were slow to process the signal, the sender may have given up and
   // no longer wants our stack trace. In that case, the 'sig' object will
   // no longer contain our thread.
-  if (!sig_data->queued_to_tid.compare_exchange_strong(my_tid, SignalData::kDumpStarted)) {
+  if (!sig_data->queued_to_tid.compare_exchange_strong(
+          my_tid, SignalData::kDumpStarted,
+          std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
     return;
   }
   // Marking it as kDumpStarted ensures that the caller thread must now wait
@@ -434,10 +449,14 @@ Status StackTraceCollector::TriggerAsync(int64_t tid, StackTrace* stack) {
   GoogleOnceInit(&g_prime_libunwind_once, &PrimeLibunwind);
 
   std::unique_ptr<SignalData> data(new SignalData());
-  // Set the target TID in our communication structure, so if we end up with any
-  // delayed signal reaching some other thread, it will know to ignore it.
-  data->queued_to_tid = tid;
   data->stack = CHECK_NOTNULL(stack);
+  // Publish the target TID last with release semantics. This ensures:
+  // 1. The stack pointer write above is visible to the signal handler before
+  //    it observes the tid (pairs with the acq_rel CAS in the signal handler).
+  // 2. The store is an atomic operation, consistent with all other accesses to
+  //    this field, avoiding the non-atomic/atomic mixed-access UB that the
+  //    in-class initializer { kNotInUse } would have caused.
+  data->queued_to_tid.store(tid, std::memory_order_release);
 
   // We use the raw syscall here instead of kill() to ensure that we don't accidentally
   // send a signal to some other process in the case that the thread has exited and

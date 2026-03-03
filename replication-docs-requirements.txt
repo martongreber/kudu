@@ -1,0 +1,17 @@
+I would like you to create end user facing documentation for the apache flink based replication for apache kudu.
+
+Sources:
+Flink connector Kudu: /Users/mgreber/git/flink-connector-kudu
+Kudu: /Users/mgreber/git/kudu
+L0/L1 systest: /Users/mgreber/git/qe-cmf/systest
+
+This should be an end user documentation.
+Describe (without order and priority):
+- how to start the flink based replication for apache kudu
+- what configuration options are available
+- what are the supported data types: array data type not supported
+- what flink metrics are available
+- how schema change is handled (i think we have systest that cover this we will add details later)
+
+
+You can create a markdown file for this documentation in this repo.

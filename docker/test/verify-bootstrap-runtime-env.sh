@@ -18,11 +18,11 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# Auxiliary script to verify that bootstrap-java-env.sh
-# installs Java 17 correctly on all supported OS images.
+# Auxiliary script to verify that bootstrap-runtime-env.sh
+# installs runtime dependencies correctly on all supported OS images.
 #
 # Usage:
-#   ./docker/verify-bootstrap-java-env.sh [image1 image2 ...]
+#   ./docker/test/verify-bootstrap-runtime-env.sh [image1 image2 ...]
 #
 # When no images are specified all supported base OS images
 # from docker-build.py are tested.
@@ -32,7 +32,7 @@
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BOOTSTRAP_SCRIPT="$SCRIPT_DIR/../bootstrap-java-env.sh"
+BOOTSTRAP_SCRIPT="$SCRIPT_DIR/../bootstrap-runtime-env.sh"
 
 # The full list of supported bases mirrors docker-build.py's --bases choices.
 DEFAULT_IMAGES=(
@@ -61,22 +61,21 @@ for IMAGE in "${IMAGES[@]}"; do
   echo "=========================================="
 
   if docker run --rm \
-    -v "$BOOTSTRAP_SCRIPT:/bootstrap-java-env.sh:ro" \
+    -v "$BOOTSTRAP_SCRIPT:/bootstrap-runtime-env.sh:ro" \
     "$IMAGE" \
     bash -xe -c "
-      /bootstrap-java-env.sh
-      JAVA_VERSION=\$(java -version 2>&1 | head -1)
-      echo \"Installed: \$JAVA_VERSION\"
-      echo \"\$JAVA_VERSION\" | grep -q '^openjdk version \"17\.' || {
-        echo 'ERROR: Expected Java 17 but got: '\"\$JAVA_VERSION\"
+      /bootstrap-runtime-env.sh
+      OPENSSL_VERSION=\$(openssl version)
+      echo \"Installed: \$OPENSSL_VERSION\"
+      echo \"\$OPENSSL_VERSION\" | grep -qi '^openssl' || {
+        echo 'ERROR: openssl not found or not working'
         exit 1
       }
-      JAVAC_VERSION=\$(javac -version 2>&1)
-      echo \"Compiler: \$JAVAC_VERSION\"
-      echo \"\$JAVAC_VERSION\" | grep -q '^javac 17\.' || {
-        echo 'ERROR: Expected javac 17 but got: '\"\$JAVAC_VERSION\"
+      which kinit || {
+        echo 'ERROR: kinit (kerberos client) not found in PATH'
         exit 1
       }
+      echo \"kinit found at: \$(which kinit)\"
     "; then
     echo ">>> PASS: $IMAGE"
     RESULTS+=("PASS: $IMAGE")

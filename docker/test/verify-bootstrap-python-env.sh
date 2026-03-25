@@ -18,11 +18,11 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# Auxiliary script to verify that bootstrap-java-env.sh
-# installs Java 17 correctly on all supported OS images.
+# Auxiliary script to verify that bootstrap-python-env.sh
+# installs Python and related packages correctly on all supported OS images.
 #
 # Usage:
-#   ./docker/verify-bootstrap-java-env.sh [image1 image2 ...]
+#   ./docker/test/verify-bootstrap-python-env.sh [image1 image2 ...]
 #
 # When no images are specified all supported base OS images
 # from docker-build.py are tested.
@@ -32,7 +32,7 @@
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BOOTSTRAP_SCRIPT="$SCRIPT_DIR/../bootstrap-java-env.sh"
+BOOTSTRAP_SCRIPT="$SCRIPT_DIR/../bootstrap-python-env.sh"
 
 # The full list of supported bases mirrors docker-build.py's --bases choices.
 DEFAULT_IMAGES=(
@@ -61,20 +61,28 @@ for IMAGE in "${IMAGES[@]}"; do
   echo "=========================================="
 
   if docker run --rm \
-    -v "$BOOTSTRAP_SCRIPT:/bootstrap-java-env.sh:ro" \
+    -v "$BOOTSTRAP_SCRIPT:/bootstrap-python-env.sh:ro" \
     "$IMAGE" \
     bash -xe -c "
-      /bootstrap-java-env.sh
-      JAVA_VERSION=\$(java -version 2>&1 | head -1)
-      echo \"Installed: \$JAVA_VERSION\"
-      echo \"\$JAVA_VERSION\" | grep -q '^openjdk version \"17\.' || {
-        echo 'ERROR: Expected Java 17 but got: '\"\$JAVA_VERSION\"
+      /bootstrap-python-env.sh
+      PYTHON_VERSION=\$(python --version 2>&1)
+      echo \"Installed: \$PYTHON_VERSION\"
+      python --version 2>&1 | grep -q 'Python' || {
+        echo 'ERROR: python not found or not working'
         exit 1
       }
-      JAVAC_VERSION=\$(javac -version 2>&1)
-      echo \"Compiler: \$JAVAC_VERSION\"
-      echo \"\$JAVAC_VERSION\" | grep -q '^javac 17\.' || {
-        echo 'ERROR: Expected javac 17 but got: '\"\$JAVAC_VERSION\"
+      PIP_VERSION=\$(pip --version 2>&1)
+      echo \"pip: \$PIP_VERSION\"
+      pip --version 2>&1 | grep -q 'pip' || {
+        echo 'ERROR: pip not found or not working'
+        exit 1
+      }
+      python -c 'import Cython; print(\"Cython:\", Cython.__version__)' || {
+        echo 'ERROR: Cython not importable'
+        exit 1
+      }
+      python -c 'import setuptools; print(\"setuptools:\", setuptools.__version__)' || {
+        echo 'ERROR: setuptools not importable'
         exit 1
       }
     "; then

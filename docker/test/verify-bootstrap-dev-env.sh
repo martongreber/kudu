@@ -18,11 +18,11 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# Auxiliary script to verify that bootstrap-java-env.sh
-# installs Java 17 correctly on all supported OS images.
+# Auxiliary script to verify that bootstrap-dev-env.sh
+# installs development tools correctly on all supported OS images.
 #
 # Usage:
-#   ./docker/verify-bootstrap-java-env.sh [image1 image2 ...]
+#   ./docker/test/verify-bootstrap-dev-env.sh [image1 image2 ...]
 #
 # When no images are specified all supported base OS images
 # from docker-build.py are tested.
@@ -32,7 +32,7 @@
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BOOTSTRAP_SCRIPT="$SCRIPT_DIR/../bootstrap-java-env.sh"
+BOOTSTRAP_SCRIPT="$SCRIPT_DIR/../bootstrap-dev-env.sh"
 
 # The full list of supported bases mirrors docker-build.py's --bases choices.
 DEFAULT_IMAGES=(
@@ -61,22 +61,22 @@ for IMAGE in "${IMAGES[@]}"; do
   echo "=========================================="
 
   if docker run --rm \
-    -v "$BOOTSTRAP_SCRIPT:/bootstrap-java-env.sh:ro" \
+    -v "$BOOTSTRAP_SCRIPT:/bootstrap-dev-env.sh:ro" \
     "$IMAGE" \
     bash -xe -c "
-      /bootstrap-java-env.sh
-      JAVA_VERSION=\$(java -version 2>&1 | head -1)
-      echo \"Installed: \$JAVA_VERSION\"
-      echo \"\$JAVA_VERSION\" | grep -q '^openjdk version \"17\.' || {
-        echo 'ERROR: Expected Java 17 but got: '\"\$JAVA_VERSION\"
-        exit 1
-      }
-      JAVAC_VERSION=\$(javac -version 2>&1)
-      echo \"Compiler: \$JAVAC_VERSION\"
-      echo \"\$JAVAC_VERSION\" | grep -q '^javac 17\.' || {
-        echo 'ERROR: Expected javac 17 but got: '\"\$JAVAC_VERSION\"
-        exit 1
-      }
+      /bootstrap-dev-env.sh
+      GCC_VERSION=\$(gcc --version | head -1)
+      echo \"gcc: \$GCC_VERSION\"
+      GXX_VERSION=\$(g++ --version | head -1)
+      echo \"g++: \$GXX_VERSION\"
+      CMAKE_VERSION=\$(cmake --version | head -1)
+      echo \"cmake: \$CMAKE_VERSION\"
+      MAKE_VERSION=\$(make --version | head -1)
+      echo \"make: \$MAKE_VERSION\"
+      GIT_VERSION=\$(git --version)
+      echo \"git: \$GIT_VERSION\"
+      NINJA_VERSION=\$(ninja --version)
+      echo \"ninja: \$NINJA_VERSION\"
     "; then
     echo ">>> PASS: $IMAGE"
     RESULTS+=("PASS: $IMAGE")

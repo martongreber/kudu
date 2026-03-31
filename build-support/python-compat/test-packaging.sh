@@ -81,9 +81,12 @@ run_one() {
   "${VIRTUALENV_CMD[@]}" -p "${py_bin}" "${build_venv}" >/dev/null
   source "${build_venv}/bin/activate"
 
-  make requirements
+  # virtualenv is required as a fallback for stripped Python installs (e.g. Python 3.7 on
+  # Debian/Ubuntu) that lack ensurepip. 'python -m build' uses venv+ensurepip by default to
+  # create an isolated build environment, and falls back to virtualenv when ensurepip is absent.
+  pip install build virtualenv
   rm -rf dist/
-  python setup.py sdist --quiet
+  python -m build --sdist --outdir dist/
 
   local sdist
   sdist="$(ls -1t dist/*.tar.gz 2>/dev/null | head -1)"
@@ -108,7 +111,7 @@ run_one() {
   "${VIRTUALENV_CMD[@]}" -p "${py_bin}" "${install_venv}" >/dev/null
   source "${install_venv}/bin/activate"
 
-  if pip install "${sdist}" && python -c "import kudu; print('kudu', kudu.__version__)"; then
+  if pip install "${sdist}" && (cd /tmp && python -c "import kudu; print('kudu', kudu.__version__)"); then
     log "pip list:"
     pip list
     ok "Python ${ver} — sdist round-trip OK."

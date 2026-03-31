@@ -39,9 +39,7 @@ export LD_LIBRARY_PATH=$KUDU_HOME/build/latest/lib/exported
 # For OS X
 export DYLD_LIBRARY_PATH=$KUDU_HOME/build/latest/lib/exported
 pushd $KUDU_HOME/python
-pip install -r requirements.txt
-python setup.py build_ext --inplace
-python setup.py install
+pip install -e .
 popd
 ```
 

@@ -18,7 +18,7 @@
 
 from __future__ import division
 
-from kudu.compat import unittest
+import unittest
 from kudu.util import *
 
 

@@ -59,9 +59,7 @@ pip install kudu-python
 
 ```bash
 cd /path/to/kudu/python  # Navigate to the python directory if not already there
-pip install -r requirements.txt
-python setup.py sdist
-pip install dist/kudu-python-*.tar.gz
+pip install -e .
 ```
 
 ## Building for Development
@@ -80,15 +78,14 @@ This variable is required by various scripts and tools in the project. Make sure
 
 ```bash
 cd $KUDU_HOME/python  # Navigate to the python directory if not already there
-pip install -r requirements.txt
 pip install -r requirements_dev.txt
-python setup.py build_ext --inplace
+pip install -e .
 ```
 
 ## Run All Tests
 
 ```bash
-python setup.py test
+python -m pytest
 ```
 
 ## Run Single Test

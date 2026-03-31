@@ -13,7 +13,7 @@
 .PHONY: all build requirements test install clean test-examples
 
 build:
-	python setup.py build_ext --inplace
+	pip install -e .
 
 all: build
 
@@ -21,11 +21,11 @@ requirements:
 	pip install -r requirements.txt
 	pip install -r requirements_dev.txt
 
-test:
+test: build
 ifdef TEST
 	python -m unittest $(TEST)
 else
-	python setup.py test
+	python -m pytest
 endif
 
 # Run Python client examples against a local Kudu cluster.
@@ -53,4 +53,4 @@ clean:
 	rm -f kudu/version.py
 
 install:
-	python setup.py install
+	pip install .

@@ -1,0 +1,9 @@
+[build-system]
+requires = [
+    "setuptools",
+    "wheel",
+    # Cython 3.x requires Python >= 3.7; use the legacy 0.29.x series for 2.7/3.6.
+    "Cython==0.29.37; python_version < '3.7'",
+    "Cython==3.0.11; python_version >= '3.7'",
+]
+build-backend = "setuptools.build_meta"

@@ -18,18 +18,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# setup-prerequisites must be the very first import in this file!
-import setup_prerequisites
+import sys
+import os
 
 from Cython.Distutils import build_ext
 from Cython.Build import cythonize
 import Cython
 
-import sys
 from setuptools import setup
 from distutils.command.clean import clean as _clean
 from distutils.extension import Extension
-import os
 import re
 import subprocess
 
@@ -165,7 +163,12 @@ for submodule_name in ext_submodules:
                     runtime_library_dirs=RT_LIBRARY_DIRS)
     extensions.append(ext)
 
-extensions = cythonize(extensions)
+# Match legacy implicit semantics (Cython previously defaulted to language_level 2).
+# language_level 3 rejects patterns used throughout client.pyx (e.g. del on C++ pointers).
+extensions = cythonize(
+    extensions,
+    compiler_directives={'language_level': 2},
+)
 
 write_version_py(VERSION)
 
@@ -189,6 +192,9 @@ CLASSIFIERS = [
     'Programming Language :: Python :: 3.9',
     'Programming Language :: Python :: 3.10',
     'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: 3.14',
     'Programming Language :: Cython'
 ]
 

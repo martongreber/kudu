@@ -2,7 +2,7 @@ include LICENSE.txt
 include MANIFEST.in
 include README.md
 include setup.py
-include setup_prerequisites.py
+include pyproject.toml
 include version.txt
 include requirements.txt
 

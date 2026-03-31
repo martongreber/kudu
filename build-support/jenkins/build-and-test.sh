@@ -721,11 +721,11 @@ if [ "$BUILD_PYTHON" == "1" ]; then
 
   pip $PIP_FLAGS install $PIP_INSTALL_FLAGS -r requirements_dev.txt
 
-  # Delete old Cython extensions to force them to be rebuilt.
-  rm -Rf build kudu_python.egg-info kudu/*.so
-
-  # Build the Python bindings. This assumes we run this script from base dir.
-  CC=$CLANG CXX=$CLANG++ python setup.py build_ext
+  # Build and install the Python bindings (Cython is installed automatically via pyproject.toml).
+  # -e (editable) is required: plain 'pip install .' copies the source to a temp directory where
+  # python/version.txt (a symlink to ../version.txt) becomes a dangling symlink and setup.py fails.
+  # Editable installs build in-place in the source directory, so the symlink resolves correctly.
+  CC=$CLANG CXX=$CLANG++ pip install -e .
 
   # A testing environment might have HTTP/HTTPS proxy configured to proxy
   # requests even for 127.0.0.0/8 network or other quirks. Since some Python
@@ -740,8 +740,8 @@ if [ "$BUILD_PYTHON" == "1" ]; then
 
   # Run the Python tests. This may also involve some compiler work.
   set +e
-  if ! CC=$CLANG CXX=$CLANG++ python setup.py test \
-      --addopts="kudu --junit-xml=$TEST_LOGDIR/python_client.xml" \
+  if ! CC=$CLANG CXX=$CLANG++ python -m pytest kudu \
+      --junit-xml=$TEST_LOGDIR/python_client.xml \
       2> $TEST_LOGDIR/python_client.log ; then
     TESTS_FAILED=1
     FAILURES="$FAILURES"$'Python tests failed\n'
@@ -776,11 +776,11 @@ if [ "$BUILD_PYTHON3" == "1" ]; then
 
   pip $PIP_FLAGS install $PIP_INSTALL_FLAGS -r requirements_dev.txt
 
-  # Delete old Cython extensions to force them to be rebuilt.
-  rm -Rf build kudu_python.egg-info kudu/*.so
-
-  # Build the Python bindings. This assumes we run this script from base dir.
-  CC=$CLANG CXX=$CLANG++ python setup.py build_ext
+  # Build and install the Python bindings (Cython is installed automatically via pyproject.toml).
+  # -e (editable) is required: plain 'pip install .' copies the source to a temp directory where
+  # python/version.txt (a symlink to ../version.txt) becomes a dangling symlink and setup.py fails.
+  # Editable installs build in-place in the source directory, so the symlink resolves correctly.
+  CC=$CLANG CXX=$CLANG++ pip install -e .
   set +e
 
   # A testing environment might have HTTP/HTTPS proxy configured to proxy
@@ -795,8 +795,8 @@ if [ "$BUILD_PYTHON3" == "1" ]; then
   unset https_proxy
 
   # Run the Python tests. This may also involve some compiler work.
-  if ! CC=$CLANG CXX=$CLANG++ python setup.py test \
-      --addopts="kudu --junit-xml=$TEST_LOGDIR/python3_client.xml" \
+  if ! CC=$CLANG CXX=$CLANG++ python -m pytest kudu \
+      --junit-xml=$TEST_LOGDIR/python3_client.xml \
       2> $TEST_LOGDIR/python3_client.log ; then
     TESTS_FAILED=1
     FAILURES="$FAILURES"$'Python 3 tests failed\n'

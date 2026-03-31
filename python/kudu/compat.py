@@ -19,6 +19,7 @@
 
 import itertools
 import contextlib
+import unittest
 try:
     import numpy as np
 except ImportError:
@@ -30,18 +31,8 @@ import six
 from six import BytesIO, StringIO, string_types as py_string
 
 
-PY26 = sys.version_info[:2] == (2, 6)
 PY2 = sys.version_info[0] == 2
 
-try:
-    if PY26:
-        import unittest2 as unittest
-    else:
-        import unittest
-except ImportError:
-    # If we can't import 'unittest', then our tests won't be able
-    # to run. But, that's fine.
-    pass
 
 if PY2:
     import cPickle
@@ -110,3 +101,19 @@ else:
 integer_types = six.integer_types
 if np is not None:
     integer_types += (np.integer,)
+
+# np.object and np.bool were deprecated in NumPy 1.20 and removed in 1.24.
+# See: https://github.com/numpy/numpy/releases/tag/v1.24.0
+# Use try/except so the aliases work on any installed NumPy version.
+if np is not None:
+    try:
+        NP_OBJECT = np.object   # NumPy < 1.24
+    except AttributeError:
+        NP_OBJECT = object      # NumPy >= 1.24: use the plain Python builtin
+    try:
+        NP_BOOL = np.bool       # NumPy < 1.24
+    except AttributeError:
+        NP_BOOL = np.bool_      # NumPy >= 1.24: use the proper NumPy scalar
+else:
+    NP_OBJECT = object
+    NP_BOOL   = bool

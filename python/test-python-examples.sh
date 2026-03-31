@@ -129,7 +129,9 @@ test_with_python_version() {
 
   pip install -r "$PYTHON_DIR/requirements.txt"
   make clean
-  make install
+  # Use editable install: plain 'pip install .' copies sources to a temp dir where
+  # version.txt (a symlink to ../version.txt) becomes dangling and setup.py fails.
+  pip install -e "$PYTHON_DIR"
 
   echo "Running Python examples with $python_version..."
 

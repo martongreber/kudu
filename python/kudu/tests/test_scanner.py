@@ -20,6 +20,7 @@ from __future__ import division
 
 from kudu.tests.util import TestScanBase
 from kudu.tests.common import KuduTestBase, TimeoutError
+from kudu.compat import NP_OBJECT, NP_BOOL
 import kudu
 import datetime
 import time
@@ -347,25 +348,25 @@ class TestScanner(TestScanBase):
         if kudu.CLIENT_SUPPORTS_DECIMAL:
             self.assertEqual(types[0], np.int64)
             self.assertEqual(types[1], 'datetime64[ns, UTC]')
-            self.assertEqual(types[2], np.object)
-            self.assertEqual(types[3], np.object)
-            self.assertEqual(types[4], np.bool)
+            self.assertEqual(types[2], NP_OBJECT)
+            self.assertEqual(types[3], NP_OBJECT)
+            self.assertEqual(types[4], NP_BOOL)
             self.assertEqual(types[5], np.float64)
             self.assertEqual(types[6], np.int8)
-            self.assertEqual(types[7], np.object)
-            self.assertEqual(types[8], np.object)
-            self.assertEqual(types[9], np.object)
+            self.assertEqual(types[7], NP_OBJECT)
+            self.assertEqual(types[8], NP_OBJECT)
+            self.assertEqual(types[9], NP_OBJECT)
             self.assertEqual(types[10], np.float32)
         else:
             self.assertEqual(types[0], np.int64)
             self.assertEqual(types[1], 'datetime64[ns, UTC]')
-            self.assertEqual(types[2], np.object)
-            self.assertEqual(types[3], np.bool)
+            self.assertEqual(types[2], NP_OBJECT)
+            self.assertEqual(types[3], NP_BOOL)
             self.assertEqual(types[4], np.float64)
             self.assertEqual(types[5], np.int8)
-            self.assertEqual(types[6], np.object)
-            self.assertEqual(types[7], np.object)
-            self.assertEqual(types[8], np.object)
+            self.assertEqual(types[6], NP_OBJECT)
+            self.assertEqual(types[7], NP_OBJECT)
+            self.assertEqual(types[8], NP_OBJECT)
             self.assertEqual(types[9], np.float32)
 
     @pytest.mark.skipif(not (kudu.CLIENT_SUPPORTS_PANDAS),

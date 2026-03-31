@@ -375,7 +375,8 @@ in its summary tab
   # Prepare and sign the python source distribution.
   cd python
   rm -rf dist/*
-  python setup.py sdist
+  pip install build
+  python -m build --sdist
   gpg --detach-sign -a dist/kudu-python-1.x.y.tar.gz
   # Upload the distribution to PyPi using twine.
   pip install twine

@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
-#include <set>
+#include <memory>
 
 #include <boost/container/vector.hpp>
 #include <gflags/gflags.h>
@@ -67,13 +67,14 @@ static bool ValidateMaxMessageSize(const char* flagname, int64_t value) {
 }
 DEFINE_validator(rpc_max_message_size, &ValidateMaxMessageSize);
 
-namespace kudu {
-namespace rpc {
 
 using std::ostringstream;
-using std::set;
 using std::string;
+using std::unique_ptr;
 using strings::Substitute;
+
+namespace kudu {
+namespace rpc {
 
 #define RETURN_ON_ERROR_OR_SOCKET_NOT_READY(status)               \
   do {                                                            \
@@ -184,24 +185,28 @@ string InboundTransfer::StatusAsString() const {
   return Substitute("$0/$1 bytes received", cur_offset_, total_length_);
 }
 
-OutboundTransfer* OutboundTransfer::CreateForCallRequest(int32_t call_id,
-                                                         TransferPayload payload,
-                                                         TransferCallbacks* callbacks) {
-  return new OutboundTransfer(call_id, std::move(payload), callbacks);
+unique_ptr<OutboundTransfer> OutboundTransfer::CreateForCallRequest(
+    int32_t call_id,
+    TransferPayload payload,
+    unique_ptr<TransferCallbacks> callbacks) {
+  return unique_ptr<OutboundTransfer>(new OutboundTransfer(
+      call_id, std::move(payload), std::move(callbacks)));
 }
 
-OutboundTransfer* OutboundTransfer::CreateForCallResponse(TransferPayload payload,
-                                                          TransferCallbacks* callbacks) {
-  return new OutboundTransfer(kInvalidCallId, std::move(payload), callbacks);
+unique_ptr<OutboundTransfer> OutboundTransfer::CreateForCallResponse(
+    TransferPayload payload,
+    unique_ptr<TransferCallbacks> callbacks) {
+  return unique_ptr<OutboundTransfer>(new OutboundTransfer(
+      kInvalidCallId, std::move(payload), std::move(callbacks)));
 }
 
 OutboundTransfer::OutboundTransfer(int32_t call_id,
                                    TransferPayload payload,
-                                   TransferCallbacks* callbacks)
+                                   unique_ptr<TransferCallbacks> callbacks)
     : payload_slices_(std::move(payload)),
       cur_slice_idx_(0),
       cur_offset_in_slice_(0),
-      callbacks_(callbacks),
+      callbacks_(std::move(callbacks)),
       call_id_(call_id),
       started_(false),
       aborted_(false) {

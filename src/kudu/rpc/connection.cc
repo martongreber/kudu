@@ -48,6 +48,7 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
@@ -320,13 +321,17 @@ void inline Connection::MaybeInjectCancellation(const shared_ptr<OutboundCall>& 
 // Callbacks after sending a call on the wire.
 // This notifies the OutboundCall object to change its state to SENT once it
 // has been fully transmitted.
-struct CallTransferCallbacks : public TransferCallbacks {
+struct CallTransferCallbacks final : public TransferCallbacks {
  public:
   explicit CallTransferCallbacks(shared_ptr<OutboundCall> call,
                                  Connection* conn)
-      : call_(std::move(call)), conn_(conn) {}
+      : call_(std::move(call)),
+        conn_(conn),
+        notified_(false) {
+  }
 
   void NotifyTransferFinished() override {
+    DCHECK(!notified_);
     // TODO(mpercy): would be better to cancel the transfer while it is still on the queue if we
     // timed out before the transfer started, but there is still a race in the case of
     // a partial send that we have to handle here
@@ -337,18 +342,20 @@ struct CallTransferCallbacks : public TransferCallbacks {
       // Test cancellation when 'call_' is in 'SENT' state.
       conn_->MaybeInjectCancellation(call_);
     }
-    delete this;
+    notified_ = true;
   }
 
   void NotifyTransferAborted(const Status& status) override {
+    DCHECK(!notified_);
+    notified_ = true;
     VLOG(1) << Substitute(
         "transfer of $0 aborted: $1", call_->ToString(), status.ToString());
-    delete this;
   }
 
  private:
   shared_ptr<OutboundCall> call_;
   Connection* conn_;
+  bool notified_;
 };
 
 void Connection::QueueOutboundCall(shared_ptr<OutboundCall> call) {
@@ -432,10 +439,11 @@ void Connection::QueueOutboundCall(shared_ptr<OutboundCall> call) {
     car->timeout_timer.start();
   }
 
-  TransferCallbacks* cb = new CallTransferCallbacks(std::move(call), this);
+  unique_ptr<TransferCallbacks> cb(new CallTransferCallbacks(std::move(call), this));
   awaiting_response_[call_id] = car.release();
-  QueueOutbound(unique_ptr<OutboundTransfer>(
-      OutboundTransfer::CreateForCallRequest(call_id, std::move(tmp_slices), cb)));
+  QueueOutbound(OutboundTransfer::CreateForCallRequest(call_id,
+                                             std::move(tmp_slices),
+                                             std::move(cb)));
 }
 
 // Callbacks for sending an RPC call response from the server.
@@ -445,30 +453,37 @@ struct ResponseTransferCallbacks final : public TransferCallbacks {
  public:
   ResponseTransferCallbacks(unique_ptr<InboundCall> call, Connection* conn)
       : call_(std::move(call)),
-        conn_(conn) {
-  }
-
-  ~ResponseTransferCallbacks() override {
-    // Remove the call from the map.
-    auto* call_from_map = EraseKeyReturnValuePtr(
-        &conn_->calls_being_handled_, call_->call_id());
-    DCHECK_EQ(call_from_map, call_.get());
+        conn_(conn),
+        notified_(false) {
   }
 
   void NotifyTransferFinished() override {
-    delete this;
+    MarkTransferComplete();
   }
 
   void NotifyTransferAborted(const Status& /*status*/) override {
     LOG(WARNING) << Substitute(
         "$0 torn down before $1 could send its response",
         conn_->ToString(), call_->ToString());
-    delete this;
+    MarkTransferComplete();
   }
 
  private:
+  // Mark the transfer as complete with the underlying connection.
+  void MarkTransferComplete() {
+    DCHECK(!notified_);
+
+    // Remove the call from the connection's map.
+    [[maybe_unused]] auto* call_from_map = EraseKeyReturnValuePtr(
+        &conn_->calls_being_handled_, call_->call_id());
+    DCHECK_EQ(call_from_map, call_.get());
+
+    notified_ = true;
+  }
+
   unique_ptr<InboundCall> call_;
   Connection* conn_;
+  bool notified_;
 };
 
 // Reactor task which puts a transfer on the outbound transfer queue.
@@ -508,15 +523,12 @@ void Connection::QueueResponseForCall(unique_ptr<InboundCall> call) {
   TransferPayload tmp_slices;
   call->SerializeResponseTo(&tmp_slices);
 
-  TransferCallbacks* cb = new ResponseTransferCallbacks(std::move(call), this);
+  unique_ptr<TransferCallbacks> cb(new ResponseTransferCallbacks(std::move(call), this));
   // After the response is sent, can delete the InboundCall object.
   // We set a dummy call ID and required feature set, since these are not needed
   // when sending responses.
-  unique_ptr<OutboundTransfer> t(
-      OutboundTransfer::CreateForCallResponse(std::move(tmp_slices), cb));
-
-  reactor_thread_->reactor()->ScheduleReactorTask(
-      new QueueTransferTask(std::move(t), this));
+  auto t(OutboundTransfer::CreateForCallResponse(std::move(tmp_slices), std::move(cb)));
+  reactor_thread_->reactor()->ScheduleReactorTask(new QueueTransferTask( std::move(t), this));
 }
 
 void Connection::set_confidential(bool is_confidential) {
@@ -697,18 +709,40 @@ void Connection::WriteHandler(ev::io& /*watcher*/, int revents) {
 }
 
 Connection::ProcessOutboundTransfersResult Connection::ProcessOutboundTransfers() {
-  while (!outbound_transfers_.empty()) {
-    OutboundTransfer* transfer = &outbound_transfers_.front();
+  decltype(outbound_transfers_) recycled_transfers;  // NOLINT(*)
+  SCOPED_CLEANUP({
+    // Perform recycling of the resources registered by the completed transfers
+    // only upon returning from the function. This is to help sending out
+    // as much data as possible without the risk of being stuck on the lock in
+    // the tcmalloc's free list. Compare this with invoking OutboundTransfer's
+    // destructor after calling OutboundTransfer::SendBuffer() for each of the
+    // completed transfers on the connection.
+    //
+    // The memory deallocation might be susceptible to lock contention in case
+    // of high concurrent activity in tcmalloc if per-thread caches aren't
+    // sized properly [1] and because of the allocation/deallocation pattern
+    // among different reactor threads.
+    //
+    // [1] https://gperftools.github.io/gperftools/tcmalloc.html
+    while (!recycled_transfers.empty()) {
+      auto* transfer_ptr = &recycled_transfers.front();
+      recycled_transfers.pop_front();
+      delete transfer_ptr;
+    }
+  });
 
-    if (!transfer->TransferStarted()) {
-      if (transfer->is_for_outbound_call()) {
-        CallAwaitingResponse* car = FindOrDie(awaiting_response_, transfer->call_id());
+  while (!outbound_transfers_.empty()) {
+    OutboundTransfer& transfer = outbound_transfers_.front();
+
+    if (!transfer.TransferStarted()) {
+      if (transfer.is_for_outbound_call()) {
+        CallAwaitingResponse* car = FindOrDie(awaiting_response_, transfer.call_id());
         if (!car->call) {
           // If the call has already timed out or has already been cancelled, the 'call'
           // field would be set to NULL. In that case, don't bother sending it.
           outbound_transfers_.pop_front();
-          transfer->Abort(Status::Aborted("already timed out or cancelled"));
-          delete transfer;
+          recycled_transfers.push_back(transfer);
+          transfer.Abort(Status::Aborted("already timed out or cancelled"));
           continue;
         }
 
@@ -720,14 +754,14 @@ Connection::ProcessOutboundTransfersResult Connection::ProcessOutboundTransfers(
         if (!includes(remote_features_.begin(), remote_features_.end(),
                       required_features.begin(), required_features.end())) {
           outbound_transfers_.pop_front();
+          recycled_transfers.push_back(transfer);
           Status s = Status::NotSupported("server does not support the required RPC features");
-          transfer->Abort(s);
+          transfer.Abort(s);
           Phase phase = negotiation_complete_ ? Phase::REMOTE_CALL : Phase::CONNECTION_NEGOTIATION;
           car->call->SetFailed(std::move(s), phase);
           // Test cancellation when 'call_' is in 'FINISHED_ERROR' state.
           MaybeInjectCancellation(car->call);
           car->call.reset();
-          delete transfer;
           continue;
         }
 
@@ -739,21 +773,23 @@ Connection::ProcessOutboundTransfersResult Connection::ProcessOutboundTransfers(
     }
 
     last_activity_time_ = reactor_thread_->cur_time();
-    Status status = transfer->SendBuffer(socket_.get());
+    Status status = transfer.SendBuffer(socket_.get());
     if (PREDICT_FALSE(!status.ok())) {
       LOG(WARNING) << Substitute(
           "$0 send error: $1", ToString(), status.ToString());
+      // ReactorThread::DestroyConnection() invokes Connection::Shutdown() which
+      // takes care of cleaning up the 'outbound_transfers_' list.
       reactor_thread_->DestroyConnection(this, status);
       return kConnectionDestroyed;
     }
 
-    if (!transfer->TransferFinished()) {
+    if (!transfer.TransferFinished()) {
       DVLOG(3) << Substitute("$0: writeHandler: xfer not finished", ToString());
       return kMoreToSend;
     }
 
     outbound_transfers_.pop_front();
-    delete transfer;
+    recycled_transfers.push_back(transfer);
   }
 
   return kNoMoreToSend;

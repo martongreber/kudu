@@ -22,6 +22,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -114,6 +115,7 @@ class GenericCalculatorService : public ServiceIf {
   static const std::string kSleepMethodName;
   static const std::string kSleepWithSidecarMethodName;
   static const std::string kPushStringsMethodName;
+  static const std::string kPushStringsFastMethodName;
   static const std::string kSendTwoStringsMethodName;
   static const std::string kAddExactlyOnce;
 
@@ -140,6 +142,8 @@ class GenericCalculatorService : public ServiceIf {
       DoSendTwoStrings(incoming);
     } else if (incoming->remote_method().method_name() == kPushStringsMethodName) {
       DoPushStrings(incoming);
+    } else if (incoming->remote_method().method_name() == kPushStringsFastMethodName) {
+      DoPushStringsFast(incoming);
     } else {
       incoming->RespondFailure(ErrorStatusPB::ERROR_NO_SUCH_METHOD,
                                Status::InvalidArgument("bad method"));
@@ -223,6 +227,24 @@ class GenericCalculatorService : public ServiceIf {
     CHECK_GT(incoming->GetTransferSize(), 0);
     incoming->DiscardTransfer();
     CHECK_EQ(0, incoming->GetTransferSize());
+    incoming->RespondSuccess(resp);
+  }
+
+  static void DoPushStringsFast(InboundCall* incoming) {
+    Slice param(incoming->serialized_request());
+    PushStringsRequestPB req;
+    if (!req.ParseFromArray(param.data(), param.size())) {
+      LOG(FATAL) << "couldn't parse: " << param.ToDebugString();
+    }
+
+    PushStringsResponsePB resp;
+    for (const auto& sidecar_idx : req.sidecar_indexes()) {
+      Slice sidecar;
+      CHECK_OK(incoming->GetInboundSidecar(sidecar_idx, &sidecar));
+      resp.add_sizes(sidecar.size());
+    }
+
+    CHECK_GT(incoming->GetTransferSize(), 0);
     incoming->RespondSuccess(resp);
   }
 
@@ -425,6 +447,7 @@ const std::string GenericCalculatorService::kAddMethodName = "Add";
 const std::string GenericCalculatorService::kSleepMethodName = "Sleep";
 const std::string GenericCalculatorService::kSleepWithSidecarMethodName = "SleepWithSidecar";
 const std::string GenericCalculatorService::kPushStringsMethodName = "PushStrings";
+const std::string GenericCalculatorService::kPushStringsFastMethodName = "PushStringsFast";
 const std::string GenericCalculatorService::kSendTwoStringsMethodName = "SendTwoStrings";
 const std::string GenericCalculatorService::kAddExactlyOnce = "AddExactlyOnce";
 
@@ -600,6 +623,36 @@ static Status DoTestSidecarWithSizeLimits(Proxy* p, int size1, int size2) {
       CHECK_EQ(crc::Crc32c(strings[i].data(), strings[i].size()),
                resp.crcs(i));
     }
+
+    return Status::OK();
+  }
+
+  // This is similar to DoTestOutgoingSidecar, but without CRC32 computations
+  // and verifying only the total size of all the sidecars sent/received.
+  static Status DoTestOutgoingSidecarFast(
+      Proxy* p, const std::vector<std::string_view>& strings) {
+    PushStringsRequestPB request;
+    RpcController controller;
+
+    size_t ref_total_size = 0;
+    for (const auto& s : strings) {
+      ref_total_size += s.size();
+      int idx;
+      RETURN_NOT_OK(controller.AddOutboundSidecar(
+          RpcSidecar::FromSlice(Slice(s.data(), s.size())), &idx));
+      request.add_sidecar_indexes(idx);
+    }
+
+    PushStringsResponsePB resp;
+    KUDU_RETURN_NOT_OK(p->SyncRequest(
+        GenericCalculatorService::kPushStringsFastMethodName, request, &resp, &controller));
+    const size_t elem_num = resp.sizes_size();
+    CHECK_EQ(strings.size(), elem_num);
+    size_t total_size = 0;
+    for (size_t i = 0; i < elem_num; i++) {
+      total_size += resp.sizes(i);
+    }
+    CHECK_EQ(ref_total_size, total_size);
 
     return Status::OK();
   }

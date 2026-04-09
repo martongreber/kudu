@@ -21,6 +21,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -31,6 +32,7 @@
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/proxy.h"
 #include "kudu/rpc/rpc-test-base.h"
@@ -61,8 +63,16 @@ METRIC_DECLARE_counter(rpcs_queue_overflow);
 METRIC_DECLARE_histogram(reactor_ev_loop_max_read_latency_us);
 METRIC_DECLARE_histogram(reactor_ev_loop_max_write_latency_us);
 
+DEFINE_uint32(mt_rpc_server_reactors_num, 4,
+              "Number of server reactor threads");
+DEFINE_uint32(mt_rpc_clients_num, 16,
+              "Number of concurrently running client threads");
+DEFINE_uint32(mt_rpc_iterations_num, 1024,
+              "Number of test iterations run by a single client thread");
+
 using std::ostringstream;
 using std::string;
+using std::string_view;
 using std::shared_ptr;
 using std::thread;
 using std::unique_ptr;
@@ -422,6 +432,76 @@ TEST_F(MultiThreadedRpcTest, ReactorMaxIOLatencyStatsEnabled) {
   // was on a contemporary hardware at the time of writing.
   ASSERT_GT(max_wr_latency, 1);
   ASSERT_GT(max_rd_latency, 1);
+}
+
+// Medium-size (256KiB <= size < 1MiB) blocks are allocated in the per-thread
+// caches in tcmalloc, but if a cache's free list is exhaused, allocations go
+// through the cental free list which is guarded by a lock. That induces lock
+// contention if multiple threads are running through the same code paths
+// concurrently.
+//
+// This test scenario is built to make sure that batch memory recycling in
+// Connection::ProcessOutboundTransfers() introduced in the same changelist
+// doesn't degrade RPC performance in such scenarios.
+TEST_F(MultiThreadedRpcTest, MediumSizeSidecars) {
+  const size_t kNumClients = FLAGS_mt_rpc_clients_num;
+  const size_t kNumIterations = FLAGS_mt_rpc_iterations_num;
+  const size_t kNumReactors = FLAGS_mt_rpc_server_reactors_num;
+
+  n_server_reactor_threads_ = kNumReactors;
+  n_worker_threads_ = kNumClients;
+
+  Sockaddr server_addr;
+  ASSERT_OK(StartTestServer(&server_addr));
+
+  constexpr const size_t kSidecarSize0 = 768 * 1024;
+  constexpr const size_t kSidecarSize1 = 384 * 1024;
+  const string kStr0(kSidecarSize0, '0');
+  const string kStr1(kSidecarSize1, '1');
+  const vector<string_view> data = {
+      { kStr0.data(), kStr0.size() },
+      { kStr1.data(), kStr1.size() },
+  };
+
+  thread threads[kNumClients];
+  CountDownLatch latch_started(1);
+  CountDownLatch latch_completed(kNumClients);
+  for (size_t i = 0; i < kNumClients; ++i) {
+    threads[i] = thread([this,
+                         server_addr,
+                         &data,
+                         kNumIterations,
+                         &latch_started,
+                         &latch_completed]() {
+      shared_ptr<Messenger> client_messenger;
+      CHECK_OK(CreateMessenger("client_messenger", &client_messenger));
+      Proxy p(client_messenger, server_addr, server_addr.host(),
+              GenericCalculatorService::static_service_name());
+
+      latch_started.Wait();
+      for (size_t iter = 0; iter < kNumIterations; ++iter) {
+        CHECK_OK(DoTestOutgoingSidecarFast(&p, data));
+      }
+      latch_completed.CountDown();
+    });
+  }
+
+  // Start tasks run by the client threads and wait for their completion.
+  Stopwatch sw;
+  sw.start();
+  latch_started.CountDown();
+  latch_completed.Wait();
+  sw.stop();
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  const auto elapsed = sw.elapsed();
+  LOG(INFO) << StringPrintf("%ld threads completed %ld iterations each in %.3f ms",
+                            kNumClients, kNumIterations, elapsed.wall_millis());
+  LOG(INFO) << StringPrintf("CPU system: %6.3f ms", elapsed.system_cpu_millis());
+  LOG(INFO) << StringPrintf("CPU user  : %6.3f ms", elapsed.user_cpu_millis());
 }
 
 TEST_F(MultiThreadedRpcTest, PerMethodQueueOverflowRejectionCounter) {

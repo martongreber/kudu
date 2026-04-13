@@ -4219,7 +4219,8 @@ TEST_F(MasterTest, PrometheusServiceDiscoveryWhenCatalogManagerNotReady) {
   }
 
   {
-    CatalogManager::ScopedCatalogManagerNotReadyForTests disabler(master_->catalog_manager());
+    using ScopedNotReady = CatalogManager::ScopedCatalogManagerNotReadyForTests;
+    ScopedNotReady disabler(master_->catalog_manager());
 
     Status s = c.FetchURL(addr, &buf);
     // This should return HTTP 503 Service Unavailable due to catalog manager not being ready
@@ -4249,7 +4250,8 @@ TEST_F(MasterTest, PrometheusServiceDiscoveryLeaderVsFollower) {
   }
 
   {
-    CatalogManager::ScopedLeaderDisablerForTests disabler(master_->catalog_manager());
+    using ScopedLeaderDisabler = CatalogManager::ScopedLeaderDisablerForTests;
+    ScopedLeaderDisabler disabler(master_->catalog_manager());
 
     ASSERT_OK(c.FetchURL(addr, &buf));
     ASSERT_EQ("[]", buf.ToString());

@@ -992,7 +992,6 @@ void MasterPathHandlers::HandlePrometheusSD(const Webserver::WebRequest& req,
   PrometheusSDData data;
   if (auto s = CollectPrometheusSDData(&data); !s.ok()) {
     LOG(WARNING) << s.ToString();
-    WriteEmptyPrometheusSDResponse(output);
     resp->status_code = HttpStatusCode::ServiceUnavailable;
     return;
   }

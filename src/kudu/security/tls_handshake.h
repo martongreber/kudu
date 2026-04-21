@@ -23,7 +23,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest_prod.h>
 
-#include "kudu/gutil/port.h"
 #include "kudu/security/cert.h"
 #include "kudu/util/openssl_util.h"
 #include "kudu/util/status.h"
@@ -152,6 +151,10 @@ class TlsHandshake {
   // Retrive the description of the negotiated cipher.
   // Only valid to call after the handshake is complete and before 'Finish()'.
   std::string GetCipherDescription() const;
+
+  // Retrieve whether the extended master secret extension was negotiated.
+  // Only valid to call after the handshake is complete and before 'Finish()'.
+  bool GetExtMS() const;
 
  private:
   FRIEND_TEST(TestTlsHandshake, HandshakeSequenceNoTLSv1dot3);

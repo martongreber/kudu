@@ -381,5 +381,15 @@ string TlsHandshake::GetCipherDescription() const {
   return ret;
 }
 
+bool TlsHandshake::GetExtMS() const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
+  CHECK(has_started_);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+  return SSL_get_extms_support(ssl_.get()) == 1;
+#else
+  return false;
+#endif
+}
+
 } // namespace security
 } // namespace kudu

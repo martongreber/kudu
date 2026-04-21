@@ -29,7 +29,6 @@
 
 #include <glog/logging.h>
 
-#include "kudu/gutil/port.h"
 #include "kudu/rpc/negotiation.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/sasl_common.h"

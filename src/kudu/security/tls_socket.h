@@ -22,7 +22,6 @@
 #include <cstdint>
 #include <string>
 
-#include "kudu/gutil/port.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/net/socket.h"
 #include "kudu/util/openssl_util.h" // IWYU pragma: keep
@@ -58,8 +57,14 @@ class TlsSocket : public Socket {
   // Get the name of the negotiated TLS protocol for the connection.
   std::string GetProtocolName() const;
 
+  // Get the name of the negotiated TLS cipher suite for the connection.
+  std::string GetCipherName() const;
+
   // Get the description of the negotiated TLS cipher suite for the connection.
   std::string GetCipherDescription() const;
+
+  // Get whether extended master secret is used for the connection.
+  bool GetExtMS() const;
 
  private:
 

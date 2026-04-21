@@ -74,6 +74,7 @@
 #include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/security/security_flags.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tools/tool.pb.h" // IWYU pragma: keep
@@ -161,6 +162,15 @@ DEFINE_string(sasl_protocol_name,
               "SASL protocol name used to connnect to a Kerberos-enabled cluster. Must match the "
               "servers' service principal name base (e.g. if it's \"kudu/_HOST\", then "
               "sasl_protocol_name must be \"kudu\" to be able to connect.");
+
+DEFINE_string(tls_min_version, kudu::security::SecurityDefaults::kDefaultTlsMinVersion,
+              "The minimum TLS version to be used for connecting to a Kudu server.");
+
+DEFINE_string(tls_ciphersuites, kudu::security::SecurityDefaults::kDefaultTlsCipherSuites,
+              "An allow-list of cipher suites to be used on a TLSv1.3 connection.");
+
+DEFINE_string(tls_ciphers, kudu::security::SecurityDefaults::kDefaultTlsCiphers,
+              "An allow-list of ciphers used on a TLSv1 to TLSv1.2 connection.");
 
 DEFINE_bool(row_count_only, false,
             "Whether to only count rows instead of reading row cells: yields "
@@ -540,6 +550,9 @@ Status BuildMessenger(std::string name, shared_ptr<Messenger>* messenger) {
   Status s = MessengerBuilder(std::move(name))
                  .set_rpc_negotiation_timeout_ms(FLAGS_negotiation_timeout_ms)
                  .set_sasl_proto_name(FLAGS_sasl_protocol_name)
+                 .set_rpc_tls_min_protocol(FLAGS_tls_min_version)
+                 .set_rpc_tls_ciphers(FLAGS_tls_ciphers)
+                 .set_rpc_tls_ciphersuites(FLAGS_tls_ciphersuites)
                  .Build(&m);
   if (s.ok()) {
     *messenger = std::move(m);

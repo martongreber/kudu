@@ -508,6 +508,11 @@ string GetProtocolName(const SSL* ssl) {
   return SSL_get_version(ssl);
 }
 
+string GetCipherName(const SSL* ssl) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
+  return SSL_get_cipher_name(ssl);
+}
+
 string GetCipherDescription(const SSL* ssl) {
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
   const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl);
@@ -523,6 +528,15 @@ string GetCipherDescription(const SSL* ssl) {
   StripTrailingNewline(&ret);
   StripDupCharacters(&ret, ' ', 0);
   return ret;
+}
+
+bool GetExtMS(SSL* ssl) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+  return SSL_get_extms_support(ssl) == 1;
+#else
+  return false;
+#endif
 }
 
 } // namespace security

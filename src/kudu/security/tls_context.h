@@ -185,6 +185,8 @@ class TlsContext {
   // for details.
   const char* GetEngineVersionInfo() const;
 
+  const char* GetSSLCipherName() const;
+
  private:
 
   Status VerifyCertChainUnlocked(const Cert& cert);

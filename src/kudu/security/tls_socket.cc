@@ -29,6 +29,7 @@
 #include <glog/logging.h>
 
 #include "kudu/gutil/basictypes.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/net/sockaddr.h"
@@ -262,6 +263,7 @@ Status TlsSocket::GetTransportDetails(TransportDetailsPB* pb) const {
   auto* tls = pb->mutable_tls();
   tls->set_protocol(GetProtocolName());
   tls->set_cipher_suite(GetCipherDescription());
+  tls->set_ext_ms(GetExtMS());
   return Socket::GetTransportDetails(pb);
 }
 
@@ -269,10 +271,17 @@ string TlsSocket::GetProtocolName() const {
   return ::kudu::security::GetProtocolName(ssl_.get());
 }
 
+string TlsSocket::GetCipherName() const {
+  return ::kudu::security::GetCipherName(ssl_.get());
+}
+
 string TlsSocket::GetCipherDescription() const {
   return ::kudu::security::GetCipherDescription(ssl_.get());
 }
 
+bool TlsSocket::GetExtMS() const {
+  return ::kudu::security::GetExtMS(ssl_.get());
+}
 
 } // namespace security
 } // namespace kudu

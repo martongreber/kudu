@@ -35,7 +35,6 @@
 
 #include <glog/logging.h>
 
-#include "kudu/gutil/port.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -158,9 +157,16 @@ Status GetPasswordFromShellCommand(const std::string& cmd, std::string* password
 // TLS handshake is complete.
 std::string GetProtocolName(const SSL* ssl);
 
-// Retrive the description of the negotiated TLS cipher.
+// Retrieve the negotiated TLS cipher name. Only valid to call after the TLS
+// handshake is complete.
+std::string GetCipherName(const SSL* ssl);
+
+// Retrieve the description of the negotiated TLS cipher.
 // Only valid to call after the handshake is complete.
 std::string GetCipherDescription(const SSL* ssl);
+
+// Retrieve whether extended master secret is used.
+bool GetExtMS(SSL* ssl);
 
 // A generic wrapper for OpenSSL structures.
 template <typename T>

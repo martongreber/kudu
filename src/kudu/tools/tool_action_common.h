@@ -24,12 +24,11 @@
 #include <vector>
 
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/response_callback.h"
 #include "kudu/tools/tool_action.h"
-#include "kudu/util/net/net_util.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/status.h"
 
 namespace kudu {

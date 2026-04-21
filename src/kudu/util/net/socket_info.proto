@@ -68,6 +68,9 @@ message TransportDetailsPB {
 
     // Description of the TLS cipher suite used.
     optional string cipher_suite = 2;
+
+    // Whether extended master secret is used.
+    optional bool ext_ms = 3;
   }
 
   optional TcpDetails tcp = 1;

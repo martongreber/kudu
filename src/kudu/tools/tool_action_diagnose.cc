@@ -18,10 +18,13 @@
 #include <algorithm>
 #include <fstream> // IWYU pragma: keep
 #include <functional>
+#include <iostream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -31,11 +34,23 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rpc/client_negotiation.h"
+#include "kudu/rpc/sasl_common.h"
+#include "kudu/security/security_flags.h"
+#include "kudu/security/tls_context.h"
+#include "kudu/security/tls_socket.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/tools/diagnostics_log_parser.h"
 #include "kudu/tools/tool_action.h"
+#include "kudu/tools/tool_action_common.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
+#include "kudu/util/openssl_util.h"
 #include "kudu/util/regex.h"
 #include "kudu/util/status.h"
 
+DEFINE_bool(disable_tls, false, "If true, it tries disabling TLS.");
 DEFINE_string(table_ids, "",
               "comma-separated list of table identifiers to aggregate table "
               "metrics across; defaults to aggregating all tables");
@@ -54,9 +69,19 @@ DEFINE_string(histogram_metrics, "",
               "comma-separated list of histogram metrics to parse "
               "percentiles for");
 
+DECLARE_string(sasl_protocol_name);
+DECLARE_string(tls_min_version);
+DECLARE_string(tls_ciphersuites);
+DECLARE_string(tls_ciphers);
+
 DECLARE_int64(timeout_ms);
 DECLARE_string(format);
 
+using kudu::security::RpcEncryption;
+using kudu::rpc::ClientNegotiation;
+using kudu::rpc::SaslInit;
+using std::cout;
+using std::endl;
 using std::ifstream;
 using std::string;
 using std::unique_ptr;
@@ -183,6 +208,61 @@ Status ParseMetrics(const RunnerContext& context) {
   return Status::OK();
 }
 
+Status TlsDebug(const RunnerContext& context) {
+  DCHECK(security::IsOpenSSLInitialized());
+  const string& address = FindOrDie(context.required_args, "server_addr");
+
+  unique_ptr<Socket> socket(new Socket());
+
+  HostPort hp;
+  RETURN_NOT_OK(hp.ParseString(address, 0));
+  vector<Sockaddr> resolved;
+  RETURN_NOT_OK(hp.ResolveAddresses(&resolved));
+  if (resolved[0].port() == 0) {
+    return Status::InvalidArgument("Port must be set.");
+  }
+
+  RETURN_NOT_OK(socket->Init(resolved[0].family(), 0));
+  RETURN_NOT_OK(socket->Connect(resolved[0]));
+
+  RETURN_NOT_OK(SaslInit());
+
+  security::TlsContext tls_context(FLAGS_tls_ciphers, FLAGS_tls_ciphersuites, FLAGS_tls_min_version, {});
+  RETURN_NOT_OK(tls_context.Init());
+
+  const auto encryption = FLAGS_disable_tls ?  RpcEncryption::DISABLED : RpcEncryption::REQUIRED;
+
+  ClientNegotiation client_negotiation(std::move(socket),
+                                       &tls_context,
+                                       std::nullopt,
+                                       std::nullopt,
+                                       encryption,
+                                       true,
+                                       FLAGS_sasl_protocol_name);
+
+  RETURN_NOT_OK(client_negotiation.EnablePlain("tls-test", "tls-test"));
+  WARN_NOT_OK(client_negotiation.EnableGSSAPI(), "Couldn't enable GSSAPI, negotiation may fail");
+  RETURN_NOT_OK(client_negotiation.Negotiate());
+
+  unique_ptr<Socket> negotiated_socket = client_negotiation.release_socket();
+  auto* tls_socket = dynamic_cast<security::TlsSocket*>(negotiated_socket.get());
+  if (tls_socket == nullptr) {
+    cout << "TLS was not negotiated - cleartext connection" << endl;
+    return Status::OK();
+  }
+
+  const auto& protocol = tls_socket->GetProtocolName();
+  const string extms = protocol == "TLSv1.3" ?
+    "N/A (TLSv1.3)" :
+    tls_socket->GetExtMS() ? "yes" : "no";
+  cout << "Negotiated protocol: " << protocol << endl;
+  cout << "Negotiated ciphersuite: " << tls_socket->GetCipherName() << endl;
+  cout << "Negotiated ciphersuite (description): " << tls_socket->GetCipherDescription() << endl;
+  cout << "Negotiated extended master secret (RFC 7627): " << extms << endl;
+
+  return Status::OK();
+}
+
 } // anonymous namespace
 
 unique_ptr<Mode> BuildDiagnoseMode() {
@@ -203,10 +283,19 @@ unique_ptr<Mode> BuildDiagnoseMode() {
       .AddOptionalParameter("histogram_metrics")
       .Build();
 
+  unique_ptr<Action> tls_debug =
+      RpcActionBuilder("tls_debug", &TlsDebug)
+      .Description("Connect to a running cluster and dump TLS debug information")
+      .AddRequiredParameter({"server_addr", "Address of a Kudu Master or Tablet server "
+                                            "of the form 'hostname:port'."})
+      .AddOptionalParameter("disable_tls")
+      .Build();
+
   return ModeBuilder("diagnose")
       .Description("Diagnostic tools for Kudu servers and clusters")
       .AddAction(std::move(parse_stacks))
       .AddAction(std::move(parse_metrics))
+      .AddAction(std::move(tls_debug))
       .Build();
 }
 

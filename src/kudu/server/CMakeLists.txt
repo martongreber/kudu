@@ -91,4 +91,5 @@ if(NOT NO_ROCKSDB)
 endif()
 
 ADD_KUDU_TEST(rpc_server-test)
+ADD_KUDU_TEST(startup_path_handler-test)
 ADD_KUDU_TEST(webserver-test)

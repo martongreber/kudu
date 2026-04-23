@@ -58,6 +58,11 @@ public:
   MonoDelta StartupProgressTimeElapsedMetric();
 
 private:
+  // Aggregates sub-step progress for the "Reading filesystem" parent step.
+  // Returns 100 when its Timer is stopped, 0 when not yet started, and a
+  // value in the [0,99] range while running.
+  int ComputeReadFilesystemPercent() const;
+
   // Hold the initialization step progress information like the status, start and end time.
   Timer init_progress_;
 

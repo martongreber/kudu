@@ -3770,7 +3770,8 @@ TEST_F(MasterStartupTest, StartupWebPage) {
         continue;
       }
       ASSERT_STR_MATCHES(buf.ToString(), "\"init_status\":(100|0)( |,)");
-      ASSERT_STR_MATCHES(buf.ToString(), "\"read_filesystem_status\":(100|0)( |,)");
+      ASSERT_STR_MATCHES(buf.ToString(), "\"read_filesystem_status\":"
+                                             "([0-9]|[1-9][0-9]|100)( |,)");
       ASSERT_STR_MATCHES(buf.ToString(), "\"read_instance_metadatafiles_status\""
                                              ":(100|0)( |,)");
       ASSERT_STR_MATCHES(buf.ToString(), "\"read_data_directories_status\":"

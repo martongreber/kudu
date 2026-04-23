@@ -90,6 +90,7 @@
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_metrics.h"
+#include "kudu/tablet/tablet-test-util.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/mini_tablet_server.h"
@@ -839,7 +840,8 @@ class TabletServerStartupWebPageTest : public TabletServerTestBase {
 
   void IsStatusValid(const string& startup_page_status) {
     ASSERT_STR_MATCHES(startup_page_status, "\"init_status\":(100|0)( |,)");
-    ASSERT_STR_MATCHES(startup_page_status, "\"read_filesystem_status\":(100|0)( |,)");
+    ASSERT_STR_MATCHES(startup_page_status, "\"read_filesystem_status\":"
+                                            "([0-9]|[1-9][0-9]|100)( |,)");
     ASSERT_STR_MATCHES(startup_page_status, "\"read_instance_metadatafiles_status\":(100|0)( |,)");
     ASSERT_STR_MATCHES(startup_page_status, "\"read_data_directories_status\":"
                                             "([0-9]|[1-9][0-9]|100)( |,)");

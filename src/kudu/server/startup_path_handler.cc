@@ -17,6 +17,9 @@
 
 #include "kudu/server/startup_path_handler.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <iosfwd>
 #include <string>
@@ -57,6 +60,17 @@ void SetWebResponse(EasyJson* output, const string& step,
                   (startup_step.TimeElapsed()).ToSeconds()));
 }
 
+// Returns 'processed / total' as an integer percentage clamped to [0, 100].
+// Uses int64 arithmetic to avoid overflow on 'processed * 100'.
+int PercentOf(int processed, int total) {
+  if (total <= 0) {
+    return 0;
+  }
+  const int64_t p = std::max(processed, 0);
+  const int64_t pct = p * 100 / total;
+  return static_cast<int>(std::min<int64_t>(100, pct));
+}
+
 StartupPathHandler::StartupPathHandler(const scoped_refptr<MetricEntity>& entity):
   tablets_processed_(0),
   tablets_total_(0),
@@ -83,35 +97,40 @@ void StartupPathHandler::Startup(const Webserver::WebRequest& /*req*/,
 
   // Populate the different startup steps with their progress
   SetWebResponse(output, "init", init_progress_);
-  SetWebResponse(output, "read_filesystem", read_filesystem_progress_);
+  SetWebResponse(output, "read_filesystem", read_filesystem_progress_,
+                 ComputeReadFilesystemPercent());
   SetWebResponse(output, "read_instance_metadatafiles", read_instance_metadata_files_progress_);
 
   // Populate the progress percentage of opening of container files in case of lbm and non-lbm
   if (is_using_lbm_) {
-    if (containers_total_ == 0) {
+    const int containers_total = containers_total_.load(std::memory_order_relaxed);
+    const int containers_processed = containers_processed_.load(std::memory_order_relaxed);
+    if (containers_total == 0) {
       SetWebResponse(output, "read_data_directories", read_data_directories_progress_);
     } else {
       SetWebResponse(output, "read_data_directories", read_data_directories_progress_,
-                      containers_processed_ * 100 / containers_total_);
+                     PercentOf(containers_processed, containers_total));
     }
-    output->Set("containers_processed", containers_processed_.load());
-    output->Set("containers_total", containers_total_.load());
+    output->Set("containers_processed", containers_processed);
+    output->Set("containers_total", containers_total);
   } else {
     SetWebResponse(output, "read_data_directories", read_data_directories_progress_);
   }
 
   // Set the bootstrapping and opening tablets step and handle the case of zero tablets
   // present in the server
-  if (tablets_total_ == 0) {
+  const int tablets_total = tablets_total_.load(std::memory_order_relaxed);
+  const int tablets_processed = tablets_processed_.load(std::memory_order_relaxed);
+  if (tablets_total == 0) {
     SetWebResponse(output, "start_tablets", start_tablets_progress_);
   } else {
     SetWebResponse(output, "start_tablets", start_tablets_progress_,
-                    tablets_processed_ * 100 / tablets_total_);
+                   PercentOf(tablets_processed, tablets_total));
   }
 
   if (is_tablet_server_) {
-    output->Set("tablets_processed", tablets_processed_.load());
-    output->Set("tablets_total", tablets_total_.load());
+    output->Set("tablets_processed", tablets_processed);
+    output->Set("tablets_total", tablets_total);
   }
 
   SetWebResponse(output, "initialize_master_catalog", initialize_master_catalog_progress_);
@@ -160,6 +179,41 @@ MonoDelta StartupPathHandler::StartupProgressTimeElapsedMetric() {
   }
   time_elapsed += start_rpc_server_progress_.TimeElapsed();
   return time_elapsed;
+}
+
+int StartupPathHandler::ComputeReadFilesystemPercent() const {
+  if (read_filesystem_progress_.IsStopped()) {
+    return 100;
+  }
+  if (!read_filesystem_progress_.IsStarted()) {
+    return 0;
+  }
+
+  // Aggregate sub-step progress. 'Reading data directories' dominates the
+  // wall-clock time on LBM deployments, so it gets the bulk of the weight.
+  constexpr int kInstanceMetadataWeight = 5;
+  constexpr int kReadDataDirsWeight = 95;
+  static_assert(kInstanceMetadataWeight + kReadDataDirsWeight == 100,
+                "sub-step weights must sum to 100");
+
+  const int metadata_percent =
+      read_instance_metadata_files_progress_.IsStopped() ? 100 : 0;
+
+  int data_dirs_percent = 0;
+  if (read_data_directories_progress_.IsStopped()) {
+    data_dirs_percent = 100;
+  } else if (read_data_directories_progress_.IsStarted() && is_using_lbm_) {
+    // Interpolate LBM progress from the per-container counters.
+    data_dirs_percent = PercentOf(containers_processed_.load(std::memory_order_relaxed),
+                                  containers_total_.load(std::memory_order_relaxed));
+  }
+
+  const int aggregate =
+      (metadata_percent * kInstanceMetadataWeight +
+       data_dirs_percent * kReadDataDirsWeight) / 100;
+  // Cap at 99 until the parent Timer is stopped, so 100% implies the whole
+  // phase in server_base.cc has completed.
+  return std::min(aggregate, 99);
 }
 
 } // namespace server

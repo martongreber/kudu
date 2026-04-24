@@ -19,7 +19,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -168,15 +167,15 @@ Status ServicePool::QueueInboundCall(unique_ptr<InboundCall> call) {
   TRACE_TO(c->trace(), "Inserting onto call queue");
 
   // Queue message on service queue
-  std::optional<InboundCall*> evicted;
+  InboundCall* evicted = nullptr;
   const auto queue_status = service_queue_.Put(c, &evicted);
   if (queue_status == QUEUE_FULL) {
     RejectTooBusy(c);
     return Status::OK();
   }
 
-  if (PREDICT_FALSE(evicted.has_value())) {
-    RejectTooBusy(*evicted);
+  if (PREDICT_FALSE(evicted != nullptr)) {
+    RejectTooBusy(evicted);
   }
 
   if (PREDICT_TRUE(queue_status == QUEUE_SUCCESS)) {

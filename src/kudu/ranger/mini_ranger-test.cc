@@ -78,7 +78,7 @@ TEST_F(MiniRangerTest, TestPersistence) {
   EasyCurl curl;
   curl.set_auth(CurlAuthType::BASIC, "admin", "admin");
   faststring result;
-  ASSERT_OK(curl.FetchURL(JoinPathSegments(ranger_.admin_url(), "service/plugins/policies/count"),
+  ASSERT_OK(curl.FetchURL(JoinPathSegments(ranger_.admin_url(), "service/plugins/policies/count?serviceName=kudu"),
                           &result));
   ASSERT_EQ("1", result.ToString());
 }

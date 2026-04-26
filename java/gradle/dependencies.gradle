@@ -58,7 +58,7 @@ versions += [
     netty               : "4.1.131.Final",
     osdetector          : "1.6.2",
     protobuf            : "3.25.5",
-    ranger              : "2.1.0",
+    ranger              : "2.6.0",
     scala211            : "2.11.12",
     scala               : "2.12.20",
     scalatest           : "3.2.19",

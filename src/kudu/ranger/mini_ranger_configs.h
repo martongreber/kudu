@@ -174,6 +174,11 @@ inline std::string GetRangerAdminSiteXml(const std::string& admin_host,
     <name>ranger.spnego.kerberos.principal</name>
     <value>HTTP/_HOST@KRBTEST.COM</value>
   </property>
+  <property>
+    <name>ranger.spnego.kerberos.name.rules</name>
+  <value>RULE:[2:$$1@$$0](kudu@KRBTEST.COM)s/(.*)@KRBTEST.COM/kudu/
+DEFAULT</value>
+  </property>
 </configuration>
 )";
   return strings::Substitute(kRangerAdminSiteTemplate, pg_host, pg_port,
@@ -302,79 +307,63 @@ inline std::string GetRangerAdminDefaultSiteXml(const std::string& pg_driver) {
     <name>ranger.users.roles.list</name>
     <value>ROLE_SYS_ADMIN, ROLE_USER, ROLE_OTHER, ROLE_ANON, ROLE_KEY_ADMIN, ROLE_ADMIN_AUDITOR, ROLE_KEY_ADMIN_AUDITOR</value>
   </property>
+  <property>
+    <name>ranger.jpa.jdbc.idletimeout</name>
+    <value>60000</value>
+    <description/>
+  </property>
+  <property>
+    <name>ranger.jpa.jdbc.connectiontimeout</name>
+    <value>30000</value>
+    <description/>
+  </property>
+  <property>
+    <name>ranger.jpa.jdbc.validationquery</name>
+    <value>select 1</value>
+    <description/>
+  </property>
+  <property>
+    <name>ranger.jpa.jdbc.dialect</name>
+    <value>org.eclipse.persistence.platform.database.PostgreSQLPlatform</value>
+    <description>JPA dialect for PostgreSQL</description>
+  </property>
+  <property>
+    <name>ranger.jpa.jdbc.maxlifetime</name>
+    <value>1800000</value>
+  </property>
 </configuration>
 )";
   return strings::Substitute(kRangerAdminDefaultSiteTemplate, pg_driver);
 }
 
-// Gets the contents of the log4j.properties file which is used to set up the
-// logging in Ranger. The only modification to the default log4j.properties is
-// the configurable log level.
-inline std::string GetRangerLog4jProperties(const std::string& log_level) {
-  // log4j.properties file.
-  //
-  // This is the default log4j.properties with the only difference that rootLogger
-  // is made configurable if it's needed for debugging.
-  //
-  // $0: log level
-  const char *kLog4jPropertiesTemplate = R"(
-log4j.rootLogger = $0,xa_log_appender
+// Generates a minimal logback.xml configuration for Ranger 2.6+ (Replaces legacy Log4j
+// properties). It routes all application logs to a single file rather than the console
+// and silences noisy background components.
+inline std::string GetRangerLogbackXml(const std::string& log_level) {
+  std::string level = log_level;
+  std::transform(level.begin(), level.end(), level.begin(), ::toupper);
 
+  constexpr const char* kLogbackTemplate = R"(
+<configuration>
+  <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+    <file>$${logdir}/ranger-admin.log</file>
+    <encoder>
+      <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
 
-# xa_logger
-log4j.appender.xa_log_appender=org.apache.log4j.DailyRollingFileAppender
-log4j.appender.xa_log_appender.file=$${logdir}/ranger-admin-$${hostname}-$${user}.log
-log4j.appender.xa_log_appender.datePattern='.'yyyy-MM-dd
-log4j.appender.xa_log_appender.append=true
-log4j.appender.xa_log_appender.layout=org.apache.log4j.PatternLayout
-log4j.appender.xa_log_appender.layout.ConversionPattern=%d [%t] %-5p %C{6} (%F:%L) - %m%n
-# xa_log_appender : category and additivity
-log4j.category.org.springframework=warn,xa_log_appender
-log4j.additivity.org.springframework=false
+  <logger name="org.apache.ranger" level="$0"/>
+  <logger name="org.springframework" level="WARN"/>
+  <logger name="org.hibernate" level="WARN"/>
+  <logger name="org.eclipse.persistence" level="WARN"/>
+  <logger name="org.apache.ranger.biz.AssetMgr" level="WARN"/>
 
-log4j.category.org.apache.ranger=info,xa_log_appender
-log4j.additivity.org.apache.ranger=false
-
-log4j.category.xa=info,xa_log_appender
-log4j.additivity.xa=false
-
-# perf_logger
-log4j.appender.perf_appender=org.apache.log4j.DailyRollingFileAppender
-log4j.appender.perf_appender.file=$${logdir}/ranger_admin_perf.log
-log4j.appender.perf_appender.datePattern='.'yyyy-MM-dd
-log4j.appender.perf_appender.append=true
-log4j.appender.perf_appender.layout=org.apache.log4j.PatternLayout
-log4j.appender.perf_appender.layout.ConversionPattern=%d [%t] %m%n
-
-
-# sql_appender
-log4j.appender.sql_appender=org.apache.log4j.DailyRollingFileAppender
-log4j.appender.sql_appender.file=$${logdir}/ranger_admin_sql.log
-log4j.appender.sql_appender.datePattern='.'yyyy-MM-dd
-log4j.appender.sql_appender.append=true
-log4j.appender.sql_appender.layout=org.apache.log4j.PatternLayout
-log4j.appender.sql_appender.layout.ConversionPattern=%d [%t] %-5p %C{6} (%F:%L) - %m%n
-
-# sql_appender : category and additivity
-log4j.category.org.hibernate.SQL=warn,sql_appender
-log4j.additivity.org.hibernate.SQL=false
-
-log4j.category.jdbc.sqlonly=fatal,sql_appender
-log4j.additivity.jdbc.sqlonly=false
-
-log4j.category.jdbc.sqltiming=warn,sql_appender
-log4j.additivity.jdbc.sqltiming=false
-
-log4j.category.jdbc.audit=fatal,sql_appender
-log4j.additivity.jdbc.audit=false
-
-log4j.category.jdbc.resultset=fatal,sql_appender
-log4j.additivity.jdbc.resultset=false
-
-log4j.category.jdbc.connection=fatal,sql_appender
-log4j.additivity.jdbc.connection=false
+  <root level="$0">
+    <appender-ref ref="FILE" />
+  </root>
+</configuration>
 )";
-  return strings::Substitute(kLog4jPropertiesTemplate, log_level);
+  return strings::Substitute(kLogbackTemplate, level);
 }
 
 // Gets the core-site.xml that configures authentication.

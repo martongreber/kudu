@@ -27,7 +27,6 @@
 
 #include <glog/logging.h>
 
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/ranger/ranger.pb.h"
 #include "kudu/util/env.h"
@@ -99,6 +98,9 @@ class MiniRanger {
 
   // Adds a new policy to Ranger.
   Status AddPolicy(AuthorizationPolicy policy);
+
+  // Creates a new user in Ranger
+  Status CreateUserIfNotExists(const std::string& user_name);
 
   // Creates the client configs files in the given directory.
   Status CreateClientConfig(const std::string& client_config_dir);

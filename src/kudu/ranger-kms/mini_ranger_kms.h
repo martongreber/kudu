@@ -130,12 +130,14 @@ class MiniRangerKMS {
     // ${RANGER_KMS_HOME}/ews/webapp/lib/:
     // ${JAVA_HOME}/lib/:
     // ${RANGER_KMS_HADOOP_CONF_DIR}/"
-    return strings::Substitute("$0:$1:$2:$3:$4",
+    return strings::Substitute("$0:$1:$2:$3:$4:$5:$6:$7",
                                kms_home,
                                JoinPathSegments(bin_dir(), "postgresql.jar"),
                                JoinPathSegments(ranger_kms_home_,
                                                 "ews/webapp/WEB-INF/classes/lib/*"),
+                               JoinPathSegments(ranger_kms_home_, "ews/webapp/WEB-INF/lib/*"),
                                JoinPathSegments(ranger_kms_home_, "ews/webapp/lib/*"),
+                               JoinPathSegments(ranger_kms_home_, "ews/lib/*"),
                                JoinPathSegments(java_home_, "lib/*"),
                                JoinPathSegments(hadoop_home_, "conf"));
   }

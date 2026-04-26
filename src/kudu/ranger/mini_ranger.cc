@@ -21,6 +21,7 @@
 #include <ostream>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include <glog/logging.h>
@@ -119,8 +120,8 @@ Status MiniRanger::CreateConfigs() {
   RETURN_NOT_OK(WriteStringToFile(env_, GetRangerCoreSiteXml(kerberos_),
                                   JoinPathSegments(admin_home, "core-site.xml")));
 
-  RETURN_NOT_OK(WriteStringToFile(env_, GetRangerLog4jProperties("info"),
-                                  JoinPathSegments(admin_home, "log4j.properties")));
+  RETURN_NOT_OK(WriteStringToFile(env_, GetRangerLogbackXml("info"),
+                                  JoinPathSegments(admin_home, "logback.xml")));
 
   return Status::OK();
 }
@@ -208,8 +209,8 @@ Status MiniRanger::StartRanger() {
         "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED",
         "-Dproc_rangeradmin",
         Substitute("-Dhostname=$0", host_),
-        Substitute("-Dlog4j.configuration=file:$0",
-                   JoinPathSegments(kAdminHome, "log4j.properties")),
+        Substitute("-Dlogback.configurationFile=file:$0",
+                     JoinPathSegments(kAdminHome, "logback.xml")),
         "-Duser=miniranger",
         Substitute("-Dranger.service.host=$0", host_),
         "-Dservername=miniranger",
@@ -275,6 +276,23 @@ Status MiniRanger::CreateKuduService() {
 }
 
 Status MiniRanger::AddPolicy(AuthorizationPolicy policy) {
+  // Ranger 2.6 needs the users to be created prior creating their respective polices
+  std::unordered_set<string> unique_users;
+  for (const auto& item : policy.items) {
+    for (const string& user : std::get<0>(item)) {
+      // Do not attempt to create special Ranger macros as literal users
+      if (user != "{OWNER}") {
+        unique_users.insert(user);
+      }
+    }
+  }
+
+  for (const string& user_name : unique_users) {
+    // Helper that checks existence or just attempts creation
+    RETURN_NOT_OK_PREPEND(CreateUserIfNotExists(user_name),
+                          Substitute("Failed to ensure user $0 exists", user_name));
+  }
+
   string policy_name = JoinStrings<vector<string>>({JoinStrings(policy.databases, ","),
                                                     JoinStrings(policy.tables, ","),
                                                     JoinStrings(policy.columns, ",")}, ";");
@@ -343,6 +361,37 @@ Status MiniRanger::AddPolicy(AuthorizationPolicy policy) {
   return Status::OK();
 }
 
+Status MiniRanger::CreateUserIfNotExists(const string& user_name) {
+  // 1. Check if user already exists
+  EasyCurl curl;
+  curl.set_auth(CurlAuthType::BASIC, "admin", "admin");
+  faststring get_result;
+  string get_url = JoinPathSegments(ranger_admin_url_,
+                                    Substitute("service/xusers/users/userName/$0", user_name));
+
+  Status get_status = curl.FetchURL(get_url, &get_result);
+
+  if (get_status.ok()) {
+    LOG(INFO) << "User " << user_name << " already exists in Ranger, moving on.";
+    return Status::OK();
+  }
+
+  // 2. Create the user if not present
+  EasyJson user;
+  user.Set("name", user_name);
+  user.Set("firstName", user_name);
+  user.Set("lastName", "TestUser");
+  user.Set("password", "Password123!");
+  user.Set("userRoleList", EasyJson::kArray).PushBack("ROLE_USER");
+
+  Status s = PostToRanger("service/xusers/secure/users", user);
+  if (s.ok()) {
+    LOG(INFO) << "Successfully created Ranger user: " << user_name;
+    return Status::OK();
+  }
+  return s;
+}
+
 Status MiniRanger::PostToRanger(const string& url, const EasyJson& payload, bool secure) {
   EasyCurl curl;
   if (secure) {
@@ -353,7 +402,8 @@ Status MiniRanger::PostToRanger(const string& url, const EasyJson& payload, bool
   faststring result;
   RETURN_NOT_OK_PREPEND(curl.PostToURL(JoinPathSegments(ranger_admin_url_, url),
                                         payload.ToString(), &result,
-                                        {"Content-Type: application/json"}),
+                                        {"Content-Type: application/json",
+                                         "Accept: application/json"}),
                         Substitute("Error received from Ranger: $0", result.ToString()));
   return Status::OK();
 }

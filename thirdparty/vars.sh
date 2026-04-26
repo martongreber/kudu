@@ -264,11 +264,11 @@ POSTGRES_JDBC_SOURCE=$TP_SOURCE_DIR/$POSTGRES_JDBC_NAME
 # mvn versions:set -DnewVersion=$(git rev-parse HEAD)
 # mvn versions:update-child-modules
 # mvn package -DskipTests
-RANGER_VERSION=2.1.0
+RANGER_VERSION=2.6.0
 RANGER_NAME=ranger-$RANGER_VERSION-admin
 RANGER_SOURCE=$TP_SOURCE_DIR/$RANGER_NAME
 
-RANGER_KMS_VERSION=2.1.0 # this probably should match the ranger version
+RANGER_KMS_VERSION=2.6.0 # this probably should match the ranger version
 RANGER_KMS_NAME=ranger-$RANGER_KMS_VERSION-kms
 RANGER_KMS_SOURCE=$TP_SOURCE_DIR/$RANGER_KMS_NAME
 

@@ -1303,6 +1303,10 @@ METRIC_DEFINE_counter(test_entity, warn_counter, "Warn Metric", MetricUnit::kReq
                       "Description of warn metric",
                       kudu::MetricLevel::kWarn);
 
+METRIC_DEFINE_counter(test_entity, info_counter, "Info Metric", MetricUnit::kRequests,
+                      "Description of info metric",
+                      kudu::MetricLevel::kInfo);
+
 METRIC_DEFINE_counter(test_entity, debug_counter, "Debug Metric", MetricUnit::kRequests,
                       "Description of debug metric",
                       kudu::MetricLevel::kDebug);
@@ -1615,6 +1619,181 @@ TEST_F(MetricsTest, PrometheusEmptyHostnameLabel) {
   // Output should match the format from the prior patch (entity labels, no hostname).
   ASSERT_STR_CONTAINS(out,
       "kudu_tablet_test_counter{type=\"tablet\",id=\"t1\",unit_type=\"bytes\"} 1\n");
+}
+
+// Tests for Prometheus-format filtering via MetricPrometheusOptions::filters.
+// Tests that use real entity types (tablet, table, server) enable the new
+// entity-labels format for readable assertions. PrometheusFilterByEntityLevel
+// is the exception: it uses test_entity (not a known type) and therefore
+// stays in legacy format.
+// TODO(KUDU-3775): once BuildPrometheusLabels() handles arbitrary entity types,
+// switch PrometheusFilterByEntityLevel to entity-labels format too.
+
+TEST_F(MetricsTest, PrometheusFilterByEntityLevel) {
+  // test_entity is not a known Prometheus entity type, so BuildPrometheusLabels()
+  // would DCHECK with the entity-labels format. Pin legacy format explicitly so
+  // this test is not sensitive to the default value of the flag.
+  google::FlagSaver saver;
+  FLAGS_metrics_prometheus_use_entity_labels = false;
+
+  MetricRegistry registry;
+  auto entity  = METRIC_ENTITY_test_entity.Instantiate(&registry, "level-test");
+  auto warn_m  = METRIC_warn_counter.Instantiate(entity);
+  auto info_m  = METRIC_info_counter.Instantiate(entity);
+  auto debug_m = METRIC_debug_counter.Instantiate(entity);
+  warn_m->Increment();
+  info_m->Increment();
+  debug_m->Increment();
+
+  {
+    // "warn" level: only warn metric should appear.
+    ostringstream out;
+    PrometheusWriter writer(&out);
+    MetricPrometheusOptions opts;
+    opts.filters.entity_level = "warn";
+    ASSERT_OK(registry.WriteAsPrometheus(&writer, opts));
+    ASSERT_STR_CONTAINS(out.str(), "warn_counter");
+    ASSERT_STR_NOT_CONTAINS(out.str(), "info_counter");
+    ASSERT_STR_NOT_CONTAINS(out.str(), "debug_counter");
+  }
+  {
+    // "info" level: warn and info metrics should appear, debug should not.
+    ostringstream out;
+    PrometheusWriter writer(&out);
+    MetricPrometheusOptions opts;
+    opts.filters.entity_level = "info";
+    ASSERT_OK(registry.WriteAsPrometheus(&writer, opts));
+    ASSERT_STR_CONTAINS(out.str(), "warn_counter");
+    ASSERT_STR_CONTAINS(out.str(), "info_counter");
+    ASSERT_STR_NOT_CONTAINS(out.str(), "debug_counter");
+  }
+  {
+    // "debug" level: all three metrics should appear.
+    ostringstream out;
+    PrometheusWriter writer(&out);
+    MetricPrometheusOptions opts;
+    opts.filters.entity_level = "debug";
+    ASSERT_OK(registry.WriteAsPrometheus(&writer, opts));
+    ASSERT_STR_CONTAINS(out.str(), "warn_counter");
+    ASSERT_STR_CONTAINS(out.str(), "info_counter");
+    ASSERT_STR_CONTAINS(out.str(), "debug_counter");
+  }
+}
+
+TEST_F(MetricsTest, PrometheusFilterByEntityType) {
+  google::FlagSaver saver;
+  FLAGS_metrics_prometheus_use_entity_labels = true;
+
+  MetricRegistry registry;
+  auto tablet_entity = METRIC_ENTITY_tablet.Instantiate(&registry, "t1");
+  auto tablet_counter = METRIC_tablet_test_counter.Instantiate(tablet_entity);
+  tablet_counter->Increment();
+
+  auto table_entity = METRIC_ENTITY_table.Instantiate(&registry, "tbl1");
+  auto table_counter = METRIC_table_test_counter.Instantiate(table_entity);
+  table_counter->Increment();
+
+  {
+    // Filter to "tablet" type only: table counter must not appear.
+    ostringstream out;
+    PrometheusWriter writer(&out);
+    MetricPrometheusOptions opts;
+    opts.filters.entity_types = { "tablet" };
+    ASSERT_OK(registry.WriteAsPrometheus(&writer, opts));
+    ASSERT_STR_CONTAINS(out.str(), "type=\"tablet\"");
+    ASSERT_STR_NOT_CONTAINS(out.str(), "type=\"table\"");
+  }
+  // TODO(KUDU-3774): add a "table" filter case here that asserts only
+  // type="table" appears and type="tablet" does not. Currently blocked because
+  // MatchName() does substring matching, so "table" also matches "tablet".
+  {
+    // Non-existent type: no metrics should appear.
+    ostringstream out;
+    PrometheusWriter writer(&out);
+    MetricPrometheusOptions opts;
+    opts.filters.entity_types = { "nonexistent_type" };
+    ASSERT_OK(registry.WriteAsPrometheus(&writer, opts));
+    ASSERT_STR_NOT_CONTAINS(out.str(), "type=\"tablet\"");
+    ASSERT_STR_NOT_CONTAINS(out.str(), "type=\"table\"");
+  }
+}
+
+TEST_F(MetricsTest, PrometheusFilterByEntityId) {
+  google::FlagSaver saver;
+  FLAGS_metrics_prometheus_use_entity_labels = true;
+
+  MetricRegistry registry;
+  auto e_keep = METRIC_ENTITY_tablet.Instantiate(&registry, "tablet-keep");
+  auto e_drop = METRIC_ENTITY_tablet.Instantiate(&registry, "tablet-drop");
+  auto c_keep = METRIC_tablet_test_counter.Instantiate(e_keep);
+  auto c_drop = METRIC_tablet_test_counter.Instantiate(e_drop);
+  c_keep->IncrementBy(10);
+  c_drop->IncrementBy(20);
+
+  ostringstream out;
+  PrometheusWriter writer(&out);
+  MetricPrometheusOptions opts;
+  opts.filters.entity_ids = { "tablet-keep" };
+  ASSERT_OK(registry.WriteAsPrometheus(&writer, opts));
+  const auto& str = out.str();
+  ASSERT_STR_CONTAINS(str, "id=\"tablet-keep\"");
+  ASSERT_STR_NOT_CONTAINS(str, "id=\"tablet-drop\"");
+}
+
+TEST_F(MetricsTest, PrometheusFilterByMetricName) {
+  google::FlagSaver saver;
+  FLAGS_metrics_prometheus_use_entity_labels = true;
+
+  MetricRegistry registry;
+  auto entity = METRIC_ENTITY_tablet.Instantiate(&registry, "t1");
+  auto counter = METRIC_tablet_test_counter.Instantiate(entity);
+  counter->Increment();
+
+  {
+    // Matching substring: the metric should appear.
+    ostringstream out;
+    PrometheusWriter writer(&out);
+    MetricPrometheusOptions opts;
+    opts.filters.entity_metrics = { "tablet_test_counter" };
+    ASSERT_OK(registry.WriteAsPrometheus(&writer, opts));
+    ASSERT_STR_CONTAINS(out.str(), "kudu_tablet_test_counter");
+  }
+  {
+    // Non-matching substring: no metrics should appear.
+    ostringstream out;
+    PrometheusWriter writer(&out);
+    MetricPrometheusOptions opts;
+    opts.filters.entity_metrics = { "nonexistent_metric" };
+    ASSERT_OK(registry.WriteAsPrometheus(&writer, opts));
+    ASSERT_STR_NOT_CONTAINS(out.str(), "kudu_tablet_test_counter");
+  }
+}
+
+TEST_F(MetricsTest, PrometheusFilterByEntityAttributes) {
+  google::FlagSaver saver;
+  FLAGS_metrics_prometheus_use_entity_labels = true;
+
+  MetricRegistry registry;
+
+  // Two tablet entities belonging to different tables.
+  auto e_a = METRIC_ENTITY_tablet.Instantiate(
+      &registry, "tablet-a", {{"table_name", "table_a"}});
+  auto e_b = METRIC_ENTITY_tablet.Instantiate(
+      &registry, "tablet-b", {{"table_name", "table_b"}});
+  auto c_a = METRIC_tablet_test_counter.Instantiate(e_a);
+  auto c_b = METRIC_tablet_test_counter.Instantiate(e_b);
+  c_a->IncrementBy(1);
+  c_b->IncrementBy(2);
+
+  // Filter to table_a: only tablet-a should appear.
+  ostringstream out;
+  PrometheusWriter writer(&out);
+  MetricPrometheusOptions opts;
+  opts.filters.entity_attrs = { "table_name", "table_a" };
+  ASSERT_OK(registry.WriteAsPrometheus(&writer, opts));
+  const auto& str = out.str();
+  ASSERT_STR_CONTAINS(str, "id=\"tablet-a\"");
+  ASSERT_STR_NOT_CONTAINS(str, "id=\"tablet-b\"");
 }
 
 } // namespace kudu

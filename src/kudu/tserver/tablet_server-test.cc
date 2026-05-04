@@ -4465,6 +4465,162 @@ TEST_F(TabletServerTest, PrometheusMetricsLevelFiltering) {
   }
 }
 
+// Verify that the ?level= query parameter on /metrics_prometheus overrides
+// the --metrics_default_level flag for a single request.
+TEST_F(TabletServerTest, PrometheusMetricsLevelQueryParam) {
+  // Set the flag to "debug" so all levels are emitted by default.
+  google::FlagSaver saver;
+  FLAGS_metrics_default_level = "debug";
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // ?level=warn overrides the flag: only warn-level metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?level=warn", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // level: debug
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // level: info
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // level: warn
+  }
+  {
+    // ?level=info overrides the flag: debug absent, info+warn present.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?level=info", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // level: debug
+    ASSERT_STR_MATCHES(str, "threads_running ");     // level: info
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // level: warn
+  }
+}
+
+// Verify that ?types= filters the Prometheus output to only entities of the
+// given type.
+TEST_F(TabletServerTest, PrometheusMetricsTypeFiltering) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // ?types=server: only server-entity metrics should appear; tablet metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=server", &buf));
+    const auto& str = buf.ToString();
+    ASSERT_STR_MATCHES(str, "threads_running ");  // server-level metric
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");    // tablet-level metric
+  }
+  {
+    // ?types=tablet: only tablet-entity metrics should appear; server metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=tablet", &buf));
+    const auto& str = buf.ToString();
+    ASSERT_STR_MATCHES(str, "raft_term ");           // tablet-level metric
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // server-level metric
+  }
+  // TODO(KUDU-3774): add a ?types=table case.
+  {
+    // ?types=nonexistent_type: no metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=nonexistent_type", &buf));
+    // No entity type matches, so the output should contain no metric value lines at all.
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?metrics= filters the output to only metrics whose names
+// contain the given substring.
+TEST_F(TabletServerTest, PrometheusMetricsNameFiltering) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // ?metrics=raft_term: only that metric should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?metrics=raft_term", &buf));
+    const auto& str = buf.ToString();
+    ASSERT_STR_MATCHES(str, "raft_term ");
+    ASSERT_STR_NOT_MATCHES(str, "threads_running ");
+  }
+  {
+    // ?metrics=nonexistent: no metrics should be emitted.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?metrics=nonexistent_metric_xyz", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?ids= filters the output to only entities with the given ID.
+TEST_F(TabletServerTest, PrometheusMetricsIdFiltering) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // ?ids=<tablet-id>: only tablet-entity metrics should appear; server metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + Substitute("?ids=$0", kTabletId), &buf));
+    const auto& str = buf.ToString();
+    ASSERT_STR_MATCHES(str, "raft_term ");        // tablet metric
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // server metric
+  }
+  {
+    // ?ids=nonexistent_id: no metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?ids=nonexistent_id_xyz", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?attributes= filters the Prometheus output to only entities
+// whose attributes match the given key/value pair.
+// This test creates two tablets belonging to different tables and verifies
+// that filtering by table_id returns only metrics for the matching table's tablets.
+TEST_F(TabletServerTest, PrometheusMetricsAttributeFiltering) {
+  // The default tablet (kTabletId) belongs to kTableId == "TestTable".
+  // Add a second tablet belonging to a different table.
+  constexpr char kOtherTableId[] = "OtherTable";
+  constexpr char kOtherTabletId[] = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  ASSERT_OK(mini_server_->AddTestTablet(kOtherTableId, kOtherTabletId, schema_));
+  ASSERT_OK(WaitForTabletRunning(kOtherTabletId));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // Filter by table_id=TestTable: the default tablet should appear,
+    // but the OtherTable tablet must be absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?attributes=table_id,TestTable", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_CONTAINS(str, kTabletId);
+    ASSERT_STR_NOT_CONTAINS(str, kOtherTabletId);
+  }
+  {
+    // Filter by table_id=OtherTable: the second tablet should appear,
+    // but the default tablet must be absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?attributes=table_id,OtherTable", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_CONTAINS(str, kOtherTabletId);
+    ASSERT_STR_NOT_CONTAINS(str, kTabletId);
+  }
+}
+
 // Test that hostname is set properly for TabletServer's Messenger.
 TEST_F(TabletServerTest, ServerHostname) {
   string server_hostname;

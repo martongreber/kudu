@@ -92,8 +92,8 @@ DEFINE_string(metrics_default_level, "debug",
               "both in JSON and Prometheus formats. Valid choices are 'debug', "
               "'info', and 'warn'. The levels are ordered and lower levels "
               "include the levels above them. This value can be overridden "
-              "by passing the level query parameter to the '/metrics' endpoint "
-              "when fetching metrics in JSON format.");
+              "per-request by passing the 'level' query parameter to the "
+              "'/metrics' or '/metrics_prometheus' endpoints.");
 TAG_FLAG(metrics_default_level, advanced);
 TAG_FLAG(metrics_default_level, runtime);
 TAG_FLAG(metrics_default_level, evolving);
@@ -486,6 +486,24 @@ static vector<string> ParseArray(const Webserver::ArgumentMap& args, const strin
   return value;
 }
 
+static bool ParseMetricFilters(const Webserver::WebRequest& req,
+                               Webserver::PrerenderedWebResponse* resp,
+                               MetricFilters* filters) {
+  filters->entity_types   = ParseArray(req.parsed_args, "types");
+  filters->entity_ids     = ParseArray(req.parsed_args, "ids");
+  filters->entity_attrs   = ParseArray(req.parsed_args, "attributes");
+  filters->entity_metrics = ParseArray(req.parsed_args, "metrics");
+  filters->entity_level   = FindWithDefault(req.parsed_args, "level",
+                                            FLAGS_metrics_default_level);
+  if (filters->entity_attrs.size() % 2 != 0) {
+    resp->status_code = HttpStatusCode::BadRequest;
+    resp->output << "The 'attributes' parameter must be provided as key-value pairs "
+                    "(i.e. an even number of values)";
+    return false;
+  }
+  return true;
+}
+
 static void WriteMetricsAsJson(const MetricRegistry* const metrics,
                                const Webserver::WebRequest& req,
                                Webserver::PrerenderedWebResponse* resp) {
@@ -493,12 +511,8 @@ static void WriteMetricsAsJson(const MetricRegistry* const metrics,
   opts.include_raw_histograms = ParseBool(req.parsed_args, "include_raw_histograms");
   opts.include_schema_info = ParseBool(req.parsed_args, "include_schema");
 
-  MetricFilters& filters = opts.filters;
-  filters.entity_types = ParseArray(req.parsed_args, "types");
-  filters.entity_ids = ParseArray(req.parsed_args, "ids");
-  filters.entity_attrs = ParseArray(req.parsed_args, "attributes");
-  filters.entity_metrics = ParseArray(req.parsed_args, "metrics");
-  filters.entity_level = FindWithDefault(req.parsed_args, "level", FLAGS_metrics_default_level);
+  if (!ParseMetricFilters(req, resp, &opts.filters)) return;
+
   vector<string> merge_rules = ParseArray(req.parsed_args, "merge_rules");
   for (const auto& merge_rule : merge_rules) {
     vector<string> values;
@@ -513,24 +527,16 @@ static void WriteMetricsAsJson(const MetricRegistry* const metrics,
 
   JsonWriter::Mode json_mode = ParseBool(req.parsed_args, "compact") ?
       JsonWriter::COMPACT : JsonWriter::PRETTY;
-
-  // The number of entity_attrs should always be even because
-  // each pair represents a key and a value.
-  if (filters.entity_attrs.size() % 2 != 0) {
-    resp->status_code = HttpStatusCode::BadRequest;
-    WARN_NOT_OK(Status::InvalidArgument(""), "The parameter of 'attributes' is wrong");
-  } else {
-    JsonWriter writer(&resp->output, json_mode);
-    WARN_NOT_OK(metrics->WriteAsJson(&writer, opts), "Couldn't write JSON metrics over HTTP");
-  }
+  JsonWriter writer(&resp->output, json_mode);
+  WARN_NOT_OK(metrics->WriteAsJson(&writer, opts), "Couldn't write JSON metrics over HTTP");
 }
 
 static void WriteMetricsAsPrometheus(const MetricRegistry* const metrics,
                                      const string& hostname,
-                                     const Webserver::WebRequest& /*req*/,
+                                     const Webserver::WebRequest& req,
                                      Webserver::PrerenderedWebResponse* resp) {
   MetricPrometheusOptions opts;
-  opts.filters.entity_level = FLAGS_metrics_default_level;
+  if (!ParseMetricFilters(req, resp, &opts.filters)) return;
   if (FLAGS_metrics_prometheus_use_entity_labels) {
     opts.hostname = hostname;
   }

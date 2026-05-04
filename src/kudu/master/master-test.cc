@@ -4113,6 +4113,147 @@ TEST_F(MasterTest, PrometheusMetricsLevelFiltering) {
   }
 }
 
+// Verify that the ?level= query parameter on /metrics_prometheus overrides
+// the --metrics_default_level flag for a single request.
+TEST_F(MasterTest, PrometheusMetricsLevelQueryParam) {
+  constexpr char kTableName[] = "prom_level_query_param";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32), ColumnSchema("v1", UINT64) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  // Set the flag to "debug" so all levels are emitted by default.
+  google::FlagSaver saver;
+  FLAGS_metrics_default_level = "debug";
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  {
+    // ?level=warn overrides the flag: only warn-level metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?level=warn", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // level: debug
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // level: info
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // level: warn
+  }
+  {
+    // ?level=info overrides the flag: debug metrics absent, info+warn present.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?level=info", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // level: debug
+    ASSERT_STR_MATCHES(str, "threads_running ");     // level: info
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // level: warn
+  }
+}
+
+// Verify that ?types= filters the output to only entities of the given type.
+TEST_F(MasterTest, PrometheusMetricsTypeFiltering) {
+  constexpr char kTableName[] = "prom_type_filter";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  {
+    // ?types=server: only server-entity metrics should appear; tablet metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=server", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "threads_running ");  // server-level metric
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");    // tablet-level metric
+  }
+  {
+    // ?types=tablet: only tablet-entity metrics should appear; server metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=tablet", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "raft_term ");           // tablet-level metric
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // server-level metric
+  }
+  // TODO(KUDU-3774): add a ?types=table case.
+  {
+    // ?types=nonexistent_type: no metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=nonexistent_type", &buf));
+    // No entity type matches, so the output should contain no metric value lines at all.
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?metrics= filters the output to only metrics whose names
+// contain the given substring.
+TEST_F(MasterTest, PrometheusMetricsNameFiltering) {
+  constexpr char kTableName[] = "prom_name_filter";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  {
+    // ?metrics=threads_running: only that metric should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?metrics=threads_running", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "threads_running ");
+    ASSERT_STR_NOT_MATCHES(str, "rpcs_queue_overflow ");
+  }
+  {
+    // ?metrics=nonexistent: no metrics should be emitted.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?metrics=nonexistent_metric_xyz", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?ids= filters the output to only entities with the given ID.
+TEST_F(MasterTest, PrometheusMetricsIdFiltering) {
+  constexpr char kTableName[] = "prom_id_filter";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  {
+    // ?ids=kudu.master: only server-entity metrics should appear (tablet metrics absent).
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?ids=kudu.master", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "threads_running ");  // server metric
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");    // tablet metric
+  }
+  {
+    // ?ids=nonexistent_id: no metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?ids=nonexistent_id", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
 // Test that the Prometheus service discovery endpoint returns proper target groups
 // for masters and tservers with all expected fields (group, scheme, cluster_id, location).
 TEST_F(MasterTest, TestPrometheusServiceDiscoveryEndpoint) {

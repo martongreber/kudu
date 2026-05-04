@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <ctime>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -4110,6 +4111,275 @@ TEST_F(MasterTest, PrometheusMetricsLevelFiltering) {
     ASSERT_STR_NOT_MATCHES(str, "threads_running ");  // level: info
     // There should be metrics only of the 'warn' level.
     ASSERT_STR_MATCHES(str, "rpcs_queue_overflow ");  // level: warn
+  }
+}
+
+// Verify that the ?level= query parameter on /metrics_prometheus overrides
+// the --metrics_default_level flag for a single request.
+TEST_F(MasterTest, PrometheusMetricsLevelQueryParam) {
+  constexpr char kTableName[] = "prom_level_query_param";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32), ColumnSchema("v1", UINT64) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  // Set the flag to "debug" so all levels are emitted by default.
+  google::FlagSaver saver;
+  FLAGS_metrics_default_level = "debug";
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  {
+    // ?level=warn overrides the flag: only warn-level metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?level=warn", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // level: debug
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // level: info
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // level: warn
+  }
+  {
+    // ?level=info overrides the flag: debug metrics absent, info+warn present.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?level=info", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // level: debug
+    ASSERT_STR_MATCHES(str, "threads_running ");     // level: info
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // level: warn
+  }
+}
+
+// Verify that ?types= filters the output to only entities of the given type.
+TEST_F(MasterTest, PrometheusMetricsTypeFiltering) {
+  constexpr char kTableName[] = "prom_type_filter";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  {
+    // ?types=server: only server-entity metrics should appear; tablet metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=server", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "threads_running ");  // server-level metric
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");    // tablet-level metric
+  }
+  {
+    // ?types=tablet: only tablet-entity metrics should appear; server metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=tablet", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "raft_term ");           // tablet-level metric
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // server-level metric
+  }
+  // TODO(KUDU-3774): add a ?types=table case.
+  {
+    // ?types=nonexistent_type: no metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=nonexistent_type", &buf));
+    // No entity type matches, so the output should contain no metric value lines at all.
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?metrics= filters the output to only metrics whose names
+// contain the given substring.
+TEST_F(MasterTest, PrometheusMetricsNameFiltering) {
+  constexpr char kTableName[] = "prom_name_filter";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  {
+    // ?metrics=threads_running: only that metric should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?metrics=threads_running", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "threads_running ");
+    ASSERT_STR_NOT_MATCHES(str, "rpcs_queue_overflow ");
+  }
+  {
+    // ?metrics=nonexistent: no metrics should be emitted.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?metrics=nonexistent_metric_xyz", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?ids= filters the output to only entities with the given ID.
+TEST_F(MasterTest, PrometheusMetricsIdFiltering) {
+  constexpr char kTableName[] = "prom_id_filter";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  {
+    // ?ids=kudu.master: only server-entity metrics should appear (tablet metrics absent).
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?ids=kudu.master", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "threads_running ");  // server metric
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");    // tablet metric
+  }
+  {
+    // ?ids=nonexistent_id: no metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?ids=nonexistent_id", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that two different filters can be combined in a single request.
+TEST_F(MasterTest, PrometheusMetricsCombinedFilters) {
+  constexpr char kTableName[] = "prom_combined_filter";
+  const Schema kTableSchema(
+      { ColumnSchema("key", INT32), ColumnSchema("v1", UINT64) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+  // ?level=info&types=server: should include info/warn server metrics
+  // but exclude debug-level metrics and any tablet-entity metrics.
+  ASSERT_OK(c.FetchURL(base_url + "?level=info&types=server", &buf));
+  const auto& str = buf.ToString();
+  NO_FATALS(CheckPrometheusOutput(str));
+  ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // debug-level, tablet entity
+  ASSERT_STR_MATCHES(str, "threads_running ");     // info-level, server entity
+  ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // warn-level, server entity
+}
+
+// Verify that the ?attributes= filter returns HTTP 400 when an odd number of
+// values is supplied (attribute keys and values must come in pairs).
+// This applies to both the JSON and Prometheus metrics endpoints.
+TEST_F(MasterTest, MetricsOddAttributesReturnsBadRequest) {
+  const string base_prom_url = Substitute("http://$0/metrics_prometheus",
+                                          mini_master_->bound_http_addr().ToString());
+  const string base_json_url = Substitute("http://$0/metrics",
+                                          mini_master_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+  // One value instead of the required even number of values.
+  Status s = c.FetchURL(base_prom_url + "?attributes=table_id", &buf);
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 400");
+
+  s = c.FetchURL(base_json_url + "?attributes=table_id", &buf);
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 400");
+}
+
+// Verify that query parameters that are meaningful only for the JSON metrics
+// endpoint (?include_raw_histograms, ?include_schema, ?compact) are silently
+// ignored when passed to /metrics_prometheus, and do not cause a crash or
+// suppress any metrics.  Unrecognized filter keys are also silently ignored.
+TEST_F(MasterTest, PrometheusMetricsJsonOnlyParamsIgnored) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+  ASSERT_OK(c.FetchURL(
+      base_url + "?include_raw_histograms=1&include_schema=1&compact=1&unknown_key=foo",
+      &buf));
+  const string& str = buf.ToString();
+  NO_FATALS(CheckPrometheusOutput(str));
+  ASSERT_STR_MATCHES(str, "threads_running ");     // info-level, server entity
+  ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // warn-level, server entity
+}
+
+// Verify that supplying an empty value for a recognized filter key is treated
+// as a no-op: the empty string matches every value via substring logic, so all
+// metrics are included and nothing crashes.
+// Similarly, ?level= with an empty value falls back to the default level,
+// again returning all metrics.
+TEST_F(MasterTest, PrometheusMetricsEmptyFilterValuesAreNoOp) {
+  constexpr char kTableName[] = "prom_empty_filter";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+
+  // Each of these supplies an empty value for a recognized filter key.
+  // None of them should crash, and all should still emit well-known metrics.
+  for (const char* query : {"?types=", "?ids=", "?metrics=", "?level="}) {
+    ASSERT_OK(c.FetchURL(base_url + query, &buf));
+    const string& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "threads_running ") << "query: " << query;
+  }
+}
+
+// Verify that a valid filter combined with invalid input (unrecognized key,
+// garbage level value, or empty value for another key) still applies the valid
+// filter correctly and does not crash.
+TEST_F(MasterTest, PrometheusMetricsValidFilterWithBadInputIgnored) {
+  constexpr char kTableName[] = "prom_valid_bad_filter";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_master_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+
+  {
+    // Valid level filter + unrecognized key: level filter must still apply.
+    ASSERT_OK(c.FetchURL(base_url + "?level=info&unknown_key=foo", &buf));
+    const string& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // debug-level, absent at info
+    ASSERT_STR_MATCHES(str, "threads_running ");     // info-level, present
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // warn-level, present
+  }
+  {
+    // Valid types filter + garbage level value: types filter must still apply,
+    // garbage level falls back to kDebug so all levels are included.
+    ASSERT_OK(c.FetchURL(base_url + "?types=server&level=garbage", &buf));
+    const string& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");        // tablet entity, absent
+    ASSERT_STR_MATCHES(str, "threads_running ");      // server entity, present
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow ");  // warn-level server entity, also present
+  }
+  {
+    // Valid level filter + empty types value: level filter must still apply,
+    // empty types matches all entity types so nothing is filtered by type.
+    ASSERT_OK(c.FetchURL(base_url + "?level=warn&types=", &buf));
+    const string& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");        // debug-level, absent at warn
+    ASSERT_STR_NOT_MATCHES(str, "threads_running ");  // info-level, absent at warn
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow ");  // warn-level, present
   }
 }
 

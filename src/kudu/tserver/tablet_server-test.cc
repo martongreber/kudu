@@ -4465,6 +4465,305 @@ TEST_F(TabletServerTest, PrometheusMetricsLevelFiltering) {
   }
 }
 
+// Verify that the ?level= query parameter on /metrics_prometheus overrides
+// the --metrics_default_level flag for a single request.
+TEST_F(TabletServerTest, PrometheusMetricsLevelQueryParam) {
+  // Set the flag to "debug" so all levels are emitted by default.
+  google::FlagSaver saver;
+  FLAGS_metrics_default_level = "debug";
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // ?level=warn overrides the flag: only warn-level metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?level=warn", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // level: debug
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // level: info
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // level: warn
+  }
+  {
+    // ?level=info overrides the flag: debug absent, info+warn present.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?level=info", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // level: debug
+    ASSERT_STR_MATCHES(str, "threads_running ");     // level: info
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // level: warn
+  }
+}
+
+// Verify that ?types= filters the Prometheus output to only entities of the
+// given type.
+TEST_F(TabletServerTest, PrometheusMetricsTypeFiltering) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // ?types=server: only server-entity metrics should appear; tablet metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=server", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "threads_running ");  // server-level metric
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");    // tablet-level metric
+  }
+  {
+    // ?types=tablet: only tablet-entity metrics should appear; server metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=tablet", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "raft_term ");           // tablet-level metric
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // server-level metric
+  }
+  // TODO(KUDU-3774): add a ?types=table case.
+  {
+    // ?types=nonexistent_type: no metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?types=nonexistent_type", &buf));
+    // No entity type matches, so the output should contain no metric value lines at all.
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?metrics= filters the output to only metrics whose names
+// contain the given substring.
+TEST_F(TabletServerTest, PrometheusMetricsNameFiltering) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // ?metrics=raft_term: only that metric should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?metrics=raft_term", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "raft_term ");
+    ASSERT_STR_NOT_MATCHES(str, "threads_running ");
+  }
+  {
+    // ?metrics=nonexistent: no metrics should be emitted.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?metrics=nonexistent_metric_xyz", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?ids= filters the output to only entities with the given ID.
+TEST_F(TabletServerTest, PrometheusMetricsIdFiltering) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // ?ids=<tablet-id>: only tablet-entity metrics should appear; server metrics absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + Substitute("?ids=$0", kTabletId), &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "raft_term ");        // tablet metric
+    ASSERT_STR_NOT_MATCHES(str, "threads_running "); // server metric
+  }
+  {
+    // ?ids=nonexistent_id: no metrics should appear.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?ids=nonexistent_id_xyz", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    NO_FATALS(CheckNoPrometheusValueLines(str));
+  }
+}
+
+// Verify that ?attributes= filters the Prometheus output to only entities
+// whose attributes match the given key/value pair.
+// This test creates two tablets belonging to different tables and verifies
+// that filtering by table_id returns only metrics for the matching table's tablets.
+TEST_F(TabletServerTest, PrometheusMetricsAttributeFiltering) {
+  // The default tablet (kTabletId) belongs to kTableId == "TestTable".
+  // Add a second tablet belonging to a different table.
+  constexpr char kOtherTableId[] = "OtherTable";
+  constexpr char kOtherTabletId[] = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  ASSERT_OK(mini_server_->AddTestTablet(kOtherTableId, kOtherTabletId, schema_));
+  ASSERT_OK(WaitForTabletRunning(kOtherTabletId));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  {
+    // Filter by table_id=TestTable: the default tablet should appear,
+    // but the OtherTable tablet must be absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?attributes=table_id,TestTable", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_CONTAINS(str, kTabletId);
+    ASSERT_STR_NOT_CONTAINS(str, kOtherTabletId);
+  }
+  {
+    // Filter by table_id=OtherTable: the second tablet should appear,
+    // but the default tablet must be absent.
+    EasyCurl c;
+    faststring buf;
+    ASSERT_OK(c.FetchURL(base_url + "?attributes=table_id,OtherTable", &buf));
+    const auto& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_CONTAINS(str, kOtherTabletId);
+    ASSERT_STR_NOT_CONTAINS(str, kTabletId);
+  }
+}
+
+// Verify that combining ?attributes= with ?ids= where the ID belongs to a
+// tablet from a *different* table returns an empty Prometheus output.
+// This guards against a scenario where the two filters interact unexpectedly.
+TEST_F(TabletServerTest, PrometheusMetricsMixedAttributesAndIds) {
+  constexpr char kOtherTableId[] = "OtherTable";
+  constexpr char kOtherTabletId[] = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  ASSERT_OK(mini_server_->AddTestTablet(kOtherTableId, kOtherTabletId, schema_));
+  ASSERT_OK(WaitForTabletRunning(kOtherTabletId));
+
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+  // Ask for table_id=TestTable but the ID of the OtherTable tablet.
+  // The attribute filter and the id filter are ANDed: no entity matches both,
+  // so the output should be empty of metric value lines.
+  ASSERT_OK(c.FetchURL(
+      base_url + Substitute("?attributes=table_id,TestTable&ids=$0", kOtherTabletId),
+      &buf));
+  const auto& str = buf.ToString();
+  NO_FATALS(CheckPrometheusOutput(str));
+  NO_FATALS(CheckNoPrometheusValueLines(str));
+}
+
+// Verify that two different filters can be combined in a single request.
+// For example, ?level=info&types=tablet should output tablet-entity metrics
+// at info level or above, with no server-entity metrics and no debug-level metrics.
+TEST_F(TabletServerTest, PrometheusMetricsCombinedFilters) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+  // ?level=info&types=tablet: only tablet entities, only info-and-above metrics.
+  ASSERT_OK(c.FetchURL(base_url + "?level=info&types=tablet", &buf));
+  const auto& str = buf.ToString();
+  NO_FATALS(CheckPrometheusOutput(str));
+  ASSERT_STR_MATCHES(str, "on_disk_data_size ");    // info-level, tablet entity
+  ASSERT_STR_NOT_MATCHES(str, "raft_term ");        // debug-level, tablet entity
+  ASSERT_STR_NOT_MATCHES(str, "threads_running ");  // info-level, but server entity
+}
+
+// Verify that the ?attributes= filter returns HTTP 400 when an odd number of
+// values is supplied (attribute keys and values must come in pairs).
+// This applies to both the JSON and Prometheus metrics endpoints.
+TEST_F(TabletServerTest, MetricsOddAttributesReturnsBadRequest) {
+  const string base_prom_url = Substitute("http://$0/metrics_prometheus",
+                                          mini_server_->bound_http_addr().ToString());
+  const string base_json_url = Substitute("http://$0/metrics",
+                                          mini_server_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+  Status s = c.FetchURL(base_prom_url + "?attributes=table_id", &buf);
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 400");
+
+  s = c.FetchURL(base_json_url + "?attributes=table_id", &buf);
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 400");
+}
+
+// Verify that query parameters that are meaningful only for the JSON metrics
+// endpoint (?include_raw_histograms, ?include_schema, ?compact) are silently
+// ignored when passed to /metrics_prometheus, and do not cause a crash or
+// suppress any metrics.  Unrecognized filter keys are also silently ignored.
+TEST_F(TabletServerTest, PrometheusMetricsJsonOnlyParamsIgnored) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+  ASSERT_OK(c.FetchURL(
+      base_url + "?include_raw_histograms=1&include_schema=1&compact=1&unknown_key=foo",
+      &buf));
+  const string& str = buf.ToString();
+  NO_FATALS(CheckPrometheusOutput(str));
+  ASSERT_STR_MATCHES(str, "threads_running ");     // info-level, server entity
+  ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // warn-level, server entity
+}
+
+// Verify that supplying an empty value for a recognized filter key is treated
+// as a no-op: the empty string matches every value via substring logic, so all
+// metrics are included and nothing crashes.
+// Similarly, ?level= with an empty value falls back to the default level,
+// again returning all metrics.
+TEST_F(TabletServerTest, PrometheusMetricsEmptyFilterValuesAreNoOp) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+
+  // Each of these supplies an empty value for a recognized filter key.
+  // None of them should crash, and all should still emit well-known metrics.
+  for (const char* query : {"?types=", "?ids=", "?metrics=", "?level="}) {
+    ASSERT_OK(c.FetchURL(base_url + query, &buf));
+    const string& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_MATCHES(str, "threads_running ") << "query: " << query;
+  }
+}
+
+// Verify that a valid filter combined with invalid input (unrecognized key,
+// garbage level value, or empty value for another key) still applies the valid
+// filter correctly and does not crash.
+TEST_F(TabletServerTest, PrometheusMetricsValidFilterWithBadInputIgnored) {
+  const string base_url = Substitute("http://$0/metrics_prometheus",
+                                     mini_server_->bound_http_addr().ToString());
+  EasyCurl c;
+  faststring buf;
+
+  {
+    // Valid level filter + unrecognized key: level filter must still apply.
+    ASSERT_OK(c.FetchURL(base_url + "?level=info&unknown_key=foo", &buf));
+    const string& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");       // debug-level, absent at info
+    ASSERT_STR_MATCHES(str, "threads_running ");     // info-level, present
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow "); // warn-level, present
+  }
+  {
+    // Valid types filter + garbage level value: types filter must still apply,
+    // garbage level falls back to kDebug so all levels are included.
+    ASSERT_OK(c.FetchURL(base_url + "?types=server&level=garbage", &buf));
+    const string& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");        // tablet entity, absent
+    ASSERT_STR_MATCHES(str, "threads_running ");      // server entity, present
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow ");  // warn-level server entity, also present
+  }
+  {
+    // Valid level filter + empty types value: level filter must still apply,
+    // empty types matches all entity types so nothing is filtered by type.
+    ASSERT_OK(c.FetchURL(base_url + "?level=warn&types=", &buf));
+    const string& str = buf.ToString();
+    NO_FATALS(CheckPrometheusOutput(str));
+    ASSERT_STR_NOT_MATCHES(str, "raft_term ");        // debug-level, absent at warn
+    ASSERT_STR_NOT_MATCHES(str, "threads_running ");  // info-level, absent at warn
+    ASSERT_STR_MATCHES(str, "rpcs_queue_overflow ");  // warn-level, present
+  }
+}
+
 // Test that hostname is set properly for TabletServer's Messenger.
 TEST_F(TabletServerTest, ServerHostname) {
   string server_hostname;

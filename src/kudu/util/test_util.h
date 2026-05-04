@@ -221,6 +221,11 @@ const std::unordered_map<std::string, std::string>& GetMasterWebserverEndpoints(
 // and the master-test, so it is placed here.
 void CheckPrometheusOutput(const std::string& prometheus_output);
 
+// Asserts that 'prometheus_output' contains no metric value lines (only comment/metadata
+// lines starting with '#' are allowed). Use after CheckPrometheusOutput() when the
+// expectation is that a filter produces an effectively empty result.
+void CheckNoPrometheusValueLines(const std::string& prometheus_output);
+
 // Beautifies test output if a test scenario fails.
 std::ostream& operator<<(std::ostream& os, const IPMode& mode);
 

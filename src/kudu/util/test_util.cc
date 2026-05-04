@@ -771,6 +771,14 @@ void CheckPrometheusOutput(const string& prometheus_output) {
   }
 }
 
+void CheckNoPrometheusValueLines(const string& prometheus_output) {
+  vector<string> lines = strings::Split(prometheus_output, "\n", strings::SkipEmpty());
+  for (const auto& line : lines) {
+    ASSERT_TRUE(HasPrefixString(line, "#"))
+        << "Unexpected metric value line: " << line;
+  }
+}
+
 std::ostream& operator<<(std::ostream& os, const IPMode& mode) {
   os << IPModeToString(mode);
   return os;

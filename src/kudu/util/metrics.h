@@ -516,10 +516,9 @@ struct MetricJsonOptions {
 // metrics in the Prometheus format.
 struct MetricPrometheusOptions {
   // Metrics are filtered per information in the 'filters' field,
-  // see the in-line MetricFilters's documentation for more details.
-  //
-  // NOTE: for Prometheus format metrics, the only applicable filtering
-  //       is by 'MetricFilters::entity_level' field.
+  // see the MetricFilters documentation for details. All filtering
+  // dimensions (entity type, entity ID, entity attributes, metric name
+  // substrings, and severity level) are applicable.
   MetricFilters filters;
 
   // The hostname of the node serving the metrics. Attached as hostname="..."

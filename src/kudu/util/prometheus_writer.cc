@@ -58,6 +58,10 @@ string BuildPrometheusLabels(
     const string& entity_type,
     const string& entity_id,
     const unordered_map<string, string>& attrs) {
+  // TODO(KUDU-3775): relax this to handle arbitrary entity types gracefully
+  // so that synthetic test entities (e.g. "test_entity") and any future
+  // entity types can use the new label-based Prometheus format without
+  // hitting this assertion.
   DCHECK(entity_type == "server" ||
          entity_type == "table" ||
          entity_type == "tablet")

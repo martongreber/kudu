@@ -100,6 +100,18 @@ DEFINE_string(webserver_password_file, "",
     "--webserver_require_spnego flag)");
 TAG_FLAG(webserver_password_file, sensitive);
 
+DEFINE_string(webserver_prometheus_token_cmd, "",
+    "A Unix command whose output is used as the bearer token for Prometheus "
+    "metrics endpoint authentication. When set, requests to the Prometheus "
+    "endpoints (/metrics_prometheus, /prometheus-sd) may authenticate via "
+    "'Authorization: Bearer <token>' as an alternative to SPNEGO. This is "
+    "primarily useful together with --webserver_require_spnego: since "
+    "Prometheus does not support SPNEGO, the bearer token allows it to scrape "
+    "a secured Kudu cluster. Clients that do support SPNEGO can still use it "
+    "on these endpoints. Requires TLS to be configured for the embedded "
+    "webserver (--webserver_certificate_file).");
+TAG_FLAG(webserver_prometheus_token_cmd, sensitive);
+
 DEFINE_int32(webserver_num_worker_threads, 50,
              "Maximum number of threads to start for handling webserver requests");
 TAG_FLAG(webserver_num_worker_threads, advanced);
@@ -187,6 +199,19 @@ bool ValidateTlsMinVersion(const char* /* flagname */, const string& ver) {
 }
 DEFINE_validator(webserver_tls_min_protocol, &ValidateTlsMinVersion);
 
+bool ValidatePrometheusTokenFlags() {
+  const bool has_token_cmd = !FLAGS_webserver_prometheus_token_cmd.empty();
+  const bool has_tls = !FLAGS_webserver_certificate_file.empty();
+
+  if (has_token_cmd && !has_tls) {
+    LOG(ERROR) << "--webserver_prometheus_token_cmd requires TLS to be configured "
+                  "for the embedded webserver (--webserver_certificate_file).";
+    return false;
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(webserver_prometheus_token_options, ValidatePrometheusTokenFlags);
+
 }; // anonymous namespace
 
 namespace kudu {
@@ -209,6 +234,7 @@ WebserverOptions::WebserverOptions()
       private_key_password_cmd(FLAGS_webserver_private_key_password_cmd),
       authentication_domain(FLAGS_webserver_authentication_domain),
       password_file(FLAGS_webserver_password_file),
+      prometheus_token_cmd(FLAGS_webserver_prometheus_token_cmd),
       tls_ciphers(FLAGS_webserver_tls_ciphers),
       tls_ciphersuites(FLAGS_webserver_tls_ciphersuites),
       tls_min_protocol(FLAGS_webserver_tls_min_protocol),

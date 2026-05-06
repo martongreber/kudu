@@ -19,6 +19,7 @@
 
 #include <gssapi/gssapi_krb5.h>
 #include <netinet/in.h>
+#include <openssl/crypto.h>
 #include <sys/socket.h>
 
 #include <algorithm>
@@ -46,6 +47,7 @@
 #include "kudu/gutil/endian.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
@@ -142,6 +144,31 @@ DECLARE_string(webserver_interface);
 namespace kudu {
 
 namespace {
+
+// Constant-time equality check for two byte sequences.
+// Returns false immediately when lengths differ (length is not considered
+// secret). For equal-length inputs, uses CRYPTO_memcmp when available
+// (OpenSSL >= 1.0.1d) and falls back to a manual XOR-accumulate loop on
+// older builds.
+bool ConstantTimeEquals(const char* a, size_t a_len, const char* b, size_t b_len) {
+  if (a_len != b_len) {
+    return false;
+  }
+#if OPENSSL_VERSION_NUMBER >= 0x1000104fL  // CRYPTO_memcmp added in OpenSSL 1.0.1d
+  return CRYPTO_memcmp(a, b, a_len) == 0;
+#else
+  // XOR-accumulate loop: reads every byte regardless of content, keeping the
+  // comparison constant-time. Regular memcmp() cannot be used because its
+  // execution time depends on the data, making it vulnerable to timing
+  // side-channel attacks (see man7.org/linux/man-pages/man3/memcmp.3.html,
+  // CAVEATS).
+  unsigned char diff = 0;
+  for (size_t i = 0; i < a_len; i++) {
+    diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+  }
+  return diff == 0;
+#endif
+}
 
 // Last error message from the webserver.
 // TODO(todd) global strings are somewhat messy and lint is complaining
@@ -248,6 +275,13 @@ Status RunSpnegoStep(const char* authz_header,
   }
   return is_complete ? Status::OK() : kIncomplete;
 }
+
+// HTTP header name for the Authorization field.
+static constexpr const char kAuthorizationHeader[] = "Authorization";
+
+// Prefix for the Bearer authentication scheme, including the trailing space.
+static constexpr const char kBearerPrefix[] = "Bearer ";
+static constexpr size_t kBearerPrefixLen = sizeof(kBearerPrefix) - 1;
 
 }  // anonymous namespace
 
@@ -397,6 +431,13 @@ Status Webserver::Start() {
     //       deprecated in favor of GSS.framework.
     krb5_gss_register_acceptor_identity(kt_file);
 #pragma GCC diagnostic pop
+  }
+
+  // Execute the token command to obtain the Prometheus bearer token.
+  if (!opts_.prometheus_token_cmd.empty()) {
+    RETURN_NOT_OK_PREPEND(
+        security::GetPasswordFromShellCommand(opts_.prometheus_token_cmd, &prometheus_token_),
+        "failed to obtain Prometheus bearer token from command");
   }
 
   options.emplace_back("listening_ports");
@@ -598,52 +639,103 @@ sq_callback_result_t Webserver::BeginRequestCallback(
   // The last SPNEGO step in a successful authentication may include a response
   // header (e.g. when using mutual authentication).
   PrerenderedWebResponse resp;
-  if (opts_.require_spnego && !is_options) {
-    const char* authz_header = sq_get_header(connection, "Authorization");
-    string authn_princ;
-    Status s = RunSpnegoStep(authz_header, &resp.response_headers, &authn_princ);
-    if (s.IsIncomplete()) {
-      resp.output << "Must authenticate with SPNEGO.";
-      resp.status_code = HttpStatusCode::AuthenticationRequired;
-      SendResponse(connection, &resp);
-      return SQ_HANDLED_OK;
-    }
-    if (s.ok() && authn_princ.empty()) {
-      s = Status::RuntimeError("SPNEGO indicated complete, but got empty principal");
-      // Crash in debug builds, but fall through to treating as an error 500 in
-      // release.
-      LOG(DFATAL) << "Got no authenticated principal for SPNEGO-authenticated "
-                  << " connection from "
-                  << GetRemoteAddress(request_info).ToString()
-                  << ": " << s.ToString();
-    }
-    if (!s.ok()) {
-      LOG(WARNING) << "Failed to authenticate request from "
-                   << GetRemoteAddress(request_info).ToString()
-                   << " via SPNEGO: " << s.ToString();
-      resp.output << s.ToString();
-      resp.status_code = s.IsNotAuthorized() ?
-                           HttpStatusCode::AuthenticationRequired :
-                           HttpStatusCode::InternalServerError;
-      SendResponse(connection, &resp);
-      return SQ_HANDLED_OK;
-    }
 
-    if (opts_.spnego_post_authn_callback) {
-      opts_.spnego_post_authn_callback(authn_princ);
-    }
+  // Prometheus endpoints support two authentication mechanisms:
+  //   1. Bearer token ('Authorization: Bearer <token>'): intended for Prometheus
+  //      scrapers, which do not support SPNEGO. Enabled by setting
+  //      --webserver_prometheus_token_cmd.
+  //   2. SPNEGO: used by human operators or proxies. Falls through to the
+  //      standard SPNEGO block below if SPNEGO is required.
+  // When a Prometheus path receives a Bearer-scheme Authorization header and a
+  // token is configured, the token is validated here and SPNEGO is skipped.
+  // All other requests (including Prometheus paths without a Bearer header)
+  // proceed to the SPNEGO block if SPNEGO is required.
+  bool is_prometheus_path = false;
+  {
+    shared_lock l(lock_);
+    is_prometheus_path = ContainsKey(prometheus_paths_, request_info->uri);
+  }
 
-    string local_user;
-    s = security::MapPrincipalToLocalName(authn_princ, &local_user);
-    if (!s.ok()) {
-      LOG(WARNING) << "Failed to map Kerberos principal '" << authn_princ
-                   << "' to local name: " << s.ToString();
-      resp.output << s.ToString();
-      resp.status_code = HttpStatusCode::InternalServerError;
-      SendResponse(connection, &resp);
-      return SQ_HANDLED_OK;
+  auto reject_bearer = [&](const char* reason) -> sq_callback_result_t {
+    LOG(WARNING) << "Failed to authenticate Prometheus request from "
+                 << GetRemoteAddress(request_info).ToString()
+                 << ": " << reason;
+    resp.response_headers.emplace("WWW-Authenticate", "Bearer");
+    resp.output << "Must authenticate with a valid bearer token: " << reason;
+    resp.status_code = HttpStatusCode::AuthenticationRequired;
+    SendResponse(connection, &resp);
+    return SQ_HANDLED_OK;
+  };
+
+  bool authenticated_via_prometheus_token = false;
+  if (is_prometheus_path && !prometheus_token_.empty() && !is_options) {
+    const char* authz_header = sq_get_header(connection, kAuthorizationHeader);
+    if (authz_header != nullptr &&
+        strncmp(authz_header, kBearerPrefix, kBearerPrefixLen) == 0) {
+      const char* provided_token = authz_header + kBearerPrefixLen;
+      if (!ConstantTimeEquals(provided_token, strlen(provided_token),
+                              prometheus_token_.c_str(),
+                              prometheus_token_.size())) {
+        return reject_bearer("invalid bearer token");
+      }
+      // Token is valid; skip SPNEGO and proceed directly to the handler.
+      authenticated_via_prometheus_token = true;
     }
-    request_info->remote_user = strdup(local_user.c_str());
+  }
+
+  if (!authenticated_via_prometheus_token) {
+    if (opts_.require_spnego && !is_options) {
+      const char* authz_header = sq_get_header(connection, kAuthorizationHeader);
+      string authn_princ;
+      Status s = RunSpnegoStep(authz_header, &resp.response_headers, &authn_princ);
+      if (s.IsIncomplete()) {
+        resp.output << "Must authenticate with SPNEGO.";
+        resp.status_code = HttpStatusCode::AuthenticationRequired;
+        SendResponse(connection, &resp);
+        return SQ_HANDLED_OK;
+      }
+      if (s.ok() && authn_princ.empty()) {
+        s = Status::RuntimeError("SPNEGO indicated complete, but got empty principal");
+        // Crash in debug builds, but fall through to treating as an error 500 in
+        // release.
+        LOG(DFATAL) << "Got no authenticated principal for SPNEGO-authenticated "
+                    << " connection from "
+                    << GetRemoteAddress(request_info).ToString()
+                    << ": " << s.ToString();
+      }
+      if (!s.ok()) {
+        LOG(WARNING) << "Failed to authenticate request from "
+                     << GetRemoteAddress(request_info).ToString()
+                     << " via SPNEGO: " << s.ToString();
+        resp.output << s.ToString();
+        resp.status_code = s.IsNotAuthorized() ?
+                             HttpStatusCode::AuthenticationRequired :
+                             HttpStatusCode::InternalServerError;
+        SendResponse(connection, &resp);
+        return SQ_HANDLED_OK;
+      }
+
+      if (opts_.spnego_post_authn_callback) {
+        opts_.spnego_post_authn_callback(authn_princ);
+      }
+
+      string local_user;
+      s = security::MapPrincipalToLocalName(authn_princ, &local_user);
+      if (!s.ok()) {
+        LOG(WARNING) << "Failed to map Kerberos principal '" << authn_princ
+                     << "' to local name: " << s.ToString();
+        resp.output << s.ToString();
+        resp.status_code = HttpStatusCode::InternalServerError;
+        SendResponse(connection, &resp);
+        return SQ_HANDLED_OK;
+      }
+      request_info->remote_user = strdup(local_user.c_str());
+    } else if (is_prometheus_path && !prometheus_token_.empty() && !is_options) {
+      // SPNEGO is not required, but a bearer token is configured and the client
+      // did not supply one. Reject with a Bearer challenge. OPTIONS requests
+      // are exempt.
+      return reject_bearer("missing or non-Bearer authorization header");
+    }
   }
 
   PathHandler* handler = nullptr;
@@ -1038,6 +1130,11 @@ void Webserver::RegisterJsonPathHandler(
                                                      is_on_nav_bar,
                                                      alias,
                                                      callback));
+}
+
+void Webserver::MarkPathAsPrometheus(const string& path) {
+  std::lock_guard l(lock_);
+  prometheus_paths_.insert(path);
 }
 
 bool Webserver::MustacheTemplateAvailable(const string& path) const {

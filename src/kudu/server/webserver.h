@@ -22,12 +22,12 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <squeasel.h>
 
-#include "kudu/gutil/port.h"
 #include "kudu/server/webserver_options.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/rw_mutex.h"
@@ -99,6 +99,12 @@ class Webserver : public WebCallbackRegistry {
 
   // True if serving all traffic over SSL, false otherwise
   bool IsSecure() const;
+
+  // Marks 'path' as a Prometheus endpoint. When --webserver_prometheus_token
+  // is set, requests to these paths may authenticate via
+  // 'Authorization: Bearer <token>' instead of SPNEGO, allowing Prometheus
+  // (which does not support SPNEGO) to scrape a secured cluster.
+  void MarkPathAsPrometheus(const std::string& path);
 
   // Change the status to true once the webserver's startup is completed. The startup
   // of a kudu server is split into two parts initialization and starting phase. In the
@@ -212,6 +218,11 @@ class Webserver : public WebCallbackRegistry {
 
   const WebserverOptions opts_;
 
+  // The effective bearer token for Prometheus endpoint authentication.
+  // Populated in Start() by running opts_.prometheus_token_cmd.
+  // Empty if bearer token auth is not configured.
+  std::string prometheus_token_;
+
   // Lock guarding the path_handlers_ map and footer_html.
   RWMutex lock_;
 
@@ -234,6 +245,10 @@ class Webserver : public WebCallbackRegistry {
 
   // Handle to Mongoose context; owned and freed by Mongoose internally
   struct sq_context* context_;
+
+  // Set of paths that accept bearer token authentication as an alternative to
+  // SPNEGO. Protected by 'lock_'.
+  std::unordered_set<std::string> prometheus_paths_;
 
   // Hold the status of the webserver's startup status.
   std::atomic<bool> is_started_;

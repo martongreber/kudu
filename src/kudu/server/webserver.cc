@@ -19,6 +19,7 @@
 
 #include <gssapi/gssapi_krb5.h>
 #include <netinet/in.h>
+#include <openssl/crypto.h>
 #include <sys/socket.h>
 
 #include <algorithm>
@@ -46,6 +47,7 @@
 #include "kudu/gutil/endian.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
@@ -598,7 +600,50 @@ sq_callback_result_t Webserver::BeginRequestCallback(
   // The last SPNEGO step in a successful authentication may include a response
   // header (e.g. when using mutual authentication).
   PrerenderedWebResponse resp;
-  if (opts_.require_spnego && !is_options) {
+
+  // Check whether this is a Prometheus endpoint with a bearer token configured.
+  // If so, validate the token and bypass SPNEGO, since Prometheus does not
+  // support SPNEGO. This allows a secured cluster to be scraped by Prometheus
+  // using 'Authorization: Bearer <token>' (see --webserver_prometheus_token).
+  bool is_prometheus_path = false;
+  if (!opts_.prometheus_token.empty()) {
+    shared_lock l(lock_);
+    is_prometheus_path = ContainsKey(prometheus_paths_, request_info->uri);
+  }
+  if (is_prometheus_path) {
+    auto reject_bearer = [&](const char* reason) -> sq_callback_result_t {
+      // Reject with HTTP 401 and a Bearer challenge, logging 'reason'.
+      LOG(WARNING) << "Failed to authenticate Prometheus request from "
+                   << GetRemoteAddress(request_info).ToString()
+                   << ": " << reason;
+      resp.response_headers.emplace("WWW-Authenticate", "Bearer");
+      resp.output << "Must authenticate with a valid bearer token: " << reason << ".";
+      resp.status_code = HttpStatusCode::AuthenticationRequired;
+      SendResponse(connection, &resp);
+      return SQ_HANDLED_OK;
+    };
+
+    const char* authz_header = sq_get_header(connection, "Authorization");
+    if (authz_header == nullptr) {
+      return reject_bearer("missing authorization header");
+    }
+    static const char* const kBearerPrefix = "Bearer ";
+    if (strncmp(authz_header, kBearerPrefix, strlen(kBearerPrefix)) != 0) {
+      return reject_bearer("authorization header does not use Bearer scheme");
+    }
+    const char* provided_token = authz_header + strlen(kBearerPrefix);
+    // Check length first to avoid overreading provided_token in CRYPTO_memcmp.
+    // Then use a constant-time compare to avoid timing attacks.
+    const size_t provided_len = strlen(provided_token);
+    const size_t expected_len = opts_.prometheus_token.size();
+    if (provided_len != expected_len ||
+        CRYPTO_memcmp(provided_token,
+                      opts_.prometheus_token.c_str(),
+                      expected_len) != 0) {
+      return reject_bearer("invalid bearer token");
+    }
+    // Token is valid; skip SPNEGO and proceed directly to the handler.
+  } else if (opts_.require_spnego && !is_options) {
     const char* authz_header = sq_get_header(connection, "Authorization");
     string authn_princ;
     Status s = RunSpnegoStep(authz_header, &resp.response_headers, &authn_princ);
@@ -1038,6 +1083,11 @@ void Webserver::RegisterJsonPathHandler(
                                                      is_on_nav_bar,
                                                      alias,
                                                      callback));
+}
+
+void Webserver::MarkPathAsPrometheus(const string& path) {
+  std::lock_guard l(lock_);
+  prometheus_paths_.insert(path);
 }
 
 bool Webserver::MustacheTemplateAvailable(const string& path) const {

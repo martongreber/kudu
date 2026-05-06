@@ -1090,6 +1090,7 @@ Status MasterPathHandlers::Register(Webserver* server) {
         this->HandlePrometheusSD(req, resp);
       },
       false /*is_on_nav_bar*/);
+  server->MarkPathAsPrometheus("/prometheus-sd");
   return Status::OK();
 }
 

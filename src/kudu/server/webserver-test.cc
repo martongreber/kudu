@@ -17,6 +17,8 @@
 
 #include "kudu/server/webserver.h"
 
+#include <string.h>
+
 #include <cstdlib>
 #include <functional>
 #include <initializer_list>
@@ -467,6 +469,150 @@ TEST_P(SpnegoWebserverTest, TestTruncatedTokens) {
 // an OPTIONS request, the server still honors it.
 TEST_P(SpnegoWebserverTest, TestAuthNotRequiredForOptions) {
   NO_FATALS(RunTestOptions());
+}
+
+class PrometheusUnsecuredWebserverTest : public WebserverTest {
+ protected:
+  void SetUp() override {
+    WebserverTest::SetUp();
+    server_->RegisterPrerenderedPathHandler(
+        "/metrics_prometheus", "Prometheus Metrics",
+        [](const Webserver::WebRequest& /*req*/,
+           Webserver::PrerenderedWebResponse* resp) {
+          resp->output << "prometheus_metric 1";
+        },
+        StyleMode::UNSTYLED, /*is_on_nav_bar=*/false);
+    server_->MarkPathAsPrometheus("/metrics_prometheus");
+  }
+
+  string PrometheusUrl() const {
+    return Substitute("http://$0/metrics_prometheus", addr_.ToString());
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(Parameters, PrometheusUnsecuredWebserverTest,
+                         testing::Values(IPMode::IPV4));
+
+// Without a prometheus_token configured, the Prometheus endpoint is freely
+// accessible with no Authorization header required.
+TEST_P(PrometheusUnsecuredWebserverTest, TestAccessibleWithoutToken) {
+  ASSERT_OK(curl_.FetchURL(PrometheusUrl(), &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "prometheus_metric");
+}
+
+// Without a prometheus_token configured, sending a bearer token does not
+// cause any error — it is simply ignored.
+TEST_P(PrometheusUnsecuredWebserverTest, TestBearerTokenIgnoredWhenNoTokenConfigured) {
+  ASSERT_OK(curl_.FetchURL(PrometheusUrl(), &buf_,
+                           {"Authorization: Bearer some-token"}));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "prometheus_metric");
+}
+
+class PrometheusTokenWebserverTest : public SpnegoWebserverTest {
+ protected:
+  static constexpr const char* kPrometheusToken = "test-prometheus-token";
+
+  void MaybeSetupSpnego(WebserverOptions* opts) override {
+    SpnegoWebserverTest::MaybeSetupSpnego(opts);
+    opts->prometheus_token = kPrometheusToken;
+  }
+
+  // Register a stub /metrics_prometheus handler that the test can hit, then
+  // mark it as a Prometheus path so bearer token auth applies.
+  void SetUp() override {
+    SpnegoWebserverTest::SetUp();
+    server_->RegisterPrerenderedPathHandler(
+        "/metrics_prometheus", "Prometheus Metrics",
+        [](const Webserver::WebRequest& /*req*/,
+           Webserver::PrerenderedWebResponse* resp) {
+          resp->output << "prometheus_metric 1";
+        },
+        StyleMode::UNSTYLED, /*is_on_nav_bar=*/false);
+    server_->MarkPathAsPrometheus("/metrics_prometheus");
+  }
+
+  string PrometheusUrl() const {
+    return Substitute(use_ssl() ? "https://$0/metrics_prometheus"
+                                : "http://$0/metrics_prometheus",
+                      addr_.ToString());
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(Parameters, PrometheusTokenWebserverTest,
+                         testing::Values(IPMode::IPV4));
+
+// No Authorization header on a Prometheus path returns 401 with a Bearer challenge.
+TEST_P(PrometheusTokenWebserverTest, TestMissingTokenDenied) {
+  curl_.set_return_headers(true);
+  Status s = curl_.FetchURL(PrometheusUrl(), &buf_);
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "401");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "WWW-Authenticate: Bearer");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "missing authorization header");
+}
+
+// Wrong auth scheme on a Prometheus path returns 401 with a Bearer challenge.
+TEST_P(PrometheusTokenWebserverTest, TestWrongSchemeDenied) {
+  curl_.set_return_headers(true);
+  Status s = curl_.FetchURL(PrometheusUrl(), &buf_,
+                             {"Authorization: Negotiate sometoken"});
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "401");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "WWW-Authenticate: Bearer");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "authorization header does not use Bearer scheme");
+}
+
+// Invalid bearer token on a Prometheus path returns 401 with a Bearer challenge.
+TEST_P(PrometheusTokenWebserverTest, TestInvalidTokenDenied) {
+  curl_.set_return_headers(true);
+  Status s = curl_.FetchURL(PrometheusUrl(), &buf_,
+                             {"Authorization: Bearer wrong-token"});
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "401");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "WWW-Authenticate: Bearer");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "invalid bearer token");
+}
+
+// A token that is a valid prefix of the configured token must be rejected.
+// Guards against CRYPTO_memcmp being called with too few bytes.
+TEST_P(PrometheusTokenWebserverTest, TestPrefixTokenDenied) {
+  curl_.set_return_headers(true);
+  string prefix_token = string(kPrometheusToken).substr(0, strlen(kPrometheusToken) - 1);
+  Status s = curl_.FetchURL(PrometheusUrl(), &buf_,
+                             {"Authorization: Bearer " + prefix_token});
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "401");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "WWW-Authenticate: Bearer");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "invalid bearer token");
+}
+
+// Valid bearer token on a Prometheus path succeeds without SPNEGO.
+TEST_P(PrometheusTokenWebserverTest, TestValidTokenAllowsAccess) {
+  string auth_header = Substitute("Authorization: Bearer $0", kPrometheusToken);
+  ASSERT_OK(curl_.FetchURL(PrometheusUrl(), &buf_, {auth_header}));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "prometheus_metric");
+}
+
+// Even a fully-authenticated Kerberos principal cannot access a Prometheus path
+// without a bearer token.
+TEST_P(PrometheusTokenWebserverTest, TestSpnegoRejectedOnPrometheusPath) {
+  ASSERT_OK(kdc_->Kinit("alice"));
+  curl_.set_auth(CurlAuthType::SPNEGO);
+  curl_.set_return_headers(true);
+  Status s = curl_.FetchURL(PrometheusUrl(), &buf_);
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "401");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "WWW-Authenticate: Bearer");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "authorization header does not use Bearer scheme");
+}
+
+// The bearer token only bypasses SPNEGO on Prometheus paths; other paths
+// still require SPNEGO. Without any credentials, the root "/" returns 401.
+TEST_P(PrometheusTokenWebserverTest, TestTokenDoesNotBypassSpnegoOnOtherPaths) {
+  Status s = curl_.FetchURL(url_, &buf_);
+  ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "401");
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Must authenticate with SPNEGO.");
 }
 
 // This is used to run all parameterized tests with different IP modes.

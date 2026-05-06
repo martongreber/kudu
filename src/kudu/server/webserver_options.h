@@ -39,6 +39,7 @@ struct WebserverOptions {
   std::string private_key_password_cmd;
   std::string authentication_domain;
   std::string password_file;
+  std::string prometheus_token;
   std::string tls_ciphers;
   std::string tls_ciphersuites;
   std::string tls_min_protocol;

@@ -565,6 +565,7 @@ void RegisterMetricsPrometheusHandler(Webserver* webserver,
   constexpr bool is_on_nav_bar = true;
   webserver->RegisterPrerenderedPathHandler("/metrics_prometheus", "Prometheus Metrics", callback,
                                             StyleMode::UNSTYLED, is_on_nav_bar);
+  webserver->MarkPathAsPrometheus("/metrics_prometheus");
 }
 
 } // namespace kudu

@@ -100,6 +100,16 @@ DEFINE_string(webserver_password_file, "",
     "--webserver_require_spnego flag)");
 TAG_FLAG(webserver_password_file, sensitive);
 
+DEFINE_string(webserver_prometheus_token, "",
+    "When set, requests to the Prometheus metrics endpoints "
+    "(/metrics_prometheus, /prometheus-sd) must supply this value as a "
+    "bearer token via 'Authorization: Bearer <token>'. This is primarily "
+    "useful together with --webserver_require_spnego: since Prometheus does "
+    "not support SPNEGO, the bearer token provides an alternative "
+    "authentication mechanism that allows Prometheus to scrape a secured "
+    "Kudu cluster.");
+TAG_FLAG(webserver_prometheus_token, sensitive);
+
 DEFINE_int32(webserver_num_worker_threads, 50,
              "Maximum number of threads to start for handling webserver requests");
 TAG_FLAG(webserver_num_worker_threads, advanced);
@@ -209,6 +219,7 @@ WebserverOptions::WebserverOptions()
       private_key_password_cmd(FLAGS_webserver_private_key_password_cmd),
       authentication_domain(FLAGS_webserver_authentication_domain),
       password_file(FLAGS_webserver_password_file),
+      prometheus_token(FLAGS_webserver_prometheus_token),
       tls_ciphers(FLAGS_webserver_tls_ciphers),
       tls_ciphersuites(FLAGS_webserver_tls_ciphersuites),
       tls_min_protocol(FLAGS_webserver_tls_min_protocol),

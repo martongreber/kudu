@@ -45,6 +45,11 @@ struct MiniPrometheusOptions {
   // HTTP path used to scrape metrics on discovered targets.
   std::string metrics_path = "/metrics_prometheus";
 
+  // If non-empty, emitted as an 'authorization: Bearer' section in the
+  // scrape_configs block, enabling bearer token authentication against
+  // secured Kudu clusters (--webserver_prometheus_token).
+  std::string bearer_token;
+
   // How frequently Prometheus scrapes discovered targets.
   std::string scrape_interval = "2s";
 
@@ -71,6 +76,10 @@ class MiniPrometheus {
   // Blocks until Prometheus has at least 'count' active (health=up) targets,
   // polling every second.
   Status WaitForActiveTargets(int count, MonoDelta timeout);
+
+  // Blocks until at least 'count' targets report the given 'health' state
+  // ("up" or "down"), polling every second.
+  Status WaitForTargetHealth(int count, const std::string& health, MonoDelta timeout);
 
   // Issues a PromQL instant query via /api/v1/query and populates 'doc' with
   // the parsed JSON response.

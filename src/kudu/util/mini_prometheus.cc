@@ -131,6 +131,13 @@ Status MiniPrometheus::WriteConfig() const {
     out << YAML::Key << "metrics_path"   << YAML::Value << options_.metrics_path;
     out << YAML::Key << "scrape_interval" << YAML::Value << options_.scrape_interval;
 
+    if (!options_.bearer_token.empty()) {
+      out << YAML::Key << "authorization" << YAML::Value << YAML::BeginMap;
+      out << YAML::Key << "type"        << YAML::Value << "Bearer";
+      out << YAML::Key << "credentials" << YAML::Value << options_.bearer_token;
+      out << YAML::EndMap;
+    }
+
     if (!options_.static_targets.empty()) {
       out << YAML::Key << "static_configs" << YAML::Value << YAML::BeginSeq;
       out << YAML::BeginMap;
@@ -149,6 +156,12 @@ Status MiniPrometheus::WriteConfig() const {
         out << YAML::BeginMap;
         out << YAML::Key << "url"              << YAML::Value << url;
         out << YAML::Key << "refresh_interval" << YAML::Value << options_.sd_refresh_interval;
+        if (!options_.bearer_token.empty()) {
+          out << YAML::Key << "authorization" << YAML::Value << YAML::BeginMap;
+          out << YAML::Key << "type"        << YAML::Value << "Bearer";
+          out << YAML::Key << "credentials" << YAML::Value << options_.bearer_token;
+          out << YAML::EndMap;
+        }
         out << YAML::EndMap;
       }
       out << YAML::EndSeq;
@@ -182,6 +195,11 @@ Status MiniPrometheus::GetTargets(rapidjson::Document* doc) {
 }
 
 Status MiniPrometheus::WaitForActiveTargets(int count, MonoDelta timeout) {
+  return WaitForTargetHealth(count, "up", timeout);
+}
+
+Status MiniPrometheus::WaitForTargetHealth(int count, const string& health,
+                                           MonoDelta timeout) {
   const MonoTime deadline = MonoTime::Now() + timeout;
   while (MonoTime::Now() < deadline) {
     rapidjson::Document doc;
@@ -189,21 +207,22 @@ Status MiniPrometheus::WaitForActiveTargets(int count, MonoDelta timeout) {
     if (s.ok() && doc.IsObject() && doc.HasMember("data") &&
         doc["data"].HasMember("activeTargets")) {
       const auto& active = doc["data"]["activeTargets"];
-      int healthy = 0;
+      int matched = 0;
       for (rapidjson::SizeType i = 0; i < active.Size(); ++i) {
         if (active[i].HasMember("health") &&
-            string(active[i]["health"].GetString()) == "up") {
-          ++healthy;
+            string(active[i]["health"].GetString()) == health) {
+          ++matched;
         }
       }
-      if (healthy >= count) {
+      if (matched >= count) {
         return Status::OK();
       }
     }
     SleepFor(MonoDelta::FromSeconds(1));
   }
   return Status::TimedOut(
-      Substitute("Timed out waiting for $0 active Prometheus targets", count));
+      Substitute("Timed out waiting for $0 Prometheus targets with health='$1'",
+                 count, health));
 }
 
 Status MiniPrometheus::Query(const string& promql, rapidjson::Document* doc) {

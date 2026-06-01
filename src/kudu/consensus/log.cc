@@ -961,6 +961,10 @@ Status Log::UpdateIndexForBatch(const LogEntryBatch& batch,
     index_entry.offset_in_segment = start_offset;
     RETURN_NOT_OK(log_index_->AddEntry(index_entry));
   }
+  if (!batch.replicate_op_ids_.empty()) {
+    last_indexed_op_index_.store(batch.replicate_op_ids_.back().index(),
+                                 std::memory_order_release);
+  }
   return Status::OK();
 }
 
@@ -997,6 +1001,18 @@ int GetPrefixSizeToGC(RetentionIndexes retention_indexes, const SegmentSequence&
       break;
     }
 
+    // CDC hard WAL-retention floor: retain any segment that closed within the CDC
+    // retention window -- and therefore, since we scan oldest-to-newest, every
+    // newer segment -- independent of consumer polling. Deliberately unconditional
+    // (not overridable by --log_max_segments_to_retain), matching the intent of a
+    // guaranteed minimum WAL age for CDC-enabled tablets.
+    if (retention_indexes.cdc_wal_retention_deadline_micros > 0 &&
+        segment->footer().has_close_timestamp_micros() &&
+        segment->footer().close_timestamp_micros() >=
+            retention_indexes.cdc_wal_retention_deadline_micros) {
+      break;
+    }
+
     // Check if removing this segment would compromise the ability to catch up a peer,
     // we should retain it, unless this would break the max_segments flag.
     if (seg_max_idx >= retention_indexes.for_peers &&
@@ -1028,7 +1044,7 @@ Status Log::Append(LogEntryPB* entry) {
   return s;
 }
 
-Status Log::WaitUntilAllFlushed() {
+Status Log::WaitUntilAllFlushed(const MonoTime& deadline) {
   // In order to make sure we empty the queue we need to use
   // the async api.
   LogEntryBatchPB entry_batch;
@@ -1037,7 +1053,7 @@ Status Log::WaitUntilAllFlushed() {
   unique_ptr<LogEntryBatch> reserved_entry_batch =
       CreateBatchFromPB(FLUSH_MARKER, entry_batch, s.AsStatusCallback());
   RETURN_NOT_OK(AsyncAppend(std::move(reserved_entry_batch)));
-  return s.Wait();
+  return deadline == MonoTime::Max() ? s.Wait() : s.WaitUntil(deadline);
 }
 
 Status Log::GC(RetentionIndexes retention_indexes, int32_t* num_gced) {
@@ -1099,17 +1115,31 @@ Status Log::GC(RetentionIndexes retention_indexes, int32_t* num_gced) {
 
 int64_t Log::GetGCableDataSize(RetentionIndexes retention_indexes) const {
   CHECK_GE(retention_indexes.for_durability, 0);
+  int64_t total_size = 0;
+  CHECK_OK(TryGetGCableDataSize(retention_indexes, &total_size));
+  return total_size;
+}
+
+Status Log::TryGetGCableDataSize(RetentionIndexes retention_indexes, int64_t* size) const {
+  if (PREDICT_FALSE(retention_indexes.for_durability < 0)) {
+    return Status::InvalidArgument(Substitute("invalid durability retention index: $0",
+                                              retention_indexes.for_durability));
+  }
   SegmentSequence segments_to_delete;
   {
     shared_lock l(state_lock_.get_lock());
-    CHECK_EQ(kLogWriting, log_state_);
+    if (PREDICT_FALSE(log_state_ != kLogWriting)) {
+      return Status::IllegalState(Substitute("log is not open for writing (state $0)",
+                                             log_state_));
+    }
     GetSegmentsToGCUnlocked(retention_indexes, &segments_to_delete);
   }
   int64_t total_size = 0;
   for (const auto& segment : segments_to_delete) {
     total_size += segment->file_size();
   }
-  return total_size;
+  *size = total_size;
+  return Status::OK();
 }
 
 void Log::GetReplaySizeMap(std::map<int64_t, int64_t>* replay_size) const {

@@ -237,6 +237,10 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
                                 ParticipantResponsePB* resp,
                                 rpc::RpcContext* context) override;
 
+  void UpdateCDCRetentionBarrier(const UpdateCDCRetentionBarrierRequestPB* req,
+                                 UpdateCDCRetentionBarrierResponsePB* resp,
+                                 rpc::RpcContext* context) override;
+
   bool SupportsFeature(uint32_t feature) const override;
 
  private:

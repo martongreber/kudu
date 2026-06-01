@@ -33,6 +33,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/cdc/cdc_service.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/wire_protocol.h"
@@ -161,6 +162,11 @@ TAG_FLAG(tablet_state_walk_min_period_ms, advanced);
 DEFINE_int32(delete_tablet_inject_latency_ms, 0,
              "Amount of delay in milliseconds to inject into delete tablet operations.");
 TAG_FLAG(delete_tablet_inject_latency_ms, unsafe);
+
+DEFINE_int32(delete_tablet_inject_latency_after_transition_ms, 0,
+             "Amount of delay in milliseconds to inject into delete tablet "
+             "operations after the replica state transition has started.");
+TAG_FLAG(delete_tablet_inject_latency_after_transition_ms, unsafe);
 
 DEFINE_int32(update_tablet_stats_interval_ms, 5000,
              "Interval at which the tablet statistics should be updated. "
@@ -873,6 +879,9 @@ void TSTabletManager::RunTabletCopy(
         // Shut down the old TabletReplica so that it is no longer allowed to
         // mutate the ConsensusMetadata.
         old_replica->Shutdown();
+        if (auto* cdc = server_->cdc_service()) {
+          cdc->EndSessionsForTablet(tablet_id);
+        }
         break;
       }
       case TABLET_DATA_READY: {
@@ -895,6 +904,9 @@ void TSTabletManager::RunTabletCopy(
         // Shut down the old TabletReplica so that it is no longer allowed to
         // mutate the ConsensusMetadata.
         old_replica->Shutdown();
+        if (auto* cdc = server_->cdc_service()) {
+          cdc->EndSessionsForTablet(tablet_id);
+        }
 
         // Note that this leaves the data dir manager without any references to
         // tablet_id. This is okay because the tablet_copy_client should
@@ -1045,6 +1057,11 @@ Status TSTabletManager::CreateAndRegisterTabletReplica(
                         reload_txn_status_tablet_pool_.get(),
                         &tsm_factory,
                         [this, tablet_id](const string& reason) {
+                          // A consensus state change may have cost this replica
+                          // its leadership; CDC is served by the leader only.
+                          if (auto* cdc = server_->cdc_service()) {
+                            cdc->EndSessionsIfNotLeader(tablet_id);
+                          }
                           this->MarkTabletDirty(tablet_id, reason);
                         }));
   Status s = replica->Init({ server_->mutable_quiescing(),
@@ -1162,6 +1179,12 @@ Status TSTabletManager::DeleteTablet(
   RETURN_NOT_OK(BeginReplicaStateTransition(tablet_id, "deleting tablet", &replica,
                                             &deleter, error_code));
 
+  if (PREDICT_FALSE(FLAGS_delete_tablet_inject_latency_after_transition_ms > 0)) {
+    LOG(WARNING) << "Injecting " << FLAGS_delete_tablet_inject_latency_after_transition_ms
+                 << "ms of latency into DeleteTablet after the state transition started";
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_delete_tablet_inject_latency_after_transition_ms));
+  }
+
   // If the tablet has been deleted or forcefully shut down, the CAS check
   // isn't possible because consensus and therefore the log is not available.
   TabletDataState data_state = replica->tablet_metadata()->tablet_data_state();
@@ -1198,6 +1221,12 @@ Status TSTabletManager::DeleteTablet(
   }
 
   replica->Stop();
+
+  // End the CDC consumer sessions of the stopped replica. After Stop(), no new
+  // session can be created for it (see CDCServiceImpl::TrackSession()).
+  if (auto* cdc = server_->cdc_service()) {
+    cdc->EndSessionsForTablet(tablet_id);
+  }
 
   optional<OpId> opt_last_logged_opid;
   if (consensus) {

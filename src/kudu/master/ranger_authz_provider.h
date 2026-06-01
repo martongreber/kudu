@@ -85,6 +85,10 @@ class RangerAuthzProvider : public AuthzProvider {
                               const std::string& user,
                               bool is_owner) override;
 
+  Status AuthorizeDeleteCDCStream(const std::string& table_name,
+                                  const std::string& user,
+                                  bool is_owner) override;
+
   Status RefreshPolicies() override;
 
   // Returns true if 'ranger_policy_server' flag is set indicating Ranger

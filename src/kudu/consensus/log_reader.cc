@@ -22,6 +22,7 @@
 #include <memory>
 #include <ostream>
 #include <type_traits>
+#include <unordered_map>
 
 #include <glog/logging.h>
 
@@ -56,6 +57,7 @@ METRIC_DEFINE_histogram(tablet, log_reader_read_batch_latency, "Log Read Latency
                         kudu::MetricLevel::kInfo,
                         60000000LU, 2);
 
+using kudu::consensus::CommitMsg;
 using kudu::consensus::OpId;
 using kudu::consensus::ReplicateMsg;
 using kudu::pb_util::SecureDebugString;
@@ -63,6 +65,7 @@ using kudu::pb_util::SecureShortDebugString;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::unordered_map;
 using std::vector;
 using strings::Substitute;
 
@@ -280,7 +283,8 @@ Status LogReader::ReadBatchUsingIndexEntry(const LogIndexEntry& index_entry,
 Status LogReader::ReadReplicatesInRange(int64_t starting_at,
                                         int64_t up_to,
                                         int64_t max_bytes_to_read,
-                                        vector<ReplicateMsg*>* replicates) const {
+                                        vector<ReplicateMsg*>* replicates,
+                                        const MonoTime& deadline) const {
   DCHECK_GT(starting_at, 0);
   DCHECK_GE(up_to, starting_at);
   DCHECK(log_index_) << "Require an index to random-read logs";
@@ -291,9 +295,14 @@ Status LogReader::ReadReplicatesInRange(int64_t starting_at,
 
   size_t total_size = 0;
   bool limit_exceeded = false;
+  // Distinct from limit_exceeded: the partial batch is returned the same way,
+  // but the reason stays visible in the code.
+  bool deadline_exceeded = false;
   faststring tmp_buf;
   LogEntryBatchPB batch;
-  for (int64_t index = starting_at; index <= up_to && !limit_exceeded; index++) {
+  for (int64_t index = starting_at;
+       index <= up_to && !limit_exceeded && !deadline_exceeded;
+       index++) {
     LogIndexEntry index_entry;
     RETURN_NOT_OK_PREPEND(log_index_->GetEntry(index, &index_entry),
                           Substitute("Failed to read log index for op $0", index));
@@ -348,9 +357,85 @@ Status LogReader::ReadReplicatesInRange(int64_t starting_at,
                  << index_entry.ToString();
 
     prev_index_entry = index_entry;
+
+    // Per-entry deadline check. The first entry is always included (as with
+    // the byte limit, at least one op is returned), so the check runs only
+    // once an entry was added. Once the deadline (MonoTime::Max() by default)
+    // has passed, return the partial batch; the caller sees a truncated batch
+    // as it does for the byte limit.
+    if (!replicates_tmp.empty() && MonoTime::Now() >= deadline) {
+      deadline_exceeded = true;
+    }
   }
 
   replicates->swap(replicates_tmp);
+  return Status::OK();
+}
+
+Status LogReader::ReadCommitsForOps(const vector<OpId>& op_ids,
+                                    vector<unique_ptr<CommitMsg>>* commits,
+                                    const MonoTime& deadline) const {
+  DCHECK(log_index_) << "Require an index to random-read logs";
+  commits->clear();
+  commits->resize(op_ids.size());
+  if (op_ids.empty()) {
+    return Status::OK();
+  }
+  // Position in 'op_ids' by op index.
+  unordered_map<int64_t, size_t> pos_by_index;
+  pos_by_index.reserve(op_ids.size());
+  for (size_t i = 0; i < op_ids.size(); ++i) {
+    DCHECK(i == 0 || op_ids[i].index() > op_ids[i - 1].index());
+    pos_by_index.emplace(op_ids[i].index(), i);
+  }
+
+  LogIndexEntry start;
+  RETURN_NOT_OK_PREPEND(log_index_->GetEntry(op_ids.front().index(), &start),
+                        Substitute("Failed to read log index for op $0",
+                                   op_ids.front().index()));
+  SegmentSequence segments;
+  GetSegmentsSnapshot(&segments);
+  const auto it = std::find_if(
+      segments.begin(), segments.end(),
+      [&](const scoped_refptr<ReadableLogSegment>& seg) {
+        return seg->header().sequence_number() >= start.segment_sequence_number;
+      });
+  if (it == segments.end() ||
+      (*it)->header().sequence_number() != start.segment_sequence_number) {
+    return Status::NotFound(Substitute("Segment $0 which contained index $1 has been GCed",
+                                       start.segment_sequence_number,
+                                       op_ids.front().index()));
+  }
+
+  size_t num_missing = op_ids.size();
+  for (auto seg = it; seg != segments.end() && num_missing > 0; ++seg) {
+    LogEntryReader reader(seg->get(), seg == it ? start.offset_in_segment
+                                                : (*seg)->first_entry_offset());
+    while (num_missing > 0) {
+      // Like ReadReplicatesInRange(), always include the first op so that a
+      // read slower than the deadline still makes progress.
+      if ((*commits)[0] && MonoTime::Now() >= deadline) {
+        return Status::OK();
+      }
+      unique_ptr<LogEntryPB> entry;
+      Status s = reader.ReadNextEntry(&entry);
+      if (s.IsEndOfFile()) {
+        break;
+      }
+      RETURN_NOT_OK(s);
+      if (entry->type() != COMMIT || !entry->commit().has_commited_op_id()) {
+        continue;
+      }
+      const OpId& id = entry->commit().commited_op_id();
+      const auto pos = pos_by_index.find(id.index());
+      if (pos == pos_by_index.end() || (*commits)[pos->second] ||
+          op_ids[pos->second].term() != id.term()) {
+        continue;
+      }
+      (*commits)[pos->second].reset(entry->release_commit());
+      --num_missing;
+    }
+  }
   return Status::OK();
 }
 

@@ -121,6 +121,16 @@ class AuthzProvider {
                                       const std::string& user,
                                       bool is_owner) = 0;
 
+  // Checks if deleting a CDC stream over the table, created by another user, is
+  // authorized for the given user. 'is_owner' indicates whether 'user' is the
+  // owner of the table.
+  //
+  // If the operation is not authorized, returns Status::NotAuthorized().
+  // Otherwise, may return other Status error codes depend on actual errors.
+  virtual Status AuthorizeDeleteCDCStream(const std::string& table_name,
+                                          const std::string& user,
+                                          bool is_owner) = 0;
+
   // Refreshes policies in the authorization provider plugin.
   virtual Status RefreshPolicies() = 0;
 

@@ -36,6 +36,7 @@
 #include "kudu/consensus/replica_management.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/hms/hms_catalog.h"
 #include "kudu/master/authz_provider.h"
@@ -130,6 +131,19 @@ DEFINE_bool(master_support_1d_array_columns, true,
             "one-dimensional columns");
 TAG_FLAG(master_support_1d_array_columns, hidden);
 TAG_FLAG(master_support_1d_array_columns, runtime);
+
+DEFINE_bool(master_support_cdc, true,
+            "Whether the master advertises the CDC feature to clients. For "
+            "testing only: lets a test emulate a master that does not support "
+            "CDC.");
+TAG_FLAG(master_support_cdc, hidden);
+TAG_FLAG(master_support_cdc, runtime);
+
+DEFINE_bool(cdc_enabled, false,
+            "Whether CDC streams may be created. Streams that already exist are "
+            "served, and may be listed and deleted, regardless of this flag.");
+TAG_FLAG(cdc_enabled, experimental);
+TAG_FLAG(cdc_enabled, runtime);
 
 using google::protobuf::Message;
 using kudu::consensus::ReplicaManagementInfoPB;
@@ -1005,9 +1019,108 @@ bool MasterServiceImpl::SupportsFeature(uint32_t feature) const {
       return FLAGS_master_support_auto_incrementing_column;
     case MasterFeatures::ARRAY_1D_COLUMN_TYPE:
       return FLAGS_master_support_1d_array_columns;
+    case MasterFeatures::CDC:
+      // Not gated by --cdc_enabled: existing streams must stay manageable.
+      return FLAGS_master_support_cdc;
     default:
       return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// CDC (Change Data Capture) RPCs
+// ---------------------------------------------------------------------------
+
+void MasterServiceImpl::CreateCDCStream(const CreateCDCStreamRequestPB* req,
+                                        CreateCDCStreamResponsePB* resp,
+                                        rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  // Checked by the leader, so that a client sent to a follower is redirected.
+  if (!FLAGS_cdc_enabled) {
+    CheckRespErrorOrSetUnknown(
+        Status::NotSupported("CDC is not enabled on this master (see --cdc_enabled)"), resp);
+    rpc->RespondSuccess();
+    return;
+  }
+  Status s = server_->catalog_manager()->CreateCDCStream(
+      req, resp, rpc->remote_user().username());
+  if (s.ok()) {
+    LOG(INFO) << Substitute("Created $0CDC stream $1 on table(s) $2 at the request of $3",
+                            req->ephemeral() ? "ephemeral " : "", resp->stream_id(),
+                            JoinStrings(req->table_ids(), ","), rpc->requestor_string());
+  }
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::DeleteCDCStream(const DeleteCDCStreamRequestPB* req,
+                                        DeleteCDCStreamResponsePB* resp,
+                                        rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->DeleteCDCStream(
+      req, resp, rpc->remote_user().username());
+  if (s.ok()) {
+    LOG(INFO) << Substitute("Marked CDC stream $0 for deletion at the request of $1",
+                            req->stream_id(), rpc->requestor_string());
+  }
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::ListCDCStreams(const ListCDCStreamsRequestPB* req,
+                                      ListCDCStreamsResponsePB* resp,
+                                      rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->ListCDCStreams(
+      req, resp, rpc->remote_user().username());
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::GetCDCStreamInfo(const GetCDCStreamInfoRequestPB* req,
+                                         GetCDCStreamInfoResponsePB* resp,
+                                         rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->GetCDCStreamInfo(
+      req, resp, rpc->remote_user().username());
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::UpdateCDCCheckpoint(const UpdateCDCCheckpointRequestPB* req,
+                                            UpdateCDCCheckpointResponsePB* resp,
+                                            rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->UpdateCDCCheckpoint(req, resp);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::UpdateCDCCheckpoints(const UpdateCDCCheckpointsRequestPB* req,
+                                             UpdateCDCCheckpointsResponsePB* resp,
+                                             rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->UpdateCDCCheckpoints(*req);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
 }
 
 } // namespace master

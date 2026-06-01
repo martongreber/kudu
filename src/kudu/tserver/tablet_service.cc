@@ -34,6 +34,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/cdc/cdc_service.h"
 #include "kudu/clock/clock.h"
 #include "kudu/common/column_predicate.h"
 #include "kudu/common/columnar_serialization.h"
@@ -187,6 +188,13 @@ DEFINE_bool(tserver_support_1d_array_columns, true,
             "one-dimensional array column");
 TAG_FLAG(tserver_support_1d_array_columns, hidden);
 TAG_FLAG(tserver_support_1d_array_columns, runtime);
+
+DEFINE_bool(tserver_support_cdc, true,
+            "Whether the tablet server advertises the CDC feature to the master. "
+            "For testing only: lets a test emulate a tablet server that does not "
+            "support CDC.");
+TAG_FLAG(tserver_support_cdc, hidden);
+TAG_FLAG(tserver_support_cdc, runtime);
 
 DECLARE_bool(enable_txn_system_client_init);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
@@ -1436,6 +1444,47 @@ void TabletServiceAdminImpl::ParticipateInTransaction(const ParticipantRequestPB
   }
 }
 
+void TabletServiceAdminImpl::UpdateCDCRetentionBarrier(
+    const UpdateCDCRetentionBarrierRequestPB* req,
+    UpdateCDCRetentionBarrierResponsePB* resp,
+    rpc::RpcContext* context) {
+  if (!CheckUuidMatchOrRespond(server_->tablet_manager(), "UpdateCDCRetentionBarrier",
+                               req, resp, context)) {
+    return;
+  }
+  cdc::CDCServiceImpl* cdc = server_->cdc_service();
+  if (PREDICT_FALSE(cdc == nullptr)) {
+    SetupErrorAndRespond(resp->mutable_error(),
+                         Status::ServiceUnavailable("CDC service not available"),
+                         TabletServerErrorPB::UNKNOWN_ERROR, context);
+    return;
+  }
+  const uint64_t history_safe_time_micros =
+      req->has_history_safe_time_micros() ? req->history_safe_time_micros() : 0;
+  const int64_t barrier_seq = req->has_barrier_seq() ? req->barrier_seq() : 0;
+  const string& release_consumer_stream_id =
+      req->has_release_consumer_stream_id() ? req->release_consumer_stream_id()
+                                            : string();
+  const bool skip_barrier_update =
+      req->has_skip_barrier_update() && req->skip_barrier_update();
+  bool superseded = false;
+  Status s = cdc->SetRetentionBarrier(req->tablet_id(), req->min_retained_op_index(),
+                                      history_safe_time_micros, barrier_seq,
+                                      release_consumer_stream_id, skip_barrier_update,
+                                      &superseded, req->tablet_dropped());
+  if (PREDICT_FALSE(!s.ok())) {
+    TabletServerErrorPB::Code code = s.IsNotFound()
+        ? TabletServerErrorPB::TABLET_NOT_FOUND
+        : TabletServerErrorPB::UNKNOWN_ERROR;
+    SetupErrorAndRespond(resp->mutable_error(), s, code, context);
+    return;
+  }
+  if (superseded) {
+    resp->set_superseded(true);
+  }
+  context->RespondSuccess();
+}
+
 bool TabletServiceAdminImpl::SupportsFeature(uint32_t feature) const {
   // TODO(awong): once transactions are useable, add a feature flag.
   switch (feature) {
@@ -1446,6 +1495,8 @@ bool TabletServiceAdminImpl::SupportsFeature(uint32_t feature) const {
       return true;
     case TabletServerFeatures::ARRAY_1D_COLUMN_TYPE:
       return PREDICT_TRUE(FLAGS_tserver_support_1d_array_columns);
+    case TabletServerFeatures::CDC:
+      return PREDICT_TRUE(FLAGS_tserver_support_cdc);
     default:
       return false;
   }
@@ -1766,10 +1817,15 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
     VLOG(2) << Substitute("submitting txn write op: $0", s.ToString());
   }
 
-  // Check that we could submit the write
+  // Check that we could submit the write. A tablet whose range partition was
+  // dropped is kept only for CDC: a client that still routes writes to it
+  // must look the partition up again.
   if (PREDICT_FALSE(!s.ok())) {
     return SetupErrorAndRespond(
-        resp->mutable_error(), s, TabletServerErrorPB::UNKNOWN_ERROR, context);
+        resp->mutable_error(), s,
+        replica->rejects_writes_of_dropped_tablet() ? TabletServerErrorPB::TABLET_NOT_FOUND
+                                                    : TabletServerErrorPB::UNKNOWN_ERROR,
+        context);
   }
 }
 

@@ -17,6 +17,7 @@
 
 #include "kudu/tserver/tablet_server.h"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <ostream>
@@ -25,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/cfile/block_cache.h"
@@ -37,29 +39,84 @@
 #include "kudu/transactions/txn_system_client.h"
 #include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/scanners.h"
+#include "kudu/cdc/cdc_service.h"
 #include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver_path_handlers.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/maintenance_manager.h"
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/prometheus_writer.h"
 #include "kudu/util/status.h"
 
+DEFINE_int32(cdc_svc_queue_length, 5000,
+             "Length of the dedicated incoming-RPC queue for the CDC service. "
+             "The CDC service runs in its own ServicePool with its own worker "
+             "threads (see --rpc_num_service_threads), so this queue is fully "
+             "isolated from consensus, tablet, and other server RPCs: a deep CDC "
+             "queue cannot starve or interfere with those services. When the queue "
+             "is full, incoming CDC RPCs are shed (rejected with a retriable "
+             "error); a larger value buffers more calls during catch-up bursts or "
+             "re-bootstrap storms before shedding begins. The default of 5000 is "
+             "appropriate for production deployments with multiple CDC "
+             "consumers.");
+TAG_FLAG(cdc_svc_queue_length, advanced);
+TAG_FLAG(cdc_svc_queue_length, experimental);
+DEFINE_validator(cdc_svc_queue_length, [](const char* /*n*/, int32_t v) { return v > 0; });
+
+DECLARE_bool(tserver_enforce_access_control);
+
 namespace kudu {
 class Timer;
 } // namespace kudu
 
 using kudu::fs::ErrorHandlerType;
+using kudu::rpc::InboundCall;
+using kudu::rpc::RemoteMethod;
+using kudu::rpc::RpcMethodInfo;
 using kudu::rpc::ServiceIf;
 using kudu::transactions::TxnSystemClientInitializer;
+using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
 namespace tserver {
+
+namespace {
+
+// Forwards to a service the TabletServer co-owns. The ServicePool owns only the
+// forwarder, so destroying the pool does not destroy the service.
+class SharedServiceForwarder : public ServiceIf {
+ public:
+  explicit SharedServiceForwarder(shared_ptr<ServiceIf> service)
+      : service_(std::move(service)) {
+  }
+
+  void Handle(InboundCall* call) override {
+    service_->Handle(call);
+  }
+
+  const string& service_name() const override {
+    return service_->service_name();
+  }
+
+  bool SupportsFeature(uint32_t feature) const override {
+    return service_->SupportsFeature(feature);
+  }
+
+  RpcMethodInfo* LookupMethod(const RemoteMethod& method) override {
+    return service_->LookupMethod(method);
+  }
+
+ private:
+  const shared_ptr<ServiceIf> service_;
+};
+
+} // anonymous namespace
 
 TabletServer::TabletServer(const TabletServerOptions& opts)
     : KuduServer("TabletServer", opts, kMetricEntityIdTabletServer),
@@ -153,11 +210,18 @@ Status TabletServer::Start() {
   unique_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(this, tablet_manager_.get()));
   unique_ptr<ServiceIf> tablet_copy_service(new TabletCopyServiceImpl(
       this, tablet_manager_.get()));
+  // Published atomically: tablets opened by Init() may already call
+  // cdc_service() from their consensus callbacks.
+  std::atomic_store(&cdc_service_, std::make_shared<cdc::CDCServiceImpl>(
+      this, [] { return FLAGS_tserver_enforce_access_control; }));
+  RETURN_NOT_OK(cdc_service_->Start());
+  unique_ptr<ServiceIf> cdc_service(new SharedServiceForwarder(cdc_service_));
 
   RETURN_NOT_OK(RegisterService(std::move(ts_service)));
   RETURN_NOT_OK(RegisterService(std::move(admin_service)));
   RETURN_NOT_OK(RegisterService(std::move(consensus_service)));
   RETURN_NOT_OK(RegisterService(std::move(tablet_copy_service)));
+  RETURN_NOT_OK(RegisterService(std::move(cdc_service), FLAGS_cdc_svc_queue_length));
   RETURN_NOT_OK(KuduServer::Start());
 
   if (web_server_) {
@@ -187,6 +251,12 @@ void TabletServer::ShutdownImpl() {
     fs_manager_->UnsetErrorNotificationCb(ErrorHandlerType::KUDU_2233_CORRUPTION);
     fs_manager_->UnsetErrorNotificationCb(ErrorHandlerType::CFILE_CORRUPTION);
     fs_manager_->UnsetErrorNotificationCb(ErrorHandlerType::DISK_ERROR);
+    // End the CDC sessions and stop the checkpoint flusher before the tablets
+    // shut down. The CDC service object itself stays alive for DeleteTablet
+    // tasks still draining below.
+    if (cdc_service_) {
+      cdc_service_->Shutdown();
+    }
     tablet_manager_->Shutdown();
 
     client_initializer_->Shutdown();

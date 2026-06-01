@@ -162,6 +162,39 @@ operators must change* (→ `OUT-OF-MODEL: non-default-build`, requirement moves
 `--rpc_authentication=required`"), but an explicit PMC call is needed because it
 reshapes §8/§10/§11a/§13 together.
 
+## CDC (change data capture) streams
+
+CDC is experimental. A stream exposes every change of its table, with all
+columns, and retains the WAL of the table's tablets (and, for FULL streams, the
+MVCC history) until its consumer checkpoints. *(inferred)*
+
+- **Gate.** The masters create streams only with `--cdc_enabled` (default off,
+  experimental). Existing streams are still served, listed and deleted when it
+  is turned off.
+- **Master RPCs**, with Ranger: `CreateCDCStream` requires SELECT on all columns
+  plus ALTER, or ALL, on each table of the stream, and records the caller as the
+  stream's owner. `DeleteCDCStream` is allowed for the owner, a superuser, or a
+  user with ALL on the stream's tables. `ListCDCStreams` and `GetCDCStreamInfo`
+  require METADATA on the stream's tables, like `ListTables`; the snapshot
+  resume keys, which hold primary key values, are returned only to the service
+  user and superusers. A stream over a dropped table is shown to, and may be
+  deleted by, only its owner, a superuser and the service user. `--cdc_max_streams` and `--cdc_max_streams_per_table`
+  bound the number of streams, and so the WAL retention clients can request.
+- **Tablet-server RPCs** (`GetChanges`, including snapshot pages, and
+  `Checkpoint`): under `--tserver_enforce_access_control` they require an authz
+  token granting SELECT on all columns of the table, as scans do; a token for
+  some columns only fails with `FATAL_UNAUTHORIZED`, a missing or expired one
+  with `ERROR_INVALID_AUTHORIZATION_TOKEN`. A tablet is served and checkpointed
+  only for a stream that covers its table, by its leader, and a checkpoint must
+  be within the tablet's WAL; the master rejects negative checkpoints and
+  checkpoints of tablets of other tables.
+- **Non-findings.** Without Ranger (the default authorization provider) or
+  without `--tserver_enforce_access_control`, any user allowed by the User ACL
+  can create, delete and consume any stream: the same posture as DDL and scans
+  on such a cluster (section 11a). Stream ids are not secrets. Exhausting disk
+  through WAL retention is denial of service, which is out of model (section 7);
+  the quotas and the tablet servers' retention valves bound it.
+
 ## §6 Assumptions about inputs
 
 Per-surface trust table (distributed service — rows are RPC/endpoints):

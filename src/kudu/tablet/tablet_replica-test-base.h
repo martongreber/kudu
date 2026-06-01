@@ -15,6 +15,7 @@
 // under the License.
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "kudu/consensus/consensus_meta_manager.h"
@@ -72,7 +73,12 @@ class TabletReplicaTestBase : public KuduTabletTest {
   // Tablet instance. The 'false' default is for cases in which the tablet may
   // have persisted a schema change; otherwise rebuilding the tablet may crash
   // with a schema mismatch.
-  Status RestartReplica(bool reset_tablet = false);
+  //
+  // If 'before_start' is set, it is called with the bootstrapped tablet before
+  // the replica is started, i.e. while the replica is still BOOTSTRAPPING.
+  Status RestartReplica(
+      bool reset_tablet = false,
+      const std::function<void(const std::shared_ptr<Tablet>&)>& before_start = nullptr);
 
   const scoped_refptr<TabletReplica>& tablet_replica() const { return tablet_replica_; }
 

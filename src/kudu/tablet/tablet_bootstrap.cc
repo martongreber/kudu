@@ -1539,6 +1539,7 @@ Status TabletBootstrap::PlayAlterSchemaRequest(const IOContext* /*io_context*/,
   RETURN_NOT_OK(SchemaFromPB(alter_schema->schema(), schema_ptr.get()));
 
   AlterSchemaOpState op_state(nullptr, alter_schema, nullptr);
+  *op_state.mutable_op_id() = replicate_msg->id();
   RETURN_NOT_OK(tablet_->CreatePreparedAlterSchema(&op_state, schema_ptr));
 
   // Apply the alter schema to the tablet

@@ -74,7 +74,7 @@ string DecimalToString(int128_t d, int8_t scale) {
   }
   // Add leading "0.".
   if (fractional) {
-    if (d != 0) {
+    if (scale != 0) {
       *--p = '.';
     }
     *--p = '0';

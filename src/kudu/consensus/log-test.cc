@@ -55,6 +55,7 @@
 #include "kudu/util/faststring.h"
 #include "kudu/util/file_cache.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
@@ -1066,6 +1067,77 @@ TEST_P(LogTestOptionalCompression, TestReadReplicatesHighIndex) {
   ASSERT_GT(op_id.index(), std::numeric_limits<int32_t>::max());
 }
 
+// ReadCommitsForOps() returns the COMMIT of exactly the requested OpIds, scanning
+// forward from the first op's REPLICATE across segments, including when it starts
+// in the middle of a closed segment.
+TEST_P(LogTestOptionalCompression, TestReadCommitsForOps) {
+  ASSERT_OK(BuildLog());
+  // Segment 1: R1, R2, C1. Segment 2: R3, C2, a COMMIT of op 3 from another
+  // term, R4, C3. Op 4 has no COMMIT.
+  ASSERT_OK(AppendReplicateBatch(MakeOpId(1, 1)));
+  ASSERT_OK(AppendReplicateBatch(MakeOpId(1, 2)));
+  ASSERT_OK(AppendCommit(MakeOpId(1, 1)));
+  ASSERT_OK(log_->AllocateSegmentAndRollOverForTests());
+  ASSERT_OK(AppendReplicateBatch(MakeOpId(1, 3)));
+  ASSERT_OK(AppendCommitWithNotFoundOpResults(MakeOpId(1, 2)));
+  ASSERT_OK(AppendCommit(MakeOpId(2, 3)));
+  ASSERT_OK(AppendReplicateBatch(MakeOpId(1, 4)));
+  ASSERT_OK(AppendCommit(MakeOpId(1, 3), /*mrs_id=*/7, /*rs_id=*/0, /*dms_id=*/0));
+  shared_ptr<LogReader> reader = log_->reader();
+
+  const vector<OpId> all_ops = { MakeOpId(1, 1), MakeOpId(1, 2), MakeOpId(1, 3),
+                                 MakeOpId(1, 4) };
+  vector<unique_ptr<CommitMsg>> commits;
+  ASSERT_OK(reader->ReadCommitsForOps(all_ops, &commits));
+  ASSERT_EQ(4, commits.size());
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_NE(nullptr, commits[i]) << i;
+    EXPECT_EQ(all_ops[i], commits[i]->commited_op_id());
+    ASSERT_EQ(2, commits[i]->result().ops_size());
+  }
+  EXPECT_FALSE(commits[0]->result().ops(0).has_failed_status());
+  EXPECT_TRUE(commits[1]->result().ops(0).has_failed_status());
+  EXPECT_EQ(7, commits[2]->result().ops(0).mutated_stores(0).mrs_id());
+  EXPECT_EQ(nullptr, commits[3]);
+
+  // Start at op 2, in the middle of the closed first segment.
+  ASSERT_OK(reader->ReadCommitsForOps({ MakeOpId(1, 2), MakeOpId(1, 3) }, &commits));
+  ASSERT_EQ(2, commits.size());
+  ASSERT_NE(nullptr, commits[0]);
+  EXPECT_TRUE(commits[0]->result().ops(0).has_failed_status());
+  ASSERT_NE(nullptr, commits[1]);
+  EXPECT_EQ(7, commits[1]->result().ops(0).mutated_stores(0).mrs_id());
+
+  // Only the COMMIT of the requested term matches.
+  ASSERT_OK(reader->ReadCommitsForOps({ MakeOpId(2, 3) }, &commits));
+  ASSERT_EQ(1, commits.size());
+  ASSERT_NE(nullptr, commits[0]);
+  EXPECT_EQ(1, commits[0]->result().ops(0).mutated_stores(0).mrs_id());
+
+  // An expired deadline still finds the COMMIT of the first op, then stops.
+  const MonoTime expired = MonoTime::Now() - MonoDelta::FromSeconds(1);
+  ASSERT_OK(reader->ReadCommitsForOps(all_ops, &commits, expired));
+  ASSERT_EQ(4, commits.size());
+  ASSERT_NE(nullptr, commits[0]);
+  EXPECT_EQ(all_ops[0], commits[0]->commited_op_id());
+  for (int i = 1; i < 4; ++i) {
+    EXPECT_EQ(nullptr, commits[i]) << i;
+  }
+
+  // ... also when that COMMIT is in a later segment than the first REPLICATE.
+  ASSERT_OK(reader->ReadCommitsForOps({ MakeOpId(1, 2), MakeOpId(1, 3) }, &commits,
+                                      expired));
+  ASSERT_EQ(2, commits.size());
+  ASSERT_NE(nullptr, commits[0]);
+  EXPECT_EQ(MakeOpId(1, 2), commits[0]->commited_op_id());
+  EXPECT_EQ(nullptr, commits[1]);
+
+  // If the first op has no COMMIT, the scan reaches the end of the log.
+  ASSERT_OK(reader->ReadCommitsForOps({ MakeOpId(1, 4) }, &commits, expired));
+  ASSERT_EQ(1, commits.size());
+  EXPECT_EQ(nullptr, commits[0]);
+}
+
 // Test various situations where we expect different segments depending on what the
 // min log index is.
 TEST_F(LogTest, TestGetGCableDataSize) {
@@ -1108,6 +1180,41 @@ TEST_F(LogTest, TestGetGCableDataSize) {
   // The last segment is not GCable because it is still open.
   FLAGS_log_min_segments_to_retain = 0;
   EXPECT_EQ(kSegmentSizeBytes * 4, log_->GetGCableDataSize(RetentionIndexes(35)));
+}
+
+// The CDC hard WAL-retention floor must keep any segment that closed within the
+// retention window (and everything newer), even when the index-based retention
+// (for_durability / for_peers) would otherwise allow GC.
+TEST_F(LogTest, TestGCableDataSizeWithCDCWalRetention) {
+  FLAGS_log_compression_codec = "no_compression";
+  FLAGS_log_min_segments_to_retain = 0;
+  ASSERT_OK(BuildLog());
+
+  const int kNumTotalSegments = 5;
+  const int kNumOpsPerSegment = 5;
+  const int64_t kSegmentSizeBytes = 352 + env_->GetEncryptionHeaderSize();
+  OpId op_id = MakeOpId(1, 10);
+  // [10-14], [15-19], [20-24], [25-29], [30-34]; the last segment stays open.
+  ASSERT_OK(AppendMultiSegmentSequence(kNumTotalSegments, kNumOpsPerSegment,
+                                       &op_id, nullptr));
+
+  // Baseline: with no CDC floor and a high index, all four closed segments are
+  // GCable (the open segment is never GCable).
+  RetentionIndexes no_floor(35);
+  ASSERT_EQ(0, no_floor.cdc_wal_retention_deadline_micros);
+  EXPECT_EQ(kSegmentSizeBytes * 4, log_->GetGCableDataSize(no_floor));
+
+  // A deadline in the distant past: every real segment closed after it, so the
+  // floor retains all closed segments regardless of the index-based retention.
+  RetentionIndexes past_floor(35);
+  past_floor.cdc_wal_retention_deadline_micros = 1;
+  EXPECT_EQ(0, log_->GetGCableDataSize(past_floor));
+
+  // A deadline in the far future: no segment closed at or after it, so the floor
+  // matches nothing and index-based GC proceeds as in the baseline.
+  RetentionIndexes future_floor(35);
+  future_floor.cdc_wal_retention_deadline_micros = 1000000000000000000LL;
+  EXPECT_EQ(kSegmentSizeBytes * 4, log_->GetGCableDataSize(future_floor));
 }
 
 // Regression test. Check that failed preallocation returns an error instead of

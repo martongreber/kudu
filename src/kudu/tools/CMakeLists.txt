@@ -103,6 +103,7 @@ target_link_libraries(kudu_tools_rebalance
 
 set(KUDU_CLI_TOOL_SRCS
   master_rebuilder.cc
+  tool_action_cdc.cc
   tool_action_cluster.cc
   tool_action_diagnose.cc
   tool_action_fs.cc
@@ -129,6 +130,7 @@ add_executable(kudu ${KUDU_CLI_TOOL_SRCS})
 set(KUDU_CLI_TOOL_LINK_LIBS
   ${SANITIZER_OPTIONS_OVERRIDE}
   ${KRB5_REALM_OVERRIDE}
+  cdc_client
   clock
   consensus
   gutil

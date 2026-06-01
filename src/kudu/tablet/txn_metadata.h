@@ -16,6 +16,7 @@
 // under the License.
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <utility>
 
@@ -82,6 +83,30 @@ class TxnMetadata : public RefCountedThreadSafe<TxnMetadata> {
     return commit_mvcc_op_timestamp_;
   }
 
+  // The index of the BEGIN_TXN op that opened the transaction on this replica.
+  // Only known if this replica applied that op since it was opened; it is not
+  // persisted.
+  void set_begin_op_index(int64_t index) {
+    std::lock_guard l(lock_);
+    begin_op_index_ = index;
+  }
+  std::optional<int64_t> begin_op_index() const {
+    std::lock_guard l(lock_);
+    return begin_op_index_;
+  }
+
+  // The index of the FINALIZE_COMMIT op that committed the transaction on this
+  // replica. Like begin_op_index(), only known if this replica applied that op
+  // since it was opened; it is not persisted.
+  void set_commit_op_index(int64_t index) {
+    std::lock_guard l(lock_);
+    commit_op_index_ = index;
+  }
+  std::optional<int64_t> commit_op_index() const {
+    std::lock_guard l(lock_);
+    return commit_op_index_;
+  }
+
   void GetTimestamps(std::optional<Timestamp>* op_ts,
                      std::optional<Timestamp>* commit_ts) const {
     std::lock_guard l(lock_);
@@ -122,6 +147,9 @@ class TxnMetadata : public RefCountedThreadSafe<TxnMetadata> {
   std::optional<Timestamp> commit_timestamp_;
 
   bool flushed_committed_mrs_;
+
+  std::optional<int64_t> begin_op_index_;
+  std::optional<int64_t> commit_op_index_;
 };
 
 } // namespace tablet

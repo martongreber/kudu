@@ -112,10 +112,16 @@ LogOptions::LogOptions()
 ////////////////////////////////////////////////////////////
 
 LogEntryReader::LogEntryReader(const ReadableLogSegment* seg)
+    : LogEntryReader(seg, seg->first_entry_offset()) {
+}
+
+LogEntryReader::LogEntryReader(const ReadableLogSegment* seg, int64_t offset)
     : seg_(seg),
       num_batches_read_(0),
       num_entries_read_(0),
-      offset_(seg_->first_entry_offset()) {
+      offset_(offset),
+      reads_whole_segment_(offset == seg->first_entry_offset()) {
+  DCHECK_GE(offset_, seg_->first_entry_offset());
 
   const int64_t readable_to_offset =
       seg_->readable_to_offset_.load(std::memory_order_relaxed);
@@ -139,7 +145,8 @@ Status LogEntryReader::ReadNextEntry(unique_ptr<LogEntryPB>* entry) {
     // If we are done reading, check that we got the expected number of entries
     // and return EOF.
     if (offset_ >= read_up_to_) {
-      if (seg_->footer_.IsInitialized() && seg_->footer_.num_entries() != num_entries_read_) {
+      if (reads_whole_segment_ && seg_->footer_.IsInitialized() &&
+          seg_->footer_.num_entries() != num_entries_read_) {
         return Status::Corruption(
             Substitute("Read $0 log entries from $1, but expected $2 based on the footer",
                        num_entries_read_, seg_->path_, seg_->footer_.num_entries()));

@@ -28,6 +28,7 @@
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/make_shared.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -41,6 +42,7 @@ class MetricEntity;
 class faststring;
 
 namespace consensus {
+class CommitMsg;
 class OpId;
 class ReplicateMsg;
 } // namespace consensus
@@ -105,13 +107,38 @@ class LogReader : public enable_make_shared<LogReader> {
   // LogReader::kNoSizeLimit. If the size limit would prevent reading any operations at
   // all, then will read exactly one operation.
   //
+  // If 'deadline' is set and expires mid-read, the function stops after the
+  // current entry and returns the partial batch accumulated so far (at least one
+  // entry is always included, mirroring the byte-limit "at least one op" rule).
+  // A caller detects a truncated result by comparing the index of the last
+  // returned op with 'up_to'. The default MonoTime::Max() never expires.
+  //
   // Requires that a LogIndex was passed into LogReader::Open().
   Status ReadReplicatesInRange(
       int64_t starting_at,
       int64_t up_to,
       int64_t max_bytes_to_read,
-      std::vector<consensus::ReplicateMsg*>* replicates) const;
+      std::vector<consensus::ReplicateMsg*>* replicates,
+      const MonoTime& deadline = MonoTime::Max()) const;
   static const int64_t kNoSizeLimit;
+
+  // Reads the COMMIT entries of the ops in 'op_ids', which must be in strictly
+  // increasing index order and present in the log index. On success, 'commits'
+  // holds one element per element of 'op_ids': the COMMIT of exactly that OpId,
+  // or nullptr if none is in the readable log (yet). A replica appends an op's
+  // COMMIT only once it has applied the op, and always after its REPLICATE, so
+  // the log is scanned forward from the REPLICATE of the first op until every
+  // COMMIT is found or the end of the readable log is reached. If 'deadline'
+  // expires, the scan stops early and the COMMITs not found so far are left as
+  // nullptr; but, as with ReadReplicatesInRange(), the scan always continues
+  // until the COMMIT of the first op is found or the end of the log is reached.
+  //
+  // Returns NotFound if the segment holding the first REPLICATE has been GCed.
+  // Requires that a LogIndex was passed into LogReader::Open().
+  Status ReadCommitsForOps(
+      const std::vector<consensus::OpId>& op_ids,
+      std::vector<std::unique_ptr<consensus::CommitMsg>>* commits,
+      const MonoTime& deadline = MonoTime::Max()) const;
 
   // Look up the OpId for the given operation index.
   // Returns a bad Status if the log index fails to load (eg. due to an IO error).

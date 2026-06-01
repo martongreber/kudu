@@ -1656,6 +1656,7 @@ endif (UNIX)
 ############################################################
 
 add_subdirectory(src/kudu/benchmarks)
+add_subdirectory(src/kudu/cdc)
 add_subdirectory(src/kudu/cfile)
 add_subdirectory(src/kudu/client)
 add_subdirectory(src/kudu/clock)

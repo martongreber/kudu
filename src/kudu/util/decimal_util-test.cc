@@ -70,6 +70,7 @@ TEST(TestDecimalUtil, TestToString) {
             DecimalToString(kMinUnscaledDecimal128, kMaxDecimal128Precision));
 
   ASSERT_EQ("0", DecimalToString(0, 0));
+  ASSERT_EQ("0.00", DecimalToString(0, 2));
   ASSERT_EQ("12345", DecimalToString(12345, 0));
   ASSERT_EQ("-12345", DecimalToString(-12345, 0));
   ASSERT_EQ("123.45", DecimalToString(12345, 2));

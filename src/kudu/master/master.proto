@@ -1233,6 +1233,402 @@ enum MasterFeatures {
   // Whether the system catalog supports tables with one-dimensional array
   // type columns.
   ARRAY_1D_COLUMN_TYPE = 12;
+  // The master supports CDC streams (the CDC stream and checkpoint RPCs).
+  CDC = 13;
+}
+
+////////////////////////////////////////////////////////////
+// CDC (Change Data Capture) messages
+////////////////////////////////////////////////////////////
+
+// Configuration for a CDC stream.
+// Kept structurally in sync with CDCStreamConfigPB in src/kudu/cdc/cdc.proto.
+message CDCStreamConfigPB {
+  // What content to include in change records.
+  enum RecordType {
+    // After-image only (changed columns for UPDATE, all columns for INSERT/DELETE).
+    CHANGE = 0;
+    // Full before-image and after-image for every row change.
+    FULL   = 1;
+  }
+
+  // Wire format for CDCRecordPB entries.
+  enum RecordFormat {
+    PROTO = 0;
+    // JSON = 1 reserved.
+  }
+
+  // Whether and how a consumer bootstraps from the table's current contents.
+  enum SnapshotMode {
+    INITIAL_AND_CONTINUE = 0;
+    NEVER                = 1;
+    INITIAL_ONLY         = 2;
+  }
+
+  optional RecordType   record_type           = 1 [default = CHANGE];
+  optional RecordFormat record_format         = 2 [default = PROTO];
+  // Was a per-stream GetChanges response size that no server ever applied; the
+  // consumer sets GetChangesRequestPB.max_bytes instead.
+  reserved 3;
+  reserved "max_bytes_per_response";
+  optional SnapshotMode snapshot_mode         = 4 [default = NEVER];
+}
+
+// The sys catalog entry for a CDC stream. Keyed by stream_id (UUID string).
+message SysCDCStreamEntryPB {
+  enum State {
+    ACTIVE   = 0;
+    DELETING = 1;
+    // The stream row and its per-tablet checkpoint rows are still being
+    // written by CreateCDCStream, which flips the state to ACTIVE last. A
+    // stream loaded in this state was abandoned mid-creation (the leader
+    // crashed or lost leadership) and is reaped like a DELETING one.
+    CREATING = 2;
+  }
+
+  // Tables included in this stream.
+  repeated bytes table_ids = 1;
+
+  optional CDCStreamConfigPB config = 2;
+
+  optional State state = 3 [default = ACTIVE];
+
+  // Fields 4-7 previously stored per-tablet checkpoint state (op_index, history
+  // floor, last-active/last-advance times) inline here, which forced every
+  // Checkpoint() RPC to take the per-stream metadata write lock and rewrite this
+  // whole proto. That state now lives in one SysCDCTabletCheckpointEntryPB row per
+  // (stream, tablet) -- see that message and CatalogManager::UpdateCDCCheckpoint.
+  // Reserved so the numbers/names are never reused.
+  reserved 4, 5, 6, 7;
+  reserved "tablet_checkpoints", "tablet_history_floors",
+           "last_active_time_micros", "last_checkpoint_advance_time_micros";
+
+  // Wall-clock time (microseconds since the Unix epoch) at which the stream was
+  // created. Absent for streams created before the field existed.
+  optional fixed64 creation_time_micros = 8;
+
+  // Whether the stream was created as a temporary one, for example by
+  // 'kudu cdc consume'. The leader master deletes an ephemeral stream once
+  // every tablet of it has been idle for --cdc_ephemeral_stream_expiry_ms, so
+  // a client that dies without deleting it does not pin the WAL for the full
+  // --cdc_stream_expiry_ms.
+  optional bool ephemeral = 9;
+
+  // The user who created the stream. The owner may delete the stream without
+  // holding ALL on its tables. Absent if the stream was created without an
+  // authenticated user (for example by an internal caller).
+  optional string owner = 10;
+}
+
+// The sys catalog entry for one (stream, tablet) CDC checkpoint. There is one
+// such row per tablet a stream is consuming, keyed by
+// entry_id = stream_id + '\0' + tablet_id (the stream/tablet pair is recovered
+// from the fields below, not by parsing the key). Splitting checkpoints into
+// their own rows lets each Checkpoint() RPC UPSERT a single small row under its
+// own metadata lock, instead of contending on the per-stream lock and rewriting
+// the entire SysCDCStreamEntryPB. Written by CatalogManager::UpdateCDCCheckpoint.
+message SysCDCTabletCheckpointEntryPB {
+  // The stream and tablet this checkpoint belongs to.
+  optional bytes stream_id = 1;
+  optional bytes tablet_id = 2;
+
+  // Durable checkpoint: the Raft log op_index the consumer has acknowledged.
+  // Advanced monotonically (max of existing and reported).
+  optional int64 op_index = 3;
+
+  // MVCC history floor (microseconds). FULL/snapshot streams only; fanned out to
+  // every replica so UNDO deltas older than the consumer's read point survive.
+  // Absent/0 for CHANGE streams.
+  optional fixed64 history_safe_time_micros = 4;
+
+  // Wall-clock time (microseconds since the Unix epoch) of the last observed
+  // consumer activity for this (stream, tablet). Refreshed on each
+  // UpdateCDCCheckpoint. A tablet idle beyond --cdc_stream_expiry_ms is excluded
+  // from the retention-min computation so its barrier is released.
+  optional fixed64 last_active_time_micros = 5;
+
+  // Wall-clock time (microseconds since the Unix epoch) of the last time this
+  // tablet's checkpoint advanced (op_index moved strictly forward), the consumer
+  // reported being caught up (see UpdateCDCCheckpointRequestPB.up_to_op_index),
+  // or the snapshot cursor moved forward. Updated only on real forward progress
+  // -- distinct from last_active_time_micros, which every poll refreshes. A
+  // tablet whose checkpoint stops advancing for longer than
+  // --cdc_max_staleness_ms is excluded from the retention-min computation even
+  // if the consumer keeps polling. 0/absent disables the guard until the first
+  // advance is recorded.
+  optional fixed64 last_checkpoint_advance_time_micros = 6;
+
+  // Durable snapshot-progress cursor for a resumable initial snapshot. Written
+  // during the server-driven paginated snapshot so a newly elected leader (or a
+  // master failover) can re-establish the in-memory snapshot session and continue
+  // the scan instead of forcing a full re-snapshot.
+  //
+  // Serialized encoded primary key of the newest snapshot position the consumer
+  // acknowledged (by asking for the page after it). A resume continues strictly
+  // after this key. Empty for the start of the table.
+  optional bytes snapshot_resume_key = 7;
+
+  // The FULL hybrid-clock timestamp (Timestamp::value()) at which the snapshot is
+  // read. Paired with snapshot_resume_key: a resume MUST rebuild the scan at this
+  // exact timestamp, never a fresh one, or the snapshot tears: a change made
+  // between the two timestamps to a row in the part already scanned would
+  // never reach the consumer. This is the
+  // full HLC, NOT history_safe_time_micros (which is physical-only and cannot
+  // reconstruct the MVCC snapshot). Also orders snapshot generations for the
+  // cursor monotonicity rule in UpdateCDCCheckpoint.
+  optional fixed64 snapshot_snap_ts = 8;
+
+  // True while the initial snapshot is in progress. Cleared only when the
+  // consumer acknowledged its last page (snapshot_done) by streaming or
+  // checkpointing from the streaming start point on: a row that the
+  // maintenance pass expires or finds stale loses its retention but keeps its
+  // unfinished snapshot, so a returning consumer takes the snapshot again
+  // rather than streaming as if it were done. A resume is attempted only
+  // while this is true.
+  optional bool snapshot_active = 9;
+
+  // True if the row was written for a tablet added to the table after the
+  // stream was created (ADD RANGE PARTITION): all of the tablet's changes are
+  // new to the stream, so a consumer reads it from its first op whatever its
+  // start mode. Rows written when the stream is created leave it unset.
+  optional bool registered_by_partition_add = 10;
+
+  // For a tablet whose range partition was dropped: the stream read every
+  // change of the tablet and applied the drop (see
+  // UpdateCDCCheckpointRequestPB), or the tablet was
+  // deleted before it did, so that the changes after 'op_index' are lost. The
+  // leader master keeps a dropped tablet while a row of an active stream for it
+  // has neither set, for at most --cdc_dropped_tablet_retention_secs.
+  optional bool dropped_tablet_drained = 11;
+  optional bool dropped_tablet_tail_lost = 12;
+}
+
+// A per-tablet durable snapshot-progress cursor, surfaced to tablet servers so a
+// newly elected leader can re-establish and resume an in-progress snapshot (see
+// SysCDCTabletCheckpointEntryPB).
+// Only present for tablets whose snapshot is currently active. The resume key
+// holds primary key bytes, so it is returned only to the service user and
+// superusers (the tablet servers); other callers see the cursor without it.
+message CDCTabletSnapshotCursorPB {
+  optional bytes   tablet_id           = 1;
+  // Full hybrid-clock timestamp of the snapshot (Timestamp::value()).
+  optional fixed64 snapshot_snap_ts    = 2;
+  // Serialized encoded primary key of the newest position the consumer
+  // acknowledged (the resume point; empty for the start of the table).
+  optional bytes   snapshot_resume_key = 3;
+  optional bool    snapshot_active     = 4;
+  // The committed op-index captured at snapshot establish; where WAL streaming
+  // begins after the snapshot completes. Stored as op_index in the checkpoint row.
+  optional int64   streaming_start_op_index = 5;
+}
+
+// The state of one (stream, tablet) checkpoint as seen by the leader master,
+// for operators. See SysCDCTabletCheckpointEntryPB.
+message CDCTabletStatusPB {
+  optional bytes   tablet_id = 1;
+  // Absent if the consumer has not checkpointed this tablet yet.
+  optional int64   op_index = 2;
+  optional fixed64 last_active_time_micros = 3;
+  optional fixed64 last_checkpoint_advance_time_micros = 4;
+  // The tablet has been idle beyond the stream's expiry (expired), or its
+  // checkpoint has not advanced within --cdc_max_staleness_ms (stale). Either
+  // way it no longer pins the WAL or history of the tablet.
+  optional bool    expired = 5;
+  optional bool    stale = 6;
+  optional bool    snapshot_active = 7;
+}
+
+// A tablet of a stream whose range partition was dropped, as seen by the
+// leader master.
+message CDCStreamDroppedTabletPB {
+  enum State {
+    UNKNOWN = 0;
+    // The tablet is kept for the stream to read the rest of its changes, from
+    // the tablet's leader, which is one of 'replicas'. The tablet rejects
+    // writes.
+    RETAINED = 1;
+    // The stream read every change of the tablet and applied the drop.
+    DRAINED = 2;
+    // The tablet was deleted before the stream acknowledged the drop: the
+    // changes after 'op_index' may be lost.
+    TAIL_LOST = 3;
+  }
+  optional bytes tablet_id = 1;
+  optional State state = 2;
+  // The tablet's partition, which bounds the rows that were dropped, and its
+  // human-readable form.
+  optional PartitionPB partition = 3;
+  optional string partition_description = 4;
+  // The stream's checkpoint of the tablet, if it has one.
+  optional int64 op_index = 5;
+  // RETAINED only: the RPC addresses of the tablet's replicas.
+  repeated HostPortPB replicas = 6;
+}
+
+// Summary returned in ListCDCStreams.
+message CDCStreamInfoPB {
+  optional bytes             stream_id = 1;
+  repeated bytes             table_ids = 2;
+  optional CDCStreamConfigPB config    = 3;
+  // The durable checkpoint of each tablet, except the tablets whose snapshot
+  // is active: a consumer must complete their snapshot before it streams them.
+  map<string, int64>         tablet_checkpoints = 4;
+  // Durable snapshot cursors for tablets with an active snapshot (filled in by
+  // GetCDCStreamInfo only). Consumed by the cold-leader resume path in
+  // CDCServiceImpl::ReadSnapshot, and by consumers to tell which tablets must
+  // complete their snapshot.
+  repeated CDCTabletSnapshotCursorPB tablet_snapshot_cursors = 5;
+  optional SysCDCStreamEntryPB.State state = 6;
+  optional fixed64           creation_time_micros = 7;
+  optional bool              ephemeral = 8;
+  // Only filled in when GetCDCStreamInfoRequestPB.include_tablet_status is set.
+  repeated CDCTabletStatusPB tablet_status = 9;
+  // The tablets whose row has registered_by_partition_add set and whose
+  // checkpoint is still 0 (filled in by GetCDCStreamInfo only). See
+  // SysCDCTabletCheckpointEntryPB.registered_by_partition_add.
+  repeated bytes             tablets_added_after_creation = 10;
+  // See SysCDCStreamEntryPB.owner.
+  optional string            owner = 11;
+  // The tablets of the stream whose range partition was dropped (filled in by
+  // GetCDCStreamInfo only). They are not in 'tablet_checkpoints'.
+  repeated CDCStreamDroppedTabletPB dropped_tablets = 12;
+}
+
+// ---- CreateCDCStream ----
+// Requires --cdc_enabled on the masters, and SELECT on all columns plus ALTER
+// (or ALL) on every table of the stream, unless the caller is the service
+// user or a superuser.
+// Bounded by --cdc_max_streams and --cdc_max_streams_per_table.
+
+message CreateCDCStreamRequestPB {
+  // The table of the stream. Exactly one is required: streams over several
+  // tables are not supported.
+  repeated bytes table_ids = 1;
+  optional CDCStreamConfigPB config = 2;
+  // Create a temporary stream (see SysCDCStreamEntryPB.ephemeral).
+  optional bool ephemeral = 3;
+}
+
+message CreateCDCStreamResponsePB {
+  optional MasterErrorPB error = 1;
+  // UUID assigned by the master for this stream.
+  optional bytes stream_id = 2;
+}
+
+// ---- DeleteCDCStream ----
+// Allowed for the stream's owner, the service user, a superuser, or a user
+// with ALL on every table of the stream. A stream whose table was dropped can
+// be deleted only by its owner, the service user or a superuser.
+
+message DeleteCDCStreamRequestPB {
+  required bytes stream_id = 1;
+}
+
+message DeleteCDCStreamResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
+// ---- ListCDCStreams ----
+
+// Returns only the streams whose tables the caller may see the metadata of.
+message ListCDCStreamsRequestPB {
+  // If set, returns only streams covering this table. Otherwise returns all streams.
+  optional bytes table_id = 1;
+  // Also return the streams that are being created or deleted.
+  optional bool include_deleting = 2;
+}
+
+message ListCDCStreamsResponsePB {
+  optional MasterErrorPB   error   = 1;
+  repeated CDCStreamInfoPB streams = 2;
+}
+
+// ---- GetCDCStreamInfo ----
+// Returns stream metadata and current tablet checkpoints for one stream. The
+// caller must be allowed to see the metadata of the stream's tables, unless it
+// is the service user or a superuser.
+
+message GetCDCStreamInfoRequestPB {
+  required bytes stream_id = 1;
+  // Also describe a stream that is being created or deleted. Otherwise such a
+  // stream is reported as not found.
+  optional bool include_deleting = 2;
+  // Fill in CDCStreamInfoPB.tablet_status.
+  optional bool include_tablet_status = 3;
+}
+
+message GetCDCStreamInfoResponsePB {
+  optional MasterErrorPB   error  = 1;
+  optional CDCStreamInfoPB stream = 2;
+  // The idle time (milliseconds) after which the leader master expires a
+  // tablet of this stream; 0 if expiry is disabled. Tablet servers use it to
+  // tell an expired stream from a transient WAL gap and to report the time to
+  // expiry, so it is configured on the masters only.
+  optional int64 stream_expiry_ms = 3;
+}
+
+// ---- UpdateCDCCheckpoint ----
+// Called by CDCService to persist a consumer's checkpoint durably on the master.
+
+message UpdateCDCCheckpointRequestPB {
+  required bytes stream_id = 1;
+  required bytes tablet_id = 2;
+  required int64 op_index  = 3;
+
+  // For FULL/snapshot streams: the MVCC history floor (microseconds) that this
+  // consumer still needs. The master stores the per-tablet minimum across
+  // streams and fans it out to replicas via UpdateCDCRetentionBarrier. Absent
+  // or 0 for CHANGE-only streams.
+  optional fixed64 history_safe_time_micros = 4;
+
+  // If set, this is a lightweight activity heartbeat from a tablet server: the
+  // master only refreshes the stream's last_active_time_micros and leaves the
+  // durable checkpoint and history floor untouched (op_index is ignored). Sent,
+  // throttled, from GetChanges so a live but not-yet-checkpointing consumer is
+  // not expired.
+  optional bool refresh_active_time_only = 5 [default = false];
+
+  // Durable snapshot-progress cursor (resumable snapshot bootstrap). Set only by
+  // the snapshot path in CDCServiceImpl; absent for ordinary streaming
+  // checkpoints and for activity heartbeats. The master applies these under a
+  // generation/monotonicity rule (see CatalogManager::UpdateCDCCheckpoint) and
+  // never touches them on the refresh_active_time_only path. An ordinary
+  // checkpoint at or past the stored op_index completes an active snapshot.
+  // snapshot_snap_ts is the FULL hybrid-clock value.
+  optional bytes   snapshot_resume_key = 6;
+  optional fixed64 snapshot_snap_ts    = 7;
+  optional bool    snapshot_active     = 8;
+
+  // The tablet's last committed op index as last observed by the reporting
+  // leader while serving this stream (the GetChanges upper bound). If the
+  // stored checkpoint is at or past it, the consumer has nothing left to read,
+  // so the master counts the report as progress for --cdc_max_staleness_ms: an
+  // idle tablet cannot advance its checkpoint. Absent when not yet known.
+  optional int64   up_to_op_index      = 9;
+
+  // The tablet's range partition was dropped, op_index is at or past its
+  // last op, and the consumer applied the drop (see
+  // cdc.CheckpointRequestPB.drop_applied).
+  optional bool    dropped_tablet_drained = 10;
+}
+
+message UpdateCDCCheckpointResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
+// ---- UpdateCDCCheckpoints ----
+// Batched UpdateCDCCheckpoint. A tablet server queues the checkpoints, snapshot
+// cursors and activity reports of its CDC sessions and sends them in one RPC.
+// The master applies the updates for one (stream, tablet) in order, writes
+// all rows with as few sys-catalog writes as possible, and skips updates for a
+// stream that is not ACTIVE. 'error' is set only when the whole batch failed,
+// in which case nothing after the failed sys-catalog write was applied.
+message UpdateCDCCheckpointsRequestPB {
+  repeated UpdateCDCCheckpointRequestPB updates = 1;
+}
+
+message UpdateCDCCheckpointsResponsePB {
+  optional MasterErrorPB error = 1;
 }
 
 service MasterService {
@@ -1336,6 +1732,37 @@ service MasterService {
 
   rpc UnregisterTServer(UnregisterTServerRequestPB) returns (UnregisterTServerResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
+  }
+
+  // CDC (Change Data Capture) RPCs
+  // ------------------------------------------------------------
+
+  rpc CreateCDCStream(CreateCDCStreamRequestPB) returns (CreateCDCStreamResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+
+  rpc DeleteCDCStream(DeleteCDCStreamRequestPB) returns (DeleteCDCStreamResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+
+  rpc ListCDCStreams(ListCDCStreamsRequestPB) returns (ListCDCStreamsResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+
+  // Also called by tablet servers to fetch the configuration of a stream.
+  rpc GetCDCStreamInfo(GetCDCStreamInfoRequestPB) returns (GetCDCStreamInfoResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
+  }
+
+  // Called by CDCService on tablet servers to durably persist consumer checkpoints.
+  rpc UpdateCDCCheckpoint(UpdateCDCCheckpointRequestPB) returns (UpdateCDCCheckpointResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeServiceUser";
+  }
+
+  // Batched UpdateCDCCheckpoint, used by the CDCService checkpoint flusher.
+  rpc UpdateCDCCheckpoints(UpdateCDCCheckpointsRequestPB)
+      returns (UpdateCDCCheckpointsResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeServiceUser";
   }
 
   // Master->Master RPCs

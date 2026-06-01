@@ -16,12 +16,14 @@
 // under the License.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -186,6 +188,18 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   Status SubmitWrite(std::unique_ptr<WriteOpState> op_state,
                      MonoTime deadline = MonoTime::Max());
 
+  // Makes the replica reject every write from now on (SubmitWrite() returns
+  // NotFound): the tablet's range partition was dropped, and the master keeps
+  // the tablet only for CDC streams to read the rest of its changes. Once this
+  // returned, every write that was not rejected is a pending op in
+  // op_tracker(). Marks the tablet metadata, and returns true if it was not
+  // marked before, in which case the caller must flush the metadata.
+  bool RejectWritesOfDroppedTablet();
+
+  // Whether the replica rejects writes because the tablet's range partition
+  // was dropped. See RejectWritesOfDroppedTablet().
+  bool rejects_writes_of_dropped_tablet() const;
+
   // Submits an op to update transaction participant state, executing it
   // asynchonously.
   Status SubmitTxnParticipantOp(std::unique_ptr<ParticipantOpState> op_state);
@@ -283,8 +297,23 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
                       std::vector<consensus::OpStatusPB>* out) const;
 
   // Returns the log indexes to be retained for durability and to catch up peers.
-  // Used for selection of log segments to delete during Log GC.
+  // Used for selection of log segments to delete during Log GC. Applies the CDC
+  // retention barrier persisted in the tablet metadata, unless the CDC
+  // retention valve is open (see CDCRetentionValveOpen()).
   log::RetentionIndexes GetRetentionIndexes() const;
+
+  // Test-only: current value of the CDC force-release counter (the number of
+  // times the CDC retention valve opened, see GetRetentionIndexes()). Returns
+  // -1 if the counter was never instantiated (no metric entity).
+  int64_t cdc_barrier_forced_releases_for_tests() const {
+    return cdc_barrier_forced_releases_ ? cdc_barrier_forced_releases_->value() : -1;
+  }
+
+  // Whether the CDC retention valve is open, i.e. whether the last call to
+  // GetRetentionIndexes() ignored the CDC retention barrier.
+  bool cdc_retention_valve_open() const {
+    return cdc_valve_open_.load(std::memory_order_relaxed);
+  }
 
   // See Log::GetReplaySizeMap(...).
   //
@@ -417,6 +446,35 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
 
   // Only for CLI tools and tests.
   TabletReplica();
+
+  // Returns 'raft_ret' with the CDC retention barrier 'cdc_min_op_index' and
+  // the --cdc_wal_retention_secs time floor applied.
+  static log::RetentionIndexes ApplyCDCRetention(log::RetentionIndexes raft_ret,
+                                                 int64_t cdc_min_op_index);
+
+  // Bytes of WAL retained only because of the CDC retention barrier
+  // 'cdc_min_op_index', given the retention 'raft_ret' without it. Returns 0
+  // if that cannot be determined, e.g. because the log is closed.
+  int64_t CDCRetainedBytes(const log::RetentionIndexes& raft_ret,
+                           int64_t cdc_min_op_index) const;
+
+  // Evaluates the conditions under which the CDC retention barrier
+  // 'cdc_min_op_index' stops retaining WAL and UNDO history (disk pressure,
+  // barrier age, barrier lease, retained bytes), given the retention
+  // 'raft_ret' without the barrier, and records whether the valve is open.
+  // Opening the valve is counted and logged once; while it stays open, the CDC
+  // history floors are kept cleared. Returns true iff the valve is open.
+  // If the free disk space is low (see --cdc_stop_retaining_min_disk_mb),
+  // returns why; returns an empty string otherwise.
+  std::string CDCLowDiskSpaceReason() const;
+
+  // The history half of the CDC retention valve for a tablet without a
+  // retention barrier: on low disk space, clears the CDC history floors that
+  // remain (e.g. the pin of a snapshot session).
+  void ReleaseCDCHistoryOnLowDiskSpace() const;
+
+  bool CDCRetentionValveOpen(const log::RetentionIndexes& raft_ret,
+                             int64_t cdc_min_op_index) const;
 
   // A class to properly dispatch transactional write operations arriving
   // with TabletServerService::Write() RPC for the specified tablet replica.
@@ -621,6 +679,18 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
 
   // Cached stats for the tablet replica.
   ReportedTabletStatsPB stats_pb_;
+
+  // Whether the CDC retention valve is open. See GetRetentionIndexes().
+  mutable std::atomic<bool> cdc_valve_open_;
+
+  // Taken shared by SubmitWrite() while it checks the tablet metadata's
+  // cdc_tablet_dropped() and registers the op, and exclusively by
+  // RejectWritesOfDroppedTablet() while it sets it.
+  mutable rw_spinlock dropped_tablet_lock_;
+
+  // Counter incremented each time the CDC retention valve opens. May be null in
+  // tests that run without a metric entity (guarded at the call site).
+  scoped_refptr<Counter> cdc_barrier_forced_releases_;
 
   // NOTE: it's important that this is the first member to be destructed. This
   // ensures we do not attempt to collect metrics while calling the destructor.

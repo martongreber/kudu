@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <shared_mutex> // IWYU pragma: keep
 #include <string>
@@ -233,6 +234,25 @@ class Tablet {
   // using 'txn' as the anchor owner.
   Status CommitTransaction(Txn* txn, Timestamp commit_ts, const consensus::OpId& op_id);
 
+  // Returns the lowest BEGIN_TXN op index of the transactions that are not
+  // aborted and whose rows 'snap' does not see, or std::nullopt if there are
+  // none. A change stream that reads the tablet as of 'snap' must stream such a
+  // transaction from its BEGIN_TXN op on, since it commits after 'snap'. A
+  // transaction whose BEGIN_TXN op this replica did not apply since it was
+  // opened counts as having begun at op index 0. 'snap' must be a snapshot at
+  // a timestamp for which all ops have been applied.
+  std::optional<int64_t> MinBeginOpIndexOfTxnsNotCommittedIn(const MvccSnapshot& snap) const;
+
+  // Returns the lowest BEGIN_TXN op index of the transactions that are not
+  // aborted and whose FINALIZE_COMMIT op is not at or below 'op_index': they
+  // have not committed yet, or committed with a higher op. A change stream
+  // that starts after 'op_index' must stream such a transaction from its
+  // BEGIN_TXN op on. A transaction that committed before this replica was
+  // opened counts as committed at or below 'op_index', and one whose BEGIN_TXN
+  // op this replica did not apply since it was opened as having begun at op
+  // index 0. Every op at or below 'op_index' must have been applied.
+  std::optional<int64_t> MinBeginOpIndexOfTxnsNotCommittedAt(int64_t op_index) const;
+
   // Merges the uncommitted transaction rowsets associated with the given
   // 'txn_id' with the committed rowsets.
   void CommitTxnRowSets(int64_t txn_id);
@@ -438,6 +458,67 @@ class Tablet {
 
   // Calculates history GC options based on properties of the Clock implementation.
   HistoryGcOpts GetHistoryGcOpts() const;
+
+  // Advances the history-GC water mark to 'opts's ancient history mark (a no-op
+  // if GC is disabled or the mark would not increase). Call from the paths that
+  // actually GC UNDO history so the mark reflects history that has become
+  // reclaimable. See cdc_history_gc_water_mark().
+  void RecordHistoryGcWaterMark(const HistoryGcOpts& opts) const;
+
+  // As above, for the ancient-UNDO/deleted-rowset GC paths that work from a raw
+  // ancient history mark rather than a HistoryGcOpts. Monotonic CAS-max.
+  void RecordHistoryGcWaterMark(Timestamp ancient_history_mark) const;
+
+  // The CDC history floor is the oldest MVCC timestamp that some CDC reader
+  // still needs from UNDO history. GetTabletAncientHistoryMark() never advances
+  // the ancient history mark past it, so compaction and UNDO-delta GC keep the
+  // versions CDC needs. The floor is the minimum over named holders: the
+  // per-tablet aggregate pushed by the master (kCDCMasterHistoryFloorHolder)
+  // and each local CDC session. One holder can neither raise nor clear the
+  // floor of another.
+  static const char* const kCDCMasterHistoryFloorHolder;
+
+  // Sets the floor held by 'holder'. Timestamp(0) removes the holder.
+  // Thread-safe.
+  void SetCDCHistoryFloorHolder(const std::string& holder, Timestamp floor);
+
+  // Raises the floor held by 'holder' to 'floor', or removes the holder if
+  // 'floor' is Timestamp(0). Does nothing if 'holder' holds no floor or one at
+  // or above 'floor', so it never pins history that is not pinned already.
+  // Thread-safe.
+  void RaiseCDCHistoryFloorHolder(const std::string& holder, Timestamp floor);
+
+  // Removes every holder, releasing the floor. Thread-safe.
+  void ClearCDCHistoryFloorHolders();
+
+  // Sets the floor of kCDCMasterHistoryFloorHolder to the master's floor in
+  // the tablet metadata (TabletMetadata::cdc_history_safe_time_micros()), or
+  // removes it if there is none. Reads the metadata under the lock of the
+  // holders, so a concurrent caller that sets the master's floor after
+  // updating the metadata cannot be overwritten with the metadata's earlier
+  // value. Thread-safe.
+  void RefreshCDCMasterHistoryFloorHolder();
+
+  // Returns the current CDC history floor (Timestamp(0) if there is none).
+  Timestamp cdc_history_floor() const {
+    return Timestamp(cdc_history_floor_.load(std::memory_order_acquire));
+  }
+
+  // Returns the CDC history-GC water mark: the highest ancient-history-mark this
+  // tablet has ever applied while GC-ing UNDO history (Timestamp(0) if none).
+  // UNDO history below this timestamp may have been physically removed, so a
+  // FULL-mode/snapshot CDC before-image that reads below it cannot be trusted.
+  //
+  // This is distinct from the *current* ancient history mark: a CDC reader
+  // pins the history floor at the timestamp it needs, which can lower the
+  // current AHM back below a point at which an earlier GC already removed
+  // history. The water mark is monotonic and records what was actually GC'd,
+  // so CDC checks against it (not the current AHM) to decide HISTORY_EXPIRED
+  // rather than emitting a wrong image. It is persisted in the superblock, so
+  // it survives a restart and is carried by a tablet copy.
+  Timestamp cdc_history_gc_water_mark() const {
+    return Timestamp(history_gc_water_mark_.load(std::memory_order_acquire));
+  }
 
   // Register the maintenance ops associated with this tablet
   void RegisterMaintenanceOps(MaintenanceManager* maint_mgr);
@@ -684,6 +765,10 @@ class Tablet {
   // finished and delta files is finished is part of Tablet class.
   void GetRowSetsForTests(std::vector<std::shared_ptr<RowSet> >* out);
 
+  // Recomputes 'cdc_history_floor_' from 'cdc_history_floor_holders_'.
+  // Requires 'cdc_history_floor_lock_'.
+  void UpdateCDCHistoryFloorUnlocked();
+
   // Verbosely dump this entire tablet to the logs. This is only
   // really useful when debugging unit tests failures where the tablet
   // has a very small number of rows.
@@ -888,6 +973,25 @@ class Tablet {
   clock::Clock* clock_;
 
   MvccManager mvcc_;
+
+  // CDC history floor holders (raw Timestamp.value() by holder name), and their
+  // minimum, read lock-free in the GC path. 0 means no floor. Both are written
+  // only under 'cdc_history_floor_lock_'. Lock order: 'cdc_history_floor_lock_'
+  // before the metadata's lock (see RefreshCDCMasterHistoryFloorHolder()).
+  simple_spinlock cdc_history_floor_lock_;
+  std::unordered_map<std::string, uint64_t> cdc_history_floor_holders_;
+  std::atomic<uint64_t> cdc_history_floor_{0};
+
+  // CDC history-GC water mark (raw Timestamp.value()): the highest
+  // ancient-history-mark ever applied while GC-ing UNDO history. Monotonic
+  // (non-decreasing), updated by RecordHistoryGcWaterMark() before each GC and
+  // mirrored into the superblock, from which Open() restores it (or seeds it
+  // with the current time if the superblock does not record it, see
+  // TabletMetadata::has_cdc_history_gc_water_mark()). Read lock-free by
+  // cdc_history_gc_water_mark(). 0 means no history GC is known.
+  // See cdc_history_gc_water_mark() for why this, and not the current AHM,
+  // gates HISTORY_EXPIRED. Mutable: updated from const GC paths.
+  mutable std::atomic<uint64_t> history_gc_water_mark_{0};
 
   LockManager lock_manager_;
 

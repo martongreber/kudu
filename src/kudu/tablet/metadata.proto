@@ -191,6 +191,65 @@ message TabletSuperBlockPB {
   // participant ops should be anchored to replay the updates upon restarting.
   // TODO(awong): consider storing these separately from the superblock.
   map<int64, TxnMetadataPB> txn_metadata = 20;
+
+  // CDC retention barrier (see CDCServiceImpl::SetRetentionBarrier). Persisted on
+  // every replica so a restarted node or a newly-elected leader restores WAL and
+  // MVCC-history retention immediately, without waiting for the master's next CDC
+  // maintenance pass (--cdc_bg_scan_interval_ms).
+
+  // The lowest Raft op index that must remain in the WAL for an active CDC stream
+  // on this tablet. Absent or negative means no active barrier.
+  optional int64 cdc_min_retained_op_index = 21;
+
+  // The oldest MVCC timestamp (physical microseconds) that an active FULL-mode or
+  // snapshot CDC stream still needs retained in UNDO history. Absent or 0 means no
+  // history floor.
+  optional int64 cdc_history_safe_time_micros = 22;
+
+  // The highest ancient history mark (a raw HybridTime value) at which this
+  // tablet has garbage-collected UNDO history. CDC refuses to reconstruct a
+  // before-image or a snapshot page read below it. Persisted so that the check
+  // survives a restart or a tablet copy. Always written by a binary that tracks
+  // it, also when 0 (no history GC known). Absent means the superblock was
+  // written by a binary that did not track it and may have GC'd history at any
+  // point: the tablet then seeds the mark with the time it is opened.
+  optional fixed64 cdc_history_gc_water_mark = 23;
+
+  // The master sequence of the last CDC retention barrier update applied on this
+  // replica. Updates with a lower sequence are superseded and ignored, also
+  // after a restart. Absent or 0 means none applied.
+  optional int64 cdc_barrier_seq = 24;
+
+  // Wall-clock time (microseconds) at which the master last refreshed the CDC
+  // retention barrier on this replica, persisted at a coarse granularity. Used
+  // to release a barrier that the master has stopped refreshing
+  // (--cdc_barrier_lease_secs). Absent or 0 means not known.
+  optional int64 cdc_barrier_refresh_time_micros = 25;
+
+  // The index of the ALTER_SCHEMA op that established 'schema'. Absent or 0 if
+  // 'schema' is the tablet's initial schema, or if it is not known.
+  optional int64 schema_op_index = 26;
+
+  // The schemas that the tablet had before 'schema', in ascending version
+  // order, for the ops still in the WAL. Lets readers of the WAL (such as CDC)
+  // interpret an op with the schema it was applied with. Bounded in size; the
+  // entries for ops that are no longer in the WAL are dropped.
+  repeated SchemaHistoryEntryPB schema_history = 27;
+
+  // Whether the tablet's range partition was dropped and the master keeps the
+  // tablet only for CDC streams to read the rest of its changes: the tablet
+  // rejects writes.
+  optional bool cdc_tablet_dropped = 28;
+}
+
+// A schema that a tablet had, and the ops that it applied with it: those after
+// the op at 'start_op_index' and up to the op at 'end_op_index', which is the
+// ALTER_SCHEMA op that replaced it.
+message SchemaHistoryEntryPB {
+  optional uint32 schema_version = 1;
+  optional SchemaPB schema = 2;
+  optional int64 start_op_index = 3;
+  optional int64 end_op_index = 4;
 }
 
 // Tablet states represent stages of a TabletReplica's object lifecycle and are

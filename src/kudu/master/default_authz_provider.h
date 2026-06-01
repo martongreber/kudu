@@ -84,6 +84,12 @@ class DefaultAuthzProvider : public AuthzProvider {
     return Status::OK();
   }
 
+  Status AuthorizeDeleteCDCStream(const std::string& /*table_name*/,
+                                  const std::string& /*user*/,
+                                  bool /*is_owner*/) override {
+    return Status::OK();
+  }
+
   Status FillTablePrivilegePB(const std::string& /*table_name*/,
                               const std::string& /*user*/,
                               bool /*is_owner*/,

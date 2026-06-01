@@ -54,8 +54,15 @@ add_dependencies(itest_util
   kudu-master
   kudu-tserver)
 
+# The reference sink of the CDC end-to-end tests.
+add_library(cdc_mirror cdc_mirror.cc)
+target_link_libraries(cdc_mirror
+  cdc_client
+  kudu_client
+  kudu_common)
+
 # Tests
-SET_KUDU_TEST_LINK_LIBS(itest_util gumbo-parser gumbo-query)
+SET_KUDU_TEST_LINK_LIBS(itest_util cdc_client gumbo-parser gumbo-query)
 if(NOT NO_ROCKSDB)
   ADD_KUDU_TEST_LINK_LIBS(
     rocksdb)
@@ -69,6 +76,20 @@ ADD_KUDU_TEST(auth_token_expire-itest)
 ADD_KUDU_TEST(authz_token-itest PROCESSORS 2)
 ADD_KUDU_TEST(auto_incrementing-itest)
 ADD_KUDU_TEST(catalog_manager_tsk-itest PROCESSORS 2)
+ADD_KUDU_TEST(cdc-itest)
+ADD_KUDU_TEST(cdc_authz-itest)
+ADD_KUDU_TEST(cdc_chaos-itest NUM_SHARDS 2 PROCESSORS 4)
+target_link_libraries(cdc_chaos-itest cdc_mirror)
+ADD_KUDU_TEST(cdc_client-itest)
+ADD_KUDU_TEST(cdc_consumer-itest NUM_SHARDS 4 PROCESSORS 2)
+target_link_libraries(cdc_consumer-itest cdc_mirror)
+ADD_KUDU_TEST(cdc_failover-itest)
+ADD_KUDU_TEST(cdc_master_failover-itest PROCESSORS 2)
+target_link_libraries(cdc_master_failover-itest cdc_mirror)
+ADD_KUDU_TEST(cdc_master_outage-itest)
+ADD_KUDU_TEST(cdc_replica_lifecycle-itest PROCESSORS 2)
+target_link_libraries(cdc_replica_lifecycle-itest cdc_mirror)
+ADD_KUDU_TEST(cdc_tool-itest)
 ADD_KUDU_TEST(varchar-itest)
 ADD_KUDU_TEST(client_failover-itest)
 ADD_KUDU_TEST(client-negotiation-failover-itest)

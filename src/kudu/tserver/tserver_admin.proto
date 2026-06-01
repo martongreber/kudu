@@ -142,6 +142,13 @@ message AlterSchemaRequestPB {
   required uint32 schema_version = 3;
   optional string new_table_name = 4;
   optional TableExtraConfigPB new_extra_config = 6;
+
+  // The schema version of the tablet right before this alter, set by the
+  // leader replica in the op's REPLICATE when it prepares the op. The master
+  // sends only the table's latest version, so a tablet can go from version N to
+  // N + 2 in one alter; this records N for readers of the WAL (such as CDC).
+  // Not set by the master, nor in REPLICATEs written by older servers.
+  optional uint32 prior_schema_version = 7;
 }
 
 message AlterSchemaResponsePB {
@@ -220,6 +227,76 @@ message DeleteTabletResponsePB {
   optional TabletServerErrorPB error = 1;
 }
 
+// Set (or release) the CDC WAL retention barrier on a tablet replica. Sent by the
+// leader master to every replica of a CDC-enabled tablet so that WAL segments at
+// or after the consumers' minimum checkpoint are retained even across leadership
+// changes and independent follower log GC.
+message UpdateCDCRetentionBarrierRequestPB {
+  // UUID of the server this request is addressed to.
+  optional bytes dest_uuid = 1;
+
+  required bytes tablet_id = 2;
+
+  // The minimum WAL op index CDC still needs; the replica retains segments at or
+  // after this index. A value < 0 releases the barrier (no active CDC stream).
+  required int64 min_retained_op_index = 3;
+
+  // The MVCC history floor (microseconds, physical component of the hybrid
+  // clock) that FULL/snapshot CDC streams still need to read: the minimum over
+  // the tablet's streams. The replica does not garbage-collect UNDO deltas
+  // older than this timestamp. Absent or 0 means no history floor from the
+  // master (CHANGE-only streams keep the cheap WAL-only path); the floors that
+  // CDC sessions on the replica hold themselves are kept, unless the barrier is
+  // released (negative 'min_retained_op_index').
+  optional fixed64 history_safe_time_micros = 4;
+
+  // Monotonic sequence number stamped by the master, used by the replica to
+  // discard reordered barrier updates (last-writer-wins). Barrier SET and
+  // RELEASE tasks are async, best-effort, one-shot and unordered, so a slow SET
+  // dispatched by an earlier maintenance pass can otherwise arrive after a later
+  // pass's RELEASE and leave the replica anchored forever (a WAL/history leak),
+  // or vice versa. The replica persists the sequence of the last update it
+  // applied and, for --cdc_barrier_reorder_window_secs after applying it (or
+  // after the tablet server started), ignores (and reports as 'superseded')
+  // any request with a lower sequence. The master's sequence is
+  // (leader term << 32) | counter, where the counter restarts at each term, so
+  // it is monotonic across passes and a new leader master always outranks the
+  // previous one, regardless of clocks.
+  // Absent or 0 means "unsequenced"; such requests are always applied.
+  optional int64 barrier_seq = 5;
+
+  // If set, the stream with this id was deleted: the replica ends that
+  // stream's CDC sessions on this tablet (dropping any session-held history
+  // floor), drops its cached stream config, and refuses new sessions for it.
+  // This is in addition to (or instead of) updating the aggregate retention
+  // barrier, which is the only long-lived WAL retention. It is fanned out to
+  // every replica because a session may live on a replica that is no longer
+  // the leader.
+  optional bytes release_consumer_stream_id = 6;
+
+  // If true, do not touch the aggregate WAL retention barrier
+  // ('min_retained_op_index' / 'history_safe_time_micros' are ignored); only
+  // act on 'release_consumer_stream_id'. Used when a stream is deleted but the
+  // tablet still has other live streams, so the aggregate barrier must be left
+  // to the master's maintenance pass to recompute rather than being released
+  // here (which would briefly drop retention for the surviving streams).
+  optional bool skip_barrier_update = 7;
+
+  // If true, the tablet's range partition was dropped, and the master keeps
+  // the tablet only for CDC streams to read the rest of its changes: the
+  // replica rejects writes from then on (persisted). Applied whatever
+  // 'barrier_seq' and 'skip_barrier_update' are.
+  optional bool tablet_dropped = 8;
+}
+
+message UpdateCDCRetentionBarrierResponsePB {
+  optional TabletServerErrorPB error = 1;
+
+  // True if the barrier update was not applied because the replica had
+  // already applied an update with a higher 'barrier_seq'.
+  optional bool superseded = 2;
+}
+
 // Enum of the server's Tablet Manager state: currently this is only
 // used for assertions, but this can also be sent to the master.
 enum TSTabletManagerStatePB {
@@ -263,6 +340,12 @@ service TabletServerAdminService {
   // Request that a tablet participate in a transaction, or update the state of
   // an existing transaction participant.
   rpc ParticipateInTransaction(ParticipantRequestPB) returns (ParticipantResponsePB);
+
+  // Set or release the CDC WAL retention barrier on a tablet replica. Driven by
+  // the leader master's periodic CDC maintenance so every replica retains the
+  // WAL that active CDC consumers still need.
+  rpc UpdateCDCRetentionBarrier(UpdateCDCRetentionBarrierRequestPB)
+      returns (UpdateCDCRetentionBarrierResponsePB);
 }
 
 message QuiesceTabletServerRequestPB {

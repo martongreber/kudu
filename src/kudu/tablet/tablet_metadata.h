@@ -37,6 +37,7 @@
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/status.h"
 #include "kudu/util/status_callback.h"
@@ -152,6 +153,27 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
 
   void SetSchema(const SchemaPtr& schema, uint32_t version);
 
+  // Sets the schema to 'schema' at 'version', established by the ALTER_SCHEMA
+  // op at index 'op_index'. The replaced schema is kept in the schema history
+  // for the ops that were applied with it (see GetSchemaForOpIndex()), until
+  // TrimSchemaHistory() drops it or the history is full. Does NOT flush.
+  void SetSchemaFromAlter(const SchemaPtr& schema, uint32_t version, int64_t op_index);
+
+  // Drops the schema history entries that only ops below 'min_op_index' were
+  // applied with. Does NOT flush.
+  void TrimSchemaHistory(int64_t min_op_index);
+
+  // Sets 'schema' and 'version' to the schema the tablet applied (or will
+  // apply) the op at index 'op_index' with, assuming that every ALTER_SCHEMA op
+  // below 'op_index' has been applied. Returns false if that schema is not
+  // known: it was dropped from the schema history, or was replaced while the
+  // history was not kept (before an upgrade).
+  bool GetSchemaForOpIndex(int64_t op_index, SchemaPtr* schema, uint32_t* version) const;
+
+  // Returns the current schema if its version is 'version', else the schema
+  // with that version in the schema history, or nullptr if there is none.
+  SchemaPtr GetSchemaForVersion(uint32_t version) const;
+
   void SetTableName(const std::string& table_name);
 
   void SetExtraConfig(TableExtraConfigPB extra_config);
@@ -162,6 +184,13 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   const SchemaPtr schema() const {
     std::lock_guard l(data_lock_);
     return schema_;
+  }
+
+  // Sets 'schema' and 'version' to the current schema and its version.
+  void GetSchemaAndVersion(SchemaPtr* schema, uint32_t* version) const {
+    std::lock_guard l(data_lock_);
+    *schema = schema_;
+    *version = schema_version_;
   }
 
   // Returns the partition schema of the tablet's table.
@@ -297,6 +326,10 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // the transaction doesn't exist and true otherwise.
   bool GetTxnMetadataPB(int64_t txn_id, TxnMetadataPB* pb) const;
 
+  // Returns the metadata of the given transaction, or nullptr if there is none.
+  // Unlike GetTxnMetadata(), does not copy the map of all the transactions.
+  scoped_refptr<TxnMetadata> FindTxnMetadata(int64_t txn_id) const;
+
   // Returns the transaction IDs that were persisted as being in-flight,
   // terminal (committed or aborted), and having un-flushed MRSs.
   void GetTxnIds(std::unordered_set<int64_t>* in_flight_txn_ids,
@@ -322,6 +355,100 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
 
   // Returns the table's dimension label.
   std::optional<std::string> dimension_label() const;
+
+  // The lowest Raft op index that must remain in the WAL for an active CDC stream
+  // on this tablet, or -1 if there is no active barrier. Persisted in the superblock
+  // and honored by TabletReplica::GetRetentionIndexes() so WAL retention survives a
+  // restart or leader change. Thread-safe.
+  int64_t cdc_min_retained_op_index() const;
+
+  // The oldest MVCC timestamp (physical microseconds) an active FULL-mode/snapshot
+  // CDC stream still needs retained in UNDO history, or 0 if there is no floor.
+  // Restored into Tablet::cdc_history_floor_ at bootstrap. Thread-safe.
+  uint64_t cdc_history_safe_time_micros() const;
+
+  // The master sequence of the last CDC retention barrier update applied on
+  // this replica (see CDCServiceImpl::SetRetentionBarrier()), or 0 if none.
+  // Persisted. Thread-safe.
+  int64_t cdc_barrier_seq() const;
+
+  // Monotonic time at which cdc_barrier_seq() was last set by
+  // ApplyCDCRetentionBarrierUpdate(), or at which this metadata was loaded.
+  // Not persisted. Thread-safe.
+  MonoTime cdc_barrier_seq_time() const;
+
+  // Wall-clock time (microseconds) of the last master update that set or
+  // refreshed the CDC retention barrier, or 0 if no barrier is set or the time
+  // is not known. After a restart this is the persisted value, which may lag
+  // the last refresh by up to the flush interval given to
+  // ApplyCDCRetentionBarrierUpdate(). Thread-safe.
+  int64_t cdc_barrier_refresh_micros() const;
+
+  // Monotonic time of the last master update that set or refreshed the CDC
+  // retention barrier, or at which this metadata was loaded. Drives the
+  // barrier-age valve (--cdc_max_wal_retention_secs). Not persisted.
+  // Thread-safe.
+  MonoTime cdc_barrier_refresh_monotime() const;
+
+  void set_cdc_barrier_refresh_monotime_for_tests(MonoTime t) {
+    std::lock_guard l(data_lock_);
+    cdc_barrier_refresh_monotime_ = t;
+  }
+
+  // Applies a master barrier update: sets the persisted CDC retention barrier
+  // (a negative 'op_index' or a 0 'history_safe_time_micros' clears the
+  // respective component), records 'barrier_seq' if it is positive, and, if
+  // the barrier is set, records 'now_micros' (and the current monotonic
+  // time) as its refresh time. Does NOT flush. Returns true iff the caller
+  // should flush: a barrier value changed, a release changed the sequence, the
+  // sequence went backwards, or the refresh time moved by at least
+  // 'refresh_flush_interval_micros' since the last update that returned true.
+  // Otherwise the sequence is persisted by the next flush. Thread-safe.
+  bool ApplyCDCRetentionBarrierUpdate(int64_t op_index,
+                                      uint64_t history_safe_time_micros,
+                                      int64_t barrier_seq,
+                                      int64_t now_micros,
+                                      int64_t refresh_flush_interval_micros);
+
+  // Clears the persisted CDC history safe-time, keeping the op-index barrier.
+  // Does NOT flush; the next superblock flush persists it. Returns true iff the
+  // value changed. Thread-safe.
+  bool ClearCDCHistorySafeTime();
+
+  // Whether the tablet's range partition was dropped and the master keeps the
+  // tablet only for CDC streams to read the rest of its changes. Thread-safe,
+  // and takes no lock.
+  bool cdc_tablet_dropped() const;
+
+  // Marks the tablet as dropped (see cdc_tablet_dropped()). Returns true if it
+  // was not marked before, in which case the caller must flush the metadata to
+  // persist it.
+  bool SetCDCTabletDropped();
+
+  // The CDC history-GC water mark (a raw Timestamp value, see
+  // Tablet::cdc_history_gc_water_mark()), or 0 if no history GC is known.
+  // Thread-safe.
+  uint64_t cdc_history_gc_water_mark() const;
+
+  // Whether the CDC history-GC water mark is known. It is known for a tablet
+  // created by this binary, and for one loaded from a superblock that records
+  // it. It is not known for a superblock written by a binary that did not track
+  // it (an upgrade, a downgrade and re-upgrade, or a tablet copy from such a
+  // binary): that binary may have GC'd UNDO history at any point up to its last
+  // run. An unknown mark is not persisted, so it stays unknown until
+  // SeedCDCHistoryGcWaterMark(). Thread-safe.
+  bool has_cdc_history_gc_water_mark() const;
+
+  // If the CDC history-GC water mark is not known, raises it to 'water_mark'
+  // and marks it known, and returns true. Otherwise does nothing and returns
+  // false. Does NOT flush. Thread-safe.
+  bool SeedCDCHistoryGcWaterMark(uint64_t water_mark);
+
+  // Raises the CDC history-GC water mark to 'water_mark' if it is higher. Does
+  // NOT flush: the superblock flush that publishes the rowsets of the GC that
+  // raised the mark also persists it. Does not make an unknown mark known.
+  // Thread-safe.
+  void AdvanceCDCHistoryGcWaterMark(uint64_t water_mark);
 
   // Loads the currently-flushed superblock from disk into the given protobuf.
   Status ReadSuperBlockFromDisk(TabletSuperBlockPB* superblock) const;
@@ -449,6 +576,32 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
 
   int64_t last_durable_mrs_id_;
 
+  // CDC retention barrier, persisted in the superblock. Protected by 'data_lock_'.
+  // 'cdc_min_retained_op_index_' is -1 when no barrier is set; the history safe-time
+  // is 0 when no FULL-mode history floor is set.
+  int64_t cdc_min_retained_op_index_;
+  uint64_t cdc_history_safe_time_micros_;
+
+  // See cdc_tablet_dropped(). Persisted in the superblock. Atomic, so that
+  // every write can check it without taking 'data_lock_'.
+  std::atomic<bool> cdc_tablet_dropped_;
+
+  // CDC history-GC water mark, persisted in the superblock while known (see
+  // has_cdc_history_gc_water_mark()). Monotonic. Protected by 'data_lock_'.
+  uint64_t cdc_history_gc_water_mark_;
+  bool cdc_history_gc_water_mark_known_;
+
+  // Sequence of the last applied CDC barrier update, and the last (and last
+  // flush-requesting) refresh time of the barrier, in wall-clock microseconds.
+  // The first two are persisted in the superblock. Protected by 'data_lock_'.
+  int64_t cdc_barrier_seq_;
+  int64_t cdc_barrier_refresh_micros_;
+  int64_t cdc_barrier_refresh_flushed_micros_;
+  // See cdc_barrier_seq_time() and cdc_barrier_refresh_monotime(). Protected
+  // by 'data_lock_'.
+  MonoTime cdc_barrier_seq_time_;
+  MonoTime cdc_barrier_refresh_monotime_;
+
   // Log anchors that are waiting on a metadata flush to be unanchored.
   std::vector<std::unique_ptr<log::MinLogIndexAnchorer>> anchors_needing_flush_;
 
@@ -459,6 +612,18 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // The current schema version.
   SchemaPtr schema_;
   uint32_t schema_version_;
+  // The index of the ALTER_SCHEMA op that established 'schema_', or 0.
+  int64_t schema_op_index_;
+
+  // A schema the tablet had before 'schema_', see SchemaHistoryEntryPB.
+  struct SchemaHistoryEntry {
+    uint32_t version;
+    SchemaPtr schema;
+    int64_t start_op_index;
+    int64_t end_op_index;
+  };
+  // In ascending version order. Protected by 'data_lock_'.
+  std::vector<SchemaHistoryEntry> schema_history_;
   std::string table_name_;
   PartitionSchema partition_schema_;
 

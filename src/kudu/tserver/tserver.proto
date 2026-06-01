@@ -544,4 +544,7 @@ enum TabletServerFeatures {
   // Whether the server supports working with tables having one-dimensional
   // array type columns.
   ARRAY_1D_COLUMN_TYPE = 7;
+  // Whether the server supports CDC (the CDC service and the CDC retention
+  // barrier updates from the master).
+  CDC = 8;
 }

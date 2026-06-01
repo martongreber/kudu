@@ -22,6 +22,7 @@
 #include <type_traits>
 #include <utility>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/arena.h>
 
@@ -37,14 +38,30 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet.pb.h"
+#include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/trace.h"
+
+DEFINE_int32(tablet_inject_latency_on_apply_alter_schema_op_ms, 0,
+             "How much latency (in milliseconds) to inject at the start of "
+             "applying an alter-schema op. Used to widen the window between an "
+             "alter being committed and being applied. For testing only!");
+TAG_FLAG(tablet_inject_latency_on_apply_alter_schema_op_ms, unsafe);
+TAG_FLAG(tablet_inject_latency_on_apply_alter_schema_op_ms, runtime);
+
+DEFINE_bool(tablet_inject_omit_alter_prior_schema_version, false,
+            "If true, the leader does not record the tablet's schema version in "
+            "the ALTER_SCHEMA ops it replicates, as a server that predates the "
+            "field. For testing only!");
+TAG_FLAG(tablet_inject_omit_alter_prior_schema_version, unsafe);
+TAG_FLAG(tablet_inject_omit_alter_prior_schema_version, hidden);
 
 namespace kudu {
 namespace tablet {
@@ -114,6 +131,16 @@ Status AlterSchemaOp::Prepare() {
   Tablet* tablet = state_->tablet_replica()->tablet();
   RETURN_NOT_OK(tablet->CreatePreparedAlterSchema(state(), schema_ptr));
 
+  // The schema lock is now held exclusively, so every write before this op has
+  // been applied, with the tablet's current schema version. Record that version
+  // in the REPLICATE for the WAL's readers: the version the master sends may
+  // skip versions that the tablet never had.
+  if (type() == consensus::LEADER && state_->consensus_round() &&
+      PREDICT_TRUE(!FLAGS_tablet_inject_omit_alter_prior_schema_version)) {
+    state_->consensus_round()->replicate_msg()->mutable_alter_schema_request()
+        ->set_prior_schema_version(tablet->metadata()->schema_version());
+  }
+
   state_->AddToAutoReleasePool(std::move(schema_ptr));
 
   TRACE("PREPARE ALTER-SCHEMA: finished");
@@ -131,6 +158,14 @@ Status AlterSchemaOp::Start() {
 
 Status AlterSchemaOp::Apply(CommitMsg** commit_msg) {
   TRACE("APPLY ALTER-SCHEMA: Starting");
+
+  if (PREDICT_FALSE(FLAGS_tablet_inject_latency_on_apply_alter_schema_op_ms > 0)) {
+    TRACE("Injecting $0ms of latency due to "
+          "--tablet_inject_latency_on_apply_alter_schema_op_ms",
+          FLAGS_tablet_inject_latency_on_apply_alter_schema_op_ms);
+    SleepFor(MonoDelta::FromMilliseconds(
+        FLAGS_tablet_inject_latency_on_apply_alter_schema_op_ms));
+  }
 
   Tablet* tablet = state_->tablet_replica()->tablet();
   RETURN_NOT_OK(tablet->AlterSchema(state()));

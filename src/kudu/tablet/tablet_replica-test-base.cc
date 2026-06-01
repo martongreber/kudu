@@ -195,7 +195,9 @@ Status TabletReplicaTestBase::StartReplicaAndWaitUntilLeader(const ConsensusBoot
   return tablet_replica_->consensus()->WaitUntilLeader(kLeadershipTimeout);
 }
 
-Status TabletReplicaTestBase::RestartReplica(bool reset_tablet) {
+Status TabletReplicaTestBase::RestartReplica(
+    bool reset_tablet,
+    const std::function<void(const shared_ptr<Tablet>&)>& before_start) {
   tablet_replica_->Shutdown();
   tablet_replica_.reset();
   // Reset the underlying harness's tablet if requested.
@@ -225,6 +227,9 @@ Status TabletReplicaTestBase::RestartReplica(bool reset_tablet) {
                                 &tablet,
                                 &log,
                                 &bootstrap_info));
+  if (before_start) {
+    before_start(tablet);
+  }
   RETURN_NOT_OK(tablet_replica_->Start(bootstrap_info,
                                        tablet,
                                        clock(),

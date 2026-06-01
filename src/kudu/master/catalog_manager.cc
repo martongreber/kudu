@@ -163,6 +163,132 @@ DEFINE_int32(tablet_creation_timeout_ms, 30 * 1000, // 30 sec
              "replicas during table creation.");
 TAG_FLAG(tablet_creation_timeout_ms, advanced);
 
+DEFINE_int32(cdc_bg_scan_interval_ms, 60 * 1000, // 60 sec
+             "Interval at which the leader master recomputes per-tablet CDC "
+             "retention barriers and pushes them to all tablet replicas. "
+             "Smaller values react faster to consumer progress at the cost of "
+             "more background work.");
+TAG_FLAG(cdc_bg_scan_interval_ms, advanced);
+TAG_FLAG(cdc_bg_scan_interval_ms, runtime);
+TAG_FLAG(cdc_bg_scan_interval_ms, experimental);
+
+DEFINE_int32(cdc_barrier_refresh_interval_ms, 5 * 60 * 1000, // 5 min
+             "Interval at which the leader master re-sends an unchanged CDC "
+             "retention barrier to a tablet replica that already acknowledged "
+             "it. A changed barrier is sent on the next maintenance pass "
+             "(--cdc_bg_scan_interval_ms). Each refresh renews the barrier lease "
+             "on the replica (--cdc_barrier_lease_secs on the tablet servers), "
+             "so this must be much smaller than that lease.");
+TAG_FLAG(cdc_barrier_refresh_interval_ms, advanced);
+TAG_FLAG(cdc_barrier_refresh_interval_ms, runtime);
+TAG_FLAG(cdc_barrier_refresh_interval_ms, experimental);
+
+DEFINE_int64(cdc_stream_expiry_ms, 8 * 3600 * 1000, // 8 hours
+             "Interval of consumer inactivity after which a CDC stream is "
+             "considered expired. An expired stream stops contributing to the "
+             "per-tablet retention minimum, so its WAL (and, for FULL streams, "
+             "MVCC history) barriers are released on all replicas and the data "
+             "it needs may be garbage-collected. Activity is refreshed on "
+             "Checkpoint and GetChanges. A newly elected leader master does not "
+             "expire a stream before it has been leader for this interval.");
+TAG_FLAG(cdc_stream_expiry_ms, advanced);
+TAG_FLAG(cdc_stream_expiry_ms, runtime);
+TAG_FLAG(cdc_stream_expiry_ms, experimental);
+
+DEFINE_int64(cdc_max_staleness_ms, 4 * 3600 * 1000, // 4 hours
+             "Maximum time a CDC stream's checkpoints may fail to advance "
+             "before the stream is considered stale. Unlike --cdc_stream_expiry_ms "
+             "(which every GetChanges poll refreshes), this guard keys off "
+             "checkpoint forward progress, so a consumer that keeps polling but "
+             "never checkpoints cannot pin WAL (and, for FULL streams, MVCC "
+             "history) indefinitely. A stale stream stops contributing to the "
+             "per-tablet retention minimum, so its barriers are released on all "
+             "replicas and a returning consumer must re-bootstrap via snapshot. "
+             "Set to 0 to disable the guard. Must be greater than "
+             "--cdc_bg_scan_interval_ms when non-zero.");
+TAG_FLAG(cdc_max_staleness_ms, advanced);
+TAG_FLAG(cdc_max_staleness_ms, runtime);
+TAG_FLAG(cdc_max_staleness_ms, experimental);
+
+DEFINE_int32(cdc_max_barrier_releases_per_run, 1000,
+             "Maximum number of CDC retention-barrier release RPCs the leader "
+             "master will fan out in a single --cdc_bg_scan_interval_ms "
+             "maintenance pass. When more tablets need their barrier released "
+             "(e.g. many streams expire at once), the excess is deferred to "
+             "subsequent passes so a mass expiry cannot flood the master's "
+             "outbound RPC path. Releases are pure cleanup and safe to defer; "
+             "barrier *sets* (which pin retention for correctness) are never "
+             "throttled. Set to 0 to disable the cap.");
+TAG_FLAG(cdc_max_barrier_releases_per_run, advanced);
+TAG_FLAG(cdc_max_barrier_releases_per_run, runtime);
+TAG_FLAG(cdc_max_barrier_releases_per_run, experimental);
+
+DEFINE_int64(cdc_ephemeral_stream_expiry_ms, 10 * 60 * 1000, // 10 min
+             "Interval of consumer inactivity after which the leader master "
+             "deletes an ephemeral CDC stream (one created as temporary, as "
+             "'kudu cdc consume' does without --stream): once all its tablets "
+             "have been idle this long, the stream is deleted and its retention "
+             "barriers are released. A live consumer reports activity at least "
+             "every --cdc_active_time_report_interval_ms (on the tablet "
+             "servers), so this must be much longer than that. Applies only if "
+             "shorter than --cdc_stream_expiry_ms. Set to 0 to treat ephemeral "
+             "streams like the others.");
+TAG_FLAG(cdc_ephemeral_stream_expiry_ms, advanced);
+TAG_FLAG(cdc_ephemeral_stream_expiry_ms, runtime);
+TAG_FLAG(cdc_ephemeral_stream_expiry_ms, experimental);
+
+DEFINE_int32(cdc_dropped_tablet_retention_secs, 24 * 3600, // 1 day
+             "How long the leader master keeps a tablet whose range partition "
+             "was dropped, so that the active CDC streams of its table can read "
+             "the rest of its changes. The tablet rejects writes meanwhile, and "
+             "is deleted as soon as every such stream read all of its changes and "
+             "acknowledged the drop, expired, went stale or was deleted. The streams that have not "
+             "read all of its changes by then lose the rest. Set to 0 to delete "
+             "the tablet when its partition is dropped.");
+TAG_FLAG(cdc_dropped_tablet_retention_secs, advanced);
+TAG_FLAG(cdc_dropped_tablet_retention_secs, runtime);
+TAG_FLAG(cdc_dropped_tablet_retention_secs, experimental);
+
+DEFINE_int32(cdc_max_streams, 100,
+             "Maximum number of CDC streams in the cluster. Every stream "
+             "retains the WAL of its tablets until its consumer checkpoints, so "
+             "this bounds the retention that clients can request. "
+             "CreateCDCStream fails once the limit is reached. 0 means no "
+             "limit.");
+TAG_FLAG(cdc_max_streams, advanced);
+TAG_FLAG(cdc_max_streams, runtime);
+TAG_FLAG(cdc_max_streams, experimental);
+
+DEFINE_int32(cdc_max_streams_per_table, 10,
+             "Maximum number of CDC streams over one table. CreateCDCStream "
+             "fails once the limit is reached for any table of the new stream. "
+             "0 means no limit.");
+TAG_FLAG(cdc_max_streams_per_table, advanced);
+TAG_FLAG(cdc_max_streams_per_table, runtime);
+TAG_FLAG(cdc_max_streams_per_table, experimental);
+
+// Test injection: if >= 0, the checkpoint write for the tablet at that
+// 0-based index in the CreateCDCStream fanout is made to return an error after
+// the rows before it are durable, simulating a mid-fanout failure (for example,
+// a lost leadership). Lets unit tests exercise the cleanup of a partially
+// created stream without real I/O failures.
+DEFINE_int32(cdc_create_stream_fail_checkpoint_idx, -1,
+             "Test-only: fail the N-th (0-indexed) per-tablet checkpoint write "
+             "during CreateCDCStream to simulate a mid-fanout failure.");
+TAG_FLAG(cdc_create_stream_fail_checkpoint_idx, hidden);
+TAG_FLAG(cdc_create_stream_fail_checkpoint_idx, unsafe);
+TAG_FLAG(cdc_create_stream_fail_checkpoint_idx, runtime);
+
+// Test injection: when true, the eager RegisterNewTabletsWithCDCStreams call
+// in AlterTable is suppressed, so only the maintenance-loop reconcile path
+// (ReconcileNewPartitionsForCDCStreams) writes the checkpoint rows. Used in
+// tests that specifically exercise the crash-recovery self-heal path.
+DEFINE_bool(cdc_skip_eager_partition_register_for_tests, false,
+            "Test-only: skip the eager CDC tablet registration in AlterTable "
+            "to force-exercise the maintenance-loop self-heal path.");
+TAG_FLAG(cdc_skip_eager_partition_register_for_tests, hidden);
+TAG_FLAG(cdc_skip_eager_partition_register_for_tests, unsafe);
+
 DEFINE_bool(catalog_manager_wait_for_new_tablets_to_elect_leader, true,
             "Whether the catalog manager should wait for a newly created tablet to "
             "elect a leader before considering it successfully created. "
@@ -310,6 +436,22 @@ DEFINE_bool(catalog_manager_step_down_leader_for_replacement, true,
             "management scheme (--raft_prepare_replacement_before_eviction).");
 TAG_FLAG(catalog_manager_step_down_leader_for_replacement, advanced);
 TAG_FLAG(catalog_manager_step_down_leader_for_replacement, runtime);
+
+DEFINE_int32(catalog_manager_inject_latency_drop_partition_ms, 0,
+             "Injects a sleep in milliseconds in AlterTable after the tablets of "
+             "dropped range partitions are marked deleted in memory, and before "
+             "their replicas are told. This is a test-only flag.");
+TAG_FLAG(catalog_manager_inject_latency_drop_partition_ms, hidden);
+TAG_FLAG(catalog_manager_inject_latency_drop_partition_ms, runtime);
+TAG_FLAG(catalog_manager_inject_latency_drop_partition_ms, unsafe);
+
+DEFINE_int32(catalog_manager_cdc_maintenance_wait_tablet_deleted_ms, 0,
+             "Makes the CDC maintenance pass wait up to this many milliseconds "
+             "for each tablet that a CDC stream references to be marked deleted, "
+             "before it reads the tablet's state. This is a test-only flag.");
+TAG_FLAG(catalog_manager_cdc_maintenance_wait_tablet_deleted_ms, hidden);
+TAG_FLAG(catalog_manager_cdc_maintenance_wait_tablet_deleted_ms, runtime);
+TAG_FLAG(catalog_manager_cdc_maintenance_wait_tablet_deleted_ms, unsafe);
 
 DEFINE_int32(catalog_manager_inject_latency_list_authz_ms, 0,
              "Injects a sleep in milliseconds while authorizing a ListTables "
@@ -476,6 +618,101 @@ DECLARE_string(ranger_config_path);
 
 METRIC_DEFINE_entity(table);
 
+// CDC maintenance-loop health metrics published on the server (master) entity.
+// The FunctionGauges read atomics that RunCDCStreamMaintenance() stamps at the
+// end of each completed pass; the counters are incremented by the passes.
+METRIC_DEFINE_counter(server, cdc_barrier_releases_total,
+                      "CDC Barrier Releases Total",
+                      kudu::MetricUnit::kUnits,
+                      "Number of CDC retention-barrier releases this master sent "
+                      "while it was the leader.",
+                      kudu::MetricLevel::kInfo);
+METRIC_DEFINE_counter(server, cdc_barrier_releases_deferred_total,
+                      "CDC Barrier Releases Deferred Total",
+                      kudu::MetricUnit::kUnits,
+                      "Number of CDC barrier releases deferred by the per-run cap "
+                      "(--cdc_max_barrier_releases_per_run). Rises when a mass "
+                      "stream expiry engages the throttle.",
+                      kudu::MetricLevel::kInfo);
+METRIC_DEFINE_counter(server, cdc_tablet_checkpoint_expirations,
+                      "CDC Tablet Checkpoint Expirations",
+                      kudu::MetricUnit::kTablets,
+                      "Number of times a (stream, tablet) checkpoint expired: its "
+                      "consumer was idle for longer than the stream's expiry "
+                      "(--cdc_stream_expiry_ms), so it stopped pinning the WAL and "
+                      "history of the tablet. A consumer that comes back has to "
+                      "bootstrap again.",
+                      kudu::MetricLevel::kWarn);
+METRIC_DEFINE_counter(server, cdc_tablet_checkpoint_stale_events,
+                      "CDC Tablet Checkpoint Stale Events",
+                      kudu::MetricUnit::kTablets,
+                      "Number of times a (stream, tablet) checkpoint became stale: "
+                      "it did not advance within --cdc_max_staleness_ms, so it "
+                      "stopped pinning the WAL and history of the tablet.",
+                      kudu::MetricLevel::kWarn);
+METRIC_DEFINE_gauge_int64(server, cdc_streams_active,
+                          "CDC Active Streams",
+                          kudu::MetricUnit::kUnits,
+                          "Number of active CDC streams, as of the last CDC "
+                          "maintenance pass of the leader master.",
+                          kudu::MetricLevel::kInfo);
+METRIC_DEFINE_gauge_int64(server, cdc_streams_deleting,
+                          "CDC Deleting Streams",
+                          kudu::MetricUnit::kUnits,
+                          "Number of CDC streams that are being deleted (or whose "
+                          "creation was abandoned) and whose cleanup has not "
+                          "finished, as of the last CDC maintenance pass.",
+                          kudu::MetricLevel::kInfo);
+METRIC_DEFINE_gauge_int64(server, cdc_tablet_checkpoints_expired,
+                          "CDC Expired Tablet Checkpoints",
+                          kudu::MetricUnit::kTablets,
+                          "Number of (stream, tablet) checkpoints of active CDC "
+                          "streams that are expired, as of the last CDC "
+                          "maintenance pass. Their consumers have to bootstrap "
+                          "again; delete the streams that are no longer used.",
+                          kudu::MetricLevel::kWarn);
+METRIC_DEFINE_gauge_int64(server, cdc_tablet_checkpoints_stale,
+                          "CDC Stale Tablet Checkpoints",
+                          kudu::MetricUnit::kTablets,
+                          "Number of (stream, tablet) checkpoints of active CDC "
+                          "streams that are stale but not expired, as of the last "
+                          "CDC maintenance pass.",
+                          kudu::MetricLevel::kWarn);
+METRIC_DEFINE_gauge_int64(server, cdc_max_checkpoint_age_micros,
+                          "CDC Max Checkpoint Age",
+                          kudu::MetricUnit::kMicroseconds,
+                          "Across the (stream, tablet) checkpoints of all active "
+                          "CDC streams, the longest time since a checkpoint last "
+                          "advanced (or its consumer last reported being caught "
+                          "up), as of the last CDC maintenance pass. Unlike the "
+                          "lag metrics of the tablet servers, this also covers a "
+                          "consumer that stopped polling. 0 if there is none.",
+                          kudu::MetricLevel::kInfo);
+METRIC_DEFINE_gauge_int64(server, cdc_barriered_tablet_count,
+                          "CDC Barriered Tablet Count",
+                          kudu::MetricUnit::kTablets,
+                          "Number of tablets currently under a CDC retention barrier "
+                          "as of the end of the last maintenance pass.",
+                          kudu::MetricLevel::kInfo);
+METRIC_DEFINE_gauge_int64(server, cdc_maintenance_last_run_micros,
+                          "CDC Maintenance Last Run Micros",
+                          kudu::MetricUnit::kMicroseconds,
+                          "Wall-clock microseconds at which the last CDC maintenance "
+                          "pass completed. 0 if the loop has never run on this master. "
+                          "Alert when (now - this) exceeds a few scan intervals.",
+                          kudu::MetricLevel::kInfo);
+METRIC_DEFINE_gauge_int64(server, cdc_maintenance_last_run_duration_micros,
+                          "CDC Maintenance Last Run Duration Micros",
+                          kudu::MetricUnit::kMicroseconds,
+                          "Duration in microseconds of the last completed CDC "
+                          "maintenance pass.",
+                          kudu::MetricLevel::kInfo);
+METRIC_DEFINE_counter(server, cdc_maintenance_runs,
+                      "CDC Maintenance Runs",
+                      kudu::MetricUnit::kUnits,
+                      "Number of completed CDC maintenance passes since master start.",
+                      kudu::MetricLevel::kInfo);
+
 using base::subtle::NoBarrier_CompareAndSwap;
 using base::subtle::NoBarrier_Load;
 using google::protobuf::Map;
@@ -623,7 +860,51 @@ bool ValidateReplicationFactorFlags()  {
 }
 GROUP_FLAG_VALIDATOR(replication_factor_flags,
                      ValidateReplicationFactorFlags);
+
+// The max-staleness guard runs in the periodic CDC maintenance scan, so it
+// cannot react faster than one scan interval; a threshold below the interval
+// would be meaningless (and, near zero, could release barriers spuriously).
+bool ValidateCdcMaxStaleness() {
+  if (FLAGS_cdc_max_staleness_ms != 0 &&
+      FLAGS_cdc_max_staleness_ms <= FLAGS_cdc_bg_scan_interval_ms) {
+    LOG(ERROR) << Substitute(
+        "--cdc_max_staleness_ms ($0) must be greater than "
+        "--cdc_bg_scan_interval_ms ($1) when non-zero",
+        FLAGS_cdc_max_staleness_ms, FLAGS_cdc_bg_scan_interval_ms);
+    return false;
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(cdc_max_staleness_flags, ValidateCdcMaxStaleness);
+
+template <typename T>
+bool ValidatePositive(const char* name, T value) {
+  if (value > 0) {
+    return true;
+  }
+  LOG(ERROR) << "--" << name << " must be positive; got " << value;
+  return false;
+}
+
+template <typename T>
+bool ValidateNonNegative(const char* name, T value) {
+  if (value >= 0) {
+    return true;
+  }
+  LOG(ERROR) << "--" << name << " must not be negative; got " << value;
+  return false;
+}
 } // anonymous namespace
+
+DEFINE_validator(cdc_bg_scan_interval_ms, &ValidatePositive<int32_t>);
+DEFINE_validator(cdc_barrier_refresh_interval_ms, &ValidateNonNegative<int32_t>);
+DEFINE_validator(cdc_stream_expiry_ms, &ValidateNonNegative<int64_t>);
+DEFINE_validator(cdc_max_staleness_ms, &ValidateNonNegative<int64_t>);
+DEFINE_validator(cdc_max_barrier_releases_per_run, &ValidateNonNegative<int32_t>);
+DEFINE_validator(cdc_ephemeral_stream_expiry_ms, &ValidateNonNegative<int64_t>);
+DEFINE_validator(cdc_dropped_tablet_retention_secs, &ValidateNonNegative<int32_t>);
+DEFINE_validator(cdc_max_streams, &ValidateNonNegative<int32_t>);
+DEFINE_validator(cdc_max_streams_per_table, &ValidateNonNegative<int32_t>);
 
 namespace kudu {
 namespace master {
@@ -810,6 +1091,7 @@ void CatalogManagerBgTasks::Shutdown() {
 
 void CatalogManagerBgTasks::Run() {
   MonoTime last_tspk_run;
+  MonoTime last_cdc_run;
   while (!NoBarrier_Load(&closing_)) {
     {
       CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
@@ -883,6 +1165,15 @@ void CatalogManagerBgTasks::Run() {
             //       master will take over as leader.
             LOG(FATAL) << err_msg;
           }
+        }
+
+        // Periodically recompute and push CDC WAL retention barriers to all
+        // replicas of CDC-enabled tablets.
+        const MonoTime now = MonoTime::Now();
+        if (!last_cdc_run.Initialized() ||
+            (now - last_cdc_run).ToMilliseconds() >= FLAGS_cdc_bg_scan_interval_ms) {
+          last_cdc_run = now;
+          catalog_manager_->RunCDCStreamMaintenance();
         }
       } else if (l.owns_lock()) {
         // This is the case of a follower catalog manager running as a part
@@ -1113,6 +1404,44 @@ Status CatalogManager::Init(bool is_first_run) {
   background_tasks_.reset(new CatalogManagerBgTasks(this));
   RETURN_NOT_OK_PREPEND(background_tasks_->Init(),
                         "Failed to initialize catalog manager background tasks");
+
+  // Register CDC maintenance-loop health metrics on the server entity.
+  // FunctionGauges read the existing atomics; AutoDetach ensures callbacks
+  // cannot fire after 'this' is destroyed (cdc_metric_detacher_ is the last
+  // member, so it is destructed first).
+  const scoped_refptr<MetricEntity>& me = master_->metric_entity();
+  cdc_barrier_releases_total_metric_ = METRIC_cdc_barrier_releases_total.Instantiate(me);
+  cdc_barrier_releases_deferred_total_metric_ =
+      METRIC_cdc_barrier_releases_deferred_total.Instantiate(me);
+  cdc_tablet_checkpoint_expirations_metric_ =
+      METRIC_cdc_tablet_checkpoint_expirations.Instantiate(me);
+  cdc_tablet_checkpoint_stale_events_metric_ =
+      METRIC_cdc_tablet_checkpoint_stale_events.Instantiate(me);
+  METRIC_cdc_streams_active.InstantiateFunctionGauge(
+      me, [this]() { return cdc_streams_active_.load(); })
+      ->AutoDetach(&cdc_metric_detacher_);
+  METRIC_cdc_streams_deleting.InstantiateFunctionGauge(
+      me, [this]() { return cdc_streams_deleting_.load(); })
+      ->AutoDetach(&cdc_metric_detacher_);
+  METRIC_cdc_tablet_checkpoints_expired.InstantiateFunctionGauge(
+      me, [this]() { return cdc_tablet_checkpoints_expired_.load(); })
+      ->AutoDetach(&cdc_metric_detacher_);
+  METRIC_cdc_tablet_checkpoints_stale.InstantiateFunctionGauge(
+      me, [this]() { return cdc_tablet_checkpoints_stale_.load(); })
+      ->AutoDetach(&cdc_metric_detacher_);
+  METRIC_cdc_max_checkpoint_age_micros.InstantiateFunctionGauge(
+      me, [this]() { return cdc_max_checkpoint_age_micros_.load(); })
+      ->AutoDetach(&cdc_metric_detacher_);
+  METRIC_cdc_barriered_tablet_count.InstantiateFunctionGauge(
+      me, [this]() { return this->cdc_barriered_tablet_count(); })
+      ->AutoDetach(&cdc_metric_detacher_);
+  METRIC_cdc_maintenance_last_run_micros.InstantiateFunctionGauge(
+      me, [this]() { return cdc_maintenance_last_run_micros_.load(); })
+      ->AutoDetach(&cdc_metric_detacher_);
+  METRIC_cdc_maintenance_last_run_duration_micros.InstantiateFunctionGauge(
+      me, [this]() { return cdc_maintenance_last_run_duration_micros_.load(); })
+      ->AutoDetach(&cdc_metric_detacher_);
+  cdc_maintenance_runs_ = METRIC_cdc_maintenance_runs.Instantiate(me);
 
   {
     std::lock_guard l(state_lock_);
@@ -1570,6 +1899,35 @@ void CatalogManager::PrepareForLeadershipTask() {
       }
     }
 
+    // CDC barrier updates of this term outrank those of every earlier term
+    // (see NextCDCBarrierSeq()).
+    DCHECK_LT(term, int64_t{1} << 31);
+    cdc_barrier_seq_.store(term << 32, std::memory_order_relaxed);
+
+    // Per-tablet checkpoint rows and stream entries are independent sys-catalog
+    // record types; load the checkpoints first so the map is populated before any
+    // stream-driven lookups.
+    static const char* const kCDCTabletCheckpointsDescription =
+        "Loading CDC per-tablet checkpoints";
+    LOG(INFO) << kCDCTabletCheckpointsDescription << "...";
+    LOG_SLOW_EXECUTION(WARNING, 1000,
+                       LogPrefix() + kCDCTabletCheckpointsDescription) {
+      if (!check([this]() { return this->LoadCDCTabletCheckpoints(); },
+                 *consensus, term, kCDCTabletCheckpointsDescription).ok()) {
+        return;
+      }
+    }
+
+    static const char* const kCDCStreamsDescription =
+        "Loading CDC streams";
+    LOG(INFO) << kCDCStreamsDescription << "...";
+    LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kCDCStreamsDescription) {
+      if (!check([this]() { return this->LoadCDCStreams(); },
+                 *consensus, term, kCDCStreamsDescription).ok()) {
+        return;
+      }
+    }
+
     if (hms_catalog_) {
       static const char* const kNotificationLogEventIdDescription =
           "Loading latest processed Hive Metastore notification log event ID";
@@ -1585,6 +1943,11 @@ void CatalogManager::PrepareForLeadershipTask() {
     // Reset the cache storing information on table locations.
     ResetTableLocationsCache();
   }
+
+  // Stamp the CDC staleness grace floor before publishing leadership readiness, so
+  // the first RunCDCStreamMaintenance pass on this leader already observes it (see
+  // cdc_leader_ready_micros_). Ordered before leader_ready_term_ for that reason.
+  cdc_leader_ready_micros_.store(GetCurrentTimeMicros(), std::memory_order_release);
 
   std::lock_guard l(state_lock_);
   leader_ready_term_ = term;
@@ -2923,6 +3286,14 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
     table_locations_cache_->Remove(table->id());
   }
 
+  // 10. Condemn any CDC stream that referenced this table. The table is
+  //     now committed REMOVED (is_deleted()), so this eagerly marks such streams
+  //     DELETING; the next RunCDCStreamMaintenance pass reaps them (releasing
+  //     their retention barriers and removing their rows). Best-effort here --
+  //     the same scan runs at the start of every maintenance pass as a durable,
+  //     failover-safe backstop, so a transient failure now is retried there.
+  MarkDeletingStreamsForDroppedTables();
+
   VLOG(1) << "Deleted table " << table->ToString();
   return Status::OK();
 }
@@ -3983,6 +4354,14 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
 
   // 12. Commit the in-memory state.
   TRACE("Committing alterations to in-memory state");
+  // Decide which dropped tablets to keep for CDC before the drop is visible,
+  // so that neither a maintenance pass nor a tablet report treats them as gone
+  // in between.
+  vector<bool> retained_for_cdc;
+  retained_for_cdc.reserve(tablets_to_drop.size());
+  for (const auto& tablet : tablets_to_drop) {
+    retained_for_cdc.push_back(RetainDroppedTabletForCDC(tablet->id()));
+  }
   {
     // Commit new tablet in-memory state. This doesn't require taking the global
     // lock since the new tablets are not yet visible, because they haven't been
@@ -4036,6 +4415,29 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   // GetTabletLocations returns a deleted tablet, the retry will never include
   // the tablet again.
   tablets_to_drop_lock.Commit();
+  if (PREDICT_FALSE(FLAGS_catalog_manager_inject_latency_drop_partition_ms > 0) &&
+      !tablets_to_drop.empty()) {
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_catalog_manager_inject_latency_drop_partition_ms));
+  }
+
+  // CDC: eagerly register new tablets with any active streams that cover this
+  // table. This is done AFTER the sys_catalog write (tablets are durable) and
+  // after table->AddRemoveTablets (tablets visible to GetTableLocations). The
+  // checkpoint rows therefore exist before any client can observe the new
+  // partition and write to it, ensuring WAL retention from op_index=0 before
+  // the first op is written. The barrier RPC itself is a no-op at this point
+  // (the tablet has no consensus state yet: SendAlterTableRequest runs below),
+  // but the maintenance loop sends it once the tablet is running.
+  // Best-effort: RegisterNewTabletsWithCDCStreams logs failures and continues;
+  // ReconcileNewPartitionsForCDCStreams self-heals on the next pass, including
+  // after master failover.
+  //
+  // The injection flag allows tests to suppress the eager path to exercise only
+  // the maintenance-loop self-heal (ReconcileNewPartitionsForCDCStreams).
+  if (!tablets_to_add.empty() &&
+      !FLAGS_cdc_skip_eager_partition_register_for_tests) {
+    RegisterNewTabletsWithCDCStreams(table->id(), tablets_to_add);
+  }
 
   // If there are schema changes or the owner or comment changed, then update the
   // entry in the Hive Metastore. This is done on a best-effort basis, since Kudu
@@ -4068,7 +4470,12 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   }
 
   SendAlterTableRequest(table);
-  for (const auto& tablet : tablets_to_drop) {
+  for (size_t i = 0; i < tablets_to_drop.size(); ++i) {
+    const auto& tablet = tablets_to_drop[i];
+    if (retained_for_cdc[i]) {
+      SendCDCDroppedTabletFence(tablet->id());
+      continue;
+    }
     TabletMetadataLock l(tablet.get(), LockMode::READ);
     SendDeleteTabletRequest(tablet, l, deletion_msg);
   }
@@ -5097,6 +5504,103 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
   tserver::DeleteTabletResponsePB resp_;
 };
 
+// Push a CDC WAL retention barrier to a specific tablet replica. Sent to every
+// replica of a CDC tablet so retention holds across leader changes and follower
+// log GC. Best-effort: a missing replica (TABLET_NOT_FOUND) is treated as done.
+// A replica that already applied a newer update reports this one as
+// superseded, which fails the task without a retry. A tablet server without
+// the CDC feature fails the task right away. The maintenance pass sends the
+// barrier again, so the task gives up after two passes (but not before the
+// usual RPC timeout) rather than after --unresponsive_ts_rpc_timeout_ms.
+class AsyncUpdateCDCRetentionBarrier : public RetrySpecificTSRpcTask {
+ public:
+  AsyncUpdateCDCRetentionBarrier(Master* master,
+                                 const string& permanent_uuid,
+                                 TableInfo* table,
+                                 string tablet_id,
+                                 int64_t min_retained_op_index,
+                                 uint64_t history_safe_time_micros,
+                                 int64_t barrier_seq,
+                                 const string& release_consumer_stream_id = "",
+                                 bool skip_barrier_update = false,
+                                 bool tablet_dropped = false)
+      : RetrySpecificTSRpcTask(master, permanent_uuid, table),
+        tablet_id_(std::move(tablet_id)) {
+    req_.set_dest_uuid(permanent_uuid);
+    req_.set_tablet_id(tablet_id_);
+    req_.set_min_retained_op_index(min_retained_op_index);
+    if (history_safe_time_micros > 0) {
+      req_.set_history_safe_time_micros(history_safe_time_micros);
+    }
+    if (barrier_seq > 0) {
+      req_.set_barrier_seq(barrier_seq);
+    }
+    if (!release_consumer_stream_id.empty()) {
+      req_.set_release_consumer_stream_id(release_consumer_stream_id);
+    }
+    if (skip_barrier_update) {
+      req_.set_skip_barrier_update(true);
+    }
+    if (tablet_dropped) {
+      req_.set_tablet_dropped(true);
+    }
+    const int64_t timeout_ms = std::min<int64_t>(
+        FLAGS_unresponsive_ts_rpc_timeout_ms,
+        std::max<int64_t>(2LL * FLAGS_cdc_bg_scan_interval_ms, FLAGS_master_ts_rpc_timeout_ms));
+    deadline_ = start_ts_ + MonoDelta::FromMilliseconds(timeout_ms);
+  }
+
+  string type_name() const override { return "UpdateCDCRetentionBarrier"; }
+
+  string description() const override {
+    return "UpdateCDCRetentionBarrier RPC for tablet " + tablet_id_ +
+        " on TS " + permanent_uuid_;
+  }
+
+ protected:
+  const string& tablet_id() const override { return tablet_id_; }
+
+  void HandleResponse(int /*attempt*/) override {
+    if (!resp_.has_error()) {
+      if (resp_.superseded()) {
+        // Not applied: the replica has a newer update, possibly from a newer
+        // leader master. Retrying the same sequence cannot succeed; a later
+        // pass sends the barrier again with a new sequence.
+        KLOG_EVERY_N_SECS(INFO, 60) << Substitute(
+            "UpdateCDCRetentionBarrier RPC for tablet $0 on TS $1 was "
+            "superseded by a newer update (barrier_seq $2)",
+            tablet_id_, target_ts_desc_->ToString(), req_.barrier_seq());
+        MarkFailed();
+        return;
+      }
+      MarkComplete();
+      return;
+    }
+    // A replica that does not (yet) host the tablet is benign; the next scan
+    // will retry once it exists.
+    if (resp_.error().code() == TabletServerErrorPB::TABLET_NOT_FOUND) {
+      MarkComplete();
+      return;
+    }
+    KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+        "UpdateCDCRetentionBarrier RPC for tablet $0 on TS $1 failed: $2",
+        tablet_id_, target_ts_desc_->ToString(),
+        StatusFromPB(resp_.error().status()).ToString());
+  }
+
+  bool SendRequest(int /*attempt*/) override {
+    rpc_.RequireServerFeature(TabletServerFeatures::CDC);
+    ts_proxy_->UpdateCDCRetentionBarrierAsync(
+        req_, &resp_, &rpc_, [this]() { this->RpcCallback(); });
+    return true;
+  }
+
+ private:
+  const string tablet_id_;
+  tserver::UpdateCDCRetentionBarrierRequestPB req_;
+  tserver::UpdateCDCRetentionBarrierResponsePB resp_;
+};
+
 // Send the "Alter Table" with the latest table schema to the leader replica
 // for the tablet.
 // Keeps retrying until we get an "ok" response.
@@ -5700,9 +6204,14 @@ Status CatalogManager::ProcessTabletReport(
     ReportedTabletUpdatesPB* update = FindOrDie(updates, tablet_id);
     bool tablet_was_mutated = false;
 
-    // 4. Delete the tablet if it (or its table) have been deleted.
+    // 4. Delete the tablet if it (or its table) have been deleted, unless it
+    // is a dropped tablet kept for CDC (see RetainDroppedTabletForCDC()).
     if (tablet->metadata().state().is_deleted() ||
         table->metadata().state().is_deleted()) {
+      if (!table->metadata().state().is_deleted() &&
+          IsCDCRetainedDroppedTablet(tablet_id)) {
+        continue;
+      }
       const string& msg = tablet->metadata().state().pb.state_msg();
       update->set_state_msg(msg);
       VLOG(1) << Substitute("Got report from deleted tablet $0 ($1)", tablet->ToString(), msg);
@@ -6190,7 +6699,8 @@ void CatalogManager::ExtractDeletedTablesAndTablets(
     scoped_refptr<TabletInfo> tablet = tablet_entry.second;
     TableMetadataLock table_lock(tablet->table().get(), LockMode::READ);
     TabletMetadataLock tablet_lock(tablet.get(), LockMode::READ);
-    if (tablet_lock.data().is_deleted() || table_lock.data().is_deleted()) {
+    if ((tablet_lock.data().is_deleted() || table_lock.data().is_deleted()) &&
+        !IsCDCRetainedDroppedTablet(tablet->id())) {
       deleted_tablets->emplace_back(tablet);
     }
   }
@@ -7590,6 +8100,12 @@ INITTED_AND_LEADER_OR_RESPOND(GetTabletLocationsResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(RecallDeletedTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(RemoveMasterResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(ReplaceTabletResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(CreateCDCStreamResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(DeleteCDCStreamResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(ListCDCStreamsResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(GetCDCStreamInfoResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(UpdateCDCCheckpointResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(UpdateCDCCheckpointsResponsePB);
 
 #undef INITTED_OR_RESPOND
 #undef INITTED_AND_LEADER_OR_RESPOND
@@ -8108,6 +8624,2663 @@ void TableInfo::DecrementSchemaVersionCountUnlocked(int64_t version) {
 void PersistentTableInfo::set_state(SysTablesEntryPB::State state, const string& msg) {
   pb.set_state(state);
   pb.set_state_msg(msg);
+}
+
+// ---------------------------------------------------------------------------
+// CDC Stream Management
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Maximum number of CDC checkpoint rows CreateCDCStream and
+// UpdateCDCCheckpoints write to the sys catalog in one write request (a row is
+// about 150 bytes).
+constexpr size_t kCDCCheckpointRowsPerWrite = 1000;
+
+// Outcome of the RELEASE tasks dispatched for a barrier release.
+enum class CDCReleaseState {
+  // At least one task is still running.
+  kInFlight,
+  // Every task completed: each replica acknowledged the release (or does not
+  // host the tablet).
+  kDelivered,
+  // No task is running and at least one failed or was aborted, so some
+  // replica may still hold the barrier: the release must be sent again.
+  kFailed,
+};
+
+CDCReleaseState GetCDCReleaseState(const scoped_refptr<MonitoredTask>& task) {
+  switch (task->state()) {
+    case MonitoredTask::kStateComplete:
+      return CDCReleaseState::kDelivered;
+    case MonitoredTask::kStateFailed:
+    case MonitoredTask::kStateAborted:
+      return CDCReleaseState::kFailed;
+    default:
+      return CDCReleaseState::kInFlight;
+  }
+}
+
+CDCReleaseState GetCDCReleaseState(
+    const vector<scoped_refptr<MonitoredTask>>& tasks) {
+  bool failed = false;
+  for (const auto& t : tasks) {
+    switch (GetCDCReleaseState(t)) {
+      case CDCReleaseState::kDelivered:
+        break;
+      case CDCReleaseState::kFailed:
+        failed = true;
+        break;
+      case CDCReleaseState::kInFlight:
+        return CDCReleaseState::kInFlight;
+    }
+  }
+  return failed ? CDCReleaseState::kFailed : CDCReleaseState::kDelivered;
+}
+
+// The idle time (microseconds) after which a tablet of a stream expires; 0 if
+// expiry is disabled. An ephemeral stream uses the shorter of the two expiries.
+int64_t CDCStreamExpiryMicros(bool ephemeral) {
+  int64_t expiry_ms = FLAGS_cdc_stream_expiry_ms;
+  const int64_t ephemeral_ms = FLAGS_cdc_ephemeral_stream_expiry_ms;
+  if (ephemeral && ephemeral_ms > 0 && (expiry_ms <= 0 || ephemeral_ms < expiry_ms)) {
+    expiry_ms = ephemeral_ms;
+  }
+  return expiry_ms > 0 ? expiry_ms * 1000 : 0;
+}
+
+// How the leader master classifies one (stream, tablet) checkpoint row.
+struct CDCCheckpointHealth {
+  // Idle beyond the expiry, but the leader has not been ready for a full
+  // expiry window yet (see 'in_expiry_grace' below).
+  bool in_expiry_grace = false;
+  bool expired = false;
+  bool stale = false;
+};
+
+// Classifies 'pb', the checkpoint row of 'row', at 'now_micros'.
+// 'leader_ready_micros' is when this master became a ready leader;
+// 'expiry_micros' and 'staleness_micros' are 0 when disabled.
+CDCCheckpointHealth GetCDCCheckpointHealth(const SysCDCTabletCheckpointEntryPB& pb,
+                                           const CDCTabletCheckpointInfo& row,
+                                           int64_t now_micros,
+                                           int64_t leader_ready_micros,
+                                           int64_t expiry_micros,
+                                           int64_t staleness_micros) {
+  CDCCheckpointHealth h;
+  // A tablet with a last-active time older than the expiry window stops
+  // pinning retention. last_active == 0 (a row that predates the field) is
+  // treated as active. A report this leader received but could not persist
+  // (last_active_attempt_micros_) counts as activity.
+  const int64_t last_active = pb.last_active_time_micros();
+  const int64_t active_attempt =
+      row.last_active_attempt_micros_.load(std::memory_order_relaxed);
+  const bool idle = expiry_micros > 0 && last_active > 0 &&
+      (now_micros - std::max(last_active, active_attempt)) > expiry_micros;
+  // An idle row is not expired until this leader has been ready for a full
+  // expiry window: after a master outage longer than the window, live
+  // consumers have not been able to report. During that grace the master
+  // neither sets nor releases a barrier that only such rows need: it cannot
+  // tell a live consumer whose barrier is still in place from a dead one whose
+  // barrier was already released, and re-pinning the latter would retain WAL
+  // that is no longer needed.
+  h.in_expiry_grace = idle && (now_micros - leader_ready_micros) <= expiry_micros;
+  h.expired = idle && !h.in_expiry_grace;
+
+  // Independent of idle-expiry: a tablet whose checkpoint has not advanced for
+  // longer than the max-staleness window stops pinning retention, even if the
+  // consumer keeps polling (which refreshes last_active but not last_advance).
+  // last_advance == 0 is treated as not-yet-stale. This is the upper bound on
+  // how long a non-advancing consumer can hold WAL/UNDO.
+  //
+  // Staleness is measured from the latest of:
+  //   (a) the last durable advance (last_checkpoint_advance_time_micros),
+  //   (b) this leader's ready time (the outage-recovery grace floor),
+  //   (c) the last in-memory advance attempt, which keeps a consumer that is
+  //       advancing while the sys-catalog writes fail from being released. A
+  //       genuinely stuck consumer stops advancing, so (c) goes stale too.
+  const int64_t last_advance = pb.last_checkpoint_advance_time_micros();
+  const int64_t advance_attempt =
+      row.last_checkpoint_advance_attempt_micros_.load(std::memory_order_relaxed);
+  const int64_t effective_advance =
+      std::max({last_advance, leader_ready_micros, advance_attempt});
+  h.stale = staleness_micros > 0 && last_advance > 0 &&
+      (now_micros - effective_advance) > staleness_micros;
+  return h;
+}
+
+// Fills in the stream-level fields of 'info' from the stream entry 'pb'.
+void FillCDCStreamInfo(const string& stream_id,
+                       const SysCDCStreamEntryPB& pb,
+                       CDCStreamInfoPB* info) {
+  info->set_stream_id(stream_id);
+  for (const auto& tid : pb.table_ids()) {
+    info->add_table_ids(tid);
+  }
+  if (pb.has_config()) {
+    info->mutable_config()->CopyFrom(pb.config());
+  }
+  info->set_state(pb.state());
+  if (pb.has_creation_time_micros()) {
+    info->set_creation_time_micros(pb.creation_time_micros());
+  }
+  info->set_ephemeral(pb.ephemeral());
+  if (pb.has_owner()) {
+    info->set_owner(pb.owner());
+  }
+}
+
+} // anonymous namespace
+
+Status CatalogManager::LoadCDCTabletCheckpoints() {
+  class CDCTabletCheckpointLoader : public CDCTabletCheckpointVisitor {
+   public:
+    CDCTabletCheckpointMap checkpoints;
+
+    Status Visit(const string& /*entry_id*/,
+                 const SysCDCTabletCheckpointEntryPB& metadata) override {
+      const string& stream_id = metadata.stream_id();
+      const string& tablet_id = metadata.tablet_id();
+      scoped_refptr<CDCTabletCheckpointInfo> info(
+          new CDCTabletCheckpointInfo(stream_id, tablet_id));
+      CDCTabletCheckpointMetadataLock l(info.get(), LockMode::WRITE);
+      l.mutable_data()->pb.CopyFrom(metadata);
+      l.Commit();
+      checkpoints[stream_id][tablet_id] = std::move(info);
+      return Status::OK();
+    }
+  };
+
+  CDCTabletCheckpointLoader loader;
+  RETURN_NOT_OK(sys_catalog_->VisitCDCTabletCheckpoints(&loader));
+
+  size_t rows = 0;
+  for (const auto& e : loader.checkpoints) {
+    rows += e.second.size();
+  }
+  std::lock_guard lock(lock_);
+  cdc_tablet_checkpoint_map_ = std::move(loader.checkpoints);
+
+  // Reset the per-term barrier bookkeeping. This leader does not know which
+  // barriers the previous leader set or still owed a release for, so seed the
+  // release diff with every tablet that has a checkpoint row: the first
+  // maintenance pass re-pins the ones a live stream still needs and releases
+  // the rest (a RELEASE is idempotent). Task handles from an earlier term of
+  // this master are dropped: the leadership change aborted those tasks, and
+  // the reap must dispatch again rather than read them as delivered. No
+  // maintenance pass runs concurrently: the caller holds leader_lock_
+  // exclusively.
+  cdc_barriered_tablets_.clear();
+  for (const auto& e : cdc_tablet_checkpoint_map_) {
+    for (const auto& t : e.second) {
+      cdc_barriered_tablets_.insert(t.first);
+    }
+  }
+  cdc_barriered_tablet_count_.store(cdc_barriered_tablets_.size());
+  cdc_eager_barriered_tablets_.clear();
+  cdc_pending_barrier_releases_.clear();
+  pending_release_tasks_.clear();
+  {
+    // Declared before the lock, so the finished tasks the old state holds are
+    // freed after the spinlock is released.
+    decltype(cdc_barrier_replica_state_) old_state;
+    std::lock_guard l(cdc_barrier_replica_state_lock_);
+    old_state.swap(cdc_barrier_replica_state_);
+  }
+
+  LOG(INFO) << "Loaded " << rows << " CDC per-tablet checkpoint(s) from sys catalog";
+  return Status::OK();
+}
+
+Status CatalogManager::LoadCDCStreams() {
+  class CDCStreamLoader : public CDCStreamVisitor {
+   public:
+    CDCStreamInfoMap streams;
+
+    Status Visit(const string& stream_id, const SysCDCStreamEntryPB& metadata) override {
+      scoped_refptr<CDCStreamInfo> stream(new CDCStreamInfo(stream_id));
+      CDCStreamMetadataLock l(stream.get(), LockMode::WRITE);
+      l.mutable_data()->pb.CopyFrom(metadata);
+      l.Commit();
+      streams[stream_id] = std::move(stream);
+      return Status::OK();
+    }
+  };
+
+  CDCStreamLoader loader;
+  RETURN_NOT_OK(sys_catalog_->VisitCDCStreams(&loader));
+
+  {
+    std::lock_guard lock(lock_);
+    cdc_stream_map_ = std::move(loader.streams);
+    LOG(INFO) << "Loaded " << cdc_stream_map_.size()
+              << " CDC stream(s) from sys catalog";
+  }
+  RebuildCDCRetainedDroppedTablets();
+  return Status::OK();
+}
+
+Status CatalogManager::CheckCDCStreamQuotas(const CreateCDCStreamRequestPB& req) {
+  const int32_t max_streams = FLAGS_cdc_max_streams;
+  const int32_t max_per_table = FLAGS_cdc_max_streams_per_table;
+  if (max_streams == 0 && max_per_table == 0) {
+    return Status::OK();
+  }
+  int num_streams = 0;
+  unordered_map<string, int> streams_per_table;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (const auto& entry : cdc_stream_map_) {
+      CDCStreamMetadataLock l(entry.second.get(), LockMode::READ);
+      // A stream that is being deleted is about to release its retention.
+      if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE) {
+        continue;
+      }
+      ++num_streams;
+      for (const auto& table_id : l.data().pb.table_ids()) {
+        ++streams_per_table[table_id];
+      }
+    }
+  }
+  if (max_streams > 0 && num_streams >= max_streams) {
+    return Status::ServiceUnavailable(Substitute(
+        "there are already $0 CDC streams, the maximum set by --cdc_max_streams",
+        num_streams));
+  }
+  if (max_per_table > 0) {
+    for (const auto& table_id : req.table_ids()) {
+      const int n = FindWithDefault(streams_per_table, table_id, 0);
+      if (n >= max_per_table) {
+        return Status::ServiceUnavailable(Substitute(
+            "table $0 already has $1 CDC streams, the maximum set by "
+            "--cdc_max_streams_per_table", table_id, n));
+      }
+    }
+  }
+  return Status::OK();
+}
+
+Status CatalogManager::AuthorizeCreateCDCStream(const TableInfo& table,
+                                                const TableMetadataLock& l,
+                                                const string& user) {
+  // A stream exposes every column of every changed row, as well as the
+  // table's history, so it requires SELECT on the whole table. Its retention
+  // affects the table's storage, so it requires ALTER as well. ALL implies
+  // both.
+  const string& table_name = l.data().name();
+  const bool is_owner = user == l.data().owner();
+  RETURN_NOT_OK(authz_provider_->AuthorizeAlterTable(table_name, table_name, user, is_owner));
+  TablePrivilegePB privilege;
+  privilege.set_table_id(table.id());
+  RETURN_NOT_OK(authz_provider_->FillTablePrivilegePB(table_name, user, is_owner,
+                                                      l.data().pb.schema(), &privilege));
+  if (!privilege.scan_privilege()) {
+    return Status::NotAuthorized("not authorized to SELECT all columns of the table");
+  }
+  return Status::OK();
+}
+
+Status CatalogManager::CreateCDCStream(const CreateCDCStreamRequestPB* req,
+                                       CreateCDCStreamResponsePB* resp,
+                                       const optional<string>& user) {
+  if (req->table_ids_size() == 0) {
+    return Status::InvalidArgument("a table_id is required");
+  }
+  // A stream over several tables would need the drop of one of them to remove
+  // it from the stream rather than delete the whole stream, and consumers that
+  // follow every table.
+  if (req->table_ids_size() > 1) {
+    return Status::NotSupported(Substitute(
+        "a CDC stream covers exactly one table, but $0 were given", req->table_ids_size()));
+  }
+  // An option of a newer client that this master does not know would be
+  // stored but not applied: the stream would not be the one asked for.
+  if (!req->config().unknown_fields().empty()) {
+    return Status::NotSupported(
+        "the CDC stream configuration has options that this master does not support");
+  }
+  // Serializes stream creation, so that the stream quotas checked below hold
+  // when the new stream is added.
+  std::lock_guard create_lock(cdc_create_stream_lock_);
+
+  // Validate that every requested table exists and is in a usable state
+  // before creating the stream. Creating a stream against a missing or
+  // being-deleted table would persist a stream (and, below, retention barriers)
+  // that could never make progress -- its barrier would pin WAL until the stream
+  // eventually expired. Reject early instead. Snapshot the table refptrs under
+  // lock_, then read each table's committed state (and enumerate its tablets for
+  // the initial barrier below) via the per-table metadata lock, taken outside
+  // lock_ to preserve lock ordering.
+  vector<scoped_refptr<TableInfo>> tables;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (int i = 0; i < req->table_ids_size(); ++i) {
+      const string& table_id = req->table_ids(i);
+      scoped_refptr<TableInfo> table = FindPtrOrNull(table_ids_map_, table_id);
+      if (!table) {
+        return Status::NotFound(Substitute("table $0 not found", table_id));
+      }
+      tables.emplace_back(std::move(table));
+    }
+  }
+  vector<scoped_refptr<TabletInfo>> stream_tablets;
+  for (const auto& table : tables) {
+    TableMetadataLock l(table.get(), LockMode::READ);
+    if (l.data().is_deleted()) {
+      return Status::NotFound(
+          Substitute("table $0 has been deleted", table->id()));
+    }
+    if (l.data().is_soft_deleted()) {
+      return Status::InvalidArgument(
+          Substitute("table $0 is soft-deleted", table->id()));
+    }
+    // is_running() covers RUNNING/ALTERING (SOFT_DELETED was rejected above);
+    // PREPARING/UNKNOWN tables are not yet ready to stream from.
+    if (!l.data().is_running()) {
+      return Status::ServiceUnavailable(
+          Substitute("table $0 is not running", table->id()));
+    }
+    if (user && !master_->IsServiceUserOrSuperUser(*user)) {
+      RETURN_NOT_OK(SetupError(AuthorizeCreateCDCStream(*table.get(), l, *user),
+                               resp, MasterErrorPB::NOT_AUTHORIZED));
+    }
+    vector<scoped_refptr<TabletInfo>> tablets;
+    table->GetAllTablets(&tablets);
+    for (auto& t : tablets) {
+      stream_tablets.emplace_back(std::move(t));
+    }
+  }
+  // After the authorization, so that an unauthorized user is not told about
+  // the streams of the cluster.
+  RETURN_NOT_OK(CheckCDCStreamQuotas(*req));
+
+  string stream_id = GenerateId();
+  scoped_refptr<CDCStreamInfo> stream(new CDCStreamInfo(stream_id));
+
+  // The stream row is written CREATING first and flipped to ACTIVE only after
+  // every per-tablet checkpoint row is durable. If this master crashes or loses
+  // leadership in between, the next leader loads a CREATING stream and reaps it
+  // (see ReapDeletedCDCStreams) instead of serving a stream that has only some
+  // of its rows. Until the flip the stream is in none of the in-memory maps, so
+  // nothing can observe it. The stream entry holds only table_ids/config/state;
+  // per-tablet checkpoint state (op_index, history floor, activity/advance
+  // times) lives in one SysCDCTabletCheckpointEntryPB row per tablet.
+  {
+    CDCStreamMetadataLock l(stream.get(), LockMode::WRITE);
+    for (int i = 0; i < req->table_ids_size(); ++i) {
+      l.mutable_data()->pb.add_table_ids(req->table_ids(i));
+    }
+    if (req->has_config()) {
+      l.mutable_data()->pb.mutable_config()->CopyFrom(req->config());
+    }
+    l.mutable_data()->pb.set_creation_time_micros(GetCurrentTimeMicros());
+    if (req->ephemeral()) {
+      l.mutable_data()->pb.set_ephemeral(true);
+    }
+    if (user) {
+      l.mutable_data()->pb.set_owner(*user);
+    }
+    l.mutable_data()->pb.set_state(SysCDCStreamEntryPB::CREATING);
+    RETURN_NOT_OK(sys_catalog_->WriteCDCStream(stream_id, l.data().pb));
+    l.Commit();
+  }
+
+  // Establish an initial retention barrier for the stream's tablets at
+  // creation time, closing the WAL race between CreateCDCStream and the
+  // consumer's first UpdateCDCCheckpoint. Without it, a tablet could GC WAL
+  // segments the new consumer has not read yet before its first checkpoint
+  // lands, forcing an immediate re-snapshot.
+  //
+  // Two durable-then-eager steps per tablet:
+  //   1. Persist a per-tablet checkpoint row at op_index=0 (retain from the log's
+  //      start). This makes the master's maintenance loop the durable owner of
+  //      the barrier from its very first pass: the row is reloaded on any
+  //      failover, so a new leader keeps pinning WAL and eventually releases it
+  //      without having to have seen the CreateCDCStream RPC. Stamping
+  //      last_active/last_advance to now lets an unused stream auto-release
+  //      through the normal expiry/staleness windows instead of pinning WAL
+  //      forever.
+  //   2. Push the barrier to every replica immediately (below), so retention
+  //      takes effect now rather than after up to --cdc_bg_scan_interval_ms.
+  // The consumer's first real checkpoint supersedes op_index=0 monotonically
+  // (UpdateCDCCheckpoint keeps max(existing, op_index)).
+  // A FULL stream needs the before-images of every change from its creation
+  // on, so its rows start with a history floor at the creation time. A floor of
+  // 0 would mean no floor, not "retain all history".
+  const int64_t now_micros = GetCurrentTimeMicros();
+  const uint64_t initial_history_floor =
+      req->config().record_type() == CDCStreamConfigPB::FULL ? now_micros : 0;
+  vector<scoped_refptr<CDCTabletCheckpointInfo>> initial_rows;
+  initial_rows.reserve(stream_tablets.size());
+  for (const auto& tablet : stream_tablets) {
+    scoped_refptr<CDCTabletCheckpointInfo> info(
+        new CDCTabletCheckpointInfo(stream_id, tablet->id()));
+    CDCTabletCheckpointMetadataLock l(info.get(), LockMode::WRITE);
+    auto& pb = l.mutable_data()->pb;
+    pb.set_stream_id(stream_id);
+    pb.set_tablet_id(tablet->id());
+    pb.set_op_index(0);
+    pb.set_last_checkpoint_advance_time_micros(now_micros);
+    pb.set_last_active_time_micros(now_micros);
+    if (initial_history_floor > 0) {
+      pb.set_history_safe_time_micros(initial_history_floor);
+    }
+    // Not yet durable, but not visible either: the rows enter the in-memory
+    // map only after the writes below.
+    l.Commit();
+    initial_rows.emplace_back(std::move(info));
+  }
+
+  // Write the rows in multi-row batches rather than one sys-catalog write per
+  // tablet, so creating a stream over many tablets stays well within the
+  // client's RPC timeout.
+  Status write_status;
+  size_t rows_written = 0;
+  vector<SysCDCTabletCheckpointEntryPB> batch;
+  while (rows_written < initial_rows.size()) {
+    size_t batch_end = std::min(rows_written + kCDCCheckpointRowsPerWrite,
+                                initial_rows.size());
+    // Test injection: the write of the row at this index fails, after the rows
+    // before it are durable.
+    const int fail_idx = FLAGS_cdc_create_stream_fail_checkpoint_idx;
+    const bool inject_failure = fail_idx >= 0 &&
+        static_cast<size_t>(fail_idx) >= rows_written &&
+        static_cast<size_t>(fail_idx) < batch_end;
+    if (inject_failure) {
+      batch_end = static_cast<size_t>(fail_idx);
+    }
+    batch.clear();
+    for (size_t i = rows_written; i < batch_end; ++i) {
+      CDCTabletCheckpointMetadataLock l(initial_rows[i].get(), LockMode::READ);
+      batch.emplace_back(l.data().pb);
+    }
+    write_status = sys_catalog_->WriteCDCTabletCheckpoints(batch);
+    if (!write_status.ok()) {
+      break;
+    }
+    rows_written = batch_end;
+    if (inject_failure) {
+      write_status = Status::IOError("injected checkpoint write failure for testing");
+      break;
+    }
+  }
+  if (write_status.ok()) {
+    CDCStreamMetadataLock l(stream.get(), LockMode::WRITE);
+    l.mutable_data()->pb.set_state(SysCDCStreamEntryPB::ACTIVE);
+    write_status = sys_catalog_->WriteCDCStream(stream_id, l.data().pb);
+    if (write_status.ok()) {
+      l.Commit();
+    }
+  }
+
+  if (!write_status.ok()) {
+    // The stream is durably CREATING with some of its rows, so any future
+    // leader reaps it. Add the stream and the durable rows to the in-memory
+    // maps as well, so this master's next maintenance pass reaps them too.
+    LOG(WARNING) << Substitute(
+        "CDC CreateCDCStream: failed to persist stream $0 ($1 of $2 checkpoint "
+        "rows written): $3; the partially created stream will be reaped",
+        stream_id, rows_written, initial_rows.size(), write_status.ToString());
+    std::lock_guard lock(lock_);
+    cdc_stream_map_[stream_id] = stream;
+    if (rows_written > 0) {
+      auto& tablets = cdc_tablet_checkpoint_map_[stream_id];
+      for (size_t i = 0; i < rows_written; ++i) {
+        tablets[initial_rows[i]->tablet_id()] = initial_rows[i];
+      }
+    }
+    return write_status;
+  }
+
+  {
+    std::lock_guard lock(lock_);
+    cdc_stream_map_[stream_id] = stream;
+    if (!initial_rows.empty()) {
+      auto& tablets = cdc_tablet_checkpoint_map_[stream_id];
+      for (const auto& info : initial_rows) {
+        tablets[info->tablet_id()] = info;
+        // Record the initial barrier we are about to push (below) so the
+        // maintenance loop knows it owns a release for this tablet even if the
+        // stream expires or goes stale before a pin pass ever tracks it. See
+        // cdc_eager_barriered_tablets_.
+        cdc_eager_barriered_tablets_.insert(info->tablet_id());
+      }
+    }
+  }
+
+  // Push the initial barrier now: min_retained_op_index=0 retains all WAL, the
+  // conservative floor a brand-new stream needs until it reports a real
+  // position. The barrier replaces the tablet's aggregate one, so the history
+  // floor is the aggregate over all streams' rows, including the new ones: a
+  // floor of 0 would clear the floor other FULL streams need until the next
+  // maintenance pass. The sequence is taken after the rows were added, so it
+  // outranks the SETs of a maintenance pass that computed its barriers before.
+  const int64_t barrier_seq = NextCDCBarrierSeq();
+  for (const auto& tablet : stream_tablets) {
+    SendCDCRetentionBarrierToAllReplicas(tablet->id(),
+                                         /*min_retained_op_index=*/0,
+                                         GetCDCTabletHistoryFloor(tablet->id()),
+                                         barrier_seq);
+  }
+
+  resp->set_stream_id(stream_id);
+  return Status::OK();
+}
+
+Status CatalogManager::DeleteCDCStream(const DeleteCDCStreamRequestPB* req,
+                                       DeleteCDCStreamResponsePB* resp,
+                                       const optional<string>& user) {
+  const string& stream_id = req->stream_id();
+
+  // Two-phase delete. This is phase 1: durably mark the stream DELETING in
+  // sys_catalog, then return. Phase 2 is an
+  // idempotent reap (ReapDeletedCDCStreams, driven from RunCDCStreamMaintenance)
+  // that whichever master is leader runs: it fans out the barrier-RELEASE RPCs,
+  // removes the per-tablet checkpoint rows, and finally removes the stream row.
+  //
+  // Why the release and row removal cannot happen inline here: the retention
+  // barrier is persisted in each tablet's superblock, but the master keeps NO
+  // durable record of which tablets it has barriered (cdc_barriered_tablets_ is
+  // in-memory only, never persisted). If this method removed the stream row first
+  // and then fired best-effort RELEASE RPCs, a master crash in that window would
+  // leave a new master with no knowledge that a release is owed -- the stream is
+  // gone from sys_catalog, so no maintenance pass ever releases those tablets and
+  // their superblock barrier pins WAL and MVCC history permanently.
+  // Persisting DELETING *first* makes the cleanup recoverable: the marker survives
+  // failover, and any leader finishes the reap idempotently until the rows are
+  // gone.
+  scoped_refptr<CDCStreamInfo> stream;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    stream = FindPtrOrNull(cdc_stream_map_, stream_id);
+  }
+  if (!stream) {
+    return Status::NotFound(Substitute("CDC stream $0 not found", stream_id));
+  }
+  if (user && !master_->IsServiceUserOrSuperUser(*user)) {
+    // The owner may delete its stream. Another user's stream requires ALL on
+    // every table of the stream. A table that was dropped cannot be authorized
+    // against: only the owner and the trusted users may delete such a stream.
+    vector<string> table_ids;
+    {
+      CDCStreamMetadataLock l(stream.get(), LockMode::READ);
+      if (!l.data().pb.has_owner() || l.data().pb.owner() != *user) {
+        table_ids.assign(l.data().pb.table_ids().begin(), l.data().pb.table_ids().end());
+      }
+    }
+    for (const auto& table_id : table_ids) {
+      scoped_refptr<TableInfo> table;
+      {
+        std::shared_lock<rw_spinlock> lock(lock_);
+        table = FindPtrOrNull(table_ids_map_, table_id);
+      }
+      if (!table) {
+        return SetupError(Status::NotAuthorized(Substitute(
+                              "table $0 of the stream no longer exists", table_id)),
+                          resp, MasterErrorPB::NOT_AUTHORIZED);
+      }
+      TableMetadataLock tl(table.get(), LockMode::READ);
+      if (tl.data().is_deleted()) {
+        return SetupError(Status::NotAuthorized(Substitute(
+                              "table $0 of the stream no longer exists", table_id)),
+                          resp, MasterErrorPB::NOT_AUTHORIZED);
+      }
+      RETURN_NOT_OK(SetupError(
+          authz_provider_->AuthorizeDeleteCDCStream(tl.data().name(), *user,
+                                                    *user == tl.data().owner()),
+          resp, MasterErrorPB::NOT_AUTHORIZED));
+    }
+  }
+
+  // The per-stream metadata WRITE lock serializes concurrent deletes: the first
+  // marks DELETING; any later one sees DELETING and returns OK without rewriting
+  // sys_catalog. Only DeleteCDCStream ever transitions ACTIVE -> DELETING, and the
+  // reap only ever acts on DELETING streams, so holding a refptr here keeps the
+  // object alive even if a concurrent reap erases it from the map -- the DELETING
+  // check below then avoids resurrecting a just-removed stream row.
+  CDCStreamMetadataLock l(stream.get(), LockMode::WRITE);
+  if (l.data().pb.state() == SysCDCStreamEntryPB::DELETING) {
+    // Already marked for deletion (a prior or concurrent call); the reap pass will
+    // finish it. Idempotent -- report success rather than NotFound.
+    return Status::OK();
+  }
+  l.mutable_data()->pb.set_state(SysCDCStreamEntryPB::DELETING);
+  RETURN_NOT_OK(sys_catalog_->WriteCDCStream(stream_id, l.data().pb));
+  l.Commit();
+  // The stream stays in cdc_stream_map_ (now DELETING). It is hidden from
+  // ListCDCStreams/GetCDCStreamInfo and excluded from barrier computation; the
+  // reap removes it from the in-memory maps once cleanup completes.
+  return Status::OK();
+}
+
+void CatalogManager::MarkDeletingStreamsForDroppedTables() {
+  // Phase A -- detect. Snapshot, under lock_, every ACTIVE stream together with
+  // the refptrs of the tables it references (nullptr where the table id is no
+  // longer in table_ids_map_ at all). Per-table committed state is read via the
+  // table metadata lock below, taken OUTSIDE lock_ to preserve the lock_ ->
+  // table-metadata ordering used elsewhere (CreateCDCStream).
+  struct Candidate {
+    scoped_refptr<CDCStreamInfo> stream;
+    vector<scoped_refptr<TableInfo>> tables;  // may contain nullptrs (absent tables)
+  };
+  vector<Candidate> candidates;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (const auto& entry : cdc_stream_map_) {
+      CDCStreamMetadataLock l(entry.second.get(), LockMode::READ);
+      if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE) {
+        continue;  // DELETING streams are already headed for the reap.
+      }
+      Candidate c;
+      c.stream = entry.second;
+      for (int i = 0; i < l.data().pb.table_ids_size(); ++i) {
+        c.tables.emplace_back(
+            FindPtrOrNull(table_ids_map_, l.data().pb.table_ids(i)));
+      }
+      candidates.emplace_back(std::move(c));
+    }
+  }
+
+  for (const auto& c : candidates) {
+    // A stream is condemned if ANY table it references has been dropped: an
+    // absent refptr (removed from table_ids_map_), or a present table in the
+    // terminal REMOVED state (is_deleted()). A soft-deleted table is recallable,
+    // so it is NOT a drop -- leave the stream ACTIVE.
+    bool references_dropped_table = false;
+    for (const auto& table : c.tables) {
+      if (!table) {
+        references_dropped_table = true;
+        break;
+      }
+      TableMetadataLock l(table.get(), LockMode::READ);
+      if (l.data().is_deleted()) {
+        references_dropped_table = true;
+        break;
+      }
+    }
+    if (!references_dropped_table) {
+      continue;
+    }
+
+    // Phase B -- mark. Take the per-stream WRITE lock, re-check the state (it may
+    // have been marked DELETING by a concurrent DeleteCDCStream between phases),
+    // then persist DELETING. The reap removes it from the maps once cleanup
+    // completes; leaving it here means the next pass simply re-confirms DELETING
+    // and skips it. A persist failure is logged, not fatal -- the table drop has
+    // already happened, and the next maintenance pass retries.
+    Status s = MarkCDCStreamDeleting(c.stream.get());
+    if (s.IsAlreadyPresent()) {
+      continue;
+    }
+    if (PREDICT_FALSE(!s.ok())) {
+      LOG(WARNING) << Substitute(
+          "failed to mark CDC stream $0 DELETING after its table was dropped: $1 "
+          "(will retry on the next maintenance pass)",
+          c.stream->id(), s.ToString());
+      continue;
+    }
+    LOG(INFO) << Substitute(
+        "marked CDC stream $0 DELETING: a table it references was dropped",
+        c.stream->id());
+  }
+}
+
+Status CatalogManager::MarkCDCStreamDeleting(CDCStreamInfo* stream) {
+  CDCStreamMetadataLock l(stream, LockMode::WRITE);
+  if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE) {
+    return Status::AlreadyPresent(Substitute("CDC stream $0 is not active", stream->id()));
+  }
+  l.mutable_data()->pb.set_state(SysCDCStreamEntryPB::DELETING);
+  RETURN_NOT_OK(sys_catalog_->WriteCDCStream(stream->id(), l.data().pb));
+  l.Commit();
+  return Status::OK();
+}
+
+uint64_t CatalogManager::GetCDCTabletHistoryFloor(const string& tablet_id) {
+  // Collect the rows under lock_; read them under their own locks after.
+  vector<std::pair<bool, scoped_refptr<CDCTabletCheckpointInfo>>> rows;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (const auto& entry : cdc_tablet_checkpoint_map_) {
+      const auto* row = FindOrNull(entry.second, tablet_id);
+      const auto* stream = FindOrNull(cdc_stream_map_, entry.first);
+      if (!row || !stream) {
+        continue;
+      }
+      CDCStreamMetadataLock l(stream->get(), LockMode::READ);
+      if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE) {
+        continue;
+      }
+      rows.emplace_back(l.data().pb.config().record_type() == CDCStreamConfigPB::FULL,
+                        *row);
+    }
+  }
+  uint64_t floor = 0;
+  for (const auto& [is_full, row] : rows) {
+    CDCTabletCheckpointMetadataLock l(row.get(), LockMode::READ);
+    const auto& pb = l.data().pb;
+    if ((is_full || pb.snapshot_active()) && pb.history_safe_time_micros() > 0) {
+      floor = floor == 0 ? pb.history_safe_time_micros()
+                         : std::min<uint64_t>(floor, pb.history_safe_time_micros());
+    }
+  }
+  return floor;
+}
+
+Status CatalogManager::WriteInitialCDCCheckpointForTablet(
+    const string& stream_id,
+    const string& tablet_id,
+    int64_t now_micros,
+    uint64_t history_safe_time_micros) {
+  // Construct the in-memory CDCTabletCheckpointInfo and lock it for writing.
+  // op_index=0 retains all WAL from the start of the tablet's life.
+  scoped_refptr<CDCTabletCheckpointInfo> info(
+      new CDCTabletCheckpointInfo(stream_id, tablet_id));
+  CDCTabletCheckpointMetadataLock l(info.get(), LockMode::WRITE);
+  auto& pb = l.mutable_data()->pb;
+  pb.set_stream_id(stream_id);
+  pb.set_tablet_id(tablet_id);
+  pb.set_op_index(0);
+  pb.set_last_checkpoint_advance_time_micros(now_micros);
+  pb.set_last_active_time_micros(now_micros);
+  if (history_safe_time_micros > 0) {
+    pb.set_history_safe_time_micros(history_safe_time_micros);
+  }
+  pb.set_registered_by_partition_add(true);
+
+  RETURN_NOT_OK(sys_catalog_->WriteCDCTabletCheckpoint(stream_id, tablet_id, pb));
+  l.Commit();
+  {
+    std::lock_guard lock(lock_);
+    cdc_tablet_checkpoint_map_[stream_id][tablet_id] = info;
+  }
+  return Status::OK();
+}
+
+void CatalogManager::RegisterNewTabletsWithCDCStreams(
+    const string& table_id,
+    const vector<scoped_refptr<TabletInfo>>& new_tablets) {
+  // Phase A: snapshot every ACTIVE stream covering 'table_id' under lock_.
+  // (DELETING streams are excluded; their barriers are being released.)
+  // Each stream id comes with whether it is a FULL stream.
+  vector<std::pair<string, bool>> stream_ids;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (const auto& entry : cdc_stream_map_) {
+      CDCStreamMetadataLock l(entry.second.get(), LockMode::READ);
+      if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE) {
+        continue;
+      }
+      for (int i = 0; i < l.data().pb.table_ids_size(); ++i) {
+        if (l.data().pb.table_ids(i) == table_id) {
+          stream_ids.emplace_back(
+              entry.first,
+              l.data().pb.config().record_type() == CDCStreamConfigPB::FULL);
+          break;
+        }
+      }
+    }
+  }
+  if (stream_ids.empty()) {
+    return;  // No streams cover this table; nothing to do.
+  }
+
+  // Phase B: write op_index=0 checkpoint rows for each (stream, new_tablet)
+  // pair. Done outside lock_ to respect the lock_ -> sys_catalog ordering. As
+  // in CreateCDCStream, a FULL stream's row starts with a history floor at
+  // (about) the tablet's creation time.
+  const int64_t now_micros = GetCurrentTimeMicros();
+  for (const auto& [stream_id, is_full] : stream_ids) {
+    for (const auto& tablet : new_tablets) {
+      Status s = WriteInitialCDCCheckpointForTablet(stream_id, tablet->id(),
+                                                    now_micros,
+                                                    is_full ? now_micros : 0);
+      if (!s.ok()) {
+        // Best-effort: log and continue. ReconcileNewPartitionsForCDCStreams
+        // self-heals this tablet on the next maintenance pass (including after
+        // master failover), so this path must NOT fail the AlterTable.
+        KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+            "CDC eager register: failed to write checkpoint row for "
+            "stream $0 new tablet $1: $2 (maintenance loop will recover)",
+            stream_id, tablet->id(), s.ToString());
+        continue;
+      }
+      // Best-effort initial barrier. At this point the tablet has no consensus
+      // state (it was just durably written but SendAlterTableRequest has not
+      // yet run, so no tserver has received the tablet yet). The call returns
+      // immediately at the no-consensus-state guard. The maintenance loop
+      // sends the real barrier once the tablet is running.
+      SendCDCRetentionBarrierToAllReplicas(tablet->id(),
+                                           /*min_retained_op_index=*/0,
+                                           GetCDCTabletHistoryFloor(tablet->id()),
+                                           NextCDCBarrierSeq());
+    }
+  }
+}
+
+void CatalogManager::ReconcileNewPartitionsForCDCStreams() {
+  // Phase A: under lock_, snapshot every ACTIVE stream together with the tablet
+  // ids it already has checkpoint rows for. This tells us which tablets in the
+  // table's current set are NOT yet tracked (the set we need to fill).
+  struct StreamEntry {
+    scoped_refptr<CDCStreamInfo> stream;
+    vector<string> table_ids;
+    std::unordered_set<string> known_tablet_ids;  // from cdc_tablet_checkpoint_map_
+    bool is_full = false;
+  };
+  vector<StreamEntry> candidates;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (const auto& entry : cdc_stream_map_) {
+      CDCStreamMetadataLock l(entry.second.get(), LockMode::READ);
+      // Skip DELETING streams: MarkDeletingStreamsForDroppedTables runs before
+      // this function so condemned streams are already DELETING.
+      if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE) {
+        continue;
+      }
+      StreamEntry se;
+      se.stream = entry.second;
+      se.is_full = l.data().pb.config().record_type() == CDCStreamConfigPB::FULL;
+      for (int i = 0; i < l.data().pb.table_ids_size(); ++i) {
+        se.table_ids.emplace_back(l.data().pb.table_ids(i));
+      }
+      auto cit = cdc_tablet_checkpoint_map_.find(entry.first);
+      if (cit != cdc_tablet_checkpoint_map_.end()) {
+        for (const auto& t : cit->second) {
+          se.known_tablet_ids.insert(t.first);
+        }
+      }
+      candidates.emplace_back(std::move(se));
+    }
+  }
+
+  // Phase B: for each active stream, compare each referenced table's current
+  // tablets against the known set and write checkpoint rows for the difference.
+  // All sys_catalog writes happen outside lock_ to respect lock ordering.
+  const int64_t now_micros = GetCurrentTimeMicros();
+  for (const auto& se : candidates) {
+    for (const auto& table_id : se.table_ids) {
+      scoped_refptr<TableInfo> table;
+      {
+        std::shared_lock<rw_spinlock> lock(lock_);
+        table = FindPtrOrNull(table_ids_map_, table_id);
+      }
+      if (!table) {
+        continue;  // Table removed; MarkDeletingStreams already condemned stream.
+      }
+      {
+        // Verify the table is still running before enumerating tablets, to
+        // avoid registering tablets for a table in a terminal state.
+        TableMetadataLock tl(table.get(), LockMode::READ);
+        if (!tl.data().is_running()) {
+          continue;
+        }
+      }
+
+      vector<scoped_refptr<TabletInfo>> current_tablets;
+      table->GetAllTablets(&current_tablets);
+
+      for (const auto& tablet : current_tablets) {
+        if (ContainsKey(se.known_tablet_ids, tablet->id())) {
+          continue;  // Already tracked; no work needed.
+        }
+        // New tablet: write op_index=0 checkpoint row. This covers:
+        //   (a) tablets added via ADD_RANGE_PARTITION after stream creation, and
+        //   (b) crash recovery if RegisterNewTabletsWithCDCStreams was interrupted.
+        Status s = WriteInitialCDCCheckpointForTablet(se.stream->id(),
+                                                      tablet->id(), now_micros,
+                                                      se.is_full ? now_micros : 0);
+        if (!s.ok()) {
+          // Best-effort: will retry on the next maintenance pass.
+          KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+              "CDC reconcile: failed to write checkpoint row for "
+              "stream $0 tablet $1: $2 (will retry next pass)",
+              se.stream->id(), tablet->id(), s.ToString());
+          continue;
+        }
+        // Best-effort barrier: a no-op if the tablet has no consensus state
+        // yet (brand-new tablet); the maintenance loop re-sends once running.
+        SendCDCRetentionBarrierToAllReplicas(tablet->id(),
+                                             /*min_retained_op_index=*/0,
+                                             GetCDCTabletHistoryFloor(tablet->id()),
+                                             NextCDCBarrierSeq());
+        LOG(INFO) << Substitute(
+            "CDC reconcile: registered new tablet $0 for stream $1 "
+            "(ADD_RANGE_PARTITION self-heal)",
+            tablet->id(), se.stream->id());
+      }
+    }
+  }
+}
+
+void CatalogManager::ReapDeletedCDCStreams() {
+  // Snapshot under lock_:
+  //   - 'deleting': every stream marked DELETING (phase 2 of DeleteCDCStream),
+  //     plus every stream_id that has checkpoint rows but no stream row at all
+  //     (orphaned rows, see below), each with the tablet ids drawn from
+  //     its per-tablet checkpoint rows.
+  //   - 'pinned_by_survivor': tablets still referenced by some surviving (present
+  //     and non-DELETING) stream. Used to decide, per tablet, whether the
+  //     aggregate WAL/history barrier may be released (orphaned) or only the
+  //     deleted stream's own consumer anchor (a live stream still pins it).
+  //
+  // A partial delete followed by failover -- under the old single-phase
+  // delete -- could strand per-tablet checkpoint rows whose owning stream row was
+  // already removed. LoadCDCTabletCheckpoints reloads them with no owner, so they
+  // leak forever. Treating "checkpoint rows with no stream row" as an implicit
+  // deletion lets this same reap collect them (row_present == false => no stream
+  // row to remove, just release barriers and drop the rows).
+  struct DeletingStream {
+    bool row_present = false;  // false => orphaned rows only, no stream row to remove
+    vector<string> tablets;
+  };
+  std::unordered_map<string, DeletingStream> deleting;
+  std::unordered_set<string> pinned_by_survivor;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (const auto& entry : cdc_stream_map_) {
+      CDCStreamMetadataLock l(entry.second.get(), LockMode::READ);
+      // A CREATING stream in the map was abandoned mid-creation (by an earlier
+      // leader, or by a failed CreateCDCStream on this one): in-progress
+      // creations are not in the map. Reap it like a deleted stream.
+      if (l.data().pb.state() == SysCDCStreamEntryPB::DELETING ||
+          l.data().pb.state() == SysCDCStreamEntryPB::CREATING) {
+        deleting[entry.first].row_present = true;
+      }
+    }
+    for (const auto& entry : cdc_tablet_checkpoint_map_) {
+      const string& stream_id = entry.first;
+      const bool surviving = ContainsKey(cdc_stream_map_, stream_id) &&
+          !ContainsKey(deleting, stream_id);
+      for (const auto& t : entry.second) {
+        if (surviving) {
+          pinned_by_survivor.insert(t.first);
+        } else {
+          auto& ds = deleting[stream_id];
+          ds.row_present = ContainsKey(cdc_stream_map_, stream_id);
+          ds.tablets.emplace_back(t.first);
+        }
+      }
+    }
+  }
+
+  if (deleting.empty()) {
+    return;
+  }
+
+  for (const auto& entry : deleting) {
+    const string& stream_id = entry.first;
+    const DeletingStream& ds = entry.second;
+
+    // Two-pass reap to close the permanent-retention-leak
+    // crash window that exists when the master crashes after removing the stream
+    // row (pass B) but before the async RELEASE RPC lands on the tablet.
+    //
+    // Pass A (first time seeing this stream in pending_release_tasks_):
+    //   Dispatch RELEASE RPCs for all of this stream's tablets, collect task
+    //   handles, and defer row removal to a future pass. If no replicas are
+    //   reachable (empty task list -- e.g. tablets not yet assigned in tests),
+    //   there is nothing to release and we fall through to removal immediately.
+    //
+    // Pass B+ (entry exists in pending_release_tasks_):
+    //   While a task is still running, leave the stream DELETING and check
+    //   again next pass. If a task failed (the replica was unreachable for
+    //   --unresponsive_ts_rpc_timeout_ms) or was aborted, the RELEASE may not
+    //   have landed: dispatch pass A again. Only once every task completed are
+    //   the rows removed. A replica that leaves the tablet's committed config is
+    //   no longer targeted, and a deleted tablet needs no release, so the retry
+    //   ends once the replica is back, replaced, or the tablet is gone.
+    //
+    // Only after every RELEASE completed do we remove checkpoint rows and the
+    // stream row. A master crash after task completion but before row removal
+    // is safe: the RELEASE is already durable on the tablet's superblock, so
+    // the new leader that finds no DELETING marker inherits a correctly
+    // released tablet -- no permanent leak.
+    //
+    // A pull model (each tablet server polls a state table and releases a
+    // barrier whose entry is gone) would avoid this window, but the master
+    // pushes barriers; this two-pass guard closes the window within that model.
+    auto pit = pending_release_tasks_.find(stream_id);
+    if (pit != pending_release_tasks_.end()) {
+      const CDCReleaseState state = GetCDCReleaseState(pit->second);
+      if (state == CDCReleaseState::kInFlight) {
+        // Tasks still in flight. Leave the stream DELETING; retry next pass.
+        continue;
+      }
+      if (state == CDCReleaseState::kFailed) {
+        KLOG_EVERY_N_SECS(INFO, 60) << Substitute(
+            "CDC reap: a barrier RELEASE for stream $0 failed or was aborted; "
+            "sending it again", stream_id);
+        pending_release_tasks_.erase(pit);
+        pit = pending_release_tasks_.end();
+      }
+      // kDelivered: every RELEASE completed. Proceed to remove rows.
+    }
+    if (pit == pending_release_tasks_.end()) {
+      // Pass A: dispatch RELEASE RPCs.
+      //   - Orphaned tablet: release aggregate WAL/history barrier (min == -1)
+      //     AND consumer anchor.
+      //   - Shared tablet: release only consumer anchor (skip_barrier_update);
+      //     aggregate barrier stays for surviving streams.
+      //
+      // The RELEASE takes a new sequence, so it strictly outranks any SET a
+      // concurrent or earlier maintenance pass sent for the same tablet.
+      const int64_t release_seq = NextCDCBarrierSeq();
+      vector<scoped_refptr<MonitoredTask>> tasks;
+      for (const auto& tablet_id : ds.tablets) {
+        const bool orphaned = !ContainsKey(pinned_by_survivor, tablet_id);
+        SendCDCRetentionBarrierToAllReplicas(
+            tablet_id,
+            /*min_retained_op_index=*/-1,
+            /*history_safe_time_micros=*/0,
+            release_seq,
+            /*release_consumer_stream_id=*/stream_id,
+            /*skip_barrier_update=*/!orphaned,
+            &tasks);
+      }
+      if (!tasks.empty()) {
+        // Real replicas contacted: defer row removal until tasks complete.
+        pending_release_tasks_[stream_id] = std::move(tasks);
+        continue;
+      }
+      // No replica to contact (no consensus config, tablet unknown or
+      // deleted): nothing to confirm. Fall through to row removal in this same
+      // pass.
+    }
+
+    // Remove checkpoint rows, then the stream row (durable DELETING marker).
+    // The ordering guarantee: checkpoint rows are only removed after every
+    // RELEASE task completed (see pass A/B above), so any master crash after
+    // this point has already delivered the RELEASE to every replica.
+    //
+    // Best-effort per row: on failure keep the stream row so a later pass
+    // retries. RemoveCDCTabletCheckpoint uses DELETE_IGNORE, so it is safe
+    // to call again even if the row was already removed in an earlier pass
+    // (the in-memory map is not updated until the whole stream is cleaned up,
+    // so a row that was removed in a prior partial pass is simply a no-op).
+    bool all_rows_removed = true;
+    for (const auto& tablet_id : ds.tablets) {
+      Status s = sys_catalog_->RemoveCDCTabletCheckpoint(stream_id, tablet_id);
+      if (!s.ok()) {
+        all_rows_removed = false;
+        KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+            "CDC reap: failed to remove checkpoint row for stream $0 tablet $1: $2",
+            stream_id, tablet_id, s.ToString());
+      }
+    }
+
+    // Only remove the stream row (the durable DELETING marker) once every
+    // checkpoint row is gone. Removing it earlier would drop the marker that
+    // drives the retry, so a lost RELEASE could never be re-sent.
+    if (!all_rows_removed) {
+      continue;
+    }
+    if (ds.row_present) {
+      Status s = sys_catalog_->RemoveCDCStream(stream_id);
+      if (!s.ok()) {
+        KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+            "CDC reap: failed to remove stream row for stream $0: $1",
+            stream_id, s.ToString());
+        continue;
+      }
+    }
+    pending_release_tasks_.erase(stream_id);
+    {
+      std::lock_guard lock(lock_);
+      cdc_stream_map_.erase(stream_id);
+      cdc_tablet_checkpoint_map_.erase(stream_id);
+    }
+  }
+}
+
+Status CatalogManager::FilterCDCTablesVisibleToUser(const string& user,
+                                                    unordered_set<string>* table_ids,
+                                                    unordered_set<string>* dropped_table_ids) {
+  vector<scoped_refptr<TableInfo>> tables;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (auto it = table_ids->begin(); it != table_ids->end();) {
+      scoped_refptr<TableInfo> table = FindPtrOrNull(table_ids_map_, *it);
+      if (!table) {
+        dropped_table_ids->insert(*it);
+        it = table_ids->erase(it);
+        continue;
+      }
+      tables.emplace_back(std::move(table));
+      ++it;
+    }
+  }
+  unordered_map<string, bool> is_owner_by_table_name;
+  vector<pair<string, string>> names_and_ids;
+  for (const auto& table : tables) {
+    TableMetadataLock l(table.get(), LockMode::READ);
+    if (l.data().is_deleted()) {
+      dropped_table_ids->insert(table->id());
+      table_ids->erase(table->id());
+      continue;
+    }
+    EmplaceIfNotPresent(&is_owner_by_table_name, l.data().name(), l.data().owner() == user);
+    names_and_ids.emplace_back(l.data().name(), table->id());
+  }
+  bool checked_table_names = false;
+  RETURN_NOT_OK(authz_provider_->AuthorizeListTables(
+      user, &is_owner_by_table_name, &checked_table_names));
+  if (checked_table_names) {
+    for (const auto& name_and_id : names_and_ids) {
+      if (!ContainsKey(is_owner_by_table_name, name_and_id.first)) {
+        table_ids->erase(name_and_id.second);
+      }
+    }
+  }
+  return Status::OK();
+}
+
+// static
+bool CatalogManager::IsCDCStreamVisibleToUser(const SysCDCStreamEntryPB& stream,
+                                              const string& user,
+                                              const unordered_set<string>& visible_table_ids,
+                                              const unordered_set<string>& dropped_table_ids) {
+  const bool is_owner = stream.has_owner() && stream.owner() == user;
+  return std::all_of(stream.table_ids().begin(), stream.table_ids().end(),
+                     [&](const string& id) {
+                       return ContainsKey(visible_table_ids, id) ||
+                           (is_owner && ContainsKey(dropped_table_ids, id));
+                     });
+}
+
+Status CatalogManager::ListCDCStreams(const ListCDCStreamsRequestPB* req,
+                                      ListCDCStreamsResponsePB* resp,
+                                      const optional<string>& user) {
+  // A user other than the service user and the superusers sees only the
+  // streams whose tables it may see the metadata of, as with ListTables.
+  const bool is_trusted_user = !user || master_->IsServiceUserOrSuperUser(*user);
+  unordered_set<string> visible_table_ids;
+  unordered_set<string> dropped_table_ids;
+  if (!is_trusted_user) {
+    {
+      std::shared_lock<rw_spinlock> lock(lock_);
+      for (const auto& entry : cdc_stream_map_) {
+        CDCStreamMetadataLock l(entry.second.get(), LockMode::READ);
+        visible_table_ids.insert(l.data().pb.table_ids().begin(),
+                                 l.data().pb.table_ids().end());
+      }
+    }
+    RETURN_NOT_OK(FilterCDCTablesVisibleToUser(*user, &visible_table_ids, &dropped_table_ids));
+  }
+
+  std::shared_lock<rw_spinlock> lock(lock_);
+  for (const auto& entry : cdc_stream_map_) {
+    const auto& stream = entry.second;
+    CDCStreamMetadataLock l(stream.get(), LockMode::READ);
+
+    // A stream marked for deletion (two-phase delete) is logically gone; do not
+    // surface it unless asked to. The reap pass removes it from the map.
+    if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE && !req->include_deleting()) {
+      continue;
+    }
+    // A stream created after the tables were checked may reference a table
+    // that was not checked: it is left out as well.
+    if (!is_trusted_user &&
+        !IsCDCStreamVisibleToUser(l.data().pb, *user, visible_table_ids, dropped_table_ids)) {
+      continue;
+    }
+
+    if (req->has_table_id()) {
+      bool found = false;
+      for (const auto& tid : l.data().pb.table_ids()) {
+        if (tid == req->table_id()) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) continue;
+    }
+
+    CDCStreamInfoPB* info = resp->add_streams();
+    FillCDCStreamInfo(stream->id(), l.data().pb, info);
+    // Assemble the response checkpoint map from this stream's per-tablet rows.
+    // lock_ is held (shared) across these row READ locks, matching the stream
+    // READ lock above; no writer takes a row lock while holding lock_.
+    auto cit = cdc_tablet_checkpoint_map_.find(entry.first);
+    if (cit != cdc_tablet_checkpoint_map_.end()) {
+      for (const auto& t : cit->second) {
+        CDCTabletCheckpointMetadataLock cl(t.second.get(), LockMode::READ);
+        // See GetCDCStreamInfo() for why a tablet whose snapshot is active is
+        // left out.
+        if (cl.data().pb.has_op_index() && !cl.data().pb.snapshot_active()) {
+          (*info->mutable_tablet_checkpoints())[t.first] = cl.data().pb.op_index();
+        }
+      }
+    }
+  }
+  return Status::OK();
+}
+
+Status CatalogManager::GetCDCStreamInfo(const GetCDCStreamInfoRequestPB* req,
+                                        GetCDCStreamInfoResponsePB* resp,
+                                        const optional<string>& user) {
+  const string& stream_id = req->stream_id();
+  scoped_refptr<CDCStreamInfo> stream;
+  // Snapshot the stream and its per-tablet checkpoint rows under lock_, then read
+  // each row's metadata lock after releasing lock_ (consistent lock ordering).
+  vector<scoped_refptr<CDCTabletCheckpointInfo>> checkpoints;
+  // The tablet of each row, or null if the master does not know it.
+  vector<scoped_refptr<TabletInfo>> tablets;
+
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    auto it = cdc_stream_map_.find(stream_id);
+    if (it == cdc_stream_map_.end()) {
+      return Status::NotFound(Substitute("CDC stream $0 not found", stream_id));
+    }
+    stream = it->second;
+    auto cit = cdc_tablet_checkpoint_map_.find(stream_id);
+    if (cit != cdc_tablet_checkpoint_map_.end()) {
+      for (const auto& t : cit->second) {
+        checkpoints.emplace_back(t.second);
+        tablets.emplace_back(FindPtrOrNull(tablet_map_, t.first));
+      }
+    }
+  }
+
+  // The tablet servers fetch the stream config as the service user. Any other
+  // user, except a superuser, must be allowed to see the metadata of the
+  // stream's tables, and is not given the snapshot resume keys: they hold
+  // primary key values.
+  const bool is_trusted_user = !user || master_->IsServiceUserOrSuperUser(*user);
+  if (!is_trusted_user) {
+    SysCDCStreamEntryPB stream_pb;
+    {
+      CDCStreamMetadataLock l(stream.get(), LockMode::READ);
+      stream_pb = l.data().pb;
+    }
+    unordered_set<string> visible_table_ids(stream_pb.table_ids().begin(),
+                                            stream_pb.table_ids().end());
+    unordered_set<string> dropped_table_ids;
+    RETURN_NOT_OK(SetupError(
+        FilterCDCTablesVisibleToUser(*user, &visible_table_ids, &dropped_table_ids),
+        resp, MasterErrorPB::UNKNOWN_ERROR));
+    if (!IsCDCStreamVisibleToUser(stream_pb, *user, visible_table_ids, dropped_table_ids)) {
+      return SetupError(Status::NotAuthorized("unauthorized action"),
+                        resp, MasterErrorPB::NOT_AUTHORIZED);
+    }
+  }
+
+  CDCStreamMetadataLock l(stream.get(), LockMode::READ);
+  // A stream being torn down must not be served to consumers: its retention
+  // barriers are being released and the WAL/history it points at may already be
+  // gone, so any config we handed back would invite reads that cannot be
+  // satisfied. Treat a non-ACTIVE stream as absent -- callers translate NotFound
+  // into STREAM_NOT_FOUND, prompting a fresh snapshot rather than a doomed
+  // resume. (Delete is two-phase: DELETING is durably persisted in phase 1 and
+  // the reap removes the stream in phase 2; this guard is live.)
+  if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE && !req->include_deleting()) {
+    return Status::NotFound(
+        Substitute("CDC stream $0 is not active", stream_id));
+  }
+  CDCStreamInfoPB* info = resp->mutable_stream();
+  FillCDCStreamInfo(stream->id(), l.data().pb, info);
+  const int64_t expiry_micros = CDCStreamExpiryMicros(l.data().pb.ephemeral());
+  resp->set_stream_expiry_ms(expiry_micros / 1000);
+  const int64_t now_micros = GetCurrentTimeMicros();
+  const int64_t leader_ready_micros =
+      cdc_leader_ready_micros_.load(std::memory_order_acquire);
+  const int64_t staleness_micros = FLAGS_cdc_max_staleness_ms > 0
+      ? FLAGS_cdc_max_staleness_ms * 1000 : 0;
+  for (size_t i = 0; i < checkpoints.size(); ++i) {
+    const auto& cp = checkpoints[i];
+    if (tablets[i] && FillCDCDroppedTablet(*tablets[i].get(), *cp.get(), info)) {
+      continue;
+    }
+    CDCTabletCheckpointMetadataLock cl(cp.get(), LockMode::READ);
+    const auto& cpb = cl.data().pb;
+    if (req->include_tablet_status()) {
+      const CDCCheckpointHealth health = GetCDCCheckpointHealth(
+          cpb, *cp.get(), now_micros, leader_ready_micros, expiry_micros, staleness_micros);
+      CDCTabletStatusPB* status = info->add_tablet_status();
+      status->set_tablet_id(cp->tablet_id());
+      if (cpb.has_op_index()) {
+        status->set_op_index(cpb.op_index());
+      }
+      status->set_last_active_time_micros(cpb.last_active_time_micros());
+      status->set_last_checkpoint_advance_time_micros(
+          cpb.last_checkpoint_advance_time_micros());
+      status->set_expired(health.expired);
+      status->set_stale(health.stale);
+      status->set_snapshot_active(cpb.snapshot_active());
+    }
+    // Only tablets with a durable checkpoint appear in the response map (a row
+    // that carries activity but no checkpoint yet has op_index unset). While a
+    // tablet's snapshot is active, op_index holds the point the WAL is streamed
+    // from once the snapshot completes: a consumer that resumed streaming from
+    // it would skip the rest of the snapshot, so the tablet is reported only by
+    // its snapshot cursor.
+    if (cpb.has_op_index() && !cpb.snapshot_active()) {
+      (*info->mutable_tablet_checkpoints())[cp->tablet_id()] = cpb.op_index();
+      if (cpb.registered_by_partition_add() && cpb.op_index() == 0) {
+        info->add_tablets_added_after_creation(cp->tablet_id());
+      }
+    }
+    // Surface the durable snapshot cursor for tablets with an active snapshot so
+    // a newly elected leader can resume the scan (cold-resume path in
+    // CDCServiceImpl::ReadSnapshot).
+    if (cpb.snapshot_active() && cpb.has_snapshot_snap_ts()) {
+      CDCTabletSnapshotCursorPB* cur = info->add_tablet_snapshot_cursors();
+      cur->set_tablet_id(cp->tablet_id());
+      cur->set_snapshot_snap_ts(cpb.snapshot_snap_ts());
+      if (is_trusted_user) {
+        cur->set_snapshot_resume_key(cpb.snapshot_resume_key());
+      }
+      cur->set_snapshot_active(true);
+      // During the snapshot phase op_index stores streaming_start_op_index.
+      if (cpb.has_op_index()) {
+        cur->set_streaming_start_op_index(cpb.op_index());
+      }
+    }
+  }
+  return Status::OK();
+}
+
+bool CatalogManager::FillCDCDroppedTablet(const TabletInfo& tablet,
+                                          const CDCTabletCheckpointInfo& row,
+                                          CDCStreamInfoPB* info) {
+  {
+    // Most rows are of live tablets: check without the table's lock first.
+    TabletMetadataLock tablet_lock(&tablet, LockMode::READ);
+    if (tablet_lock.data().pb.state() != SysTabletsEntryPB::DELETED) {
+      return false;
+    }
+  }
+  CDCStreamDroppedTabletPB dropped;
+  vector<consensus::RaftPeerPB> peers;
+  {
+    TableMetadataLock table_lock(tablet.table().get(), LockMode::READ);
+    TabletMetadataLock tablet_lock(&tablet, LockMode::READ);
+    const auto& tablet_pb = tablet_lock.data().pb;
+    if (tablet_pb.state() != SysTabletsEntryPB::DELETED) {
+      return false;
+    }
+    const auto& table_pb = table_lock.data().pb;
+    Schema schema;
+    PartitionSchema partition_schema;
+    Partition partition;
+    Partition::FromPB(tablet_pb.partition(), &partition);
+    if (SchemaFromPB(table_pb.schema(), &schema).ok() &&
+        PartitionSchema::FromPB(table_pb.partition_schema(), schema, &partition_schema).ok()) {
+      dropped.set_partition_description(
+          partition_schema.PartitionDebugString(partition, schema));
+    }
+    *dropped.mutable_partition() = tablet_pb.partition();
+    if (tablet_pb.has_consensus_state()) {
+      const auto& config_peers = tablet_pb.consensus_state().committed_config().peers();
+      peers.assign(config_peers.begin(), config_peers.end());
+    }
+  }
+  dropped.set_tablet_id(tablet.id());
+  {
+    CDCTabletCheckpointMetadataLock l(&row, LockMode::READ);
+    const auto& pb = l.data().pb;
+    if (pb.has_op_index()) {
+      dropped.set_op_index(pb.op_index());
+    }
+    if (pb.dropped_tablet_drained()) {
+      dropped.set_state(CDCStreamDroppedTabletPB::DRAINED);
+    } else if (!pb.dropped_tablet_tail_lost() && IsCDCRetainedDroppedTablet(tablet.id())) {
+      dropped.set_state(CDCStreamDroppedTabletPB::RETAINED);
+    } else {
+      dropped.set_state(CDCStreamDroppedTabletPB::TAIL_LOST);
+    }
+  }
+  if (dropped.state() == CDCStreamDroppedTabletPB::RETAINED) {
+    // The leader of the tablet is not tracked once it is dropped: give every
+    // replica, at the address its tablet server registered with if known.
+    for (const auto& peer : peers) {
+      shared_ptr<TSDescriptor> ts_desc;
+      TSInfoPB ts_info;
+      if (master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid(), &ts_desc)) {
+        ts_desc->GetTSInfoPB(&ts_info, /*use_external_addr=*/false);
+      }
+      if (ts_info.rpc_addresses_size() > 0) {
+        *dropped.add_replicas() = ts_info.rpc_addresses(0);
+      } else if (peer.has_last_known_addr()) {
+        *dropped.add_replicas() = peer.last_known_addr();
+      }
+    }
+  }
+  *info->add_dropped_tablets() = std::move(dropped);
+  return true;
+}
+
+namespace {
+
+// Applies one checkpoint or activity report 'req' to the checkpoint row 'pb' of
+// 'info', which the caller holds locked for writing. 'now_micros' is the time
+// of the report.
+void ApplyCDCCheckpointUpdate(const UpdateCDCCheckpointRequestPB& req,
+                              int64_t now_micros,
+                              CDCTabletCheckpointInfo* info,
+                              SysCDCTabletCheckpointEntryPB* pb) {
+  // Always stamp the row's identity (also initializes a freshly-created object).
+  pb->set_stream_id(req.stream_id());
+  pb->set_tablet_id(req.tablet_id());
+  // Whether this report shows forward progress for the max-staleness guard.
+  bool progress = false;
+  // A lightweight activity heartbeat only refreshes the last-active time; it must
+  // not touch the durable checkpoint or history floor.
+  if (!req.refresh_active_time_only()) {
+    // A consumer checkpoint (one without a snapshot cursor) at or past the
+    // streaming start point of an active snapshot, which the stored op_index
+    // is at or above, comes from a consumer that got the snapshot's last page
+    // and streams the WAL: the snapshot is complete. The tablet server that
+    // served that page reports the completion with the cursor, but it may no
+    // longer be the leader. A checkpoint of 0 is not such a report, even if
+    // the streaming start point is 0: it is the position of a consumer that
+    // has not streamed yet.
+    if (!req.has_snapshot_snap_ts() && pb->snapshot_active() && pb->has_op_index() &&
+        req.op_index() > 0 && req.op_index() >= pb->op_index()) {
+      pb->set_snapshot_active(false);
+      progress = true;
+    }
+    // A checkpoint whose op_index strictly exceeds the stored one is forward
+    // progress. Re-sending the same (or a lower) index -- as a consumer that
+    // polls but never advances does -- is not, so the max-staleness guard can
+    // fire. A tablet with no prior checkpoint (op_index unset) counts as an
+    // advance (the first progress).
+    //
+    // Persist the checkpoint monotonically (keep max(existing, op_index)). A
+    // new leader whose local WAL anchor lags could otherwise report a lower
+    // op_index; storing it would move the durable checkpoint backward and make
+    // RunCDCStreamMaintenance fan out a lower min_retained_op_index, retaining
+    // more WAL than needed (safe but wasteful and confusing). Only ever advance.
+    if (!pb->has_op_index() || req.op_index() > pb->op_index()) {
+      pb->set_op_index(req.op_index());
+      progress = true;
+    }
+    if (req.has_history_safe_time_micros()) {
+      pb->set_history_safe_time_micros(req.history_safe_time_micros());
+    }
+    if (req.dropped_tablet_drained()) {
+      pb->set_dropped_tablet_drained(true);
+    }
+    // Durable snapshot-progress cursor (resumable snapshot bootstrap). Applied
+    // under a generation/monotonicity rule so neither a lagging new leader nor a
+    // stale write from an abandoned snapshot generation can corrupt the cursor.
+    // HybridTime is strictly increasing, so snapshot_snap_ts orders generations;
+    // within a generation the encoded PK is lexicographically increasing (as
+    // op_index is kept monotonic above).
+    //
+    // During a snapshot op_index stays at the streaming start, so a cursor that
+    // moves forward is what counts as progress for the max-staleness guard; a
+    // re-sent cursor is not.
+    if (req.has_snapshot_snap_ts()) {
+      const uint64_t in_ts = req.snapshot_snap_ts();
+      const uint64_t cur_ts = pb->snapshot_snap_ts();  // 0 when unset
+      if (!pb->has_snapshot_snap_ts() || in_ts > cur_ts) {
+        // A new (strictly later) snapshot generation: replace wholesale. This is
+        // the establish of a fresh snapshot, including a legitimate re-snapshot
+        // after a genuine loss (which takes a later snap_ts).
+        pb->set_snapshot_snap_ts(in_ts);
+        pb->set_snapshot_resume_key(req.snapshot_resume_key());
+        pb->set_snapshot_active(req.snapshot_active());
+        progress = true;
+      } else if (in_ts == cur_ts) {
+        // Same generation: advance the cursor forward only. A lagging new leader
+        // that re-persists an earlier page must not move it backward.
+        if (req.snapshot_resume_key() > pb->snapshot_resume_key()) {
+          pb->set_snapshot_resume_key(req.snapshot_resume_key());
+          progress = true;
+        }
+        // Within a generation the snapshot only ever goes from active to done:
+        // a delayed page write landing after the completion write must not
+        // re-activate it (a completed snapshot would be offered for resume).
+        if (pb->snapshot_active() && !req.snapshot_active()) {
+          pb->set_snapshot_active(false);
+          progress = true;
+        }
+      }
+      // in_ts < cur_ts: a stale write from an older, abandoned generation. Ignore.
+    }
+  }
+  // A consumer whose checkpoint is at or past the tablet's committed index has
+  // nothing left to read. An idle tablet cannot advance its checkpoint, so
+  // count such a report as progress too.
+  if (req.has_up_to_op_index() && pb->has_op_index() &&
+      pb->op_index() >= req.up_to_op_index()) {
+    progress = true;
+  }
+  if (progress) {
+    pb->set_last_checkpoint_advance_time_micros(now_micros);
+    // Record the advance attempt in memory BEFORE the sys-catalog write.
+    // If the durable write fails (e.g. transient sys-catalog error), this lets
+    // RunCDCStreamMaintenance distinguish "consumer is advancing but cannot
+    // persist" (barrier must be held) from "consumer is genuinely stuck"
+    // (barrier may be released). Not durable; it resets to 0 on master restart,
+    // where cdc_leader_ready_micros_ provides the equivalent grace.
+    info->last_checkpoint_advance_attempt_micros_.store(now_micros,
+                                                        std::memory_order_relaxed);
+  }
+  // Any checkpoint or activity report refreshes the tablet's last-active time so
+  // the retention barrier is held for a live consumer.
+  pb->set_last_active_time_micros(now_micros);
+}
+
+} // anonymous namespace
+
+Status CatalogManager::ValidateCDCCheckpointUpdate(const UpdateCDCCheckpointRequestPB& req) {
+  // A negative index would make the tablet's barrier a release.
+  if (!req.refresh_active_time_only() && req.op_index() < 0) {
+    return Status::InvalidArgument(Substitute(
+        "CDC checkpoint of stream $0 tablet $1 has a negative op index $2",
+        req.stream_id(), req.tablet_id(), req.op_index()));
+  }
+  scoped_refptr<CDCStreamInfo> stream;
+  scoped_refptr<TabletInfo> tablet;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    stream = FindPtrOrNull(cdc_stream_map_, req.stream_id());
+    tablet = FindPtrOrNull(tablet_map_, req.tablet_id());
+  }
+  if (!stream) {
+    return Status::OK();  // the write skips it
+  }
+  CDCStreamMetadataLock l(stream.get(), LockMode::READ);
+  if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE) {
+    return Status::OK();  // the write skips it
+  }
+  // A row for a tablet of another table would set or release that tablet's
+  // barrier.
+  const auto& table_ids = l.data().pb.table_ids();
+  if (!tablet || std::find(table_ids.begin(), table_ids.end(), tablet->table()->id()) ==
+                     table_ids.end()) {
+    return Status::InvalidArgument(Substitute(
+        "tablet $0 is not a tablet of CDC stream $1", req.tablet_id(), req.stream_id()));
+  }
+  return Status::OK();
+}
+
+Status CatalogManager::UpdateCDCCheckpoint(const UpdateCDCCheckpointRequestPB* req,
+                                           UpdateCDCCheckpointResponsePB* /*resp*/) {
+  RETURN_NOT_OK(ValidateCDCCheckpointUpdate(*req));
+  int num_skipped = 0;
+  RETURN_NOT_OK(WriteCDCCheckpointUpdates({ req }, &num_skipped));
+  if (num_skipped > 0) {
+    return Status::NotFound(Substitute("CDC stream $0 not found", req->stream_id()));
+  }
+  return Status::OK();
+}
+
+Status CatalogManager::UpdateCDCCheckpoints(const UpdateCDCCheckpointsRequestPB& req) {
+  vector<const UpdateCDCCheckpointRequestPB*> updates;
+  updates.reserve(req.updates_size());
+  for (const auto& u : req.updates()) {
+    Status s = ValidateCDCCheckpointUpdate(u);
+    if (PREDICT_FALSE(!s.ok())) {
+      KLOG_EVERY_N_SECS(WARNING, 60) << "CDC: rejected checkpoint update: " << s.ToString();
+      continue;
+    }
+    updates.push_back(&u);
+  }
+  int num_skipped = 0;
+  RETURN_NOT_OK(WriteCDCCheckpointUpdates(updates, &num_skipped));
+  if (num_skipped > 0) {
+    VLOG(1) << Substitute("CDC: skipped $0 of $1 checkpoint updates for streams "
+                          "that are not active", num_skipped, updates.size());
+  }
+  return Status::OK();
+}
+
+Status CatalogManager::WriteCDCCheckpointUpdates(
+    const vector<const UpdateCDCCheckpointRequestPB*>& updates,
+    int* num_skipped) {
+  *num_skipped = 0;
+  // The updates grouped by row, in (stream, tablet) order. Every writer locks
+  // rows in this order, so two concurrent batches cannot deadlock.
+  std::map<std::pair<string, string>, vector<const UpdateCDCCheckpointRequestPB*>>
+      updates_by_row;
+  for (const auto* u : updates) {
+    updates_by_row[{ u->stream_id(), u->tablet_id() }].push_back(u);
+  }
+
+  // Confirm each stream exists and is ACTIVE, and locate any existing
+  // per-(stream, tablet) checkpoint rows in one shared-lock pass. Each tablet
+  // keeps an independent row and lock, so a checkpoint does not rewrite the
+  // whole stream proto. A stream that is not ACTIVE is treated as absent, as in
+  // GetCDCStreamInfo: a DELETING stream is being reaped, and a row written now
+  // could land after the reap removed the stream's rows and outlive it.
+  const auto is_active = [](const scoped_refptr<CDCStreamInfo>& s) {
+    CDCStreamMetadataLock l(s.get(), LockMode::READ);
+    return l.data().pb.state() == SysCDCStreamEntryPB::ACTIVE;
+  };
+  std::map<string, scoped_refptr<CDCStreamInfo>> streams;
+  struct Row {
+    scoped_refptr<CDCTabletCheckpointInfo> info;
+    const vector<const UpdateCDCCheckpointRequestPB*>* updates;
+  };
+  vector<Row> rows;
+  rows.reserve(updates_by_row.size());
+  bool missing_rows = false;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (const auto& e : updates_by_row) {
+      const string& stream_id = e.first.first;
+      auto stream_it = streams.find(stream_id);
+      if (stream_it == streams.end()) {
+        scoped_refptr<CDCStreamInfo> stream = FindPtrOrNull(cdc_stream_map_, stream_id);
+        stream_it = streams.emplace(stream_id,
+                                    stream && is_active(stream) ? stream : nullptr).first;
+      }
+      if (!stream_it->second) {
+        *num_skipped += e.second.size();
+        continue;
+      }
+      scoped_refptr<CDCTabletCheckpointInfo> info;
+      auto sit = cdc_tablet_checkpoint_map_.find(stream_id);
+      if (sit != cdc_tablet_checkpoint_map_.end()) {
+        info = FindPtrOrNull(sit->second, e.first.second);
+      }
+      missing_rows |= !info;
+      rows.push_back({ std::move(info), &e.second });
+    }
+  }
+  // First checkpoint (or heartbeat) for a tablet: create the canonical row
+  // object under a brief write lock. Double-checked because the shared lock was
+  // dropped, so a concurrent create for the same tablet resolves to one object.
+  if (missing_rows) {
+    std::lock_guard lock(lock_);
+    auto it = rows.begin();
+    while (it != rows.end()) {
+      if (it->info) {
+        ++it;
+        continue;
+      }
+      const auto* first = it->updates->front();
+      const string& stream_id = first->stream_id();
+      const auto& stream = streams[stream_id];
+      if (!ContainsKey(cdc_stream_map_, stream_id) || !is_active(stream)) {
+        *num_skipped += it->updates->size();
+        it = rows.erase(it);
+        continue;
+      }
+      auto& tablets = cdc_tablet_checkpoint_map_[stream_id];
+      it->info = FindPtrOrNull(tablets, first->tablet_id());
+      if (!it->info) {
+        it->info = new CDCTabletCheckpointInfo(stream_id, first->tablet_id());
+        tablets[first->tablet_id()] = it->info;
+      }
+      ++it;
+    }
+  }
+
+  // Hold each stream's READ lock across the writes: DeleteCDCStream cannot
+  // commit DELETING until they are done, so once a stream is DELETING no later
+  // checkpoint can write a row behind the reap. lock_ is not held here, which
+  // keeps the lock_ -> stream lock order used elsewhere. Streams are locked in
+  // id order, before any row.
+  vector<CDCStreamMetadataLock> stream_locks;
+  stream_locks.reserve(streams.size());
+  std::unordered_set<string> inactive_streams;
+  for (const auto& e : streams) {
+    if (!e.second) {
+      continue;
+    }
+    stream_locks.emplace_back(e.second.get(), LockMode::READ);
+    if (stream_locks.back().data().pb.state() != SysCDCStreamEntryPB::ACTIVE) {
+      inactive_streams.insert(e.first);
+    }
+  }
+
+  const int64_t now_micros = GetCurrentTimeMicros();
+  vector<CDCTabletCheckpointMetadataLock> row_locks;
+  row_locks.reserve(rows.size());
+  vector<SysCDCTabletCheckpointEntryPB> pbs;
+  pbs.reserve(rows.size());
+  for (const auto& row : rows) {
+    if (ContainsKey(inactive_streams, row.info->stream_id())) {
+      *num_skipped += row.updates->size();
+      continue;
+    }
+    // Record the report in memory before the sys-catalog write below, so a
+    // consumer that keeps reporting is not expired while the durable write of
+    // last_active_time_micros fails (see last_active_attempt_micros_).
+    row.info->last_active_attempt_micros_.store(now_micros, std::memory_order_relaxed);
+    row_locks.emplace_back(row.info.get(), LockMode::WRITE);
+    auto* pb = &row_locks.back().mutable_data()->pb;
+    for (const auto* u : *row.updates) {
+      ApplyCDCCheckpointUpdate(*u, now_micros, row.info.get(), pb);
+    }
+    pbs.push_back(*pb);
+  }
+
+  // Write the rows in chunks. A failed chunk leaves its rows and all later
+  // ones uncommitted (the locks abort their changes); earlier chunks are
+  // durable and committed.
+  for (size_t begin = 0; begin < pbs.size(); begin += kCDCCheckpointRowsPerWrite) {
+    const size_t end = std::min(begin + kCDCCheckpointRowsPerWrite, pbs.size());
+    const vector<SysCDCTabletCheckpointEntryPB> chunk(pbs.begin() + begin,
+                                                      pbs.begin() + end);
+    RETURN_NOT_OK(sys_catalog_->WriteCDCTabletCheckpoints(chunk));
+    for (size_t i = begin; i < end; ++i) {
+      row_locks[i].Commit();
+    }
+  }
+  return Status::OK();
+}
+
+void CatalogManager::set_last_checkpoint_advance_attempt_micros_for_tests(
+    const string& stream_id, const string& tablet_id, int64_t v) {
+  std::shared_lock<rw_spinlock> lock(lock_);
+  auto sit = cdc_tablet_checkpoint_map_.find(stream_id);
+  if (sit == cdc_tablet_checkpoint_map_.end()) return;
+  auto it = sit->second.find(tablet_id);
+  if (it == sit->second.end()) return;
+  it->second->last_checkpoint_advance_attempt_micros_.store(v, std::memory_order_relaxed);
+}
+
+bool CatalogManager::GetCDCBarrierReplicas(const string& tablet_id,
+                                           scoped_refptr<TabletInfo>* tablet,
+                                           vector<string>* replica_uuids) {
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    *tablet = FindPtrOrNull(tablet_map_, tablet_id);
+  }
+  if (!*tablet) {
+    return false;
+  }
+  TabletMetadataLock l(tablet->get(), LockMode::READ);
+  // A deleted (dropped or replaced) tablet's replicas are being deleted along
+  // with their WAL and barrier, so there is nothing to set or release, unless
+  // the tablet is kept for CDC.
+  if ((l.data().is_deleted() && !IsCDCRetainedDroppedTablet(tablet_id)) ||
+      !l.data().pb.has_consensus_state()) {
+    return false;
+  }
+  replica_uuids->clear();
+  for (const auto& peer : l.data().pb.consensus_state().committed_config().peers()) {
+    replica_uuids->emplace_back(peer.permanent_uuid());
+  }
+  return true;
+}
+
+void CatalogManager::SendCDCRetentionBarrierToAllReplicas(
+    const string& tablet_id,
+    int64_t min_retained_op_index,
+    uint64_t history_safe_time_micros,
+    int64_t barrier_seq,
+    const string& release_consumer_stream_id,
+    bool skip_barrier_update,
+    vector<scoped_refptr<MonitoredTask>>* out_tasks,
+    bool tablet_dropped) {
+  if (!skip_barrier_update) {
+    // This update replaces the barrier the last maintenance pass sent, so the
+    // next pass must send its barrier to every replica again. The finished
+    // tasks of the forgotten state are freed after the spinlock.
+    decltype(cdc_barrier_replica_state_)::node_type forgotten;
+    std::lock_guard l(cdc_barrier_replica_state_lock_);
+    forgotten = cdc_barrier_replica_state_.extract(tablet_id);
+  }
+  scoped_refptr<TabletInfo> tablet;
+  vector<string> replica_uuids;
+  if (!GetCDCBarrierReplicas(tablet_id, &tablet, &replica_uuids)) {
+    return;
+  }
+  for (const auto& uuid : replica_uuids) {
+    scoped_refptr<AsyncUpdateCDCRetentionBarrier> task =
+        new AsyncUpdateCDCRetentionBarrier(
+            master_, uuid, tablet->table().get(),
+            tablet_id, min_retained_op_index, history_safe_time_micros,
+            barrier_seq, release_consumer_stream_id, skip_barrier_update, tablet_dropped);
+    tablet->table()->AddTask(tablet_id, task);
+    WARN_NOT_OK(task->Run(), Substitute(
+        "Failed to send UpdateCDCRetentionBarrier for tablet $0", tablet_id));
+    if (out_tasks) {
+      out_tasks->push_back(task);
+    }
+  }
+}
+
+void CatalogManager::SetCDCBarrierOnReplicas(const string& tablet_id,
+                                             int64_t min_retained_op_index,
+                                             uint64_t history_safe_time_micros,
+                                             int64_t barrier_seq,
+                                             bool tablet_dropped) {
+  scoped_refptr<TabletInfo> tablet;
+  vector<string> replica_uuids;
+  if (!GetCDCBarrierReplicas(tablet_id, &tablet, &replica_uuids)) {
+    return;
+  }
+  // The instance sequence number of a tablet server changes when it restarts,
+  // which drops the in-memory part of the barrier.
+  vector<int64_t> ts_seqnos;
+  ts_seqnos.reserve(replica_uuids.size());
+  for (const auto& uuid : replica_uuids) {
+    shared_ptr<TSDescriptor> ts_desc;
+    ts_seqnos.push_back(master_->ts_manager()->LookupTSByUUID(uuid, &ts_desc)
+                            ? ts_desc->latest_seqno() : -1);
+  }
+  const MonoTime now = MonoTime::Now();
+  const MonoDelta refresh_interval =
+      MonoDelta::FromMilliseconds(FLAGS_cdc_barrier_refresh_interval_ms);
+  // The replicas to send the barrier to, and the finished tasks to free once
+  // the spinlock is released.
+  vector<size_t> send_to;
+  vector<scoped_refptr<MonitoredTask>> finished;
+  {
+    std::lock_guard l(cdc_barrier_replica_state_lock_);
+    auto& replicas = cdc_barrier_replica_state_[tablet_id];
+    // Forget the replicas that left the config.
+    for (auto it = replicas.begin(); it != replicas.end();) {
+      if (std::find(replica_uuids.begin(), replica_uuids.end(), it->first) ==
+          replica_uuids.end()) {
+        finished.emplace_back(std::move(it->second.task));
+        it = replicas.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (size_t i = 0; i < replica_uuids.size(); ++i) {
+      auto* st = FindOrNull(replicas, replica_uuids[i]);
+      if (!st) {
+        send_to.push_back(i);
+        continue;
+      }
+      if (st->task) {
+        const CDCReleaseState state = GetCDCReleaseState(st->task);
+        if (state == CDCReleaseState::kInFlight) {
+          // Still trying to deliver an earlier barrier. The replica's sequence
+          // gate orders it against this pass's barrier, which is sent once the
+          // earlier task ends.
+          continue;
+        }
+        st->delivered = state == CDCReleaseState::kDelivered;
+        finished.emplace_back(std::move(st->task));
+      }
+      if (st->delivered &&
+          st->min_retained_op_index == min_retained_op_index &&
+          st->history_safe_time_micros == history_safe_time_micros &&
+          st->tablet_dropped == tablet_dropped &&
+          st->ts_instance_seqno == ts_seqnos[i] &&
+          now - st->sent_time < refresh_interval) {
+        continue;
+      }
+      send_to.push_back(i);
+    }
+  }
+  finished.clear();
+  if (send_to.empty()) {
+    return;
+  }
+
+  vector<scoped_refptr<AsyncUpdateCDCRetentionBarrier>> tasks;
+  tasks.reserve(send_to.size());
+  for (size_t i : send_to) {
+    tasks.emplace_back(new AsyncUpdateCDCRetentionBarrier(
+        master_, replica_uuids[i], tablet->table().get(), tablet_id,
+        min_retained_op_index, history_safe_time_micros, barrier_seq,
+        /*release_consumer_stream_id=*/"", /*skip_barrier_update=*/false, tablet_dropped));
+  }
+  {
+    std::lock_guard l(cdc_barrier_replica_state_lock_);
+    auto& replicas = cdc_barrier_replica_state_[tablet_id];
+    for (size_t j = 0; j < send_to.size(); ++j) {
+      const size_t i = send_to[j];
+      replicas[replica_uuids[i]] = { tasks[j], /*delivered=*/false, min_retained_op_index,
+                                     history_safe_time_micros, tablet_dropped, ts_seqnos[i],
+                                     now };
+    }
+  }
+  for (const auto& task : tasks) {
+    tablet->table()->AddTask(tablet_id, task);
+    WARN_NOT_OK(task->Run(), Substitute(
+        "Failed to send UpdateCDCRetentionBarrier for tablet $0", tablet_id));
+  }
+}
+
+int CatalogManager::NumFinishedCDCBarrierTasksHeldForTests(const string& tablet_id) {
+  std::lock_guard l(cdc_barrier_replica_state_lock_);
+  const auto* replicas = FindOrNull(cdc_barrier_replica_state_, tablet_id);
+  if (!replicas) {
+    return 0;
+  }
+  int n = 0;
+  for (const auto& e : *replicas) {
+    if (e.second.task && GetCDCReleaseState(e.second.task) != CDCReleaseState::kInFlight) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+void CatalogManager::GetActiveCDCRowsOfTablet(
+    const string& tablet_id, vector<scoped_refptr<CDCTabletCheckpointInfo>>* rows,
+    bool streaming_only) {
+  rows->clear();
+  std::shared_lock<rw_spinlock> lock(lock_);
+  for (const auto& e : cdc_tablet_checkpoint_map_) {
+    const auto* row = FindOrNull(e.second, tablet_id);
+    const auto* stream = FindOrNull(cdc_stream_map_, e.first);
+    if (!row || !stream) {
+      continue;
+    }
+    CDCStreamMetadataLock l(stream->get(), LockMode::READ);
+    if (l.data().pb.state() == SysCDCStreamEntryPB::ACTIVE &&
+        (!streaming_only ||
+         l.data().pb.config().snapshot_mode() != CDCStreamConfigPB::INITIAL_ONLY)) {
+      rows->emplace_back(*row);
+    }
+  }
+}
+
+bool CatalogManager::RetainDroppedTabletForCDC(const string& tablet_id) {
+  if (FLAGS_cdc_dropped_tablet_retention_secs == 0) {
+    return false;
+  }
+  // A stream whose output is a snapshot only does not read the WAL.
+  vector<scoped_refptr<CDCTabletCheckpointInfo>> rows;
+  GetActiveCDCRowsOfTablet(tablet_id, &rows, /*streaming_only=*/true);
+  bool needed = false;
+  for (const auto& row : rows) {
+    CDCTabletCheckpointMetadataLock l(row.get(), LockMode::READ);
+    const auto& pb = l.data().pb;
+    needed |= !pb.dropped_tablet_drained() && !pb.dropped_tablet_tail_lost();
+  }
+  if (!needed) {
+    return false;
+  }
+  {
+    std::lock_guard l(cdc_retained_dropped_tablets_lock_);
+    cdc_retained_dropped_tablets_.insert(tablet_id);
+  }
+  LOG_WITH_PREFIX(INFO) << Substitute(
+      "keeping tablet $0 of a dropped range partition for at most $1 s for CDC "
+      "streams to read the rest of its changes", tablet_id,
+      FLAGS_cdc_dropped_tablet_retention_secs);
+  return true;
+}
+
+void CatalogManager::SendCDCDroppedTabletFence(const string& tablet_id) {
+  // The replicas reject writes from now on. The barrier of each maintenance
+  // pass tells them again.
+  SendCDCRetentionBarrierToAllReplicas(tablet_id, /*min_retained_op_index=*/-1,
+                                       /*history_safe_time_micros=*/0, /*barrier_seq=*/0,
+                                       /*release_consumer_stream_id=*/"",
+                                       /*skip_barrier_update=*/true, /*out_tasks=*/nullptr,
+                                       /*tablet_dropped=*/true);
+}
+
+bool CatalogManager::IsCDCRetainedDroppedTablet(const string& tablet_id) const {
+  std::lock_guard l(cdc_retained_dropped_tablets_lock_);
+  return ContainsKey(cdc_retained_dropped_tablets_, tablet_id);
+}
+
+void CatalogManager::RebuildCDCRetainedDroppedTablets() {
+  // Collect the rows of the active streams that read the WAL, and their
+  // tablets, under lock_; read them under their own locks after.
+  vector<std::pair<scoped_refptr<TabletInfo>, scoped_refptr<CDCTabletCheckpointInfo>>> rows;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (const auto& e : cdc_tablet_checkpoint_map_) {
+      const auto* stream = FindOrNull(cdc_stream_map_, e.first);
+      if (!stream) {
+        continue;
+      }
+      CDCStreamMetadataLock l(stream->get(), LockMode::READ);
+      if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE ||
+          l.data().pb.config().snapshot_mode() == CDCStreamConfigPB::INITIAL_ONLY) {
+        continue;
+      }
+      for (const auto& t : e.second) {
+        scoped_refptr<TabletInfo> tablet = FindPtrOrNull(tablet_map_, t.first);
+        if (tablet) {
+          rows.emplace_back(std::move(tablet), t.second);
+        }
+      }
+    }
+  }
+  std::unordered_set<string> retained;
+  for (const auto& [tablet, row] : rows) {
+    {
+      TableMetadataLock table_lock(tablet->table().get(), LockMode::READ);
+      TabletMetadataLock tablet_lock(tablet.get(), LockMode::READ);
+      // Only a tablet of a dropped range partition, which did run.
+      if (table_lock.data().is_deleted() ||
+          tablet_lock.data().pb.state() != SysTabletsEntryPB::DELETED ||
+          !tablet_lock.data().pb.has_consensus_state()) {
+        continue;
+      }
+    }
+    CDCTabletCheckpointMetadataLock l(row.get(), LockMode::READ);
+    if (!l.data().pb.dropped_tablet_drained() && !l.data().pb.dropped_tablet_tail_lost()) {
+      retained.insert(tablet->id());
+    }
+  }
+  if (!retained.empty()) {
+    LOG_WITH_PREFIX(INFO) << Substitute(
+        "$0 tablet(s) of dropped range partitions are kept for CDC streams", retained.size());
+  }
+  std::lock_guard l(cdc_retained_dropped_tablets_lock_);
+  cdc_retained_dropped_tablets_.swap(retained);
+}
+
+Status CatalogManager::MarkCDCRowsTailLost(
+    const vector<scoped_refptr<CDCTabletCheckpointInfo>>& rows) {
+  for (const auto& row : rows) {
+    CDCTabletCheckpointMetadataLock l(row.get(), LockMode::WRITE);
+    auto* pb = &l.mutable_data()->pb;
+    if (pb->dropped_tablet_drained() || pb->dropped_tablet_tail_lost()) {
+      continue;
+    }
+    pb->set_stream_id(row->stream_id());
+    pb->set_tablet_id(row->tablet_id());
+    pb->set_dropped_tablet_tail_lost(true);
+    RETURN_NOT_OK(sys_catalog_->WriteCDCTabletCheckpoint(row->stream_id(), row->tablet_id(),
+                                                         *pb));
+    // Read before Commit(), which frees the mutable copy 'pb' points into.
+    const string op_index = pb->has_op_index() ? std::to_string(pb->op_index()) : "<none>";
+    l.Commit();
+    LOG_WITH_PREFIX(WARNING) << Substitute(
+        "CDC stream $0 did not read all changes of tablet $1, whose range partition "
+        "was dropped, before the tablet was deleted: the changes after op index $2 "
+        "are lost to it", row->stream_id(), row->tablet_id(), op_index);
+  }
+  return Status::OK();
+}
+
+void CatalogManager::ReleaseCDCRetainedDroppedTablets(
+    const std::unordered_set<string>& needed_tablets) {
+  vector<string> retained;
+  {
+    std::lock_guard l(cdc_retained_dropped_tablets_lock_);
+    retained.assign(cdc_retained_dropped_tablets_.begin(), cdc_retained_dropped_tablets_.end());
+  }
+  const int64_t now = time(nullptr);
+  for (const auto& tablet_id : retained) {
+    scoped_refptr<TabletInfo> tablet;
+    {
+      std::shared_lock<rw_spinlock> lock(lock_);
+      tablet = FindPtrOrNull(tablet_map_, tablet_id);
+    }
+    bool table_deleted = false;
+    int64_t drop_time = 0;
+    if (tablet) {
+      TableMetadataLock table_lock(tablet->table().get(), LockMode::READ);
+      TabletMetadataLock tablet_lock(tablet.get(), LockMode::READ);
+      // The drop is not committed in memory yet (see AlterTable()).
+      if (tablet_lock.data().pb.state() != SysTabletsEntryPB::DELETED) {
+        continue;
+      }
+      table_deleted = table_lock.data().is_deleted();
+      drop_time = tablet_lock.data().pb.delete_timestamp();
+    }
+    const bool retention_expired =
+        now - drop_time >= FLAGS_cdc_dropped_tablet_retention_secs;
+    if (tablet && !table_deleted && !retention_expired &&
+        ContainsKey(needed_tablets, tablet_id)) {
+      continue;
+    }
+    // Record which streams lose the rest of the tablet's changes before the
+    // tablet is gone. Retried by the next pass if that fails.
+    vector<scoped_refptr<CDCTabletCheckpointInfo>> rows;
+    GetActiveCDCRowsOfTablet(tablet_id, &rows);
+    Status s = MarkCDCRowsTailLost(rows);
+    if (!s.ok()) {
+      KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+          "CDC: failed to record the streams that did not read all changes of dropped "
+          "tablet $0: $1 (will retry on the next maintenance pass)", tablet_id, s.ToString());
+      continue;
+    }
+    {
+      std::lock_guard l(cdc_retained_dropped_tablets_lock_);
+      cdc_retained_dropped_tablets_.erase(tablet_id);
+    }
+    if (!tablet) {
+      continue;
+    }
+    LOG_WITH_PREFIX(INFO) << Substitute(
+        "deleting tablet $0 of a dropped range partition, which was kept for CDC: $1",
+        tablet_id, retention_expired ? "--cdc_dropped_tablet_retention_secs elapsed"
+                                     : "no active CDC stream needs its changes any more");
+    TabletMetadataLock l(tablet.get(), LockMode::READ);
+    SendDeleteTabletRequest(tablet, l, l.data().pb.state_msg());
+  }
+}
+
+void CatalogManager::RunCDCStreamMaintenance() {
+  // 0a. Backstop: mark DELETING any ACTIVE stream whose referenced
+  //     table has been dropped. DeleteTable already does this eagerly, but this
+  //     pass self-heals across master failover and any best-effort eager failure
+  //     (and catches ghost streams created before this logic existed). Runs
+  //     before the reap so a stream condemned here is cleaned up this same pass.
+  MarkDeletingStreamsForDroppedTables();
+
+  // 0b. Finish any two-phase stream deletions (phase 2 of DeleteCDCStream) and
+  //    reap orphaned checkpoint rows before computing barriers, so a DELETING
+  //    stream's tablets are released this pass rather than lingering, and reaped
+  //    streams are already out of the maps for the computation below.
+  ReapDeletedCDCStreams();
+
+  // 0c. Register tablets added by ADD_RANGE_PARTITION since the last pass.
+  //     This is the crash-safe self-heal path: if the eager AlterTable hook
+  //     (RegisterNewTabletsWithCDCStreams) was skipped or the master failed
+  //     before it completed, this pass restores correct coverage. Runs after
+  //     the reap so DELETING streams are already excluded, and the checkpoint
+  //     rows written here are visible to the barrier snapshot below (step 1).
+  ReconcileNewPartitionsForCDCStreams();
+
+  // 1. Compute the per-tablet minimum checkpoint across all active, non-expired
+  //    streams. The minimum is the furthest-behind consumer, i.e. the op index
+  //    the WAL must still retain for that tablet. A stream idle beyond
+  //    --cdc_stream_expiry_ms is excluded, so its barriers are released below.
+  std::unordered_map<string, int64_t> tablet_min_index;
+  // For FULL/snapshot streams: the per-tablet minimum (oldest) MVCC history floor
+  // across those streams. Fanned out so followers retain the UNDO history that
+  // before-image / snapshot reads need.
+  std::unordered_map<string, uint64_t> tablet_min_history_floor;
+  // Per active stream: the tablet ids it references, so stale (dropped-partition)
+  // ones can be pruned from its metadata below.
+  std::unordered_map<string, vector<string>> stream_refs;
+  const int64_t now_micros = GetCurrentTimeMicros();
+  // Taken before the barriers are computed, so an eager barrier pushed while
+  // this pass runs (CreateCDCStream) outranks this pass's SETs.
+  const int64_t pass_seq = NextCDCBarrierSeq();
+  const int64_t staleness_micros = FLAGS_cdc_max_staleness_ms > 0
+      ? FLAGS_cdc_max_staleness_ms * 1000 : 0;
+  // Grace floor for the staleness guard and the expiry check: never count
+  // staleness or idleness that accrued before this master leader was ready to
+  // receive checkpoint persists and activity reports. A stream whose last
+  // durable report predates this leader becoming ready (e.g. because the
+  // previous master was unreachable and every PersistCheckpoint was failing) is
+  // given a full window from readiness to report again. After the master has
+  // been leader longer than the window this is a no-op (the floor is far in the
+  // past), so a genuinely stuck or dead consumer is still released on schedule.
+  const int64_t leader_ready_micros =
+      cdc_leader_ready_micros_.load(std::memory_order_acquire);
+  // Tablets whose rows are idle beyond the expiry window but still within the
+  // window since this leader became ready (see 'in_expiry_grace' below), with
+  // the minimum op index and history floor of those rows.
+  std::unordered_map<string, int64_t> grace_min_index;
+  std::unordered_map<string, uint64_t> grace_min_history_floor;
+  // Snapshot each active stream (its record type and its per-tablet checkpoint
+  // row refptrs) under lock_, so the per-row metadata locks below are taken
+  // without holding lock_.
+  struct StreamSnapshot {
+    scoped_refptr<CDCStreamInfo> stream;
+    bool is_full;
+    bool ephemeral;
+    // Whether the stream's output is a snapshot only.
+    bool initial_only;
+    vector<scoped_refptr<CDCTabletCheckpointInfo>> rows;
+  };
+  std::unordered_map<string, StreamSnapshot> snapshot;
+  int64_t num_deleting_streams = 0;
+  {
+    std::shared_lock<rw_spinlock> lock(lock_);
+    for (const auto& entry : cdc_stream_map_) {
+      CDCStreamMetadataLock l(entry.second.get(), LockMode::READ);
+      if (l.data().pb.state() != SysCDCStreamEntryPB::ACTIVE) {
+        ++num_deleting_streams;
+        continue;
+      }
+      StreamSnapshot ss;
+      ss.stream = entry.second;
+      ss.is_full = l.data().pb.config().record_type() == CDCStreamConfigPB::FULL;
+      ss.ephemeral = l.data().pb.ephemeral();
+      ss.initial_only =
+          l.data().pb.config().snapshot_mode() == CDCStreamConfigPB::INITIAL_ONLY;
+      auto cit = cdc_tablet_checkpoint_map_.find(entry.first);
+      if (cit != cdc_tablet_checkpoint_map_.end()) {
+        for (const auto& t : cit->second) {
+          ss.rows.emplace_back(t.second);
+        }
+      }
+      snapshot.emplace(entry.first, std::move(ss));
+    }
+  }
+
+  // Expiry and staleness are now evaluated per (stream, tablet): activity and
+  // checkpoint advancement are reported per tablet, so a single lagging or idle
+  // tablet no longer drags the whole stream's retention (or vice versa).
+  // Ephemeral streams all of whose tablets expired; deleted below.
+  vector<scoped_refptr<CDCStreamInfo>> expired_ephemeral_streams;
+  int64_t num_expired_rows = 0;
+  int64_t num_stale_rows = 0;
+  int64_t max_checkpoint_age_micros = 0;
+  // The tablets that an active stream still needs: it has a live row for the
+  // tablet that is not done with it (see the dropped_tablet_* fields).
+  std::unordered_set<string> needed_tablets;
+  // stream id -> the tablets whose row may be removed once the tablet is gone:
+  // the stream drained the dropped tablet, or the row recording that it lost
+  // the tablet's changes expired.
+  std::unordered_map<string, std::unordered_set<string>> removable_rows;
+  // stream id -> tablet id -> its row, for the rows of dropped tablets to mark.
+  std::unordered_map<string, std::unordered_map<string, scoped_refptr<CDCTabletCheckpointInfo>>>
+      rows_by_tablet;
+  for (const auto& entry : snapshot) {
+    const string& stream_id = entry.first;
+    const bool is_full = entry.second.is_full;
+    const int64_t stream_expiry_micros = CDCStreamExpiryMicros(entry.second.ephemeral);
+    bool all_rows_expired = !entry.second.rows.empty();
+    auto& refs = stream_refs[stream_id];
+    for (const auto& row : entry.second.rows) {
+      const string& tablet_id = row->tablet_id();
+      refs.emplace_back(tablet_id);
+      CDCTabletCheckpointMetadataLock l(row.get(), LockMode::READ);
+      const auto& pb = l.data().pb;
+      const CDCCheckpointHealth health = GetCDCCheckpointHealth(
+          pb, *row.get(), now_micros, leader_ready_micros, stream_expiry_micros,
+          staleness_micros);
+      const bool in_expiry_grace = health.in_expiry_grace;
+      const bool expired = health.expired;
+      const bool stale = health.stale;
+      rows_by_tablet[stream_id][tablet_id] = row;
+      // The stream is done with this dropped tablet: the row pins nothing. It
+      // is kept, until it expires, if it records that the stream lost the
+      // tablet's changes, so that the consumer can learn it.
+      if (pb.dropped_tablet_drained() || pb.dropped_tablet_tail_lost()) {
+        if (pb.dropped_tablet_drained() || expired) {
+          removable_rows[stream_id].insert(tablet_id);
+        }
+        continue;
+      }
+      all_rows_expired &= expired;
+      const int64_t last_advance = pb.last_checkpoint_advance_time_micros();
+      if (last_advance > 0) {
+        max_checkpoint_age_micros =
+            std::max(max_checkpoint_age_micros, now_micros - last_advance);
+      }
+      // Log and count each transition to expired or stale once.
+      if (expired) {
+        ++num_expired_rows;
+        if (!row->expiry_reported_.exchange(true)) {
+          LOG(INFO) << Substitute(
+              "CDC stream $0 tablet $1 expired: no consumer activity for $2 ms "
+              "(expiry $3 ms); releasing its retention barrier. A returning "
+              "consumer must bootstrap again.",
+              stream_id, tablet_id,
+              (now_micros - pb.last_active_time_micros()) / 1000,
+              stream_expiry_micros / 1000);
+          cdc_tablet_checkpoint_expirations_.fetch_add(1);
+          if (cdc_tablet_checkpoint_expirations_metric_) {
+            cdc_tablet_checkpoint_expirations_metric_->Increment();
+          }
+        }
+      } else {
+        row->expiry_reported_.store(false);
+      }
+      if (stale && !expired) {
+        ++num_stale_rows;
+        if (!row->staleness_reported_.exchange(true)) {
+          LOG(WARNING) << Substitute(
+              "CDC stream $0 tablet $1 checkpoint has not advanced in $2 ms (limit "
+              "--cdc_max_staleness_ms=$3); releasing its retention barrier. A "
+              "returning consumer must re-bootstrap via snapshot.",
+              stream_id, tablet_id, (now_micros - last_advance) / 1000,
+              FLAGS_cdc_max_staleness_ms);
+          cdc_tablet_checkpoint_stale_events_.fetch_add(1);
+          if (cdc_tablet_checkpoint_stale_events_metric_) {
+            cdc_tablet_checkpoint_stale_events_metric_->Increment();
+          }
+        }
+      } else if (!stale) {
+        row->staleness_reported_.store(false);
+      }
+
+      // Either condition releases this tablet's contribution to retention, the
+      // WAL and the history floor. It does not end a snapshot in progress: the
+      // row keeps snapshot_active and its cursor, and op_index stays the
+      // streaming start point, which GetCDCStreamInfo does not report as a
+      // checkpoint while the snapshot is active. A consumer that returns takes
+      // the snapshot again, at its snap_ts if that history is still there, or
+      // gets SNAPSHOT_SESSION_LOST; one that streamed from op_index would skip
+      // the rows of the snapshot it did not read.
+      if (expired || stale) {
+        continue;
+      }
+      if (!entry.second.initial_only) {
+        needed_tablets.insert(tablet_id);
+      }
+      // FULL streams need history for before-images, and a snapshot in
+      // progress (of any record type) needs it at snap_ts, which is the row's
+      // floor while the snapshot is active. Fanned out to every replica, so a
+      // new leader can resume the snapshot.
+      const bool needs_history = is_full || pb.snapshot_active();
+      // A negative barrier index is a release, which a row must never turn
+      // into: retain the whole WAL for a row with a negative index instead.
+      // UpdateCDCCheckpoint rejects such an index.
+      const int64_t row_op_index = std::max<int64_t>(pb.op_index(), 0);
+      if (in_expiry_grace) {
+        if (pb.has_op_index()) {
+          auto it = grace_min_index.find(tablet_id);
+          if (it == grace_min_index.end() || row_op_index < it->second) {
+            grace_min_index[tablet_id] = row_op_index;
+          }
+        }
+        if (needs_history && pb.history_safe_time_micros() > 0) {
+          const uint64_t floor = pb.history_safe_time_micros();
+          auto it = grace_min_history_floor.find(tablet_id);
+          if (it == grace_min_history_floor.end() || floor < it->second) {
+            grace_min_history_floor[tablet_id] = floor;
+          }
+        }
+        continue;
+      }
+      // Only a tablet with a durable checkpoint pins WAL (a row carrying activity
+      // but no checkpoint yet has op_index unset).
+      if (pb.has_op_index()) {
+        auto it = tablet_min_index.find(tablet_id);
+        if (it == tablet_min_index.end() || row_op_index < it->second) {
+          tablet_min_index[tablet_id] = row_op_index;
+        }
+      }
+      if (needs_history && pb.history_safe_time_micros() > 0) {
+        const uint64_t floor = pb.history_safe_time_micros();
+        auto it = tablet_min_history_floor.find(tablet_id);
+        if (it == tablet_min_history_floor.end() || floor < it->second) {
+          tablet_min_history_floor[tablet_id] = floor;
+        }
+      }
+    }
+    if (entry.second.ephemeral && all_rows_expired) {
+      expired_ephemeral_streams.emplace_back(entry.second.stream);
+    }
+  }
+  cdc_streams_active_.store(static_cast<int64_t>(snapshot.size()));
+  cdc_streams_deleting_.store(num_deleting_streams);
+  cdc_tablet_checkpoints_expired_.store(num_expired_rows);
+  cdc_tablet_checkpoints_stale_.store(num_stale_rows);
+  cdc_max_checkpoint_age_micros_.store(max_checkpoint_age_micros);
+
+  // An ephemeral stream whose consumer went away is deleted, so that it does
+  // not linger: its client was expected to delete it. The reap of a later pass
+  // releases its barriers.
+  for (const auto& stream : expired_ephemeral_streams) {
+    Status s = MarkCDCStreamDeleting(stream.get());
+    if (s.ok()) {
+      LOG(INFO) << Substitute("marked ephemeral CDC stream $0 DELETING: all its "
+                              "tablets expired", stream->id());
+    } else if (!s.IsAlreadyPresent()) {
+      LOG(WARNING) << Substitute("failed to mark expired ephemeral CDC stream $0 "
+                                 "DELETING: $1 (will retry on the next maintenance pass)",
+                                 stream->id(), s.ToString());
+    }
+  }
+
+  // Delete the dropped tablets kept for CDC that no active stream needs any
+  // more. They are gone below.
+  ReleaseCDCRetainedDroppedTablets(needed_tablets);
+
+  // Determine which referenced tablets are gone (absent from tablet_map_, or
+  // marked DELETED/REPLACED by a dropped range partition, unless kept for CDC).
+  // The rows of the dropped (DELETED) ones are kept, see step 2. Tablet
+  // metadata locks are taken outside lock_ to preserve lock ordering.
+  std::unordered_set<string> gone_tablets;
+  std::unordered_set<string> dropped_tablets;
+  {
+    std::unordered_set<string> referenced;
+    for (const auto& e : stream_refs) {
+      for (const auto& t : e.second) {
+        referenced.insert(t);
+      }
+    }
+    for (const auto& tablet_id : referenced) {
+      scoped_refptr<TabletInfo> tablet;
+      {
+        std::shared_lock<rw_spinlock> lock(lock_);
+        tablet = FindPtrOrNull(tablet_map_, tablet_id);
+      }
+      if (!tablet) {
+        gone_tablets.insert(tablet_id);
+        continue;
+      }
+      if (PREDICT_FALSE(FLAGS_catalog_manager_cdc_maintenance_wait_tablet_deleted_ms > 0)) {
+        const MonoTime deadline = MonoTime::Now() + MonoDelta::FromMilliseconds(
+            FLAGS_catalog_manager_cdc_maintenance_wait_tablet_deleted_ms);
+        while (MonoTime::Now() < deadline) {
+          {
+            TabletMetadataLock l(tablet.get(), LockMode::READ);
+            if (l.data().is_deleted()) {
+              break;
+            }
+          }
+          SleepFor(MonoDelta::FromMilliseconds(10));
+        }
+      }
+      // A dropped tablet is added to the kept set before it is marked DELETED,
+      // so the set must be checked after the state is read.
+      TabletMetadataLock l(tablet.get(), LockMode::READ);
+      if (l.data().is_deleted() && !IsCDCRetainedDroppedTablet(tablet_id)) {
+        gone_tablets.insert(tablet_id);
+        if (l.data().pb.state() == SysTabletsEntryPB::DELETED) {
+          dropped_tablets.insert(tablet_id);
+        }
+      }
+    }
+  }
+  // A gone tablet must not be barriered.
+  for (const auto& tablet_id : gone_tablets) {
+    tablet_min_index.erase(tablet_id);
+    tablet_min_history_floor.erase(tablet_id);
+    grace_min_index.erase(tablet_id);
+    grace_min_history_floor.erase(tablet_id);
+  }
+
+  // Rows in the expiry grace: where a live row pins the tablet anyway, include
+  // them in the barrier (conservative). A tablet pinned only by such rows is
+  // held: it gets neither a SET nor a RELEASE this pass, and stays in
+  // cdc_barriered_tablets_ so that it is released once the grace ends.
+  std::unordered_set<string> held_tablets;
+  for (const auto& e : grace_min_index) {
+    auto it = tablet_min_index.find(e.first);
+    if (it == tablet_min_index.end()) {
+      held_tablets.insert(e.first);
+      continue;
+    }
+    it->second = std::min(it->second, e.second);
+    if (auto hf = FindOrNull(grace_min_history_floor, e.first)) {
+      auto fit = tablet_min_history_floor.find(e.first);
+      if (fit == tablet_min_history_floor.end() || *hf < fit->second) {
+        tablet_min_history_floor[e.first] = *hf;
+      }
+    }
+  }
+
+  // 2. Prune gone tablet checkpoint rows. The tablet and its WAL are already
+  //    gone, so no release RPC is needed -- just delete the row and drop it
+  //    from the in-memory map. The row of a dropped tablet that the stream did
+  //    not drain records instead that the stream lost the tablet's changes,
+  //    until it expires (see GetCDCStreamInfo()). Best-effort per row: a failed
+  //    write or delete is retried on a later pass.
+  for (const auto& e : stream_refs) {
+    vector<string> pruned;
+    const auto* removable = FindOrNull(removable_rows, e.first);
+    for (const auto& tablet_id : e.second) {
+      if (!ContainsKey(gone_tablets, tablet_id)) {
+        continue;
+      }
+      if (ContainsKey(dropped_tablets, tablet_id) &&
+          (!removable || !ContainsKey(*removable, tablet_id))) {
+        Status s = MarkCDCRowsTailLost({ FindOrDie(FindOrDie(rows_by_tablet, e.first),
+                                                   tablet_id) });
+        if (!s.ok()) {
+          KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+              "Failed to record that CDC stream $0 lost the changes of dropped tablet "
+              "$1: $2", e.first, tablet_id, s.ToString());
+        }
+        continue;
+      }
+      Status s = sys_catalog_->RemoveCDCTabletCheckpoint(e.first, tablet_id);
+      if (!s.ok()) {
+        KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+            "Failed to prune dropped-partition tablet $0 from CDC stream $1: $2",
+            tablet_id, e.first, s.ToString());
+        continue;
+      }
+      pruned.emplace_back(tablet_id);
+    }
+    if (pruned.empty()) {
+      continue;
+    }
+    std::lock_guard lock(lock_);
+    auto sit = cdc_tablet_checkpoint_map_.find(e.first);
+    if (sit != cdc_tablet_checkpoint_map_.end()) {
+      for (const auto& tablet_id : pruned) {
+        sit->second.erase(tablet_id);
+      }
+      if (sit->second.empty()) {
+        cdc_tablet_checkpoint_map_.erase(sit);
+      }
+    }
+  }
+
+  // 3. Set the barrier on every replica of each pinned CDC tablet. A replica
+  //    only gets it when it changed, when it needs a refresh, or when the
+  //    previous one was not delivered (see SetCDCBarrierOnReplicas()).
+  for (const auto& e : tablet_min_index) {
+    uint64_t history_floor = 0;
+    if (auto hf = FindOrNull(tablet_min_history_floor, e.first)) {
+      history_floor = *hf;
+    }
+    // Stamp every barrier RPC with this pass's sequence so a slow SET from
+    // this pass cannot land after a later pass's RELEASE and re-anchor the
+    // replica (last-writer-wins on the replica side).
+    SetCDCBarrierOnReplicas(e.first, e.second, history_floor, pass_seq,
+                            IsCDCRetainedDroppedTablet(e.first));
+  }
+  {
+    // Forget the replicas of the tablets that are no longer pinned, and free
+    // their finished tasks after the spinlock.
+    vector<decltype(cdc_barrier_replica_state_)::node_type> forgotten;
+    std::lock_guard l(cdc_barrier_replica_state_lock_);
+    for (auto it = cdc_barrier_replica_state_.begin();
+         it != cdc_barrier_replica_state_.end();) {
+      if (ContainsKey(tablet_min_index, it->first)) {
+        ++it;
+      } else {
+        forgotten.emplace_back(cdc_barrier_replica_state_.extract(it++));
+      }
+    }
+  }
+
+  // 4. Release the barrier for tablets that were pinned on a previous pass but
+  //    are no longer needed by any live stream (deleted/expired stream). Tablets
+  //    that vanished from tablet_map_ (dropped partitions) need no RPC.
+  //
+  //    A mass expiry (many streams lapsing in one tick) could otherwise fan a
+  //    release RPC to every dropped tablet at once, flooding the master's
+  //    outbound RPC path. Cap the number of releases per pass; any excess stays
+  //    in cdc_barriered_tablets_ (step 5 re-adds the un-released ones) so the
+  //    next maintenance pass retries them. Releases are pure cleanup, so
+  //    deferring them only delays WAL/history GC by a few passes -- it never
+  //    risks losing data a live consumer needs (that is guarded by the barrier
+  //    *sets* in step 3, which are never throttled).
+  //
+  //    A release is only done once every replica acknowledged it: the tablet
+  //    stays tracked in cdc_pending_barrier_releases_ (and so in
+  //    cdc_barriered_tablets_) while its tasks run, and is released again if a
+  //    task failed or was aborted, e.g. because a replica was down for longer
+  //    than --unresponsive_ts_rpc_timeout_ms. Re-sends count against the cap.
+  //
+  // Fold in tablets that received an eager barrier SET outside the pin path
+  // (CreateCDCStream's initial push). They register a real anchor on their replicas,
+  // but if the stream expires/goes stale before any pass pins them they would
+  // never enter cdc_barriered_tablets_ and their anchor would leak. Draining
+  // them here lets the release diff below reclaim them: a tablet still pinned
+  // this pass (in tablet_min_index) is skipped by the release loop, while an
+  // unpinned one is released like any other.
+  {
+    std::lock_guard lock(lock_);
+    for (const auto& tablet_id : cdc_eager_barriered_tablets_) {
+      cdc_barriered_tablets_.insert(tablet_id);
+    }
+    cdc_eager_barriered_tablets_.clear();
+  }
+
+  const int32_t max_releases = FLAGS_cdc_max_barrier_releases_per_run;
+  int32_t released = 0;
+  std::unordered_set<string> deferred_releases;
+  for (const auto& tablet_id : cdc_barriered_tablets_) {
+    if (ContainsKey(tablet_min_index, tablet_id)) {
+      // Pinned again: this pass's SET supersedes any release still pending.
+      cdc_pending_barrier_releases_.erase(tablet_id);
+      continue;
+    }
+    if (ContainsKey(held_tablets, tablet_id)) {
+      continue;
+    }
+    if (const auto* tasks = FindOrNull(cdc_pending_barrier_releases_, tablet_id)) {
+      const CDCReleaseState state = GetCDCReleaseState(*tasks);
+      if (state == CDCReleaseState::kInFlight) {
+        continue;
+      }
+      if (state == CDCReleaseState::kDelivered) {
+        cdc_pending_barrier_releases_.erase(tablet_id);
+        continue;
+      }
+      // kFailed: send the release again below.
+    }
+    if (max_releases > 0 && released >= max_releases) {
+      // Cap reached: defer this and all remaining releases to a later pass.
+      deferred_releases.insert(tablet_id);
+      continue;
+    }
+    vector<scoped_refptr<MonitoredTask>> tasks;
+    SendCDCRetentionBarrierToAllReplicas(tablet_id, /*min_retained_op_index=*/-1,
+                                         /*history_safe_time_micros=*/0,
+                                         pass_seq,
+                                         /*release_consumer_stream_id=*/"",
+                                         /*skip_barrier_update=*/false,
+                                         &tasks);
+    if (tasks.empty()) {
+      // No replica to contact (tablet unknown, deleted or without a config).
+      cdc_pending_barrier_releases_.erase(tablet_id);
+    } else {
+      cdc_pending_barrier_releases_[tablet_id] = std::move(tasks);
+    }
+    ++released;
+  }
+  cdc_barrier_releases_total_.fetch_add(released);
+  if (cdc_barrier_releases_total_metric_) {
+    cdc_barrier_releases_total_metric_->IncrementBy(released);
+  }
+  if (!deferred_releases.empty()) {
+    cdc_barrier_releases_deferred_total_.fetch_add(deferred_releases.size());
+    if (cdc_barrier_releases_deferred_total_metric_) {
+      cdc_barrier_releases_deferred_total_metric_->IncrementBy(deferred_releases.size());
+    }
+    KLOG_EVERY_N_SECS(INFO, 60) << Substitute(
+        "CDC maintenance released $0 retention barriers this pass (cap "
+        "--cdc_max_barrier_releases_per_run=$1); deferring $2 more to "
+        "subsequent passes.",
+        released, max_releases, deferred_releases.size());
+  }
+
+  // 5. Remember the set of tablets that may hold a barrier for the next pass's
+  //    release diff: the currently-pinned and held tablets, any releases
+  //    deferred by the cap above, and the releases not yet confirmed, so the
+  //    deferred and failed ones are retried next pass.
+  cdc_barriered_tablets_.clear();
+  for (const auto& e : tablet_min_index) {
+    cdc_barriered_tablets_.insert(e.first);
+  }
+  for (const auto& tablet_id : held_tablets) {
+    cdc_barriered_tablets_.insert(tablet_id);
+  }
+  for (const auto& tablet_id : deferred_releases) {
+    cdc_barriered_tablets_.insert(tablet_id);
+  }
+  for (const auto& e : cdc_pending_barrier_releases_) {
+    cdc_barriered_tablets_.insert(e.first);
+  }
+  cdc_barriered_tablet_count_.store(cdc_barriered_tablets_.size());
+
+  // Stamp liveness metrics for this completed pass. now_micros was captured at
+  // the top of this function; end_micros is the wall clock after all work is done.
+  const int64_t end_micros = GetCurrentTimeMicros();
+  cdc_maintenance_last_run_micros_.store(end_micros);
+  const int64_t run_duration = end_micros - now_micros;
+  cdc_maintenance_last_run_duration_micros_.store(run_duration >= 0 ? run_duration : 0);
+  if (cdc_maintenance_runs_) {
+    cdc_maintenance_runs_->Increment();
+  }
 }
 
 } // namespace master

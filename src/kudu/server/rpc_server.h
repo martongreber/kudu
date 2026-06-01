@@ -81,7 +81,15 @@ class RpcServer {
 
   // Services need to be registered after Init'ing, but before Start'ing.
   // The service's ownership will be given to a ServicePool.
+  //
+  // The single-argument form uses the shared incoming-RPC queue length
+  // (--rpc_service_queue_length). The two-argument form lets a service opt into
+  // its own dedicated queue depth so that it neither starves nor is starved by
+  // the shared queue. Each ServicePool, regardless of which form is used,
+  // gets its own dedicated set of --rpc_num_service_threads worker threads.
   Status RegisterService(std::unique_ptr<rpc::ServiceIf> service);
+  Status RegisterService(std::unique_ptr<rpc::ServiceIf> service,
+                         int service_queue_length);
   Status Bind();
   Status Start();
   void Shutdown();

@@ -43,6 +43,7 @@
 #include "kudu/util/faststring.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/promise.h"
 #include "kudu/util/rw_mutex.h"
 #include "kudu/util/slice.h"
@@ -311,7 +312,8 @@ class Log : public RefCountedThreadSafe<Log> {
 
   // Blocks the current thread until all the entries in the log queue
   // are flushed and fsynced (if fsync of log entries is enabled).
-  Status WaitUntilAllFlushed();
+  // Returns TimedOut if that has not happened by 'deadline'.
+  Status WaitUntilAllFlushed(const MonoTime& deadline = MonoTime::Max());
 
   // Syncs all state and closes the log.
   Status Close();
@@ -332,6 +334,13 @@ class Log : public RefCountedThreadSafe<Log> {
   // this function will return NULL, but existing reader references will
   // remain live.
   std::shared_ptr<LogReader> reader() const { return reader_; }
+
+  // Returns the index of the last REPLICATE op written to the log and indexed,
+  // so that reader() can read it and every op before it that was not GCed, or
+  // -1 if no op was written since the log was opened.
+  int64_t last_indexed_op_index() const {
+    return last_indexed_op_index_.load(std::memory_order_acquire);
+  }
 
   void SetMaxSegmentSizeForTests(uint64_t max_segment_size) {
     segment_allocator_.max_segment_size_ = max_segment_size;
@@ -368,6 +377,11 @@ class Log : public RefCountedThreadSafe<Log> {
 
   // Computes the amount of bytes that would have been GC'd if Log::GC had been called.
   int64_t GetGCableDataSize(RetentionIndexes retention_indexes) const;
+
+  // Like GetGCableDataSize(), but returns an error instead of crashing if the log
+  // is not open for writing, e.g. because it was closed concurrently. On success,
+  // stores the result in 'size'.
+  Status TryGetGCableDataSize(RetentionIndexes retention_indexes, int64_t* size) const;
 
   // Returns a map which can be used to determine the cumulative size of log segments
   // containing entries at or above any given log index.
@@ -501,6 +515,9 @@ class Log : public RefCountedThreadSafe<Log> {
   // of the operation in the log.
   scoped_refptr<LogIndex> log_index_;
 
+  // See last_indexed_op_index().
+  std::atomic<int64_t> last_indexed_op_index_{-1};
+
   // The maximum segment size, in bytes.
   uint64_t max_segment_size_;
 
@@ -544,6 +561,13 @@ struct RetentionIndexes {
   // still be GCed in the case that they are from very old log segments
   // or the log has become too large.
   int64_t for_peers;
+
+  // If > 0, a hard CDC WAL-retention floor expressed as a wall-clock deadline in
+  // microseconds: any segment whose footer close time is at or after this value
+  // (and therefore every newer segment) must be retained, regardless of consumer
+  // polling or index-based retention. 0 (the default) disables the floor, so
+  // non-CDC callers are unaffected. See TabletReplica::GetRetentionIndexes().
+  int64_t cdc_wal_retention_deadline_micros = 0;
 };
 
 

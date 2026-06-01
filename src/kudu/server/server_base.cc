@@ -1198,6 +1198,11 @@ Status ServerBase::RegisterService(unique_ptr<rpc::ServiceIf> rpc_impl) {
   return rpc_server_->RegisterService(std::move(rpc_impl));
 }
 
+Status ServerBase::RegisterService(unique_ptr<rpc::ServiceIf> rpc_impl,
+                                   int service_queue_length) {
+  return rpc_server_->RegisterService(std::move(rpc_impl), service_queue_length);
+}
+
 Status ServerBase::StartMetricsLogging() {
   if (options_.metrics_log_interval_ms <= 0) {
     return Status::OK();

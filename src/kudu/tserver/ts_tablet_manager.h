@@ -256,6 +256,11 @@ class TSTabletManager : public tserver::TabletReplicaLookupIf {
   // This method is for use in tests only. See KUDU-2444.
   Status WaitForNoTransitionsForTests(const MonoDelta& timeout) const;
 
+  // For tests: the manager of the cached consensus metadata of the replicas.
+  const scoped_refptr<consensus::ConsensusMetadataManager>& cmeta_manager_for_tests() const {
+    return cmeta_manager_;
+  }
+
   // Update the tablet statistics if necessary.
   void UpdateTabletStatsIfNecessary();
 

@@ -103,6 +103,11 @@ class LogEntryReader {
   // 'seg' must outlive the LogEntryReader.
   explicit LogEntryReader(const ReadableLogSegment* seg);
 
+  // Same as above, but starts reading at the entry batch at 'offset' instead of
+  // at the first entry of the segment. 'offset' must be the offset of an entry
+  // batch, e.g. a LogIndexEntry's 'offset_in_segment'.
+  LogEntryReader(const ReadableLogSegment* seg, int64_t offset);
+
   ~LogEntryReader();
 
   // Read the next entry from the log, replacing the contents of 'entry'.
@@ -153,6 +158,10 @@ class LogEntryReader {
 
   // The offset of the next entry to be read.
   int64_t offset_;
+
+  // Whether reading started at the first entry of the segment, so the number
+  // of entries read can be checked against the segment's footer.
+  const bool reads_whole_segment_;
 
   // The offset at which this reader will stop reading entries.
   int64_t read_up_to_;

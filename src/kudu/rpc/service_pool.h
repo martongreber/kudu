@@ -86,6 +86,14 @@ class ServicePool : public RpcService {
     return rpcs_queue_overflow_.get();
   }
 
+  // Test-only: the configured maximum depth of this pool's incoming-RPC queue,
+  // i.e. the service_queue_length this pool was constructed with. Used to
+  // assert that a service registered with a dedicated queue length gets its
+  // own queue depth rather than the shared --rpc_service_queue_length.
+  size_t queue_length_for_tests() const {
+    return service_queue_.max_size();
+  }
+
   const std::string& service_name() const;
 
  private:

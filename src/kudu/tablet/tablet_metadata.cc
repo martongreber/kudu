@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <ostream>
@@ -325,8 +326,19 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id,
       log_prefix_(Substitute("T $0 P $1: ", tablet_id_, fs_manager_->uuid())),
       next_rowset_idx_(0),
       last_durable_mrs_id_(kNoDurableMemStore),
+      cdc_min_retained_op_index_(-1),
+      cdc_history_safe_time_micros_(0),
+      cdc_tablet_dropped_(false),
+      cdc_history_gc_water_mark_(0),
+      cdc_history_gc_water_mark_known_(true),
+      cdc_barrier_seq_(0),
+      cdc_barrier_refresh_micros_(0),
+      cdc_barrier_refresh_flushed_micros_(0),
+      cdc_barrier_seq_time_(MonoTime::Now()),
+      cdc_barrier_refresh_monotime_(cdc_barrier_seq_time_),
       schema_(std::make_shared<Schema>(schema)),
       schema_version_(0),
+      schema_op_index_(0),
       table_name_(std::move(table_name)),
       partition_schema_(std::move(partition_schema)),
       tablet_data_state_(tablet_data_state),
@@ -351,6 +363,17 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id)
       tablet_id_(std::move(tablet_id)),
       fs_manager_(fs_manager),
       next_rowset_idx_(0),
+      cdc_min_retained_op_index_(-1),
+      cdc_history_safe_time_micros_(0),
+      cdc_tablet_dropped_(false),
+      cdc_history_gc_water_mark_(0),
+      cdc_history_gc_water_mark_known_(false),
+      cdc_barrier_seq_(0),
+      cdc_barrier_refresh_micros_(0),
+      cdc_barrier_refresh_flushed_micros_(0),
+      cdc_barrier_seq_time_(MonoTime::Now()),
+      cdc_barrier_refresh_monotime_(cdc_barrier_seq_time_),
+      schema_op_index_(0),
       num_flush_pins_(0),
       needs_flush_(false),
       flush_count_for_tests_(0),
@@ -398,6 +421,26 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
 
     last_durable_mrs_id_ = superblock.last_durable_mrs_id();
 
+    // CDC retention barrier. Absence reads back as the "no barrier" sentinels so
+    // that a released barrier (which omits the fields) is restored as released.
+    cdc_min_retained_op_index_ =
+        superblock.has_cdc_min_retained_op_index() ?
+            superblock.cdc_min_retained_op_index() : -1;
+    cdc_history_safe_time_micros_ =
+        superblock.has_cdc_history_safe_time_micros() ?
+            superblock.cdc_history_safe_time_micros() : 0;
+    // A missing water mark is unknown, not 0: the superblock was written by a
+    // binary that did not track it. See has_cdc_history_gc_water_mark().
+    cdc_history_gc_water_mark_known_ = superblock.has_cdc_history_gc_water_mark();
+    cdc_history_gc_water_mark_ =
+        cdc_history_gc_water_mark_known_ ? superblock.cdc_history_gc_water_mark() : 0;
+    cdc_tablet_dropped_ = superblock.cdc_tablet_dropped();
+    cdc_barrier_seq_ = superblock.cdc_barrier_seq();
+    cdc_barrier_refresh_micros_ = superblock.cdc_barrier_refresh_time_micros();
+    cdc_barrier_refresh_flushed_micros_ = cdc_barrier_refresh_micros_;
+    cdc_barrier_seq_time_ = MonoTime::Now();
+    cdc_barrier_refresh_monotime_ = cdc_barrier_seq_time_;
+
     table_name_ = superblock.table_name();
 
     uint32_t schema_version = superblock.schema_version();
@@ -408,6 +451,15 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
     {
       SchemaPtr old_schema;
       SwapSchemaUnlocked(schema, schema_version, &old_schema);
+    }
+    schema_op_index_ = superblock.schema_op_index();
+    schema_history_.clear();
+    for (const auto& entry_pb : superblock.schema_history()) {
+      SchemaPtr entry_schema = std::make_shared<Schema>();
+      RETURN_NOT_OK_PREPEND(SchemaFromPB(entry_pb.schema(), entry_schema.get()),
+                            "Failed to parse a schema history entry from superblock");
+      schema_history_.push_back({ entry_pb.schema_version(), std::move(entry_schema),
+                                  entry_pb.start_op_index(), entry_pb.end_op_index() });
     }
 
     if (!superblock.has_partition()) {
@@ -778,7 +830,40 @@ Status TabletMetadata::ToSuperBlockUnlocked(TabletSuperBlockPB* super_block,
   pb.set_tablet_id(tablet_id_);
   partition_.ToPB(pb.mutable_partition());
   pb.set_last_durable_mrs_id(last_durable_mrs_id_);
+  // CDC retention barrier. Omit the fields when released so the superblock stays
+  // clean for non-CDC tablets and a release is durable (absence == no barrier).
+  if (cdc_min_retained_op_index_ >= 0) {
+    pb.set_cdc_min_retained_op_index(cdc_min_retained_op_index_);
+  }
+  if (cdc_history_safe_time_micros_ > 0) {
+    pb.set_cdc_history_safe_time_micros(cdc_history_safe_time_micros_);
+  }
+  // The water mark is written whenever it is known, also when it is 0, so a
+  // later load can tell "no history GC" from "not tracked". An unknown mark is
+  // omitted, so it stays unknown across a flush until the tablet seeds it.
+  if (cdc_history_gc_water_mark_known_) {
+    pb.set_cdc_history_gc_water_mark(cdc_history_gc_water_mark_);
+  }
+  if (cdc_tablet_dropped()) {
+    pb.set_cdc_tablet_dropped(true);
+  }
+  if (cdc_barrier_seq_ > 0) {
+    pb.set_cdc_barrier_seq(cdc_barrier_seq_);
+  }
+  if (cdc_min_retained_op_index_ >= 0 && cdc_barrier_refresh_micros_ > 0) {
+    pb.set_cdc_barrier_refresh_time_micros(cdc_barrier_refresh_micros_);
+  }
   pb.set_schema_version(schema_version_);
+  if (schema_op_index_ > 0) {
+    pb.set_schema_op_index(schema_op_index_);
+  }
+  for (const auto& entry : schema_history_) {
+    SchemaHistoryEntryPB* entry_pb = pb.add_schema_history();
+    entry_pb->set_schema_version(entry.version);
+    RETURN_NOT_OK(SchemaToPB(*entry.schema, entry_pb->mutable_schema()));
+    entry_pb->set_start_op_index(entry.start_op_index);
+    entry_pb->set_end_op_index(entry.end_op_index);
+  }
   RETURN_NOT_OK(partition_schema_.ToPB(*schema_, pb.mutable_partition_schema()));
   pb.set_table_name(table_name_);
 
@@ -944,6 +1029,11 @@ unordered_map<int64_t, scoped_refptr<TxnMetadata>> TabletMetadata::GetTxnMetadat
   return txn_metadata_by_txn_id_;
 }
 
+scoped_refptr<TxnMetadata> TabletMetadata::FindTxnMetadata(int64_t txn_id) const {
+  std::lock_guard l(data_lock_);
+  return FindPtrOrNull(txn_metadata_by_txn_id_, txn_id);
+}
+
 bool TabletMetadata::GetTxnMetadataPB(int64_t txn_id, TxnMetadataPB* pb) const {
   std::lock_guard l(data_lock_);
   auto txn_meta = FindPtrOrNull(txn_metadata_by_txn_id_, txn_id);
@@ -981,6 +1071,81 @@ void TabletMetadata::SetSchema(const SchemaPtr& schema, uint32_t version) {
     std::lock_guard l(data_lock_);
     SwapSchemaUnlocked(schema, version, &old_schema);
   }
+}
+
+void TabletMetadata::SetSchemaFromAlter(const SchemaPtr& schema,
+                                        uint32_t version,
+                                        int64_t op_index) {
+  // Bounds the size of the superblock for a tablet altered many times while
+  // its old ops are in the WAL.
+  constexpr size_t kMaxSchemaHistoryEntries = 32;
+  SchemaPtr old_schema;
+  {
+    std::lock_guard l(data_lock_);
+    // Bootstrap replays the ALTER_SCHEMA ops in the WAL after rewinding the
+    // schema, but not 'schema_op_index_': the history entries of the replayed
+    // ops are kept from before (if any), and an entry is added only when its op
+    // range is known.
+    const bool known = schema_op_index_ < op_index && schema_version_ < version &&
+        std::none_of(schema_history_.begin(), schema_history_.end(),
+                     [&](const SchemaHistoryEntry& e) { return e.version == schema_version_; });
+    if (known) {
+      auto pos = std::upper_bound(
+          schema_history_.begin(), schema_history_.end(), schema_version_,
+          [](uint32_t v, const SchemaHistoryEntry& e) { return v < e.version; });
+      schema_history_.insert(pos, { schema_version_, schema_, schema_op_index_, op_index });
+      if (schema_history_.size() > kMaxSchemaHistoryEntries) {
+        schema_history_.erase(schema_history_.begin());
+      }
+    }
+    schema_op_index_ = op_index;
+    SwapSchemaUnlocked(schema, version, &old_schema);
+  }
+}
+
+void TabletMetadata::TrimSchemaHistory(int64_t min_op_index) {
+  vector<SchemaHistoryEntry> dropped;
+  {
+    std::lock_guard l(data_lock_);
+    auto keep = std::find_if(
+        schema_history_.begin(), schema_history_.end(),
+        [&](const SchemaHistoryEntry& e) { return e.end_op_index >= min_op_index; });
+    dropped.assign(std::make_move_iterator(schema_history_.begin()),
+                   std::make_move_iterator(keep));
+    schema_history_.erase(schema_history_.begin(), keep);
+  }
+}
+
+bool TabletMetadata::GetSchemaForOpIndex(int64_t op_index,
+                                         SchemaPtr* schema,
+                                         uint32_t* version) const {
+  std::lock_guard l(data_lock_);
+  if (op_index > schema_op_index_) {
+    *schema = schema_;
+    *version = schema_version_;
+    return true;
+  }
+  for (const auto& e : schema_history_) {
+    if (e.start_op_index < op_index && op_index <= e.end_op_index) {
+      *schema = e.schema;
+      *version = e.version;
+      return true;
+    }
+  }
+  return false;
+}
+
+SchemaPtr TabletMetadata::GetSchemaForVersion(uint32_t version) const {
+  std::lock_guard l(data_lock_);
+  if (version == schema_version_) {
+    return schema_;
+  }
+  for (const auto& e : schema_history_) {
+    if (e.version == version) {
+      return e.schema;
+    }
+  }
+  return nullptr;
 }
 
 void TabletMetadata::SwapSchemaUnlocked(SchemaPtr schema, uint32_t version,
@@ -1034,6 +1199,116 @@ optional<TableExtraConfigPB> TabletMetadata::extra_config() const {
 optional<string> TabletMetadata::dimension_label() const {
   std::lock_guard l(data_lock_);
   return dimension_label_;
+}
+
+int64_t TabletMetadata::cdc_min_retained_op_index() const {
+  std::lock_guard l(data_lock_);
+  return cdc_min_retained_op_index_;
+}
+
+uint64_t TabletMetadata::cdc_history_safe_time_micros() const {
+  std::lock_guard l(data_lock_);
+  return cdc_history_safe_time_micros_;
+}
+
+int64_t TabletMetadata::cdc_barrier_seq() const {
+  std::lock_guard l(data_lock_);
+  return cdc_barrier_seq_;
+}
+
+MonoTime TabletMetadata::cdc_barrier_seq_time() const {
+  std::lock_guard l(data_lock_);
+  return cdc_barrier_seq_time_;
+}
+
+int64_t TabletMetadata::cdc_barrier_refresh_micros() const {
+  std::lock_guard l(data_lock_);
+  return cdc_barrier_refresh_micros_;
+}
+
+MonoTime TabletMetadata::cdc_barrier_refresh_monotime() const {
+  std::lock_guard l(data_lock_);
+  return cdc_barrier_refresh_monotime_;
+}
+
+bool TabletMetadata::ApplyCDCRetentionBarrierUpdate(int64_t op_index,
+                                                    uint64_t history_safe_time_micros,
+                                                    int64_t barrier_seq,
+                                                    int64_t now_micros,
+                                                    int64_t refresh_flush_interval_micros) {
+  const int64_t new_op_index = op_index < 0 ? -1 : op_index;
+  std::lock_guard l(data_lock_);
+  bool needs_flush = cdc_min_retained_op_index_ != new_op_index ||
+                     cdc_history_safe_time_micros_ != history_safe_time_micros;
+  cdc_min_retained_op_index_ = new_op_index;
+  cdc_history_safe_time_micros_ = history_safe_time_micros;
+  if (barrier_seq > 0) {
+    // Persist right away a sequence that a restart must not lose although the
+    // barrier is unchanged: one that went backwards (see the reorder window in
+    // CDCServiceImpl::SetRetentionBarrier()), and that of a release, since a
+    // released barrier is not refreshed.
+    if (barrier_seq < cdc_barrier_seq_ ||
+        (new_op_index < 0 && barrier_seq != cdc_barrier_seq_)) {
+      needs_flush = true;
+    }
+    cdc_barrier_seq_ = barrier_seq;
+    cdc_barrier_seq_time_ = MonoTime::Now();
+  }
+  if (new_op_index < 0) {
+    cdc_barrier_refresh_micros_ = 0;
+  } else {
+    cdc_barrier_refresh_micros_ = now_micros;
+    cdc_barrier_refresh_monotime_ = MonoTime::Now();
+    if (now_micros - cdc_barrier_refresh_flushed_micros_ >= refresh_flush_interval_micros) {
+      needs_flush = true;
+    }
+  }
+  if (needs_flush) {
+    cdc_barrier_refresh_flushed_micros_ = cdc_barrier_refresh_micros_;
+  }
+  return needs_flush;
+}
+
+bool TabletMetadata::ClearCDCHistorySafeTime() {
+  std::lock_guard l(data_lock_);
+  if (cdc_history_safe_time_micros_ == 0) {
+    return false;
+  }
+  cdc_history_safe_time_micros_ = 0;
+  return true;
+}
+
+bool TabletMetadata::cdc_tablet_dropped() const {
+  return cdc_tablet_dropped_.load(std::memory_order_acquire);
+}
+
+bool TabletMetadata::SetCDCTabletDropped() {
+  return !cdc_tablet_dropped_.exchange(true, std::memory_order_acq_rel);
+}
+
+uint64_t TabletMetadata::cdc_history_gc_water_mark() const {
+  std::lock_guard l(data_lock_);
+  return cdc_history_gc_water_mark_;
+}
+
+bool TabletMetadata::has_cdc_history_gc_water_mark() const {
+  std::lock_guard l(data_lock_);
+  return cdc_history_gc_water_mark_known_;
+}
+
+bool TabletMetadata::SeedCDCHistoryGcWaterMark(uint64_t water_mark) {
+  std::lock_guard l(data_lock_);
+  if (cdc_history_gc_water_mark_known_) {
+    return false;
+  }
+  cdc_history_gc_water_mark_ = std::max(cdc_history_gc_water_mark_, water_mark);
+  cdc_history_gc_water_mark_known_ = true;
+  return true;
+}
+
+void TabletMetadata::AdvanceCDCHistoryGcWaterMark(uint64_t water_mark) {
+  std::lock_guard l(data_lock_);
+  cdc_history_gc_water_mark_ = std::max(cdc_history_gc_water_mark_, water_mark);
 }
 
 const optional<TableTypePB>& TabletMetadata::table_type() const {

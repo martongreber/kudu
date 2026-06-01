@@ -237,6 +237,58 @@ TEST_F(TestTabletMetadata, TestOnDiskSize) {
   ASSERT_GE(final_size, superblock_pb.ByteSizeLong());
 }
 
+// The CDC retention barrier (op-index floor + FULL-mode history safe-time) must
+// survive a restart: it is persisted in the superblock and reloaded at bootstrap so
+// WAL/history retention does not reset to zero on restart or leader change.
+TEST_F(TestTabletMetadata, TestCDCRetentionBarrierRoundTrip) {
+  TabletMetadata* meta = harness_->tablet()->metadata();
+
+  // A freshly created tablet has no barrier.
+  ASSERT_EQ(-1, meta->cdc_min_retained_op_index());
+  ASSERT_EQ(0, meta->cdc_history_safe_time_micros());
+
+  // Setting a barrier reports a change; setting the identical values does not.
+  const int64_t kOpIndex = 4242;
+  const uint64_t kHistoryMicros = 1234567890ULL;
+  ASSERT_TRUE(meta->SetCDCRetentionBarrier(kOpIndex, kHistoryMicros));
+  ASSERT_FALSE(meta->SetCDCRetentionBarrier(kOpIndex, kHistoryMicros));
+  ASSERT_EQ(kOpIndex, meta->cdc_min_retained_op_index());
+  ASSERT_EQ(kHistoryMicros, meta->cdc_history_safe_time_micros());
+  ASSERT_OK(meta->Flush());
+
+  // Reload from disk and confirm both values were restored.
+  {
+    scoped_refptr<TabletMetadata> reloaded;
+    ASSERT_OK(TabletMetadata::Load(harness_->fs_manager(),
+                                   harness_->tablet()->tablet_id(),
+                                   &reloaded));
+    ASSERT_EQ(kOpIndex, reloaded->cdc_min_retained_op_index());
+    ASSERT_EQ(kHistoryMicros, reloaded->cdc_history_safe_time_micros());
+  }
+
+  // Releasing the barrier (negative index, zero history) clears it, and the release
+  // is itself durable: a reload reads back the "no barrier" sentinels, not the
+  // previously-persisted values.
+  ASSERT_TRUE(meta->SetCDCRetentionBarrier(-1, 0));
+  ASSERT_EQ(-1, meta->cdc_min_retained_op_index());
+  ASSERT_EQ(0, meta->cdc_history_safe_time_micros());
+  ASSERT_OK(meta->Flush());
+  {
+    scoped_refptr<TabletMetadata> reloaded;
+    ASSERT_OK(TabletMetadata::Load(harness_->fs_manager(),
+                                   harness_->tablet()->tablet_id(),
+                                   &reloaded));
+    ASSERT_EQ(-1, reloaded->cdc_min_retained_op_index());
+    ASSERT_EQ(0, reloaded->cdc_history_safe_time_micros());
+  }
+
+  // Any negative index normalizes to the -1 sentinel: re-arm a real barrier, then
+  // release with an arbitrary negative index and confirm it lands on -1.
+  ASSERT_TRUE(meta->SetCDCRetentionBarrier(kOpIndex, 0));
+  ASSERT_TRUE(meta->SetCDCRetentionBarrier(-99, 0));
+  ASSERT_EQ(-1, meta->cdc_min_retained_op_index());
+}
+
 TEST_F(TestTabletMetadata, BenchmarkCollectBlockIds) {
   auto tablet_meta = harness_->tablet()->metadata();
   RowSetMetadataVector rs_metas;

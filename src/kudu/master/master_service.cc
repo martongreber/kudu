@@ -1010,5 +1010,69 @@ bool MasterServiceImpl::SupportsFeature(uint32_t feature) const {
   }
 }
 
+// ---------------------------------------------------------------------------
+// CDC (Change Data Capture) RPCs
+// ---------------------------------------------------------------------------
+
+void MasterServiceImpl::CreateCDCStream(const CreateCDCStreamRequestPB* req,
+                                        CreateCDCStreamResponsePB* resp,
+                                        rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->CreateCDCStream(req, resp);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::DeleteCDCStream(const DeleteCDCStreamRequestPB* req,
+                                        DeleteCDCStreamResponsePB* resp,
+                                        rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->DeleteCDCStream(req, resp);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::ListCDCStreams(const ListCDCStreamsRequestPB* req,
+                                      ListCDCStreamsResponsePB* resp,
+                                      rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->ListCDCStreams(req, resp);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::GetCDCStreamInfo(const GetCDCStreamInfoRequestPB* req,
+                                         GetCDCStreamInfoResponsePB* resp,
+                                         rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->GetCDCStreamInfo(req, resp);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::UpdateCDCCheckpoint(const UpdateCDCCheckpointRequestPB* req,
+                                            UpdateCDCCheckpointResponsePB* resp,
+                                            rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+  Status s = server_->catalog_manager()->UpdateCDCCheckpoint(req, resp);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
 } // namespace master
 } // namespace kudu

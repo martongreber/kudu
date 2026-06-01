@@ -96,6 +96,7 @@
 #include "kudu/transactions/txn_status_manager.h"
 #include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_replica_lookup.h"
+#include "kudu/cdc/cdc_service.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver.pb.h"
@@ -1434,6 +1435,42 @@ void TabletServiceAdminImpl::ParticipateInTransaction(const ParticipantRequestPB
                          TabletServerErrorPB::UNKNOWN_ERROR,
                          context);
   }
+}
+
+void TabletServiceAdminImpl::UpdateCDCRetentionBarrier(
+    const UpdateCDCRetentionBarrierRequestPB* req,
+    UpdateCDCRetentionBarrierResponsePB* resp,
+    rpc::RpcContext* context) {
+  if (!CheckUuidMatchOrRespond(server_->tablet_manager(), "UpdateCDCRetentionBarrier",
+                               req, resp, context)) {
+    return;
+  }
+  cdc::CDCServiceImpl* cdc = server_->cdc_service();
+  if (PREDICT_FALSE(cdc == nullptr)) {
+    SetupErrorAndRespond(resp->mutable_error(),
+                         Status::ServiceUnavailable("CDC service not available"),
+                         TabletServerErrorPB::UNKNOWN_ERROR, context);
+    return;
+  }
+  const uint64_t history_safe_time_micros =
+      req->has_history_safe_time_micros() ? req->history_safe_time_micros() : 0;
+  const int64_t barrier_seq = req->has_barrier_seq() ? req->barrier_seq() : 0;
+  const string& release_consumer_stream_id =
+      req->has_release_consumer_stream_id() ? req->release_consumer_stream_id()
+                                            : string();
+  const bool skip_barrier_update =
+      req->has_skip_barrier_update() && req->skip_barrier_update();
+  Status s = cdc->SetRetentionBarrier(req->tablet_id(), req->min_retained_op_index(),
+                                      history_safe_time_micros, barrier_seq,
+                                      release_consumer_stream_id, skip_barrier_update);
+  if (PREDICT_FALSE(!s.ok())) {
+    TabletServerErrorPB::Code code = s.IsNotFound()
+        ? TabletServerErrorPB::TABLET_NOT_FOUND
+        : TabletServerErrorPB::UNKNOWN_ERROR;
+    SetupErrorAndRespond(resp->mutable_error(), s, code, context);
+    return;
+  }
+  context->RespondSuccess();
 }
 
 bool TabletServiceAdminImpl::SupportsFeature(uint32_t feature) const {

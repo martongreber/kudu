@@ -31,6 +31,10 @@ namespace kudu {
 
 class MaintenanceManager;
 
+namespace cdc {
+class CDCServiceImpl;
+} // namespace cdc
+
 namespace transactions {
 class TxnSystemClientInitializer;
 } // namespace transactions
@@ -99,6 +103,14 @@ class TabletServer : public kserver::KuduServer {
     return &quiescing_;
   }
 
+  cdc::CDCServiceImpl* cdc_service() const { return cdc_service_; }
+
+  // The master addresses this server was configured with. Used by the CDC
+  // service to persist consumer checkpoints on the leader master.
+  const std::vector<HostPort>& master_addresses() const {
+    return opts_.master_addresses;
+  }
+
  private:
   friend class TabletServerTestBase;
 
@@ -142,6 +154,9 @@ class TabletServer : public kserver::KuduServer {
 
   // The maintenance manager for this tablet server
   std::shared_ptr<MaintenanceManager> maintenance_manager_;
+
+  // The CDC service instance. Owned by the RPC ServicePool after registration.
+  cdc::CDCServiceImpl* cdc_service_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletServer);
 };

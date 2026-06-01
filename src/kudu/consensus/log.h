@@ -544,6 +544,13 @@ struct RetentionIndexes {
   // still be GCed in the case that they are from very old log segments
   // or the log has become too large.
   int64_t for_peers;
+
+  // If > 0, a hard CDC WAL-retention floor expressed as a wall-clock deadline in
+  // microseconds: any segment whose footer close time is at or after this value
+  // (and therefore every newer segment) must be retained, regardless of consumer
+  // polling or index-based retention. 0 (the default) disables the floor, so
+  // non-CDC callers are unaffected. See TabletReplica::GetRetentionIndexes().
+  int64_t cdc_wal_retention_deadline_micros = 0;
 };
 
 

@@ -52,9 +52,11 @@
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/cow_object.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/oid_generator.h"
 #include "kudu/util/random.h"
+#include "kudu/server/monitored_task.h"
 #include "kudu/util/rw_mutex.h"
 #include "kudu/util/status.h"
 
@@ -517,6 +519,105 @@ typedef MetadataLock<TabletInfo> TabletMetadataLock;
 typedef MetadataGroupLock<TableInfo> TableMetadataGroupLock;
 typedef MetadataGroupLock<TabletInfo> TabletMetadataGroupLock;
 
+// The persistent metadata for a CDC stream, managed via CowObject.
+struct PersistentCDCStreamInfo {
+  SysCDCStreamEntryPB pb;
+};
+
+// In-memory representation of a CDC stream registered with the master.
+class CDCStreamInfo : public RefCountedThreadSafe<CDCStreamInfo> {
+ public:
+  typedef PersistentCDCStreamInfo cow_state;
+
+  explicit CDCStreamInfo(std::string stream_id)
+      : stream_id_(std::move(stream_id)) {}
+
+  const std::string& id() const { return stream_id_; }
+
+  const CowObject<PersistentCDCStreamInfo>& metadata() const { return metadata_; }
+  CowObject<PersistentCDCStreamInfo>* mutable_metadata() { return &metadata_; }
+
+  std::string ToString() const { return stream_id_; }
+
+ private:
+  friend class RefCountedThreadSafe<CDCStreamInfo>;
+  ~CDCStreamInfo() = default;
+
+  const std::string stream_id_;
+  CowObject<PersistentCDCStreamInfo> metadata_;
+
+  DISALLOW_COPY_AND_ASSIGN(CDCStreamInfo);
+};
+
+typedef MetadataLock<CDCStreamInfo> CDCStreamMetadataLock;
+typedef std::unordered_map<std::string, scoped_refptr<CDCStreamInfo>> CDCStreamInfoMap;
+
+// The persistent metadata for one (stream, tablet) CDC checkpoint, managed via
+// CowObject. Stored as its own sys-catalog row so a Checkpoint() RPC updates a
+// single small row under its own lock instead of rewriting the whole stream
+// entry under the per-stream lock.
+struct PersistentCDCTabletCheckpointInfo {
+  SysCDCTabletCheckpointEntryPB pb;
+};
+
+// In-memory representation of one (stream, tablet) CDC checkpoint.
+class CDCTabletCheckpointInfo : public RefCountedThreadSafe<CDCTabletCheckpointInfo> {
+ public:
+  typedef PersistentCDCTabletCheckpointInfo cow_state;
+
+  CDCTabletCheckpointInfo(std::string stream_id, std::string tablet_id)
+      : stream_id_(std::move(stream_id)), tablet_id_(std::move(tablet_id)) {}
+
+  const std::string& stream_id() const { return stream_id_; }
+  const std::string& tablet_id() const { return tablet_id_; }
+
+  const CowObject<PersistentCDCTabletCheckpointInfo>& metadata() const {
+    return metadata_;
+  }
+  CowObject<PersistentCDCTabletCheckpointInfo>* mutable_metadata() {
+    return &metadata_;
+  }
+
+  std::string ToString() const { return stream_id_ + "/" + tablet_id_; }
+
+  // Wall-clock time (microseconds since the Unix epoch) of the most recent
+  // checkpoint advance ATTEMPT for this (stream, tablet), as seen by the
+  // master's UpdateCDCCheckpoint handler. Stamped whenever the incoming
+  // op_index strictly advances the stored one, BEFORE the sys-catalog write,
+  // so it is updated even if the durable write subsequently fails.
+  //
+  // Pure in-memory: not persisted across master restarts. Resets to 0 on
+  // failover, at which point cdc_leader_ready_micros_ (DR-015) provides the
+  // equivalent grace. After the leader has been up longer than the staleness
+  // window, this being 0 is harmless -- the consumer either re-persists (and
+  // this is refreshed) or is genuinely stuck and staleness fires normally.
+  //
+  // Used by RunCDCStreamMaintenance as a third term in effective_advance
+  // (alongside last_checkpoint_advance_time_micros from sys-catalog and
+  // cdc_leader_ready_micros_) to suppress spurious staleness releases while
+  // the consumer IS advancing but sys-catalog writes are failing (CF-2).
+  std::atomic<int64_t> last_checkpoint_advance_attempt_micros_{0};
+
+ private:
+  friend class RefCountedThreadSafe<CDCTabletCheckpointInfo>;
+  ~CDCTabletCheckpointInfo() = default;
+
+  const std::string stream_id_;
+  const std::string tablet_id_;
+  CowObject<PersistentCDCTabletCheckpointInfo> metadata_;
+
+  DISALLOW_COPY_AND_ASSIGN(CDCTabletCheckpointInfo);
+};
+
+typedef MetadataLock<CDCTabletCheckpointInfo> CDCTabletCheckpointMetadataLock;
+// stream_id -> (tablet_id -> checkpoint). The nested map allows cheap
+// enumeration of a single stream's tablets (GetCDCStreamInfo, DeleteCDCStream)
+// while each checkpoint carries its own CowObject lock.
+typedef std::unordered_map<
+    std::string,
+    std::unordered_map<std::string, scoped_refptr<CDCTabletCheckpointInfo>>>
+        CDCTabletCheckpointMap;
+
 // The component of the master which tracks the state and location
 // of tables/tablets in the cluster.
 //
@@ -862,6 +963,17 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Returns the latest handled Hive Metastore notification log event ID.
   int64_t GetLatestNotificationLogEventId();
 
+  // Loads CDC streams from the sys catalog into in-memory map after leader election.
+  // Also migrates any legacy inline per-tablet checkpoints (fields 4-7 of
+  // SysCDCStreamEntryPB) into per-(stream, tablet) rows -- see the migration note
+  // in the .cc. Assumes LoadCDCTabletCheckpoints() already ran.
+  Status LoadCDCStreams();
+
+  // Loads per-(stream, tablet) CDC checkpoint rows from the sys catalog into
+  // cdc_tablet_checkpoint_map_ after leader election. Must run before
+  // LoadCDCStreams() so the migration can skip pairs already stored as rows.
+  Status LoadCDCTabletCheckpoints();
+
   // Initializes the cached latest handled Hive Metastore notification log event ID
   // after a leader election.
   Status InitLatestNotificationLogEventId();
@@ -1001,7 +1113,81 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
     tsk_private_key_password_ = std::move(tsk_private_key_password);
   }
 
+  // CDC stream management.
+  Status CreateCDCStream(const CreateCDCStreamRequestPB* req,
+                         CreateCDCStreamResponsePB* resp);
+  Status DeleteCDCStream(const DeleteCDCStreamRequestPB* req,
+                         DeleteCDCStreamResponsePB* resp);
+  Status ListCDCStreams(const ListCDCStreamsRequestPB* req,
+                        ListCDCStreamsResponsePB* resp);
+  Status GetCDCStreamInfo(const GetCDCStreamInfoRequestPB* req,
+                          GetCDCStreamInfoResponsePB* resp);
+  Status UpdateCDCCheckpoint(const UpdateCDCCheckpointRequestPB* req,
+                             UpdateCDCCheckpointResponsePB* resp);
+
+  // Recomputes the per-tablet minimum CDC checkpoint across all active,
+  // non-expired streams and pushes a WAL (and, for FULL streams, MVCC history)
+  // retention barrier to every replica of each CDC tablet. Also releases the
+  // barrier for tablets no longer pinned by any live stream, and prunes
+  // dropped-partition tablet entries from stream metadata. Run periodically from
+  // the catalog manager background task on the leader.
+  void RunCDCStreamMaintenance();
+
+  // Phase 2 of the two-phase CDC stream delete (see DeleteCDCStream). Idempotent:
+  // for every stream marked DELETING -- and every stream_id with checkpoint rows
+  // but no stream row (orphaned rows) -- fans out the retention-barrier RELEASE
+  // RPCs to all replicas, removes the per-tablet checkpoint rows, then removes the
+  // stream row and drops both in-memory map entries. Safe to re-run on any leader
+  // after failover; runs at the start of each RunCDCStreamMaintenance pass.
+  // Public so tests can exercise the reap in isolation from the rest of the
+  // maintenance pass (barrier recompute / dropped-partition pruning).
+  void ReapDeletedCDCStreams();
+
+  // Marks every ACTIVE CDC stream that references a dropped table (one absent
+  // from table_ids_map_, or present but in the REMOVED/is_deleted() state) as
+  // DELETING, persisting the transition to sys_catalog. The subsequent
+  // ReapDeletedCDCStreams pass then releases its barriers and removes its rows.
+  //
+  // A table drop otherwise leaves its stream ACTIVE in sys_catalog forever (a
+  // ghost in ListCDCStreams whose barrier SETs target tablets that no longer
+  // exist) -- gap L2. This closes it. Called eagerly from DeleteTable (the sole
+  // table -> REMOVED transition) and again at the start of every
+  // RunCDCStreamMaintenance pass, so it is a durable backstop that self-heals
+  // across master failover and the eager call's best-effort failures. Soft-
+  // deleted (recallable) tables are deliberately NOT treated as dropped, so a
+  // recall leaves the stream intact.
+  //
+  // Public so tests can exercise it in isolation.
+  void MarkDeletingStreamsForDroppedTables();
+
  private:
+  // Sends an UpdateCDCRetentionBarrier RPC to every replica of 'tablet_id'.
+  // 'min_retained_op_index' == -1 releases the WAL anchor; 'history_safe_time_micros'
+  // == 0 releases the MVCC history floor. No-op if the tablet is unknown or has
+  // no committed config. Does not hold lock_ across task dispatch.
+  // 'barrier_seq' is a monotonic (wall-clock-micros) sequence stamped on the RPC
+  // so replicas can discard reordered SET/RELEASE updates (last-writer-wins);
+  // callers pass the current pass's time so a later pass always outranks an
+  // earlier one. See UpdateCDCRetentionBarrierRequestPB.barrier_seq.
+  //
+  // If 'release_consumer_stream_id' is non-empty, each replica also releases the
+  // per-(stream, tablet) consumer anchor for that stream (used on stream
+  // deletion; see UpdateCDCRetentionBarrierRequestPB.release_consumer_stream_id).
+  // If 'skip_barrier_update' is true, only that consumer-anchor release is
+  // performed and the aggregate barrier is left untouched (used when the tablet
+  // still has other live streams).
+  // 'out_tasks', if non-null, receives a scoped_refptr for every RPC task
+  // dispatched (one per replica per tablet). Used by ReapDeletedCDCStreams to
+  // gate stream-row removal on confirmed task completion (DR-010 F-2 guard).
+  void SendCDCRetentionBarrierToAllReplicas(
+      const std::string& tablet_id,
+      int64_t min_retained_op_index,
+      uint64_t history_safe_time_micros,
+      int64_t barrier_seq,
+      const std::string& release_consumer_stream_id = "",
+      bool skip_barrier_update = false,
+      std::vector<scoped_refptr<MonitoredTask>>* out_tasks = nullptr);
+
   // These tests calls ElectedAsLeaderCb() directly.
   FRIEND_TEST(kudu::client::ClientTest, TestSoftDeleteAndReserveTable);
   FRIEND_TEST(MasterTest, TestShutdownDuringTableVisit);
@@ -1430,6 +1616,90 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Tablet maps: tablet-id -> TabletInfo
   TabletInfoMap tablet_map_;
 
+  // CDC stream maps: stream-id -> CDCStreamInfo
+  CDCStreamInfoMap cdc_stream_map_;
+
+  // CDC per-tablet checkpoints: stream-id -> (tablet-id -> CDCTabletCheckpointInfo).
+  // Guarded by lock_ for the map structure itself; each entry carries its own
+  // CowObject lock for its metadata. See UpdateCDCCheckpoint.
+  CDCTabletCheckpointMap cdc_tablet_checkpoint_map_;
+
+  // Set of tablet ids that RunCDCStreamMaintenance placed under a CDC retention
+  // barrier on the previous pass. Used to detect tablets that are no longer
+  // pinned by any live (active, non-expired) stream so their barriers can be
+  // released. Accessed only from the catalog manager background task thread.
+  std::unordered_set<std::string> cdc_barriered_tablets_;
+
+  // DR-010 F-2 guard: per-stream RELEASE task handles spawned by
+  // ReapDeletedCDCStreams. Stream-row removal is deferred until all tasks for
+  // that stream reach a terminal state (complete/failed/aborted), ensuring the
+  // barrier RELEASE has been sent to every reachable replica before the DELETING
+  // marker is erased. Tasks always terminate within --unresponsive_ts_rpc_timeout_ms
+  // (default 10 min), so the guard cannot stall the reap indefinitely.
+  //
+  // Lost on master failover; the new leader re-runs pass A and re-populates.
+  // Accessed only from the catalog manager background task thread.
+  std::unordered_map<std::string,
+                     std::vector<scoped_refptr<MonitoredTask>>> pending_release_tasks_;
+
+ public:
+  // Cumulative counters for CDC retention-barrier release fan-out, updated by
+  // RunCDCStreamMaintenance. Exposed for observability (an operator can watch
+  // 'deferred' rise when a mass expiry engages the
+  // --cdc_max_barrier_releases_per_run throttle) and for tests. Monotonic;
+  // written only from the single background task thread, read atomically.
+  int64_t cdc_barrier_releases_total() const {
+    return cdc_barrier_releases_total_.load();
+  }
+  int64_t cdc_barrier_releases_deferred_total() const {
+    return cdc_barrier_releases_deferred_total_.load();
+  }
+  // Number of tablets currently pinned under a CDC retention barrier, as of the
+  // end of the last maintenance pass. Snapshot of cdc_barriered_tablets_.size().
+  int64_t cdc_barriered_tablet_count() const {
+    return cdc_barriered_tablet_count_.load();
+  }
+
+  // Test-only: override the CDC staleness grace floor (see cdc_leader_ready_micros_)
+  // so a test can deterministically place the "leader became ready" instant before
+  // or after a doctored checkpoint's last-advance time, without depending on real
+  // elapsed time.
+  void set_cdc_leader_ready_micros_for_tests(int64_t v) {
+    cdc_leader_ready_micros_.store(v, std::memory_order_release);
+  }
+
+  // Test-only: override the in-memory advance-attempt timestamp for a specific
+  // (stream_id, tablet_id) checkpoint, simulating a consumer that is advancing
+  // but whose sys-catalog writes are failing (CF-2). Used to verify that
+  // RunCDCStreamMaintenance holds the barrier while advance attempts are recent,
+  // and still releases it once attempts also go stale (the truly-stuck case).
+  void set_last_checkpoint_advance_attempt_micros_for_tests(
+      const std::string& stream_id, const std::string& tablet_id, int64_t v);
+
+  // Test-only: inject a mock task into pending_release_tasks_ for a stream,
+  // simulating an in-flight RELEASE RPC. Used to exercise the DR-010 F-2 guard
+  // without real tablet servers. Must be called only from the test thread while
+  // the background maintenance task is effectively frozen (e.g. via
+  // --cdc_bg_scan_interval_ms set to a large value).
+  void inject_pending_release_task_for_tests(const std::string& stream_id,
+                                             scoped_refptr<MonitoredTask> task) {
+    pending_release_tasks_[stream_id].push_back(std::move(task));
+  }
+
+ private:
+  std::atomic<int64_t> cdc_barrier_releases_total_{0};
+  std::atomic<int64_t> cdc_barrier_releases_deferred_total_{0};
+  std::atomic<int64_t> cdc_barriered_tablet_count_{0};
+
+  // Liveness signals for the CDC maintenance loop, stamped at the end of each
+  // completed pass by RunCDCStreamMaintenance(). Written from the background
+  // task thread, read atomically by the FunctionGauge callbacks below.
+  std::atomic<int64_t> cdc_maintenance_last_run_micros_{0};
+  std::atomic<int64_t> cdc_maintenance_last_run_duration_micros_{0};
+
+  // Counter incremented once per completed maintenance pass.
+  scoped_refptr<Counter> cdc_maintenance_runs_;
+
   // Names of tables that are currently reserved by CreateTable() or AlterTable().
   //
   // As a rule, operations that add new table names should do so as follows:
@@ -1514,6 +1784,17 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // correctly.
   int64_t leader_ready_term_;
 
+  // Wall-clock micros at which this master last became a ready leader (set right
+  // after leader_ready_term_). RunCDCStreamMaintenance() uses it as a grace floor
+  // for the --cdc_max_staleness_ms guard: a stream cannot be declared stale until
+  // at least that window has elapsed since this leader became ready. Without it, a
+  // master that was unreachable longer than the staleness window would, on the
+  // first maintenance pass after recovery, immediately release retention barriers
+  // for consumers that were healthy all along (PersistCheckpoint had merely been
+  // failing against the down master) -- silently GC'ing WAL they still need (V4).
+  // Read lock-free from the single-threaded bg maintenance task.
+  std::atomic<int64_t> cdc_leader_ready_micros_{0};
+
   // This field is updated when a node becomes leader master, and the HMS
   // integration is enabled. It caches the latest processed Hive Metastore
   // notification log event ID so that every request does not need to hit the
@@ -1549,6 +1830,12 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   std::string cluster_id_;
 
   bool is_joining_existing_cluster_;
+
+  // NOTE: this must be the last member to be destructed. It detaches the CDC
+  // FunctionGauge callbacks before the atomics they read are destroyed.
+  // (Members are destructed in reverse declaration order, so "last" here means
+  // "destructed first".)
+  FunctionGaugeDetacher cdc_metric_detacher_;
 
   DISALLOW_COPY_AND_ASSIGN(CatalogManager);
 };

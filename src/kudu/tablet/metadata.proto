@@ -191,6 +191,20 @@ message TabletSuperBlockPB {
   // participant ops should be anchored to replay the updates upon restarting.
   // TODO(awong): consider storing these separately from the superblock.
   map<int64, TxnMetadataPB> txn_metadata = 20;
+
+  // CDC retention barrier (see CDCServiceImpl::SetRetentionBarrier). Persisted on
+  // every replica so a restarted node or a newly-elected leader restores WAL and
+  // MVCC-history retention immediately, without waiting for the master's next CDC
+  // maintenance pass (--cdc_bg_scan_interval_ms).
+
+  // The lowest Raft op index that must remain in the WAL for an active CDC stream
+  // on this tablet. Absent or negative means no active barrier.
+  optional int64 cdc_min_retained_op_index = 21;
+
+  // The oldest MVCC timestamp (physical microseconds) that an active FULL-mode or
+  // snapshot CDC stream still needs retained in UNDO history. Absent or 0 means no
+  // history floor.
+  optional int64 cdc_history_safe_time_micros = 22;
 }
 
 // Tablet states represent stages of a TabletReplica's object lifecycle and are

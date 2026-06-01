@@ -1,0 +1,102 @@
+Kudu CDC: the C++ client
+========================
+
+WHAT IT IS
+
+The client is the consumer side of Kudu CDC. The server exposes ordered row
+changes per tablet (see CDC_OVERVIEW.txt); the client turns that into a simple
+"give me the changes for this table" experience. It talks to the master for
+stream lifecycle and topology, and to each tablet leader for the data path. It
+does NOT depend on KuduClient internals - it owns its own Messenger and the
+generated master/tserver proxies.
+
+There are three layers: a low-level CDCClient (RPC + discovery), a higher-level
+CDCConsumer (pollers + decoding + fan-out), and the `kudu cdc` CLI on top.
+
+
+1. CDCClient (low-level RPCs and discovery)
+
+- Stream lifecycle: CreateStream / DeleteStream / ListStreams / GetStreamInfo,
+  each a master RPC. CreateStream resolves the table NAME to its canonical table
+  id first, so a stream is bound to the table's identity, not its (mutable) name.
+- Table metadata: resolves the current schema and, on secured clusters, a signed
+  authz token to forward on the data path.
+- Topology: GetTabletLocations paginates the table's partition range and returns
+  each tablet with its current leader and replica set.
+- Data path: GetChanges / Checkpoint, issued directly to a tablet leader.
+- Master failover is internal: it cycles through the configured masters on
+  NOT_THE_LEADER or transport errors and remembers the current leader. A single
+  instance is thread-safe.
+
+
+2. CDCConsumer (the orchestration layer)
+
+Given a stream id, the consumer discovers the covered table's tablets and spawns
+one poller thread per tablet. Each poller runs the GetChanges loop, decodes each
+record against the schema, and hands finished batches to a user callback.
+
+- Delivery: the callback gets one batch per tablet, in ascending op-index order.
+  It may run concurrently across tablets, but never concurrently for the SAME
+  tablet. Returning non-OK stops that tablet's poller.
+- Per-tablet leader failover: on a leader change the poller re-resolves the
+  leader from the master and retries; it does not lose its place.
+- Checkpointing: progress is durably checkpointed to the master periodically
+  (default every 10s) and on clean shutdown. Flush() forces an immediate
+  checkpoint on every tablet. NOTE: the server persists a checkpoint to the
+  master asynchronously, AFTER acknowledging the Checkpoint RPC - so a durable
+  checkpoint may lag the RPC return by a moment.
+- Resume: a tablet that already has a durable server-side checkpoint always
+  resumes from it. The start mode below is only the fallback for tablets with no
+  checkpoint yet.
+- Backoff: when a tablet has no new records the poller idles with capped
+  exponential backoff (200ms up to 2s) instead of hot-looping.
+- Expiry: if the server reports the stream/WAL/history has expired, the tablet's
+  progress is flagged needs_resnapshot rather than silently losing data.
+
+Start modes (per Options.start_mode; fallback only, see Resume):
+- kNow: skip history, tail the current end. The tail is anchored deterministically
+  at Start() time by probing each tablet's current committed index (so changes
+  written just before Start() are not accidentally included or missed by a racy
+  first poll).
+- kEarliest: start from the oldest WAL still retained on the server.
+- kSnapshot: emit a consistent snapshot first (READ records), then follow live
+  changes. Requires a stream created with a snapshot mode other than NEVER.
+
+
+3. RECORD DECODING (what the callback sees)
+
+Each CDCDecodedRecord carries the op type (INSERT/UPDATE/DELETE/UPSERT/DDL/
+BEGIN/COMMIT/ABORT/READ), op index/term, timestamps, schema version, and:
+- after: the after-image columns (for DELETE, just the primary key).
+- before: the before-image, populated only for FULL streams (UPDATE/DELETE).
+Values are decoded to human-readable strings against the current schema, with a
+hex fallback for anything that cannot be rendered. DDL records carry the new
+schema and the consumer switches its decode schema over on the fly.
+
+
+4. THE CLI (kudu cdc)
+
+Stream management:
+- kudu cdc stream create <masters> <table> [--record_type=change|full]
+                                           [--snapshot_mode=never|...]
+- kudu cdc stream list     <masters> [--stream_table_id=<id>] [--format=...]
+- kudu cdc stream describe <masters> <stream_id> [--format=...]
+- kudu cdc stream delete   <masters> <stream_id>
+
+Consuming:
+- kudu cdc consume <masters> <table> [--stream=<id>] [--from=now|earliest|snapshot]
+                                     [--record_type=change|full]
+                                     [--max_records=N] [--format=...]
+  Without --stream, a temporary stream is created and deleted on exit (good for
+  ad-hoc inspection). With --stream, it consumes and durably checkpoints an
+  existing stream that covers the table (durable progress across runs). Runs
+  until interrupted (Ctrl-C) unless --max_records is set.
+
+
+5. THREADING AND OWNERSHIP (quick notes for integrators)
+
+- The consumer does NOT own the CDCClient; keep the client alive for the
+  consumer's lifetime.
+- Start/Stop/Flush are meant to be driven from one controlling thread; Stop() is
+  idempotent and joins all pollers. GetProgress() is safe to call concurrently
+  and returns per-tablet lag/checkpoint/error state for monitoring.

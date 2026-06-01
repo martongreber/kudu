@@ -22,6 +22,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -285,6 +286,24 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   // Returns the log indexes to be retained for durability and to catch up peers.
   // Used for selection of log segments to delete during Log GC.
   log::RetentionIndexes GetRetentionIndexes() const;
+
+  // Test-only: current value of the CDC force-release counter (the number of
+  // Log-GC cycles in which the CDC WAL retention barrier was force-released by
+  // the disk-pressure valve or the barrier-age ceiling). Returns -1 if the
+  // counter was never instantiated (no metric entity).
+  int64_t cdc_barrier_forced_releases_for_tests() const {
+    return cdc_barrier_forced_releases_ ? cdc_barrier_forced_releases_->value() : -1;
+  }
+
+  // Test-only: backdate the "barrier last advanced" clock the age-ceiling valve
+  // (--cdc_max_wal_retention_secs) measures against, so a test can trip that
+  // backstop deterministically instead of sleeping. Must be called after a first
+  // GetRetentionIndexes() has observed the current barrier index (otherwise the
+  // next call re-stamps this to now on first observation).
+  void set_cdc_barrier_last_advanced_micros_for_tests(int64_t micros) {
+    std::lock_guard<simple_spinlock> l(cdc_barrier_lock_);
+    cdc_barrier_last_advanced_micros_ = micros;
+  }
 
   // See Log::GetReplaySizeMap(...).
   //
@@ -621,6 +640,26 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
 
   // Cached stats for the tablet replica.
   ReportedTabletStatsPB stats_pb_;
+
+  // CDC barrier force-release tracking. Guards 'cdc_barrier_prev_op_index_' and
+  // 'cdc_barrier_last_advanced_micros_'. Mutable because GetRetentionIndexes() is
+  // const but lazily updates these cached values on each call.
+  mutable simple_spinlock cdc_barrier_lock_;
+  // Last barrier index observed in this process lifetime. Initialized to -2 (a
+  // value that can never be a real barrier index, which are always >= 0) so the
+  // very first observation always records the current time in
+  // 'cdc_barrier_last_advanced_micros_', preventing an immediate age-ceiling release
+  // on tserver startup.
+  mutable int64_t cdc_barrier_prev_op_index_;
+  // Wall-clock time in microseconds when 'cdc_barrier_prev_op_index_' last changed.
+  // Zero until the first positive barrier index is observed.
+  mutable int64_t cdc_barrier_last_advanced_micros_;
+
+  // Counter incremented each log-GC cycle in which the CDC WAL retention barrier
+  // was force-released due to disk pressure (--cdc_stop_retaining_min_disk_mb) or
+  // the max-retention ceiling (--cdc_max_wal_retention_secs). May be null in tests
+  // that run without a metric entity (guarded at the call site).
+  scoped_refptr<Counter> cdc_barrier_forced_releases_;
 
   // NOTE: it's important that this is the first member to be destructed. This
   // ensures we do not attempt to collect metrics while calling the destructor.

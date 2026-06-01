@@ -439,6 +439,46 @@ class Tablet {
   // Calculates history GC options based on properties of the Clock implementation.
   HistoryGcOpts GetHistoryGcOpts() const;
 
+  // Advances the history-GC water mark to 'opts's ancient history mark (a no-op
+  // if GC is disabled or the mark would not increase). Call from the paths that
+  // actually GC UNDO history so the mark reflects history that has become
+  // reclaimable. See cdc_history_gc_water_mark().
+  void RecordHistoryGcWaterMark(const HistoryGcOpts& opts) const;
+
+  // As above, for the ancient-UNDO/deleted-rowset GC paths that work from a raw
+  // ancient history mark rather than a HistoryGcOpts. Monotonic CAS-max.
+  void RecordHistoryGcWaterMark(Timestamp ancient_history_mark) const;
+
+  // Sets the CDC history floor: the oldest MVCC timestamp that an active
+  // FULL-mode or snapshot CDC stream still needs to read from UNDO history.
+  // GetTabletAncientHistoryMark() will not advance the ancient history mark past
+  // this value, so compaction and UNDO-delta GC retain the versions CDC needs.
+  // A value of Timestamp(0) (the default) disables the floor. Thread-safe.
+  void SetCDCHistoryFloor(Timestamp floor) {
+    cdc_history_floor_.store(floor.value(), std::memory_order_release);
+  }
+
+  // Returns the current CDC history floor (Timestamp(0) if unset). For tests
+  // and observability.
+  Timestamp cdc_history_floor() const {
+    return Timestamp(cdc_history_floor_.load(std::memory_order_acquire));
+  }
+
+  // Returns the CDC history-GC water mark: the highest ancient-history-mark this
+  // tablet has ever applied while GC-ing UNDO history (Timestamp(0) if none).
+  // UNDO history below this timestamp may have been physically removed, so a
+  // FULL-mode/snapshot CDC before-image that reads below it cannot be trusted.
+  //
+  // This is distinct from the *current* ancient history mark: the CDC history
+  // floor is re-pinned to each GetChanges batch's minimum op timestamp, which
+  // can transiently lower the current AHM back below a point at which an earlier
+  // GC already removed history. The water mark is monotonic and records what was
+  // actually GC'd, so before-image reconstruction checks against it (not the
+  // current AHM) to decide HISTORY_EXPIRED rather than emitting a wrong image.
+  Timestamp cdc_history_gc_water_mark() const {
+    return Timestamp(history_gc_water_mark_.load(std::memory_order_acquire));
+  }
+
   // Register the maintenance ops associated with this tablet
   void RegisterMaintenanceOps(MaintenanceManager* maint_mgr);
 
@@ -888,6 +928,23 @@ class Tablet {
   clock::Clock* clock_;
 
   MvccManager mvcc_;
+
+  // CDC history floor (raw Timestamp.value()): the oldest MVCC timestamp that an
+  // active FULL-mode/snapshot CDC stream still needs. GetTabletAncientHistoryMark()
+  // clamps the ancient history mark to this value so UNDO history CDC needs is not
+  // GC'd. 0 means no floor. Written by SetCDCHistoryFloor(), read lock-free in the
+  // GC path.
+  std::atomic<uint64_t> cdc_history_floor_{0};
+
+  // CDC history-GC water mark (raw Timestamp.value()): the highest
+  // ancient-history-mark ever applied while GC-ing UNDO history. Monotonic
+  // (non-decreasing), updated in GetHistoryGcOpts() (the chokepoint every
+  // flush/compaction reads to decide what history to drop). Read lock-free by
+  // cdc_history_gc_water_mark() during before-image reconstruction. 0 means no
+  // history GC has run. See cdc_history_gc_water_mark() for why this, and not
+  // the current AHM, gates HISTORY_EXPIRED. Mutable: updated from the const
+  // GetHistoryGcOpts().
+  mutable std::atomic<uint64_t> history_gc_water_mark_{0};
 
   LockManager lock_manager_;
 

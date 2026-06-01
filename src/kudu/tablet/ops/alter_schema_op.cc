@@ -22,6 +22,7 @@
 #include <type_traits>
 #include <utility>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/arena.h>
 
@@ -40,11 +41,19 @@
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/trace.h"
+
+DEFINE_int32(tablet_inject_latency_on_apply_alter_schema_op_ms, 0,
+             "How much latency (in milliseconds) to inject at the start of "
+             "applying an alter-schema op. Used to widen the window between an "
+             "alter being committed and being applied. For testing only!");
+TAG_FLAG(tablet_inject_latency_on_apply_alter_schema_op_ms, unsafe);
+TAG_FLAG(tablet_inject_latency_on_apply_alter_schema_op_ms, runtime);
 
 namespace kudu {
 namespace tablet {
@@ -131,6 +140,14 @@ Status AlterSchemaOp::Start() {
 
 Status AlterSchemaOp::Apply(CommitMsg** commit_msg) {
   TRACE("APPLY ALTER-SCHEMA: Starting");
+
+  if (PREDICT_FALSE(FLAGS_tablet_inject_latency_on_apply_alter_schema_op_ms > 0)) {
+    TRACE("Injecting $0ms of latency due to "
+          "--tablet_inject_latency_on_apply_alter_schema_op_ms",
+          FLAGS_tablet_inject_latency_on_apply_alter_schema_op_ms);
+    SleepFor(MonoDelta::FromMilliseconds(
+        FLAGS_tablet_inject_latency_on_apply_alter_schema_op_ms));
+  }
 
   Tablet* tablet = state_->tablet_replica()->tablet();
   RETURN_NOT_OK(tablet->AlterSchema(state()));

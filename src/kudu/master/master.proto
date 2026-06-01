@@ -1235,6 +1235,185 @@ enum MasterFeatures {
   ARRAY_1D_COLUMN_TYPE = 12;
 }
 
+////////////////////////////////////////////////////////////
+// CDC (Change Data Capture) messages
+////////////////////////////////////////////////////////////
+
+// Configuration for a CDC stream.
+// Kept structurally in sync with CDCStreamConfigPB in src/kudu/cdc/cdc.proto.
+message CDCStreamConfigPB {
+  // What content to include in change records.
+  enum RecordType {
+    // After-image only (changed columns for UPDATE, all columns for INSERT/DELETE).
+    CHANGE = 0;
+    // Full before-image and after-image for every row change.
+    FULL   = 1;
+  }
+
+  // Wire format for CDCRecordPB entries.
+  enum RecordFormat {
+    PROTO = 0;
+    // JSON = 1 reserved.
+  }
+
+  // Whether and how a consumer bootstraps from the table's current contents.
+  enum SnapshotMode {
+    INITIAL_AND_CONTINUE = 0;
+    NEVER                = 1;
+    INITIAL_ONLY         = 2;
+  }
+
+  optional RecordType   record_type           = 1 [default = CHANGE];
+  optional RecordFormat record_format         = 2 [default = PROTO];
+  // Maximum serialized bytes per GetChanges response (default 64 MiB).
+  optional int64 max_bytes_per_response = 3 [default = 67108864];
+  optional SnapshotMode snapshot_mode         = 4 [default = NEVER];
+}
+
+// The sys catalog entry for a CDC stream. Keyed by stream_id (UUID string).
+message SysCDCStreamEntryPB {
+  enum State {
+    ACTIVE   = 0;
+    DELETING = 1;
+  }
+
+  // Tables included in this stream.
+  repeated bytes table_ids = 1;
+
+  optional CDCStreamConfigPB config = 2;
+
+  optional State state = 3 [default = ACTIVE];
+
+  // Fields 4-7 previously stored per-tablet checkpoint state (op_index, history
+  // floor, last-active/last-advance times) inline here, which forced every
+  // Checkpoint() RPC to take the per-stream metadata write lock and rewrite this
+  // whole proto. That state now lives in one SysCDCTabletCheckpointEntryPB row per
+  // (stream, tablet) -- see that message and CatalogManager::UpdateCDCCheckpoint.
+  // Reserved so the numbers/names are never reused.
+  reserved 4, 5, 6, 7;
+  reserved "tablet_checkpoints", "tablet_history_floors",
+           "last_active_time_micros", "last_checkpoint_advance_time_micros";
+}
+
+// The sys catalog entry for one (stream, tablet) CDC checkpoint. There is one
+// such row per tablet a stream is consuming, keyed by
+// entry_id = stream_id + '\0' + tablet_id (the stream/tablet pair is recovered
+// from the fields below, not by parsing the key). Splitting checkpoints into
+// their own rows lets each Checkpoint() RPC UPSERT a single small row under its
+// own metadata lock, instead of contending on the per-stream lock and rewriting
+// the entire SysCDCStreamEntryPB. Written by CatalogManager::UpdateCDCCheckpoint.
+message SysCDCTabletCheckpointEntryPB {
+  // The stream and tablet this checkpoint belongs to.
+  optional bytes stream_id = 1;
+  optional bytes tablet_id = 2;
+
+  // Durable checkpoint: the Raft log op_index the consumer has acknowledged.
+  // Advanced monotonically (max of existing and reported).
+  optional int64 op_index = 3;
+
+  // MVCC history floor (microseconds). FULL/snapshot streams only; fanned out to
+  // every replica so UNDO deltas older than the consumer's read point survive.
+  // Absent/0 for CHANGE streams.
+  optional fixed64 history_safe_time_micros = 4;
+
+  // Wall-clock time (microseconds since the Unix epoch) of the last observed
+  // consumer activity for this (stream, tablet). Refreshed on each
+  // UpdateCDCCheckpoint. A tablet idle beyond --cdc_stream_expiry_ms is excluded
+  // from the retention-min computation so its barrier is released.
+  optional fixed64 last_active_time_micros = 5;
+
+  // Wall-clock time (microseconds since the Unix epoch) of the last time this
+  // tablet's checkpoint advanced (op_index moved strictly forward). Updated only
+  // on real forward progress -- distinct from last_active_time_micros, which
+  // every poll refreshes. A tablet whose checkpoint stops advancing for longer
+  // than --cdc_max_staleness_ms is excluded from the retention-min computation
+  // even if the consumer keeps polling. 0/absent disables the guard until the
+  // first advance is recorded.
+  optional fixed64 last_checkpoint_advance_time_micros = 6;
+}
+
+// Summary returned in ListCDCStreams.
+message CDCStreamInfoPB {
+  optional bytes             stream_id = 1;
+  repeated bytes             table_ids = 2;
+  optional CDCStreamConfigPB config    = 3;
+  map<string, int64>         tablet_checkpoints = 4;
+}
+
+// ---- CreateCDCStream ----
+
+message CreateCDCStreamRequestPB {
+  // At least one table_id is required.
+  repeated bytes table_ids = 1;
+  optional CDCStreamConfigPB config = 2;
+}
+
+message CreateCDCStreamResponsePB {
+  optional MasterErrorPB error = 1;
+  // UUID assigned by the master for this stream.
+  optional bytes stream_id = 2;
+}
+
+// ---- DeleteCDCStream ----
+
+message DeleteCDCStreamRequestPB {
+  required bytes stream_id = 1;
+}
+
+message DeleteCDCStreamResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
+// ---- ListCDCStreams ----
+
+message ListCDCStreamsRequestPB {
+  // If set, returns only streams covering this table. Otherwise returns all streams.
+  optional bytes table_id = 1;
+}
+
+message ListCDCStreamsResponsePB {
+  optional MasterErrorPB   error   = 1;
+  repeated CDCStreamInfoPB streams = 2;
+}
+
+// ---- GetCDCDBStreamInfo ----
+// Returns stream metadata and current tablet checkpoints for one stream.
+
+message GetCDCStreamInfoRequestPB {
+  required bytes stream_id = 1;
+}
+
+message GetCDCStreamInfoResponsePB {
+  optional MasterErrorPB   error  = 1;
+  optional CDCStreamInfoPB stream = 2;
+}
+
+// ---- UpdateCDCCheckpoint ----
+// Called by CDCService to persist a consumer's checkpoint durably on the master.
+
+message UpdateCDCCheckpointRequestPB {
+  required bytes stream_id = 1;
+  required bytes tablet_id = 2;
+  required int64 op_index  = 3;
+
+  // For FULL/snapshot streams: the MVCC history floor (microseconds) that this
+  // consumer still needs. The master stores the per-tablet minimum across
+  // streams and fans it out to replicas via UpdateCDCRetentionBarrier. Absent
+  // or 0 for CHANGE-only streams.
+  optional fixed64 history_safe_time_micros = 4;
+
+  // If set, this is a lightweight activity heartbeat from a tablet server: the
+  // master only refreshes the stream's last_active_time_micros and leaves the
+  // durable checkpoint and history floor untouched (op_index is ignored). Sent,
+  // throttled, from GetChanges so a live but not-yet-checkpointing consumer is
+  // not expired.
+  optional bool refresh_active_time_only = 5 [default = false];
+}
+
+message UpdateCDCCheckpointResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
 service MasterService {
   // Set the default authz method to something invalid, so that if
   // we forget to set the option on a new RPC call, we'll get a build
@@ -1336,6 +1515,30 @@ service MasterService {
 
   rpc UnregisterTServer(UnregisterTServerRequestPB) returns (UnregisterTServerResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
+  }
+
+  // CDC (Change Data Capture) RPCs
+  // ------------------------------------------------------------
+
+  rpc CreateCDCStream(CreateCDCStreamRequestPB) returns (CreateCDCStreamResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+
+  rpc DeleteCDCStream(DeleteCDCStreamRequestPB) returns (DeleteCDCStreamResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+
+  rpc ListCDCStreams(ListCDCStreamsRequestPB) returns (ListCDCStreamsResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+
+  rpc GetCDCStreamInfo(GetCDCStreamInfoRequestPB) returns (GetCDCStreamInfoResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+
+  // Called by CDCService on tablet servers to durably persist consumer checkpoints.
+  rpc UpdateCDCCheckpoint(UpdateCDCCheckpointRequestPB) returns (UpdateCDCCheckpointResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeServiceUser";
   }
 
   // Master->Master RPCs

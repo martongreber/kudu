@@ -220,6 +220,64 @@ message DeleteTabletResponsePB {
   optional TabletServerErrorPB error = 1;
 }
 
+// Set (or release) the CDC WAL retention barrier on a tablet replica. Sent by the
+// leader master to every replica of a CDC-enabled tablet so that WAL segments at
+// or after the consumers' minimum checkpoint are retained even across leadership
+// changes and independent follower log GC.
+message UpdateCDCRetentionBarrierRequestPB {
+  // UUID of the server this request is addressed to.
+  optional bytes dest_uuid = 1;
+
+  required bytes tablet_id = 2;
+
+  // The minimum WAL op index CDC still needs; the replica retains segments at or
+  // after this index. A value < 0 releases the barrier (no active CDC stream).
+  required int64 min_retained_op_index = 3;
+
+  // The MVCC history floor (microseconds, physical component of the hybrid
+  // clock) that FULL/snapshot CDC streams still need to read. The replica does
+  // not garbage-collect UNDO deltas older than this timestamp. Absent or 0
+  // means no history floor (CHANGE-only streams keep the cheap WAL-only path).
+  optional fixed64 history_safe_time_micros = 4;
+
+  // Monotonic sequence number stamped by the master, used by the replica to
+  // discard reordered barrier updates (last-writer-wins). Barrier SET and
+  // RELEASE tasks are async, best-effort, one-shot and unordered, so a slow SET
+  // dispatched by an earlier maintenance pass can otherwise arrive after a later
+  // pass's RELEASE and leave the replica anchored forever (a WAL/history leak),
+  // or vice versa. The replica remembers the highest sequence it has applied per
+  // tablet and ignores any request with a lower sequence. The master uses the
+  // maintenance pass's wall-clock time (microseconds) as the sequence, so it is
+  // monotonic across passes and across master failovers (clocks are NTP-synced).
+  // Absent or 0 means "unsequenced" (a legacy master); such requests are always
+  // applied, preserving the prior behavior.
+  optional int64 barrier_seq = 5;
+
+  // If set, the replica also releases the per-(stream, tablet) CDC consumer
+  // anchor for this stream id, in addition to (or instead of) updating the
+  // aggregate WAL retention barrier. This is used on stream deletion: the
+  // aggregate barrier lives in 'retention_anchors_' (all replicas, master
+  // pushed), but the consumer anchor lives in 'stream_tablet_state_' (leader
+  // only, established by the consumer's own GetChanges/Checkpoint polling) and
+  // is otherwise freed only when the tablet itself is deleted -- so a deleted
+  // stream would keep pinning the WAL until then. Fanning this to every replica
+  // covers the case where the anchor was established on a replica that is no
+  // longer the leader.
+  optional bytes release_consumer_stream_id = 6;
+
+  // If true, do not touch the aggregate WAL retention barrier
+  // ('min_retained_op_index' / 'history_safe_time_micros' are ignored); only
+  // act on 'release_consumer_stream_id'. Used when a stream is deleted but the
+  // tablet still has other live streams, so the aggregate barrier must be left
+  // to the master's maintenance pass to recompute rather than being released
+  // here (which would briefly drop retention for the surviving streams).
+  optional bool skip_barrier_update = 7;
+}
+
+message UpdateCDCRetentionBarrierResponsePB {
+  optional TabletServerErrorPB error = 1;
+}
+
 // Enum of the server's Tablet Manager state: currently this is only
 // used for assertions, but this can also be sent to the master.
 enum TSTabletManagerStatePB {
@@ -263,6 +321,12 @@ service TabletServerAdminService {
   // Request that a tablet participate in a transaction, or update the state of
   // an existing transaction participant.
   rpc ParticipateInTransaction(ParticipantRequestPB) returns (ParticipantResponsePB);
+
+  // Set or release the CDC WAL retention barrier on a tablet replica. Driven by
+  // the leader master's periodic CDC maintenance so every replica retains the
+  // WAL that active CDC consumers still need.
+  rpc UpdateCDCRetentionBarrier(UpdateCDCRetentionBarrierRequestPB)
+      returns (UpdateCDCRetentionBarrierResponsePB);
 }
 
 message QuiesceTabletServerRequestPB {

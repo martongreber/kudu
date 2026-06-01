@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -31,8 +32,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/clock/hybrid_clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/row_operations.pb.h"
 #include "kudu/common/schema.h"
@@ -76,12 +79,15 @@
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_int32(flush_threshold_mb);
 DECLARE_int32(tablet_history_max_age_sec);
+DECLARE_int64(cdc_stop_retaining_min_disk_mb);
+DECLARE_int64(cdc_max_wal_retention_secs);
 
 METRIC_DECLARE_entity(tablet);
 
 METRIC_DECLARE_gauge_uint64(live_row_count);
 METRIC_DECLARE_histogram(alter_schema_duration);
 
+using kudu::clock::HybridClock;
 using kudu::consensus::CommitMsg;
 using kudu::consensus::ConsensusBootstrapInfo;
 using kudu::consensus::OpId;
@@ -286,7 +292,7 @@ TEST_F(TabletReplicaTest, TestMRSAnchorPreventsLogGC) {
   ConsensusBootstrapInfo info;
   ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
 
-  Log* log = tablet_replica_->log_.get();
+  Log* log = tablet_replica_->log();
   int32_t num_gced;
 
   ASSERT_EVENTUALLY([&]{ AssertNoLogAnchors(); });
@@ -326,7 +332,7 @@ TEST_F(TabletReplicaTest, TestDMSAnchorPreventsLogGC) {
   ConsensusBootstrapInfo info;
   ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
 
-  Log* log = tablet_replica_->log_.get();
+  Log* log = tablet_replica_->log();
   shared_ptr<RaftConsensus> consensus = tablet_replica_->shared_consensus();
   int32_t num_gced;
 
@@ -406,7 +412,7 @@ TEST_F(TabletReplicaTest, TestActiveOpPreventsLogGC) {
   ConsensusBootstrapInfo info;
   ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
 
-  Log* log = tablet_replica_->log_.get();
+  Log* log = tablet_replica_->log();
   int32_t num_gced;
 
   ASSERT_EVENTUALLY([&]{ AssertNoLogAnchors(); });
@@ -520,6 +526,232 @@ TEST_F(TabletReplicaTest, TestGCEmptyLog) {
   ASSERT_OK(StartReplica(info));
   // We don't wait on consensus on purpose.
   tablet_replica_->RunLogGC();
+}
+
+// When the CDC disk-pressure valve fires, GetRetentionIndexes() must release the
+// in-memory MVCC/UNDO history floor in addition to the WAL clamp -- otherwise the
+// valve is only half-open: WAL GC resumes but compaction/UNDO GC stays pinned to
+// the stale floor during the exact disk-full event the valve exists to relieve.
+TEST_F(TabletReplicaTest, TestCDCValveReleasesHistoryFloor) {
+  ConsensusBootstrapInfo info;
+  ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
+
+  Tablet* tablet = tablet_replica_->tablet();
+
+  // Simulate an active FULL/snapshot CDC stream: a persisted retention barrier
+  // (op_index >= 0 arms the CDC path in GetRetentionIndexes) plus a live history
+  // floor the master last pushed.
+  const uint64_t kHistoryMicros = 1234567890ULL;
+  ASSERT_TRUE(tablet_replica_->tablet_metadata()->SetCDCRetentionBarrier(
+      /*op_index=*/1, kHistoryMicros));
+  tablet->SetCDCHistoryFloor(HybridClock::TimestampFromMicroseconds(kHistoryMicros));
+  ASSERT_NE(Timestamp(0), tablet->cdc_history_floor());
+
+  // Valve closed: with the disk valve disabled and the age ceiling not tripped,
+  // GetRetentionIndexes() must leave the floor intact.
+  FLAGS_cdc_stop_retaining_min_disk_mb = 0;
+  FLAGS_cdc_max_wal_retention_secs = 0;
+  (void)tablet_replica_->GetRetentionIndexes();
+  ASSERT_EQ(HybridClock::TimestampFromMicroseconds(kHistoryMicros),
+            tablet->cdc_history_floor())
+      << "history floor must survive when no valve fires";
+
+  // Valve open (disk pressure): a threshold larger than any real free space
+  // forces the disk-pressure release. The history floor must now be cleared.
+  FLAGS_cdc_stop_retaining_min_disk_mb = std::numeric_limits<int64_t>::max();
+  (void)tablet_replica_->GetRetentionIndexes();
+  ASSERT_EQ(Timestamp(0), tablet->cdc_history_floor())
+      << "disk-pressure valve must release the MVCC history floor";
+}
+
+// The barrier-age ceiling (--cdc_max_wal_retention_secs) must also release the
+// in-memory MVCC/UNDO history floor when it fires, not just the WAL clamp.
+// Both valve conditions converge in the same skip_cdc_clamp block in
+// GetRetentionIndexes(), so releasing one without the other is a latent bug.
+// The age ceiling fires only when the barrier is actually pinning WAL
+// (cdc_min_op_index < ret.for_durability), so we first do inserts to advance
+// the Raft durability floor above the pinned barrier index.
+TEST_F(TabletReplicaTest, TestCDCAgeCeilingValveReleasesHistoryFloor) {
+  ConsensusBootstrapInfo info;
+  ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
+
+  // Build WAL segments and flush so the Raft durability floor advances well
+  // above index 1; the age-ceiling pre-condition (barrier < Raft floor)
+  // requires this.
+  ASSERT_OK(ExecuteInsertsAndRollLogs(3));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  ASSERT_EVENTUALLY([&]{ AssertNoLogAnchors(); });
+
+  Tablet* tablet = tablet_replica_->tablet();
+
+  // Simulate an active FULL/snapshot CDC stream: barrier at index 1 plus a
+  // live history floor.
+  const uint64_t kHistoryMicros = 1234567890ULL;
+  ASSERT_TRUE(tablet_replica_->tablet_metadata()->SetCDCRetentionBarrier(
+      /*op_index=*/1, kHistoryMicros));
+  tablet->SetCDCHistoryFloor(HybridClock::TimestampFromMicroseconds(kHistoryMicros));
+  ASSERT_NE(Timestamp(0), tablet->cdc_history_floor());
+
+  // Disable the disk valve so the age ceiling is the only active release path.
+  FLAGS_cdc_stop_retaining_min_disk_mb = 0;
+  const int64_t kMaxRetainSecs = 3600;
+  FLAGS_cdc_max_wal_retention_secs = kMaxRetainSecs;
+
+  // First observation: stamps the barrier-advanced clock to "now". The floor
+  // must stay intact -- anti-flap guarantee.
+  (void)tablet_replica_->GetRetentionIndexes();
+  ASSERT_EQ(HybridClock::TimestampFromMicroseconds(kHistoryMicros),
+            tablet->cdc_history_floor())
+      << "history floor must survive on first observation (anti-flap)";
+
+  // Backdate the advanced clock well past the ceiling. The barrier index is
+  // unchanged, so the next call does not re-stamp it. The age valve must fire
+  // and clear the history floor to the no-floor sentinel.
+  tablet_replica_->set_cdc_barrier_last_advanced_micros_for_tests(
+      GetCurrentTimeMicros() - (kMaxRetainSecs + 60) * 1000000LL);
+  (void)tablet_replica_->GetRetentionIndexes();
+  ASSERT_EQ(Timestamp(0), tablet->cdc_history_floor())
+      << "age-ceiling valve must release the MVCC history floor";
+}
+
+// V2/G2: end-to-end coverage of the disk-pressure backstop
+// (--cdc_stop_retaining_min_disk_mb). With a CDC retention barrier pinning an
+// early WAL index, the clamp normally holds segments the Raft floor would
+// otherwise let go. When free space drops below the threshold the valve must
+// (a) bump the cdc_barrier_forced_releases counter and (b) release the clamp so
+// for_durability reverts to the true Raft floor and Log GC can reclaim the WAL.
+TEST_F(TabletReplicaTest, TestCDCDiskPressureValveReleasesWAL) {
+  ConsensusBootstrapInfo info;
+  ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
+  Log* log = tablet_replica_->log();
+
+  // Build several WAL segments and flush the MRS so no MRS/DMS anchor holds the
+  // early segments -- the CDC barrier is then the only thing pinning them.
+  ASSERT_OK(ExecuteInsertsAndRollLogs(3));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  ASSERT_EVENTUALLY([&]{ AssertNoLogAnchors(); });
+
+  // Pin WAL from index 1 (below the true Raft durability floor, which now sits
+  // near the last op after the flush). CHANGE stream: no history floor.
+  ASSERT_TRUE(tablet_replica_->tablet_metadata()->SetCDCRetentionBarrier(
+      /*op_index=*/1, /*history_safe_time_micros=*/0));
+
+  // Valve closed: disk check disabled, age ceiling disabled. The clamp holds, so
+  // for_durability is pinned at the barrier and the counter does not move.
+  FLAGS_cdc_stop_retaining_min_disk_mb = 0;
+  FLAGS_cdc_max_wal_retention_secs = 0;
+  const int64_t releases_before = tablet_replica_->cdc_barrier_forced_releases_for_tests();
+  const int64_t fd_clamped = tablet_replica_->GetRetentionIndexes().for_durability;
+  ASSERT_EQ(releases_before, tablet_replica_->cdc_barrier_forced_releases_for_tests())
+      << "counter must not move while no valve fires";
+  ASSERT_EQ(fd_clamped, 1)
+      << "barrier must clamp for_durability to exactly the pinned index";
+
+  // Valve open: a threshold larger than any real free space forces the disk
+  // release. The counter increments and the clamp is skipped, so for_durability
+  // reverts above the barrier.
+  FLAGS_cdc_stop_retaining_min_disk_mb = std::numeric_limits<int64_t>::max();
+  const log::RetentionIndexes released = tablet_replica_->GetRetentionIndexes();
+  ASSERT_EQ(releases_before + 1, tablet_replica_->cdc_barrier_forced_releases_for_tests())
+      << "disk-pressure valve must increment cdc_barrier_forced_releases";
+  ASSERT_GT(released.for_durability, fd_clamped)
+      << "disk-pressure valve must release the WAL clamp (for_durability reverts "
+         "to the true Raft floor)";
+
+  // And GC actually proceeds now that the clamp is released.
+  int32_t num_gced = 0;
+  ASSERT_OK(log->GC(released, &num_gced));
+  ASSERT_GT(num_gced, 0) << "released barrier must let Log GC reclaim WAL segments";
+}
+
+// V2/G2: end-to-end coverage of the barrier-age ceiling
+// (--cdc_max_wal_retention_secs), the dead-master backstop. If the master stops
+// refreshing the barrier for longer than the ceiling, the tserver must release
+// it on its own: bump cdc_barrier_forced_releases and skip the clamp. The age
+// clock is backdated via a test hook so the test is deterministic (no sleep).
+TEST_F(TabletReplicaTest, TestCDCAgeCeilingValveReleasesWAL) {
+  ConsensusBootstrapInfo info;
+  ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
+  Log* log = tablet_replica_->log();
+
+  ASSERT_OK(ExecuteInsertsAndRollLogs(3));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  ASSERT_EVENTUALLY([&]{ AssertNoLogAnchors(); });
+
+  ASSERT_TRUE(tablet_replica_->tablet_metadata()->SetCDCRetentionBarrier(
+      /*op_index=*/1, /*history_safe_time_micros=*/0));
+
+  // Disable the disk valve so the age ceiling is the only release path.
+  FLAGS_cdc_stop_retaining_min_disk_mb = 0;
+  const int64_t kMaxRetainSecs = 3600;
+  FLAGS_cdc_max_wal_retention_secs = kMaxRetainSecs;
+
+  // First observation: stamps the barrier-advanced clock to "now" and clamps
+  // for_durability to the barrier. The counter must not move (age not yet
+  // exceeded) -- this is the anti-flap guarantee right after a restart.
+  const int64_t releases_before = tablet_replica_->cdc_barrier_forced_releases_for_tests();
+  const int64_t fd_clamped = tablet_replica_->GetRetentionIndexes().for_durability;
+  ASSERT_EQ(releases_before, tablet_replica_->cdc_barrier_forced_releases_for_tests())
+      << "age ceiling must not fire on the first observation of a barrier";
+  ASSERT_EQ(fd_clamped, 1)
+      << "barrier must clamp for_durability to exactly the pinned index";
+
+  // Backdate the advanced clock well past the ceiling (barrier index unchanged,
+  // so the next call will not re-stamp it) and re-evaluate: the age valve fires.
+  tablet_replica_->set_cdc_barrier_last_advanced_micros_for_tests(
+      GetCurrentTimeMicros() - (kMaxRetainSecs + 60) * 1000000LL);
+  const log::RetentionIndexes released = tablet_replica_->GetRetentionIndexes();
+  ASSERT_EQ(releases_before + 1, tablet_replica_->cdc_barrier_forced_releases_for_tests())
+      << "age ceiling must increment cdc_barrier_forced_releases once exceeded";
+  ASSERT_GT(released.for_durability, fd_clamped)
+      << "age ceiling must release the WAL clamp (for_durability reverts to the "
+         "true Raft floor)";
+
+  int32_t num_gced = 0;
+  ASSERT_OK(log->GC(released, &num_gced));
+  ASSERT_GT(num_gced, 0) << "released barrier must let Log GC reclaim WAL segments";
+}
+
+// Negative case: NEITHER valve must fire under normal conditions (healthy disk,
+// young barrier). A spurious release would send a WAL_EXPIRED response to a
+// live CDC consumer, forcing an unnecessary re-snapshot. This test exercises the
+// actual comparison logic of each valve with the valves enabled at their
+// production defaults, not disabled -- verifying the condition evaluates
+// correctly, not just that the code is skipped when the flag is zero.
+//   (a) disk-pressure: flag = 100 MB (default), actual WAL dir free space >>
+//       100 MB on any viable build machine -- the comparison free_mb < 100 must
+//       evaluate to false and not release.
+//   (b) age-ceiling: flag = 3600 s (default), barrier just observed (age ~ 0 s
+//       << 3600 s) -- age_secs > max_retain_secs must evaluate to false.
+TEST_F(TabletReplicaTest, TestCDCValveNoSpuriousRelease) {
+  ConsensusBootstrapInfo info;
+  ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
+
+  ASSERT_OK(ExecuteInsertsAndRollLogs(3));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  ASSERT_EVENTUALLY([&]{ AssertNoLogAnchors(); });
+
+  // Pin WAL from index 1 with no history floor (CHANGE stream).
+  ASSERT_TRUE(tablet_replica_->tablet_metadata()->SetCDCRetentionBarrier(
+      /*op_index=*/1, /*history_safe_time_micros=*/0));
+
+  // Both valves enabled at production defaults. On a healthy machine neither
+  // condition (low disk / old barrier) is met.
+  FLAGS_cdc_stop_retaining_min_disk_mb = 100;
+  FLAGS_cdc_max_wal_retention_secs = 3600;
+
+  const int64_t releases_before = tablet_replica_->cdc_barrier_forced_releases_for_tests();
+
+  // Call GetRetentionIndexes() -- this also stamps the barrier-observed clock
+  // to "now" (first observation of index 1), so age is effectively 0 s.
+  const log::RetentionIndexes ret = tablet_replica_->GetRetentionIndexes();
+
+  ASSERT_EQ(releases_before, tablet_replica_->cdc_barrier_forced_releases_for_tests())
+      << "no valve must fire on healthy disk (> 100 MB free) with a freshly "
+         "observed barrier (age ~ 0 s, ceiling = 3600 s)";
+  ASSERT_EQ(ret.for_durability, 1)
+      << "CDC clamp must remain active: for_durability must equal the barrier "
+         "index when no valve fires";
 }
 
 TEST_F(TabletReplicaTest, TestFlushOpsPerfImprovements) {

@@ -1,0 +1,411 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto2";
+package kudu.cdc;
+
+option java_package = "org.apache.kudu.cdc";
+
+import "kudu/common/common.proto";
+import "kudu/common/wire_protocol.proto";
+import "kudu/rpc/rpc_header.proto";
+import "kudu/security/token.proto";
+
+// ===========================================================================
+// Error handling
+// ===========================================================================
+
+message CDCErrorPB {
+  enum Code {
+    UNKNOWN_ERROR = 1;
+
+    // The requested stream_id does not exist.
+    STREAM_NOT_FOUND = 2;
+
+    // The requested tablet is not hosted on this server.
+    TABLET_NOT_FOUND = 3;
+
+    // This tablet server is not the leader for the requested tablet.
+    // The consumer should discover the new leader and retry.
+    TABLET_NOT_LEADER = 4;
+
+    // The requested from_op_index is no longer available (WAL GC'd past it).
+    // Consumer must reset to a new snapshot.
+    WAL_EXPIRED = 5;
+
+    // The tablet is not in RUNNING state.
+    TABLET_NOT_RUNNING = 6;
+
+    // A before-image (or snapshot) read could not be served because the MVCC
+    // history it needs has already been garbage-collected (the CDC history
+    // barrier was not in place in time). Consumer must reset to a new snapshot.
+    HISTORY_EXPIRED = 7;
+
+    // The stream has been idle beyond --cdc_stream_expiry_ms, so its retention
+    // barriers have been (or are being) released and the WAL the consumer needs
+    // may already be garbage-collected. Consumer must reset to a new snapshot.
+    STREAM_EXPIRED = 8;
+
+    // The caller is not authorized to read this stream/table.
+    NOT_AUTHORIZED = 9;
+
+    // The server is at its CDC heavy-scan concurrency or memory budget (see
+    // --cdc_max_concurrent_scans and --cdc_scan_mem_limit_bytes) and shed this
+    // request to protect user-facing traffic. Transient: the consumer should
+    // back off and retry the same request.
+    SERVER_TOO_BUSY = 10;
+
+    // A snapshot resume was requested (snapshot_resume_key set) but the server
+    // has no matching in-progress snapshot session -- typically because a leader
+    // change discarded the in-memory session that fixed the snapshot timestamp.
+    // Continuing at a freshly chosen timestamp would splice a table tail read at
+    // the new timestamp onto a head read at the old one, yielding an
+    // inconsistent snapshot. The consumer must restart the snapshot from the
+    // beginning (is_snapshot_start=true, no resume key).
+    SNAPSHOT_SESSION_LOST = 11;
+
+    // An open transaction's WAL span (first write .. FINALIZE_COMMIT) exceeds
+    // --cdc_max_transaction_span_bytes, so it cannot be read into a single
+    // window and emitted atomically. The stream cannot advance past this
+    // transaction. This is a hard, non-retryable condition requiring operator
+    // intervention (raise --cdc_max_transaction_span_bytes) rather than a
+    // transient error; retrying the same request will keep failing.
+    TRANSACTION_TOO_LARGE = 12;
+
+    // The consumer declared (via GetChangesRequestPB.schema_version) that it is
+    // decoding against a schema version older than the tablet's current schema
+    // version: an ALTER has landed that the consumer never saw, so it would
+    // silently decode new columns as hex. The consumer should re-issue the
+    // request with need_schema_info=true to fetch the current schema, then
+    // resume. Retryable (after refreshing the schema), not a re-snapshot.
+    SCHEMA_VERSION_MISMATCH = 13;
+  }
+
+  required Code code = 1;
+  required AppStatusPB status = 2;
+
+  // Machine-readable retry classification, set by the server for every CDC
+  // error so a consumer can act correctly without re-implementing the per-code
+  // taxonomy. The two are mutually exclusive:
+  //   is_retryable     -- transient: re-issue the SAME request after a backoff
+  //                       (resolving the new leader first where applicable).
+  //                       True for TABLET_NOT_LEADER, TABLET_NOT_FOUND,
+  //                       TABLET_NOT_RUNNING, SERVER_TOO_BUSY, NOT_AUTHORIZED,
+  //                       SCHEMA_VERSION_MISMATCH.
+  //   needs_resnapshot -- the requested WAL/history position is gone: discard
+  //                       progress and start a fresh snapshot. True for
+  //                       WAL_EXPIRED, HISTORY_EXPIRED, STREAM_EXPIRED.
+  // Both false means fatal/operator-action (UNKNOWN_ERROR, STREAM_NOT_FOUND,
+  // SNAPSHOT_SESSION_LOST, TRANSACTION_TOO_LARGE): stop and page an operator.
+  optional bool is_retryable = 3;
+  optional bool needs_resnapshot = 4;
+}
+
+// ===========================================================================
+// Stream configuration (stored in sys catalog)
+// ===========================================================================
+
+message CDCStreamConfigPB {
+  // What columns to include in change records.
+  enum RecordType {
+    // After-image only (changed columns for UPDATE; all columns for INSERT/DELETE).
+    CHANGE = 0;
+    // Full before-image and after-image for every row change. Requires the MVCC
+    // history barrier (before-images are reconstructed from tablet UNDO history).
+    FULL   = 1;
+  }
+
+  // Wire format for change records.
+  enum RecordFormat {
+    PROTO = 0;
+    // Reserved: JSON = 1
+  }
+
+  // Whether and how a consumer bootstraps from the table's current contents
+  // before following the WAL.
+  enum SnapshotMode {
+    // Emit a consistent snapshot of the table, then hand off to WAL streaming.
+    INITIAL_AND_CONTINUE = 0;
+    // No snapshot; start WAL streaming immediately (preserves pre-snapshot
+    // behavior and is the default).
+    NEVER                = 1;
+    // Emit the snapshot only; do not stream the WAL afterwards.
+    INITIAL_ONLY         = 2;
+  }
+
+  optional RecordType   record_type           = 1 [default = CHANGE];
+  optional RecordFormat record_format         = 2 [default = PROTO];
+
+  // Maximum total serialized size of CDCRecordPB entries in a single
+  // GetChangesResponsePB. At least one record is always returned even
+  // if it exceeds this limit.
+  optional int64 max_bytes_per_response = 3 [default = 67108864];  // 64 MiB
+
+  optional SnapshotMode snapshot_mode         = 4 [default = NEVER];
+}
+
+// The sys catalog entry for a CDC stream. One entry per stream, persisted
+// on the master. Key: stream_id (UUID string).
+message SysCDCStreamEntryPB {
+  enum State {
+    ACTIVE    = 0;
+    DELETING  = 1;
+  }
+
+  // Tables covered by this stream.
+  repeated bytes table_ids = 1;
+
+  optional CDCStreamConfigPB config = 2;
+
+  optional State state = 3 [default = ACTIVE];
+
+  // Fields 4-6 previously stored per-tablet checkpoint state inline here. That
+  // state now lives in one row per (stream, tablet) in the master sys catalog
+  // (master.proto SysCDCTabletCheckpointEntryPB) so a Checkpoint() RPC no longer
+  // rewrites this whole proto under the per-stream lock. Reserved so the
+  // numbers/names are never reused. (This message mirrors master.proto's
+  // SysCDCStreamEntryPB; keep in sync.)
+  reserved 4, 5, 6;
+  reserved "tablet_checkpoints", "tablet_history_floors", "last_active_time_micros";
+}
+
+// ===========================================================================
+// Change event records
+// ===========================================================================
+
+// The type of change captured from the WAL.
+enum CDCOpTypePB {
+  // Row-level DML
+  INSERT  = 0;
+  UPDATE  = 1;
+  DELETE  = 2;
+  UPSERT  = 3;
+
+  // Schema change
+  DDL     = 4;
+
+  // Transaction boundaries (emitted for transactional writes)
+  BEGIN   = 5;
+  COMMIT  = 6;
+  ABORT   = 7;
+
+  // A row emitted during the initial consistent snapshot (server-driven
+  // bootstrap). Carries the full row image at the snapshot timestamp.
+  READ    = 8;
+}
+
+// A single column value within a change record.
+message CDCColumnValuePB {
+  // Column identifier within the schema at schema_version.
+  optional int32  column_id   = 1;
+  optional string column_name = 2;
+
+  // Serialized cell value in the canonical Kudu on-wire format.
+  // Absent (and is_null=false) if the column was not set in this operation
+  // (e.g. partial UPDATE).
+  optional bytes  value       = 3;
+  optional bool   is_null     = 4 [default = false];
+}
+
+// A single change record, corresponding to one row operation from the WAL.
+// One CDCRecordPB is produced per row in a WriteRequestPB (a single client
+// write may contain multiple rows).
+message CDCRecordPB {
+  // The type of operation.
+  optional CDCOpTypePB op_type = 1;
+
+  // The Raft log index of the ReplicateMsg that contained this operation.
+  // Monotonically increasing within a tablet (restarts at 1 after term change,
+  // but combined (op_term, op_index) is globally unique within a tablet).
+  optional int64 op_index = 2;
+
+  // The Raft term.
+  optional int64 op_term = 3;
+
+  // The hybrid logical clock timestamp assigned to this operation (microseconds
+  // since epoch, hybrid logical time encoding).
+  optional fixed64 timestamp = 4;
+
+  // Schema version at the time of this operation. Use this to look up the
+  // schema when decoding column values.
+  optional uint32 schema_version = 5;
+
+  // Transaction ID for transactional writes (absent for non-transactional).
+  optional bytes txn_id = 6;
+
+  // After-image column values.
+  // CHANGE streams: INSERT/UPSERT = all set columns; UPDATE = only the columns
+  // that changed; DELETE = primary key columns only.
+  // FULL streams: INSERT/UPSERT/UPDATE = the complete row after the change;
+  // DELETE = primary key columns only.
+  // READ (snapshot): the complete row at the snapshot timestamp.
+  // For BEGIN/COMMIT/ABORT: empty.
+  repeated CDCColumnValuePB changes = 7;
+
+  // For DDL records: the new schema after the alter.
+  optional SchemaPB new_schema = 8;
+
+  // For DDL records: the new schema version.
+  optional uint32 new_schema_version = 9;
+
+  // For transactional records, the commit timestamp of the transaction
+  // (hybrid logical time). Set on the BEGIN/COMMIT markers and on every row
+  // record belonging to a committed transaction. Absent for non-transactional
+  // records (which are ordered by 'timestamp' instead).
+  optional fixed64 commit_timestamp = 10;
+
+  // Before-image column values (FULL streams only): the complete row state
+  // immediately before this change. Populated for UPDATE and DELETE (and for
+  // UPSERT that resolved to an update of an existing row). Empty for INSERT,
+  // for UPSERT that created a new row, and for READ/BEGIN/COMMIT/ABORT.
+  repeated CDCColumnValuePB old_changes = 11;
+}
+
+// ===========================================================================
+// GetChanges RPC
+// ===========================================================================
+
+message GetChangesRequestPB {
+  // The CDC stream to read from.
+  required bytes stream_id = 1;
+
+  // The tablet to read from. The caller must contact the tablet leader.
+  required bytes tablet_id = 2;
+
+  // Exclusive lower bound: return records with op_index > from_op_index.
+  // Use 0 to start from the beginning of the available WAL.
+  optional int64 from_op_index = 3 [default = 0];
+
+  // Maximum total serialized size of returned records. If not set, the
+  // stream's configured max_bytes_per_response is used.
+  // At least one record is always returned even if it exceeds the limit.
+  optional int64 max_bytes = 4;
+
+  // Snapshot protocol (server-driven consistent snapshot).
+  // Set true on the first call to begin a snapshot: the server captures a
+  // snapshot timestamp and the current committed op-index, then returns the
+  // first page of READ records. Ignored if a snapshot is already in progress
+  // for this (stream, tablet), or if the stream's snapshot_mode is NEVER.
+  optional bool is_snapshot_start = 5 [default = false];
+
+  // Opaque resume key returned as snapshot_resume_key in the previous response.
+  // Pass it back verbatim to fetch the next page of the snapshot scan.
+  optional bytes snapshot_resume_key = 6;
+
+  // If set, the server prepends a synthetic DDL record carrying the tablet's
+  // current schema (new_schema/new_schema_version) before the WAL records, so a
+  // consumer attaching mid-stream after an ALTER has a base schema. The synthetic
+  // record reuses from_op_index and does not advance checkpoint_op_index.
+  optional bool need_schema_info = 7 [default = false];
+
+  // Signed authorization token proving the caller may read the table backing this
+  // tablet (reuses the scan-token machinery: obtain it from the master's
+  // GetTableSchema response). Verified only when the tablet server runs with
+  // --tserver_enforce_access_control; ignored on unsecured clusters.
+  optional security.SignedTokenPB authz_token = 8;
+
+  // The schema version the consumer is currently decoding records against. If
+  // set and older than the tablet's current schema version, the server returns
+  // SCHEMA_VERSION_MISMATCH (instead of records) so the consumer can refresh its
+  // layout with need_schema_info=true rather than silently decoding new columns
+  // as hex. Unset (the default) disables the check -- for backward compatibility
+  // and for consumers that track schema in-band via DDL records. Ignored when
+  // need_schema_info=true, since the current schema is being sent in that case.
+  optional uint32 schema_version = 9;
+}
+
+message GetChangesResponsePB {
+  optional CDCErrorPB error = 1;
+
+  // The change records, in WAL order (ascending op_index).
+  repeated CDCRecordPB records = 2;
+
+  // The op_index of the last record in this response. Use as from_op_index
+  // in the next GetChanges call. -1 if no records were returned.
+  optional int64 checkpoint_op_index = 3 [default = -1];
+
+  // Tablet UUID (echoed for routing convenience).
+  optional bytes tablet_id = 4;
+
+  // Snapshot protocol (server-driven consistent snapshot).
+  // True once the full snapshot scan has completed; the consumer should then
+  // begin WAL streaming from snapshot_streaming_start_op_index.
+  optional bool snapshot_done = 5 [default = false];
+
+  // The committed op-index captured when the snapshot began. Use it as
+  // from_op_index for the first WAL-streaming GetChanges call after the
+  // snapshot completes. Set only when snapshot_done is true.
+  optional int64 snapshot_streaming_start_op_index = 6;
+
+  // Opaque resume key: pass it as snapshot_resume_key in the next GetChanges
+  // call to continue the snapshot scan. Set only while the snapshot is still
+  // in progress (snapshot_done false).
+  optional bytes snapshot_resume_key = 7;
+
+  // True when this WAL-streaming batch was cut short by the per-response byte
+  // budget before reaching the tablet's committed watermark -- i.e. more
+  // records are immediately available. A consumer should keep polling right
+  // away (from checkpoint_op_index) rather than backing off. False means the
+  // batch reached the committed head: the consumer is caught up and should poll
+  // on its normal interval. Not set on the snapshot path (use snapshot_done).
+  optional bool have_more_records = 8 [default = false];
+}
+
+// ===========================================================================
+// Checkpoint RPC
+// ===========================================================================
+
+// Durably persists the consumer's progress for a specific (stream, tablet).
+// This advances the WAL anchor, allowing GC of segments before op_index.
+// Consumers should call this periodically (not on every batch) to bound I/O.
+message CheckpointRequestPB {
+  required bytes stream_id = 1;
+  required bytes tablet_id = 2;
+
+  // The op_index up to which the consumer has successfully processed and
+  // committed all records. This index is inclusive.
+  required int64 op_index = 3;
+
+  // Signed authorization token (see GetChangesRequestPB.authz_token). Verified
+  // only under --tserver_enforce_access_control.
+  optional security.SignedTokenPB authz_token = 4;
+}
+
+message CheckpointResponsePB {
+  optional CDCErrorPB error = 1;
+}
+
+// ===========================================================================
+// CDCService — hosted on each tablet server
+// ===========================================================================
+
+service CDCService {
+  // CDC exposes raw WAL contents, so every RPC requires the caller to be an
+  // authenticated client, service, or super user. (On an unsecured cluster
+  // authorization is a no-op, as elsewhere in Kudu.) When the tablet server runs
+  // with --tserver_enforce_access_control, GetChanges/Checkpoint additionally
+  // require a signed authz_token granting SCAN privilege on the target table.
+  option (kudu.rpc.default_authz_method) = "AuthorizeClientOrServiceUser";
+
+  // Returns a batch of change records for the given tablet, starting after
+  // from_op_index. The caller must be connected to the tablet leader.
+  rpc GetChanges(GetChangesRequestPB) returns (GetChangesResponsePB);
+
+  // Persists the consumer's checkpoint for a (stream, tablet) pair.
+  // Advances the WAL retention anchor to allow GC of consumed segments.
+  rpc Checkpoint(CheckpointRequestPB) returns (CheckpointResponsePB);
+}

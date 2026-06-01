@@ -997,6 +997,18 @@ int GetPrefixSizeToGC(RetentionIndexes retention_indexes, const SegmentSequence&
       break;
     }
 
+    // CDC hard WAL-retention floor: retain any segment that closed within the CDC
+    // retention window -- and therefore, since we scan oldest-to-newest, every
+    // newer segment -- independent of consumer polling. Deliberately unconditional
+    // (not overridable by --log_max_segments_to_retain), matching the intent of a
+    // guaranteed minimum WAL age for CDC-enabled tablets.
+    if (retention_indexes.cdc_wal_retention_deadline_micros > 0 &&
+        segment->footer().has_close_timestamp_micros() &&
+        segment->footer().close_timestamp_micros() >=
+            retention_indexes.cdc_wal_retention_deadline_micros) {
+      break;
+    }
+
     // Check if removing this segment would compromise the ability to catch up a peer,
     // we should retain it, unless this would break the max_segments flag.
     if (seg_max_idx >= retention_indexes.for_peers &&

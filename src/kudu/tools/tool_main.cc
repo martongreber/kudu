@@ -62,6 +62,7 @@ namespace tools {
 unique_ptr<Mode> RootMode(const string& name) {
   return ModeBuilder(name)
       .Description("Kudu Command Line Tools") // root mode description isn't printed
+      .AddMode(BuildCdcMode())
       .AddMode(BuildClusterMode())
       .AddMode(BuildDiagnoseMode())
       .AddMode(BuildFsMode())

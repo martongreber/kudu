@@ -1016,6 +1016,119 @@ Status SysCatalogTable::RemoveTServerState(const string& tserver_id) {
 }
 
 // ------------------------------------------------------------------
+// CDC stream related methods
+// ------------------------------------------------------------------
+
+Status SysCatalogTable::WriteCDCStream(const string& stream_id,
+                                       const SysCDCStreamEntryPB& entry) {
+  DCHECK(!stream_id.empty());
+  WriteRequestPB req;
+  req.set_tablet_id(kSysCatalogTabletId);
+  RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
+  KuduPartialRow row(&schema_);
+  RETURN_NOT_OK(row.SetInt8(kSysCatalogTableColType, CDC_STREAM));
+  RETURN_NOT_OK(row.SetString(kSysCatalogTableColId, stream_id));
+
+  faststring metadata_buf;
+  pb_util::SerializeToString(entry, &metadata_buf);
+  RETURN_NOT_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
+
+  RowOperationsPBEncoder enc(req.mutable_row_operations());
+  enc.Add(RowOperationsPB::UPSERT, row);
+
+  return SyncWrite(req);
+}
+
+Status SysCatalogTable::RemoveCDCStream(const string& stream_id) {
+  WriteRequestPB req;
+  req.set_tablet_id(kSysCatalogTabletId);
+  RowOperationsPBEncoder enc(req.mutable_row_operations());
+  RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
+  KuduPartialRow row(&schema_);
+  RETURN_NOT_OK(row.SetInt8(kSysCatalogTableColType, CDC_STREAM));
+  RETURN_NOT_OK(row.SetStringNoCopy(kSysCatalogTableColId, stream_id));
+  enc.Add(RowOperationsPB::DELETE, row);
+
+  return SyncWrite(req);
+}
+
+Status SysCatalogTable::VisitCDCStreams(CDCStreamVisitor* visitor) {
+  TRACE_EVENT0("master", "SysCatalogTable::VisitCDCStreams");
+  const auto processor = [&](const string& entry_id,
+                             const SysCDCStreamEntryPB& entry_data) {
+    return visitor->Visit(entry_id, entry_data);
+  };
+  return ProcessRows<SysCDCStreamEntryPB, CDC_STREAM>(processor);
+}
+
+namespace {
+// Row key for a per-(stream, tablet) CDC checkpoint entry. A NUL separator keeps
+// the key unambiguous (ids never contain NUL) and groups a stream's rows under a
+// common prefix. The (stream, tablet) pair is recovered from the entry's proto
+// fields, not by parsing this key.
+string CDCTabletCheckpointEntryId(const string& stream_id, const string& tablet_id) {
+  string id;
+  id.reserve(stream_id.size() + 1 + tablet_id.size());
+  id.append(stream_id);
+  id.push_back('\0');
+  id.append(tablet_id);
+  return id;
+}
+} // anonymous namespace
+
+Status SysCatalogTable::WriteCDCTabletCheckpoint(
+    const string& stream_id,
+    const string& tablet_id,
+    const SysCDCTabletCheckpointEntryPB& entry) {
+  DCHECK(!stream_id.empty());
+  DCHECK(!tablet_id.empty());
+  WriteRequestPB req;
+  req.set_tablet_id(kSysCatalogTabletId);
+  RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
+  KuduPartialRow row(&schema_);
+  RETURN_NOT_OK(row.SetInt8(kSysCatalogTableColType, CDC_TABLET_CHECKPOINT));
+  RETURN_NOT_OK(row.SetString(kSysCatalogTableColId,
+                              CDCTabletCheckpointEntryId(stream_id, tablet_id)));
+
+  faststring metadata_buf;
+  pb_util::SerializeToString(entry, &metadata_buf);
+  RETURN_NOT_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
+
+  RowOperationsPBEncoder enc(req.mutable_row_operations());
+  enc.Add(RowOperationsPB::UPSERT, row);
+
+  return SyncWrite(req);
+}
+
+Status SysCatalogTable::RemoveCDCTabletCheckpoint(const string& stream_id,
+                                                  const string& tablet_id) {
+  WriteRequestPB req;
+  req.set_tablet_id(kSysCatalogTabletId);
+  RowOperationsPBEncoder enc(req.mutable_row_operations());
+  RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
+  KuduPartialRow row(&schema_);
+  RETURN_NOT_OK(row.SetInt8(kSysCatalogTableColType, CDC_TABLET_CHECKPOINT));
+  RETURN_NOT_OK(row.SetString(kSysCatalogTableColId,
+                              CDCTabletCheckpointEntryId(stream_id, tablet_id)));
+  // DELETE_IGNORE makes this idempotent: if the row was already removed in a
+  // previous reap pass (in-memory map was not yet updated), re-running produces
+  // a no-op rather than a per-row error. This is safe because the desired
+  // post-state (row absent) is already satisfied.
+  enc.Add(RowOperationsPB::DELETE_IGNORE, row);
+
+  return SyncWrite(req);
+}
+
+Status SysCatalogTable::VisitCDCTabletCheckpoints(CDCTabletCheckpointVisitor* visitor) {
+  TRACE_EVENT0("master", "SysCatalogTable::VisitCDCTabletCheckpoints");
+  const auto processor = [&](const string& entry_id,
+                             const SysCDCTabletCheckpointEntryPB& entry_data) {
+    return visitor->Visit(entry_id, entry_data);
+  };
+  return ProcessRows<SysCDCTabletCheckpointEntryPB, CDC_TABLET_CHECKPOINT>(processor);
+}
+
+// ------------------------------------------------------------------
 // Tablet related methods
 // ------------------------------------------------------------------
 

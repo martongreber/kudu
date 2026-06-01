@@ -33,6 +33,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/cdc/cdc_service.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/wire_protocol.h"
@@ -1195,6 +1196,12 @@ Status TSTabletManager::DeleteTablet(
                                              *cas_config_index,
                                              committed_config.opid_index()));
     }
+  }
+
+  // Release any CDC WAL anchors this tablet holds before shutting it down, so
+  // its LogAnchorRegistry is empty when destroyed (it CHECKs for that).
+  if (auto* cdc = server_->cdc_service()) {
+    cdc->ReleaseAnchorsForTablet(tablet_id);
   }
 
   replica->Stop();

@@ -330,6 +330,7 @@ void AppendHardWrapped(StringPiece to_append,
                        std::string* dst);
 
 // Returns new nodes for each major mode.
+std::unique_ptr<Mode> BuildCdcMode();
 std::unique_ptr<Mode> BuildClusterMode();
 std::unique_ptr<Mode> BuildDiagnoseMode();
 std::unique_ptr<Mode> BuildFsMode();

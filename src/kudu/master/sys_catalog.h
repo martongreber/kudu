@@ -59,6 +59,7 @@ class WriteRequestPB;
 namespace master {
 
 class Master;
+class SysCDCStreamEntryPB;
 class SysCertAuthorityEntryPB;
 class SysClusterIdEntryPB;
 class SysTServerStateEntryPB;
@@ -100,6 +101,23 @@ class TServerStateVisitor {
   virtual ~TServerStateVisitor() = default;
   virtual Status Visit(const std::string& tserver_id,
                        const SysTServerStateEntryPB& metadata) = 0;
+};
+
+class CDCStreamVisitor {
+ public:
+  virtual ~CDCStreamVisitor() = default;
+  virtual Status Visit(const std::string& stream_id,
+                       const SysCDCStreamEntryPB& metadata) = 0;
+};
+
+class CDCTabletCheckpointVisitor {
+ public:
+  virtual ~CDCTabletCheckpointVisitor() = default;
+  // 'entry_id' is the raw row key (stream_id + '\0' + tablet_id); the stream and
+  // tablet ids are also carried in 'metadata'. Callers should use the metadata
+  // fields rather than parse the key.
+  virtual Status Visit(const std::string& entry_id,
+                       const SysCDCTabletCheckpointEntryPB& metadata) = 0;
 };
 
 class TableInfoLoader : public TableVisitor {
@@ -176,7 +194,9 @@ class SysCatalogTable {
     TSK_ENTRY = 4,            // Token Signing Key entry.
     HMS_NOTIFICATION_LOG = 5, // HMS notification log latest event ID.
     TSERVER_STATE = 6,        // TServer state.
-    CLUSTER_ID = 7            // Unique Cluster ID.
+    CLUSTER_ID = 7,           // Unique Cluster ID.
+    CDC_STREAM = 8,           // CDC stream metadata.
+    CDC_TABLET_CHECKPOINT = 9 // Per-(stream, tablet) CDC checkpoint.
   };
 
   enum SysCatalogOperation {
@@ -288,6 +308,29 @@ class SysCatalogTable {
 
   // Remove a tserver state entry from the system table.
   Status RemoveTServerState(const std::string& tserver_id);
+
+  // Add or update a CDC stream entry in the system table.
+  Status WriteCDCStream(const std::string& stream_id,
+                        const SysCDCStreamEntryPB& entry);
+
+  // Remove a CDC stream entry from the system table.
+  Status RemoveCDCStream(const std::string& stream_id);
+
+  // Scan for CDC stream entries in the system table.
+  Status VisitCDCStreams(CDCStreamVisitor* visitor);
+
+  // Add or update the per-(stream, tablet) CDC checkpoint row. Writes a single
+  // small row keyed by (stream_id, tablet_id) -- see SysCDCTabletCheckpointEntryPB.
+  Status WriteCDCTabletCheckpoint(const std::string& stream_id,
+                                  const std::string& tablet_id,
+                                  const SysCDCTabletCheckpointEntryPB& entry);
+
+  // Remove the per-(stream, tablet) CDC checkpoint row.
+  Status RemoveCDCTabletCheckpoint(const std::string& stream_id,
+                                   const std::string& tablet_id);
+
+  // Scan for per-(stream, tablet) CDC checkpoint rows in the system table.
+  Status VisitCDCTabletCheckpoints(CDCTabletCheckpointVisitor* visitor);
 
   // Return the underlying TabletReplica instance hosting the metadata.
   // This should be used with caution -- typically the various methods

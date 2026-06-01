@@ -32,6 +32,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/clock/hybrid_clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/timestamp.h"
@@ -50,6 +51,7 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/walltime.h"
 #include "kudu/rpc/result_tracker.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/tablet/mvcc.h"
@@ -81,6 +83,48 @@ DEFINE_uint32(tablet_max_pending_txn_write_ops, 2,
               "as a participant in the corresponding transaction");
 TAG_FLAG(tablet_max_pending_txn_write_ops, experimental);
 TAG_FLAG(tablet_max_pending_txn_write_ops, runtime);
+
+DEFINE_int32(cdc_wal_retention_secs, 8 * 3600,
+             "For a CDC-enabled tablet (one with an active retention barrier), the "
+             "minimum age in seconds below which WAL segments are retained by log GC "
+             "regardless of consumer progress. This is a hard floor enforced locally "
+             "in log GC, independent of the master's CDC maintenance loop, so it "
+             "bounds WAL reclamation across restarts and leader changes. Set to 0 to "
+             "disable. Note: this is a time-only floor with no byte/segment ceiling, "
+             "so a high-ingest CDC tablet can accumulate significant WAL.");
+TAG_FLAG(cdc_wal_retention_secs, advanced);
+TAG_FLAG(cdc_wal_retention_secs, runtime);
+
+// Bounded-WAL guarantee: the two flags below implement tserver-local release
+// conditions that override the CDC retention barrier if it would otherwise
+// allow the WAL to grow without bound. Releasing the barrier means skipping
+// the std::min(for_durability, cdc_min_op_index) clamp in GetRetentionIndexes(),
+// which lets for_durability revert to the true Raft floor. This is
+// durability-safe: it never lowers for_durability below its genuine value.
+// Consumers whose WAL is subsequently GC'd will receive WAL_EXPIRED on their
+// next GetChanges call, which is the expected error for this case.
+
+DEFINE_int64(cdc_stop_retaining_min_disk_mb, 100,
+             "If free disk space on the WAL directory of a CDC-enabled tablet "
+             "falls below this threshold (in MB), force-release the CDC WAL "
+             "retention barrier so normal GC can reclaim space. Set to 0 to "
+             "disable. Consumers whose WAL is reclaimed will receive WAL_EXPIRED "
+             "on the next GetChanges call. This is a local override independent "
+             "of the master's CDC maintenance loop.");
+TAG_FLAG(cdc_stop_retaining_min_disk_mb, advanced);
+TAG_FLAG(cdc_stop_retaining_min_disk_mb, runtime);
+
+DEFINE_int64(cdc_max_wal_retention_secs, 86400,
+             "Maximum number of seconds a CDC WAL retention barrier may remain "
+             "at the same index before it is force-released locally. A healthy "
+             "master advances the barrier index on every maintenance cycle, so "
+             "this limit is never reached under normal operation. It acts as a "
+             "dead-master backstop: if the master stops pushing barrier updates "
+             "(e.g. due to a prolonged outage), WAL GC resumes automatically "
+             "after this many seconds. Set to 0 to disable. Consumers whose "
+             "WAL is reclaimed will receive WAL_EXPIRED on the next GetChanges.");
+TAG_FLAG(cdc_max_wal_retention_secs, advanced);
+TAG_FLAG(cdc_max_wal_retention_secs, runtime);
 
 METRIC_DEFINE_histogram(tablet, op_prepare_queue_length, "Operation Prepare Queue Length",
                         kudu::MetricUnit::kTasks,
@@ -119,6 +163,54 @@ METRIC_DEFINE_gauge_uint64(tablet, live_row_count, "Tablet Live Row Count",
                            kudu::MetricUnit::kRows,
                            "Number of live rows in this tablet, excludes deleted rows.",
                            kudu::MetricLevel::kInfo);
+
+// Counter for the bounded-WAL guarantee: incremented each GC cycle that
+// force-releases the CDC retention barrier due to disk pressure
+// (--cdc_stop_retaining_min_disk_mb) or the barrier-age ceiling
+// (--cdc_max_wal_retention_secs). Defined on the 'tablet' entity because
+// TabletReplica already has the tablet MetricEntity from tablet_->GetMetricEntity(),
+// and the release decision is made per tablet (each TabletReplica owns one barrier).
+METRIC_DEFINE_counter(tablet, cdc_barrier_forced_releases,
+                      "CDC Barrier Forced Releases",
+                      kudu::MetricUnit::kUnits,
+                      "Number of log-GC cycles in which the CDC WAL retention "
+                      "barrier on this tablet was force-released locally due to "
+                      "disk pressure (--cdc_stop_retaining_min_disk_mb) or the "
+                      "max-WAL-retention ceiling (--cdc_max_wal_retention_secs). "
+                      "Each increment represents one GC pass that declined to pin "
+                      "extra WAL for CDC; consumers may receive WAL_EXPIRED on "
+                      "their next GetChanges call.",
+                      kudu::MetricLevel::kWarn);
+
+// Gauge: bytes of WAL retained on this tablet specifically because of the CDC
+// retention barrier. Zero when no barrier is active. Computed as the difference
+// in GC-able WAL between the true Raft durability retention (consensus floor
+// only) and the CDC-clamped retention (including both the index barrier and the
+// time-based --cdc_wal_retention_secs floor). Sampled by the metrics reader;
+// the callback calls GetGCableDataSize twice, which is O(log-segments) but is
+// acceptable for an occasional scrape and not on any write path.
+METRIC_DEFINE_gauge_int64(tablet, cdc_wal_retained_bytes,
+                          "CDC WAL Retained Bytes",
+                          kudu::MetricUnit::kBytes,
+                          "Bytes of WAL retained on this tablet specifically because of the "
+                          "CDC retention barrier. Computed as the difference between the "
+                          "GC-able bytes under the true Raft durability floor and the "
+                          "GC-able bytes under the current CDC-clamped retention. Zero when "
+                          "no CDC barrier is active.",
+                          kudu::MetricLevel::kInfo);
+
+// Gauge: age in microseconds of the CDC MVCC/UNDO history-retention floor
+// (wall-clock now minus the floor's physical timestamp). Zero when the floor is
+// unset (no active CDC history retention). A steadily rising value indicates
+// that the CDC stream has not advanced its history floor recently.
+METRIC_DEFINE_gauge_int64(tablet, cdc_history_floor_age_micros,
+                          "CDC History Floor Age",
+                          kudu::MetricUnit::kMicroseconds,
+                          "Age in microseconds of the CDC MVCC/UNDO history-retention floor "
+                          "on this tablet (wall-clock now minus the floor physical timestamp). "
+                          "Zero when no floor is set. A rising value means the CDC stream "
+                          "is not advancing its history floor.",
+                          kudu::MetricLevel::kInfo);
 
 DECLARE_bool(prevent_kudu_2233_corruption);
 
@@ -184,14 +276,18 @@ TabletReplica::TabletReplica(
                          this->TxnStatusReplicaStateChanged(this->tablet_id(), reason);
                        } : std::move(cb)),
       state_(NOT_INITIALIZED),
-      last_status_("Tablet initializing...") {
+      last_status_("Tablet initializing..."),
+      cdc_barrier_prev_op_index_(-2),
+      cdc_barrier_last_advanced_micros_(0) {
 }
 
 TabletReplica::TabletReplica()
     : apply_pool_(nullptr),
       reload_txn_status_tablet_pool_(nullptr),
       state_(SHUTDOWN),
-      last_status_("Fake replica created") {
+      last_status_("Fake replica created"),
+      cdc_barrier_prev_op_index_(-2),
+      cdc_barrier_last_advanced_micros_(0) {
 }
 
 TabletReplica::~TabletReplica() {
@@ -256,6 +352,8 @@ Status TabletReplica::Start(
               METRIC_op_prepare_queue_time.Instantiate(metric_entity),
               METRIC_op_prepare_run_time.Instantiate(metric_entity)
           });
+      cdc_barrier_forced_releases_ =
+          METRIC_cdc_barrier_forced_releases.Instantiate(metric_entity);
 
       if (tablet_->metrics() != nullptr) {
         TRACE("Starting instrumentation");
@@ -274,6 +372,62 @@ Status TabletReplica::Start(
         } else {
           METRIC_live_row_count.InstantiateInvalid(tablet_->GetMetricEntity(), 0);
         }
+
+        // CDC retention-cost gauges (P1-2). Both are sampled by the metrics
+        // reader and are not on any write or GC hot path. They AutoDetach
+        // before log_/consensus_/tablet_ are destroyed (metric_detacher_ is
+        // the first member destroyed; see the NOTE in tablet_replica.h).
+
+        // Bytes of WAL pinned by the CDC retention barrier. Computed as the
+        // difference between GC-able bytes under the pure Raft floor and
+        // GC-able bytes under the full CDC-clamped floor (index + time).
+        // The CDC clamp is applied here directly rather than calling
+        // GetRetentionIndexes() to avoid the side effects of the P0
+        // force-release checks (disk-space stat, counter increment).
+        METRIC_cdc_wal_retained_bytes.InstantiateFunctionGauge(
+            tablet_->GetMetricEntity(),
+            [this]() -> int64_t {
+              if (!log_ || !consensus_) return 0;
+              const int64_t cdc_min = meta_->cdc_min_retained_op_index();
+              if (cdc_min < 0) return 0;
+              // True Raft-only retention: no CDC clamp applied.
+              log::RetentionIndexes raft_ret = consensus_->GetRetentionIndexes();
+              // CDC-clamped retention: mirrors the non-force-release path in
+              // GetRetentionIndexes() without the disk-pressure / age checks.
+              log::RetentionIndexes cdc_ret = raft_ret;
+              cdc_ret.for_durability = std::min(cdc_ret.for_durability, cdc_min);
+              if (FLAGS_cdc_wal_retention_secs > 0) {
+                cdc_ret.cdc_wal_retention_deadline_micros =
+                    GetCurrentTimeMicros() -
+                    static_cast<int64_t>(FLAGS_cdc_wal_retention_secs) * 1000000L;
+              }
+              int64_t gcable_raft = log_->GetGCableDataSize(raft_ret);
+              int64_t gcable_cdc  = log_->GetGCableDataSize(cdc_ret);
+              int64_t retained = gcable_raft - gcable_cdc;
+              return retained > 0 ? retained : 0;
+            })
+            ->AutoDetach(&metric_detacher_);
+
+        // Age of the CDC MVCC/UNDO history-retention floor in microseconds.
+        // Snapshot tablet_ under lock_ because tablet_.reset() can race with
+        // this callback during Stop() (before metric_detacher_ fires).
+        METRIC_cdc_history_floor_age_micros.InstantiateFunctionGauge(
+            tablet_->GetMetricEntity(),
+            [this]() -> int64_t {
+              shared_ptr<Tablet> t;
+              {
+                std::lock_guard l(lock_);
+                t = tablet_;
+              }
+              if (!t) return 0;
+              Timestamp floor = t->cdc_history_floor();
+              if (floor == Timestamp(0)) return 0;
+              uint64_t floor_us = kudu::clock::HybridClock::GetPhysicalValueMicros(floor);
+              if (floor_us == 0) return 0;
+              int64_t age = GetCurrentTimeMicros() - static_cast<int64_t>(floor_us);
+              return age > 0 ? age : 0;
+            })
+            ->AutoDetach(&metric_detacher_);
       }
       op_tracker_.StartMemoryTracking(tablet_->mem_tracker());
 
@@ -745,6 +899,127 @@ log::RetentionIndexes TabletReplica::GetRetentionIndexes() const {
   log::RetentionIndexes ret = consensus_->GetRetentionIndexes();
   VLOG_WITH_PREFIX(4) << "Log GC: With Consensus retention: "
                       << Substitute("{dur: $0, peers: $1}", ret.for_durability, ret.for_peers);
+
+  // CDC retention. A tablet is CDC-enabled iff a retention barrier is currently
+  // persisted (the master pushes one to every replica while a stream is active and
+  // clears it on release). Both terms below are read straight from the durably
+  // persisted superblock, so they are honored on the very first GC after a restart
+  // or leader change -- before the in-memory anchor is re-established and without
+  // waiting for the master's next maintenance pass.
+  const int64_t cdc_min_op_index = meta_->cdc_min_retained_op_index();
+  if (cdc_min_op_index >= 0) {
+    // Track when the barrier index last changed value so we can detect a stale
+    // barrier (one the master has stopped advancing) and release it automatically.
+    // On first observation in this process lifetime the clock is initialized to
+    // now, so the age ceiling never fires immediately after a tserver restart.
+    const int64_t now_us = GetCurrentTimeMicros();
+    int64_t last_advanced_us;
+    {
+      std::lock_guard l(cdc_barrier_lock_);
+      if (cdc_min_op_index != cdc_barrier_prev_op_index_) {
+        cdc_barrier_prev_op_index_ = cdc_min_op_index;
+        cdc_barrier_last_advanced_micros_ = now_us;
+      }
+      last_advanced_us = cdc_barrier_last_advanced_micros_;
+    }
+
+    // Bounded-WAL guarantee: the two conditions below can skip the CDC clamp
+    // (the std::min below), letting for_durability revert to its true Raft
+    // floor so normal WAL GC can proceed. Skipping the clamp is
+    // durability-safe: we only decline to lower for_durability below its
+    // genuine value. Consumers whose WAL is subsequently GC'd will receive
+    // WAL_EXPIRED on the next GetChanges call.
+    bool skip_cdc_clamp = false;
+
+    // Condition 1: disk-pressure valve. If free space on the WAL directory
+    // drops below --cdc_stop_retaining_min_disk_mb, release the barrier to
+    // prevent a lagging CDC consumer from filling the disk and crashing the
+    // tserver. Applies regardless of how recently the barrier was advanced.
+    const int64_t min_disk_mb = FLAGS_cdc_stop_retaining_min_disk_mb;
+    if (!skip_cdc_clamp && min_disk_mb > 0) {
+      SpaceInfo si;
+      const string wal_dir = meta_->fs_manager()->GetTabletWalDir(tablet_id());
+      if (meta_->fs_manager()->GetEnv()->GetSpaceInfo(wal_dir, &si).ok()) {
+        const int64_t free_mb = si.free_bytes / (1024LL * 1024);
+        if (free_mb < min_disk_mb) {
+          KLOG_EVERY_N_SECS(WARNING, 60)
+              << LogPrefix() << "CDC: force-releasing WAL retention barrier "
+              << "due to disk pressure: free=" << free_mb << " MB, "
+              << "threshold=" << min_disk_mb << " MB on " << wal_dir;
+          skip_cdc_clamp = true;
+        }
+      }
+    }
+
+    // Condition 2: barrier-age ceiling. If the barrier index has not been
+    // advanced by the master for more than --cdc_max_wal_retention_secs, release
+    // it. A healthy master refreshes the barrier on every maintenance cycle, so
+    // this triggers only when the master has been partitioned or stopped for an
+    // extended time -- it is the dead-master backstop. Only applied when the
+    // barrier is actually pinning extra WAL (i.e. barrier is below the true
+    // Raft durability floor); if no extra WAL is being retained there is
+    // nothing to release and no need to log a warning.
+    const int64_t max_retain_secs = FLAGS_cdc_max_wal_retention_secs;
+    if (!skip_cdc_clamp && max_retain_secs > 0 &&
+        cdc_min_op_index < ret.for_durability && last_advanced_us > 0) {
+      const int64_t age_secs = (now_us - last_advanced_us) / 1000000LL;
+      if (age_secs > max_retain_secs) {
+        KLOG_EVERY_N_SECS(WARNING, 60)
+            << LogPrefix() << "CDC: force-releasing WAL retention barrier "
+            << "due to age: barrier index=" << cdc_min_op_index
+            << " has not advanced for " << age_secs << " secs "
+            << "(max=" << max_retain_secs << " secs)";
+        skip_cdc_clamp = true;
+      }
+    }
+
+    if (skip_cdc_clamp) {
+      // Barrier released: count each GC cycle that skips the CDC clamp so
+      // operators can detect and alert on a sustained release condition.
+      if (cdc_barrier_forced_releases_) {
+        cdc_barrier_forced_releases_->Increment();
+      }
+
+      // Also release the in-memory MVCC/UNDO history floor. Skipping only the
+      // WAL clamp above would leave the valve half-open: WAL GC resumes but
+      // GetTabletAncientHistoryMark() keeps clamping the AHM to the stale
+      // 'cdc_history_floor_' the master last pushed, so compaction/flush-UNDO GC
+      // cannot reclaim rowset history -- during the very disk-full event the
+      // valve exists to relieve. Both valve conditions signal "stop retaining
+      // for CDC" (disk pressure, or a master that has stopped refreshing the
+      // barrier), and in this single-clock model WAL and history staleness
+      // advance together, so both are released together (YB releases its WAL and
+      // history barriers on their respective staleness clocks the same way,
+      // tablet_peer.cc reset_cdc_retention_barriers_if_stale). Timestamp(0) is
+      // the "no floor" sentinel. If the master later resumes and re-pushes the
+      // barrier (SetRetentionBarrier), it re-raises the floor; under sustained
+      // disk pressure the floor is re-cleared each pass, so UNDO is reclaimed
+      // opportunistically -- the intended emergency behavior. A subsequently
+      // GC'd FULL/snapshot consumer receives HISTORY_EXPIRED, mirroring the
+      // WAL_EXPIRED the WAL-side release already yields.
+      if (std::shared_ptr<Tablet> tablet = shared_tablet()) {
+        tablet->SetCDCHistoryFloor(Timestamp(0));
+      }
+    } else {
+      // (a) WAL index floor: never GC below the barrier the master computed from
+      // the durable consumer checkpoint. Coexists with the live per-tablet anchor
+      // in the LogAnchorRegistry (both derive from SetRetentionBarrier); the
+      // min() below simply errs toward retention if the persisted value lags the
+      // live anchor.
+      ret.for_durability = std::min(ret.for_durability, cdc_min_op_index);
+
+      // (b) Hard time-based WAL floor: retain any segment younger than
+      // --cdc_wal_retention_secs. Enforced in GetPrefixSizeToGC() against the
+      // segment footer's wall-clock close time, so it does not depend on any op
+      // index or on polling.
+      if (FLAGS_cdc_wal_retention_secs > 0) {
+        ret.cdc_wal_retention_deadline_micros =
+            GetCurrentTimeMicros() -
+            static_cast<int64_t>(FLAGS_cdc_wal_retention_secs) * 1000000L;
+      }
+    }
+  }
+
   // If we never have written to the log, no need to proceed.
   if (ret.for_durability == 0) return ret;
 

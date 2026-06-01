@@ -55,7 +55,7 @@ add_dependencies(itest_util
   kudu-tserver)
 
 # Tests
-SET_KUDU_TEST_LINK_LIBS(itest_util gumbo-parser gumbo-query)
+SET_KUDU_TEST_LINK_LIBS(itest_util cdc_client gumbo-parser gumbo-query)
 if(NOT NO_ROCKSDB)
   ADD_KUDU_TEST_LINK_LIBS(
     rocksdb)
@@ -69,6 +69,9 @@ ADD_KUDU_TEST(auth_token_expire-itest)
 ADD_KUDU_TEST(authz_token-itest PROCESSORS 2)
 ADD_KUDU_TEST(auto_incrementing-itest)
 ADD_KUDU_TEST(catalog_manager_tsk-itest PROCESSORS 2)
+ADD_KUDU_TEST(cdc-itest)
+ADD_KUDU_TEST(cdc_client-itest)
+ADD_KUDU_TEST(cdc_failover-itest)
 ADD_KUDU_TEST(varchar-itest)
 ADD_KUDU_TEST(client_failover-itest)
 ADD_KUDU_TEST(client-negotiation-failover-itest)

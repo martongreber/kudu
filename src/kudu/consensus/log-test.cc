@@ -1110,6 +1110,41 @@ TEST_F(LogTest, TestGetGCableDataSize) {
   EXPECT_EQ(kSegmentSizeBytes * 4, log_->GetGCableDataSize(RetentionIndexes(35)));
 }
 
+// The CDC hard WAL-retention floor must keep any segment that closed within the
+// retention window (and everything newer), even when the index-based retention
+// (for_durability / for_peers) would otherwise allow GC.
+TEST_F(LogTest, TestGCableDataSizeWithCDCWalRetention) {
+  FLAGS_log_compression_codec = "no_compression";
+  FLAGS_log_min_segments_to_retain = 0;
+  ASSERT_OK(BuildLog());
+
+  const int kNumTotalSegments = 5;
+  const int kNumOpsPerSegment = 5;
+  const int64_t kSegmentSizeBytes = 352 + env_->GetEncryptionHeaderSize();
+  OpId op_id = MakeOpId(1, 10);
+  // [10-14], [15-19], [20-24], [25-29], [30-34]; the last segment stays open.
+  ASSERT_OK(AppendMultiSegmentSequence(kNumTotalSegments, kNumOpsPerSegment,
+                                       &op_id, nullptr));
+
+  // Baseline: with no CDC floor and a high index, all four closed segments are
+  // GCable (the open segment is never GCable).
+  RetentionIndexes no_floor(35);
+  ASSERT_EQ(0, no_floor.cdc_wal_retention_deadline_micros);
+  EXPECT_EQ(kSegmentSizeBytes * 4, log_->GetGCableDataSize(no_floor));
+
+  // A deadline in the distant past: every real segment closed after it, so the
+  // floor retains all closed segments regardless of the index-based retention.
+  RetentionIndexes past_floor(35);
+  past_floor.cdc_wal_retention_deadline_micros = 1;
+  EXPECT_EQ(0, log_->GetGCableDataSize(past_floor));
+
+  // A deadline in the far future: no segment closed at or after it, so the floor
+  // matches nothing and index-based GC proceeds as in the baseline.
+  RetentionIndexes future_floor(35);
+  future_floor.cdc_wal_retention_deadline_micros = 1000000000000000000LL;
+  EXPECT_EQ(kSegmentSizeBytes * 4, log_->GetGCableDataSize(future_floor));
+}
+
 // Regression test. Check that failed preallocation returns an error instead of
 // hanging.
 TEST_F(LogTest, TestFailedLogPreAllocation) {

@@ -164,7 +164,14 @@ class ServerBase {
 
   // Registers a new RPC service. Once Start() is called, the server will
   // process and dispatch incoming RPCs belonging to this service.
+  //
+  // The two-argument form registers the service with its own dedicated
+  // incoming-RPC queue of the given length instead of the shared
+  // --rpc_service_queue_length. Each ServicePool gets its own dedicated
+  // --rpc_num_service_threads worker threads regardless of queue form used.
   Status RegisterService(std::unique_ptr<rpc::ServiceIf> rpc_impl);
+  Status RegisterService(std::unique_ptr<rpc::ServiceIf> rpc_impl,
+                         int service_queue_length);
 
   // Unregisters all RPC services. After this function returns, any subsequent
   // incoming RPCs will be rejected.

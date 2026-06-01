@@ -416,6 +416,16 @@ Status Tablet::Open(const unordered_set<int64_t>& in_flight_txn_ids,
 
   next_mrs_id_ = metadata_->last_durable_mrs_id() + 1;
 
+  // Restore the CDC MVCC history floor persisted in the superblock, if any, so a
+  // restart or leader change does not transiently expose UNDO history that an
+  // active FULL-mode/snapshot CDC stream still needs. Without this, the floor would
+  // start at 0 and a compaction could GC that history before the master re-pushes
+  // the barrier (up to --cdc_bg_scan_interval_ms later). See SetCDCHistoryFloor().
+  const uint64_t cdc_hst_micros = metadata_->cdc_history_safe_time_micros();
+  if (cdc_hst_micros > 0) {
+    SetCDCHistoryFloor(HybridClock::TimestampFromMicroseconds(cdc_hst_micros));
+  }
+
   // If we persisted the state of any transaction IDs before shutting down,
   // initialize those that were in-flight here as kOpen. If there were any ops
   // applied that didn't get persisted to the tablet metadata, the bootstrap
@@ -1515,8 +1525,10 @@ Status Tablet::DoMajorDeltaCompaction(const vector<ColumnId>& col_ids,
                                       const shared_ptr<RowSet>& input_rs,
                                       const IOContext* io_context) {
   RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
+  HistoryGcOpts history_gc_opts = GetHistoryGcOpts();
+  RecordHistoryGcWaterMark(history_gc_opts);
   Status s = down_cast<DiskRowSet*>(input_rs.get())
-      ->MajorCompactDeltaStoresWithColumnIds(col_ids, io_context, GetHistoryGcOpts());
+      ->MajorCompactDeltaStoresWithColumnIds(col_ids, io_context, history_gc_opts);
   return s;
 }
 
@@ -1545,6 +1557,14 @@ bool Tablet::GetTabletAncientHistoryMark(Timestamp* ancient_history_mark) const 
   } else {
     *ancient_history_mark = Timestamp(0);
   }
+  // Clamp the ancient history mark against any active CDC history floor so that
+  // UNDO deltas needed by FULL-mode/snapshot CDC streams are not GC'd. The floor
+  // is the oldest timestamp CDC still needs to read; the AHM must not advance
+  // past it.
+  uint64_t cdc_floor = cdc_history_floor_.load(std::memory_order_acquire);
+  if (cdc_floor > 0 && Timestamp(cdc_floor) < *ancient_history_mark) {
+    *ancient_history_mark = Timestamp(cdc_floor);
+  }
   return true;
 }
 
@@ -1554,6 +1574,30 @@ HistoryGcOpts Tablet::GetHistoryGcOpts() const {
     return HistoryGcOpts::Enabled(ancient_history_mark);
   }
   return HistoryGcOpts::Disabled();
+}
+
+void Tablet::RecordHistoryGcWaterMark(const HistoryGcOpts& opts) const {
+  // Advance the history-GC water mark to the AHM this compaction/flush is about
+  // to apply. Called only from the paths that physically rewrite rowsets with
+  // UNDO history GC (not the read-side ancient-history check), so the mark
+  // reflects history that has actually become reclaimable. Monotonic: a later
+  // GC with a lower (e.g. CDC-floor-clamped) AHM must not pull it back down, or a
+  // stale before-image read could slip past the HISTORY_EXPIRED gate. CAS-max
+  // because flush/compaction run concurrently. See cdc_history_gc_water_mark().
+  if (!opts.gc_enabled()) {
+    return;
+  }
+  RecordHistoryGcWaterMark(opts.ancient_history_mark());
+}
+
+void Tablet::RecordHistoryGcWaterMark(Timestamp ancient_history_mark) const {
+  uint64_t ahm = ancient_history_mark.value();
+  uint64_t prev = history_gc_water_mark_.load(std::memory_order_relaxed);
+  while (ahm > prev &&
+         !history_gc_water_mark_.compare_exchange_weak(
+             prev, ahm, std::memory_order_release, std::memory_order_relaxed)) {
+    // 'prev' reloaded by compare_exchange_weak; retry while ahm is still higher.
+  }
 }
 
 Status Tablet::Flush() {
@@ -2084,6 +2128,9 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompactionOrFlush &input,
 
   // Get tablet history, to be used later for AHM validation checks.
   HistoryGcOpts history_gc_opts = GetHistoryGcOpts();
+  // This compaction/flush is about to apply UNDO-history GC at this AHM; record
+  // it so CDC before-image reconstruction knows the history is gone.
+  RecordHistoryGcWaterMark(history_gc_opts);
 
   // Apply REDO and UNDO deltas to the rows, merge histories of rows with 'ghost' entries.
   RETURN_NOT_OK_PREPEND(
@@ -2892,7 +2939,9 @@ Status Tablet::MajorCompactAllDeltaStoresForTests() {
     DiskRowSet* drs = down_cast<DiskRowSet*>(rs.get());
     RETURN_NOT_OK(drs->mutable_delta_tracker()->InitAllDeltaStoresForTests(
         DeltaTracker::REDOS_ONLY));
-    RETURN_NOT_OK_PREPEND(drs->MajorCompactDeltaStores(&io_context, GetHistoryGcOpts()),
+    HistoryGcOpts history_gc_opts = GetHistoryGcOpts();
+    RecordHistoryGcWaterMark(history_gc_opts);
+    RETURN_NOT_OK_PREPEND(drs->MajorCompactDeltaStores(&io_context, history_gc_opts),
                           "Failed major delta compaction on " + rs->ToString());
   }
   return Status::OK();
@@ -2926,8 +2975,10 @@ Status Tablet::CompactWorstDeltas(RowSet::DeltaCompactionType type) {
     RETURN_NOT_OK_PREPEND(rs->MinorCompactDeltaStores(&io_context),
                           "Failed minor delta compaction on " + rs->ToString());
   } else if (type == RowSet::MAJOR_DELTA_COMPACTION) {
+    HistoryGcOpts history_gc_opts = GetHistoryGcOpts();
+    RecordHistoryGcWaterMark(history_gc_opts);
     RETURN_NOT_OK_PREPEND(
-        down_cast<DiskRowSet*>(rs.get())->MajorCompactDeltaStores(&io_context, GetHistoryGcOpts()),
+        down_cast<DiskRowSet*>(rs.get())->MajorCompactDeltaStores(&io_context, history_gc_opts),
         "Failed major delta compaction on " + rs->ToString());
   }
   return Status::OK();
@@ -3130,6 +3181,10 @@ Status Tablet::DeleteAncientDeletedRowsets() {
   if (to_delete.empty()) {
     return Status::OK();
   }
+  // Ancient deleted rowsets (all rows deleted and fully below the AHM) are about
+  // to be dropped; their history is gone, so advance the CDC before-image water
+  // mark. See cdc_history_gc_water_mark().
+  RecordHistoryGcWaterMark(ancient_history_mark);
   RETURN_NOT_OK(HandleEmptyCompactionOrFlush(
       to_delete, TabletMetadata::kNoMrsFlushed, {}));
   metrics_->deleted_rowset_gc_bytes_deleted->IncrementBy(bytes_deleted);
@@ -3179,6 +3234,10 @@ Status Tablet::DeleteAncientUndoDeltas(int64_t* blocks_deleted, int64_t* bytes_d
   // We flush the tablet metadata at the end because we don't flush per-RowSet
   // for performance reasons.
   if (tablet_blocks_deleted > 0) {
+    // UNDO history below the AHM has actually been removed; advance the CDC
+    // before-image water mark so reconstruction below it returns HISTORY_EXPIRED
+    // rather than reading the current row. See cdc_history_gc_water_mark().
+    RecordHistoryGcWaterMark(ancient_history_mark);
     RETURN_NOT_OK(FlushTabletMetadataAndUpdateMetrics());
   }
 

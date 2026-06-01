@@ -206,6 +206,27 @@ class MasterServiceImpl : public MasterServiceIf {
 
   bool SupportsFeature(uint32_t feature) const override;
 
+  // CDC (Change Data Capture) RPCs
+  void CreateCDCStream(const CreateCDCStreamRequestPB* req,
+                       CreateCDCStreamResponsePB* resp,
+                       rpc::RpcContext* rpc) override;
+
+  void DeleteCDCStream(const DeleteCDCStreamRequestPB* req,
+                       DeleteCDCStreamResponsePB* resp,
+                       rpc::RpcContext* rpc) override;
+
+  void ListCDCStreams(const ListCDCStreamsRequestPB* req,
+                     ListCDCStreamsResponsePB* resp,
+                     rpc::RpcContext* rpc) override;
+
+  void GetCDCStreamInfo(const GetCDCStreamInfoRequestPB* req,
+                        GetCDCStreamInfoResponsePB* resp,
+                        rpc::RpcContext* rpc) override;
+
+  void UpdateCDCCheckpoint(const UpdateCDCCheckpointRequestPB* req,
+                           UpdateCDCCheckpointResponsePB* resp,
+                           rpc::RpcContext* rpc) override;
+
  private:
   Master* server_;
 

@@ -1,0 +1,139 @@
+Kudu CDC: key ideas and components
+==================================
+
+WHAT IT IS
+
+Change Data Capture (CDC) lets an external consumer read the ordered stream of
+row changes for a table, straight from each tablet's write-ahead log (WAL). It is
+server-side and YugabyteDB-inspired, but deliberately leaner: no virtual WAL, no
+replication slots, no tablet-split lineage.
+
+The system is built from a handful of cooperating pieces.
+
+
+1. STREAMS AND STATE (the master owns durable state)
+
+- A "stream" is a subscription to one or more tables. It is created/deleted via
+  master RPCs and stored durably in the master sys-catalog as SysCDCStreamEntryPB.
+- Per stream the master keeps: the tables, a config, and a per-tablet checkpoint
+  map (tablet -> last consumed WAL index), plus a per-tablet history floor and a
+  last-active timestamp.
+- This survives master failover: on leader election the streams are reloaded.
+
+
+2. RETENTION (the correctness core)
+
+The problem: a consumer that lags must not have the WAL it still needs garbage-
+collected - not on the leader, and not on followers (a follower could GC data
+before it ever becomes leader).
+
+The solution: two "barriers" that hold data back on EVERY replica.
+- WAL barrier: a log anchor at the consumer's checkpoint index, so segments below
+  it are kept.
+- History barrier (FULL streams only): a floor on MVCC history GC, so the old row
+  versions needed for before-images survive.
+
+How the barriers get everywhere:
+- A periodic master background task (RunCDCStreamMaintenance) computes, per tablet,
+  the minimum checkpoint across all live streams, and fans out an
+  UpdateCDCRetentionBarrier RPC to every replica of that tablet.
+- The tserver handler registers/updates the anchor (works on followers too) and
+  persists the floor, so retention holds across leader changes and restarts.
+
+
+3. READING CHANGES (the producer path)
+
+- GetChanges(tablet, from_index) returns a batch of change records read from the
+  WAL up to the committed index, then the consumer advances.
+- Checkpoint(tablet, index) durably records progress (via the master) and lets the
+  WAL below that index be reclaimed.
+- Only the tablet leader serves changes; followers say "not leader".
+
+Hardening (isolation from user traffic): CDC already has its own RPC thread pool,
+but heavy CDC work - snapshot scans and FULL before/after-image reconstruction -
+reads the same tablet storage as user queries and so competes for I/O and memory.
+The number of concurrent heavy scans (--cdc_max_concurrent_scans) and their heap
+budget (--cdc_scan_mem_limit_bytes) can now be bounded, and requests over the
+limits are shed with a retryable "server busy" error rather than being allowed to
+crowd out user traffic. Plain CHANGE-mode WAL streaming is cheap and is not capped.
+Raw file-cache I/O remains shared and is a known residual.
+
+
+4. TRANSACTIONS
+
+- Writes belonging to a multi-row transaction are buffered per transaction and
+  emitted only when the commit is seen: BEGIN, the rows (stamped with the commit
+  timestamp), then COMMIT. Aborted transactions are dropped.
+- The checkpoint never advances past the oldest still-open transaction, so a
+  transaction is never split across responses or lost (head-of-line blocking).
+- Ordering is per-tablet, in commit order (no cross-tablet ordering).
+
+
+5. RECORD TYPES AND IMAGES
+
+- CHANGE (cheap, default): the after-image only - changed columns for updates,
+  key for deletes. No history barrier needed.
+- FULL: both the before-image and the complete after-image of each row,
+  reconstructed by reading the tablet at the operation timestamp and just before
+  it. This is what needs the MVCC history barrier.
+
+Hardening (FULL image correctness): an operation is durable in the WAL before the
+apply pool has applied it to the in-memory store. FULL reconstruction now waits
+for all committed operations up to the relevant timestamp to be applied before it
+reads, so before/after-images are always complete - including right after a leader
+change, when a freshly-elected leader may hold committed-but-not-yet-applied
+operations. On a wait timeout the consumer gets a retryable error instead of a
+wrong or empty image.
+
+
+6. SNAPSHOT (bootstrap from current data)
+
+- A stream can start with a consistent snapshot of the table's current contents
+  before it follows the WAL. The server picks a snapshot timestamp, records the
+  WAL index to resume from, emits the rows in pages (READ records), then hands off
+  to normal streaming. The history barrier keeps the snapshot readable meanwhile.
+
+Hardening: snapshot pages default to a smaller size than streaming
+(--cdc_snapshot_max_bytes_per_response), so the initial bulk scan is broken into
+lighter responses that compete less with user traffic.
+
+
+7. SCHEMA
+
+- Schema changes (ALTER) appear in the stream as DDL records carrying the new
+  schema, and each row is stamped with the schema version it was written under.
+- A consumer attaching mid-stream can set need_schema_info to get the tablet's
+  current schema prepended, so it has a base to decode against.
+
+
+8. LIFECYCLE AND GC
+
+- Idle streams: if a consumer stops checkpointing/polling for longer than
+  --cdc_stream_expiry_ms, the stream is treated as expired. It stops pinning
+  retention (its barriers are released) but the stream row is kept, so a returning
+  consumer gets a clear error rather than silent data loss.
+- Deleting a stream, or a stream expiring, releases the retention barriers on all
+  replicas for any tablet no longer needed by another stream.
+- Dropping a range partition: the gone tablet's entries are pruned from stream
+  metadata, and the tserver releases that tablet's CDC anchors before deleting it.
+
+Hardening (stuck, not just idle): idle-expiry keys off polling activity, so a
+consumer that keeps polling but never advances its checkpoint would pin the WAL
+(and, for FULL, MVCC history) indefinitely. A second bound, --cdc_max_staleness_ms,
+releases the barriers of a stream whose checkpoint has not advanced for too long,
+regardless of polling, with a warning logged before the release.
+
+
+9. SECURITY AND OBSERVABILITY
+
+- Every RPC requires an authenticated user. With --cdc_enforce_access_control on,
+  callers must also present a signed token proving SCAN privilege on the table
+  (the same token machinery scans use).
+- Metrics expose request/record/error counts plus lag/retention gauges: consumer
+  sent-lag, time since last consumer activity, and active stream count.
+
+Hardening: alongside the server-wide maxima, per-(stream, tablet) sent-lag and
+inactivity-age gauges are published, tagged with the stream and tablet ids, so a
+lagging stream can be pinpointed instead of only seeing "the worst session on this
+server". These pair with the max-staleness bound above for operating a lagging
+stream safely.

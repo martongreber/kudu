@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/cfile/block_cache.h"
@@ -37,15 +38,30 @@
 #include "kudu/transactions/txn_system_client.h"
 #include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/scanners.h"
+#include "kudu/cdc/cdc_service.h"
 #include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/tserver/tserver_path_handlers.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/maintenance_manager.h"
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/prometheus_writer.h"
 #include "kudu/util/status.h"
+
+DEFINE_int32(cdc_svc_queue_length, 5000,
+             "Length of the dedicated incoming-RPC queue for the CDC service. "
+             "The CDC service runs in its own ServicePool with its own worker "
+             "threads (see --rpc_num_service_threads), so this queue is fully "
+             "isolated from consensus, tablet, and other server RPCs: a deep CDC "
+             "queue cannot starve or interfere with those services. When the queue "
+             "is full, incoming CDC RPCs are shed (rejected with a retriable "
+             "error); a larger value buffers more calls during catch-up bursts or "
+             "re-bootstrap storms before shedding begins. The default of 5000 "
+             "matches YB's xcluster_svc_queue_length and is appropriate for "
+             "production deployments with multiple CDC consumers.");
+TAG_FLAG(cdc_svc_queue_length, advanced);
 
 namespace kudu {
 class Timer;
@@ -153,11 +169,14 @@ Status TabletServer::Start() {
   unique_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(this, tablet_manager_.get()));
   unique_ptr<ServiceIf> tablet_copy_service(new TabletCopyServiceImpl(
       this, tablet_manager_.get()));
+  unique_ptr<ServiceIf> cdc_service(new cdc::CDCServiceImpl(this));
+  cdc_service_ = static_cast<cdc::CDCServiceImpl*>(cdc_service.get());
 
   RETURN_NOT_OK(RegisterService(std::move(ts_service)));
   RETURN_NOT_OK(RegisterService(std::move(admin_service)));
   RETURN_NOT_OK(RegisterService(std::move(consensus_service)));
   RETURN_NOT_OK(RegisterService(std::move(tablet_copy_service)));
+  RETURN_NOT_OK(RegisterService(std::move(cdc_service), FLAGS_cdc_svc_queue_length));
   RETURN_NOT_OK(KuduServer::Start());
 
   if (web_server_) {

@@ -325,6 +325,8 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id,
       log_prefix_(Substitute("T $0 P $1: ", tablet_id_, fs_manager_->uuid())),
       next_rowset_idx_(0),
       last_durable_mrs_id_(kNoDurableMemStore),
+      cdc_min_retained_op_index_(-1),
+      cdc_history_safe_time_micros_(0),
       schema_(std::make_shared<Schema>(schema)),
       schema_version_(0),
       table_name_(std::move(table_name)),
@@ -351,6 +353,8 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id)
       tablet_id_(std::move(tablet_id)),
       fs_manager_(fs_manager),
       next_rowset_idx_(0),
+      cdc_min_retained_op_index_(-1),
+      cdc_history_safe_time_micros_(0),
       num_flush_pins_(0),
       needs_flush_(false),
       flush_count_for_tests_(0),
@@ -397,6 +401,15 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
     }
 
     last_durable_mrs_id_ = superblock.last_durable_mrs_id();
+
+    // CDC retention barrier. Absence reads back as the "no barrier" sentinels so
+    // that a released barrier (which omits the fields) is restored as released.
+    cdc_min_retained_op_index_ =
+        superblock.has_cdc_min_retained_op_index() ?
+            superblock.cdc_min_retained_op_index() : -1;
+    cdc_history_safe_time_micros_ =
+        superblock.has_cdc_history_safe_time_micros() ?
+            superblock.cdc_history_safe_time_micros() : 0;
 
     table_name_ = superblock.table_name();
 
@@ -778,6 +791,14 @@ Status TabletMetadata::ToSuperBlockUnlocked(TabletSuperBlockPB* super_block,
   pb.set_tablet_id(tablet_id_);
   partition_.ToPB(pb.mutable_partition());
   pb.set_last_durable_mrs_id(last_durable_mrs_id_);
+  // CDC retention barrier. Omit the fields when released so the superblock stays
+  // clean for non-CDC tablets and a release is durable (absence == no barrier).
+  if (cdc_min_retained_op_index_ >= 0) {
+    pb.set_cdc_min_retained_op_index(cdc_min_retained_op_index_);
+  }
+  if (cdc_history_safe_time_micros_ > 0) {
+    pb.set_cdc_history_safe_time_micros(cdc_history_safe_time_micros_);
+  }
   pb.set_schema_version(schema_version_);
   RETURN_NOT_OK(partition_schema_.ToPB(*schema_, pb.mutable_partition_schema()));
   pb.set_table_name(table_name_);
@@ -1034,6 +1055,31 @@ optional<TableExtraConfigPB> TabletMetadata::extra_config() const {
 optional<string> TabletMetadata::dimension_label() const {
   std::lock_guard l(data_lock_);
   return dimension_label_;
+}
+
+int64_t TabletMetadata::cdc_min_retained_op_index() const {
+  std::lock_guard l(data_lock_);
+  return cdc_min_retained_op_index_;
+}
+
+uint64_t TabletMetadata::cdc_history_safe_time_micros() const {
+  std::lock_guard l(data_lock_);
+  return cdc_history_safe_time_micros_;
+}
+
+bool TabletMetadata::SetCDCRetentionBarrier(int64_t op_index,
+                                            uint64_t history_safe_time_micros) {
+  // Normalize a released barrier to the canonical sentinel so a release reliably
+  // clears a previously-persisted value (and reads back as "no barrier").
+  const int64_t new_op_index = op_index < 0 ? -1 : op_index;
+  std::lock_guard l(data_lock_);
+  if (cdc_min_retained_op_index_ == new_op_index &&
+      cdc_history_safe_time_micros_ == history_safe_time_micros) {
+    return false;
+  }
+  cdc_min_retained_op_index_ = new_op_index;
+  cdc_history_safe_time_micros_ = history_safe_time_micros;
+  return true;
 }
 
 const optional<TableTypePB>& TabletMetadata::table_type() const {

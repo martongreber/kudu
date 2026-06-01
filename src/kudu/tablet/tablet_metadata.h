@@ -323,6 +323,23 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // Returns the table's dimension label.
   std::optional<std::string> dimension_label() const;
 
+  // The lowest Raft op index that must remain in the WAL for an active CDC stream
+  // on this tablet, or -1 if there is no active barrier. Persisted in the superblock
+  // and honored by TabletReplica::GetRetentionIndexes() so WAL retention survives a
+  // restart or leader change. Thread-safe.
+  int64_t cdc_min_retained_op_index() const;
+
+  // The oldest MVCC timestamp (physical microseconds) an active FULL-mode/snapshot
+  // CDC stream still needs retained in UNDO history, or 0 if there is no floor.
+  // Restored into Tablet::cdc_history_floor_ at bootstrap. Thread-safe.
+  uint64_t cdc_history_safe_time_micros() const;
+
+  // Updates the persisted CDC retention barrier. A negative 'op_index' or a 0
+  // 'history_safe_time_micros' clears the respective component (barrier released).
+  // Does NOT flush; the caller flushes only when this returns true. Returns true
+  // iff either persisted value changed. Thread-safe.
+  bool SetCDCRetentionBarrier(int64_t op_index, uint64_t history_safe_time_micros);
+
   // Loads the currently-flushed superblock from disk into the given protobuf.
   Status ReadSuperBlockFromDisk(TabletSuperBlockPB* superblock) const;
 
@@ -448,6 +465,12 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   base::subtle::Atomic64 next_rowset_idx_;
 
   int64_t last_durable_mrs_id_;
+
+  // CDC retention barrier, persisted in the superblock. Protected by 'data_lock_'.
+  // 'cdc_min_retained_op_index_' is -1 when no barrier is set; the history safe-time
+  // is 0 when no FULL-mode history floor is set.
+  int64_t cdc_min_retained_op_index_;
+  uint64_t cdc_history_safe_time_micros_;
 
   // Log anchors that are waiting on a metadata flush to be unanchored.
   std::vector<std::unique_ptr<log::MinLogIndexAnchorer>> anchors_needing_flush_;

@@ -175,9 +175,12 @@ DEFINE_uint64(log_container_metadata_inmem_replay_threshold_bytes,
               "spike per concurrently-loading container for a large reduction in the "
               "number of syscalls performed during 'Reading filesystem' at startup. "
               "Set to 0 to disable and always use the streaming code path. Only "
-              "applies to --block_manager='log' (native metadata); encrypted metadata "
-              "files are not supported by this optimization in the current version and "
-              "always use the streaming code path regardless of this flag.");
+              "applies to --block_manager='log' (native metadata). For encrypted "
+              "metadata the buffer holds the ciphertext payload and small per-record "
+              "decryption is performed on each in-memory Read(); the threshold is "
+              "compared against the cleartext payload size in both cases, so the "
+              "same flag value applies uniformly to encrypted and non-encrypted "
+              "clusters.");
 TAG_FLAG(log_container_metadata_inmem_replay_threshold_bytes, advanced);
 TAG_FLAG(log_container_metadata_inmem_replay_threshold_bytes, experimental);
 TAG_FLAG(log_container_metadata_inmem_replay_threshold_bytes, runtime);
@@ -1427,42 +1430,119 @@ namespace {
 // subsequent ReadablePBContainerFile preadv() from memory, we eliminate the
 // per-record syscall.
 //
-// Encrypted metadata files are intentionally not handled here (see
-// MaybePreloadMetadataIntoMemory below), so this class assumes a plaintext
-// on-disk layout with no encryption header.
+// Encrypted files are supported transparently: the buffer holds the raw
+// ciphertext bytes that follow the encryption header (offsets in the buffer
+// are therefore "logical_offset - header_size"), and per-Read()/-ReadV() we
+// forward to the underlying RandomAccessFile's Decrypt() to recover plaintext
+// on a per-slice basis. This preserves the per-slice IsAllZeros() short-circuit
+// that streaming-mode pb_util relies on for KUDU-2260 trailing-zero recovery:
+// for an unencrypted file Decrypt() is a no-op, and for an encrypted file the
+// slices handed to Decrypt() are exactly the ones the caller originally
+// requested (typically small length+cksum / body+cksum chunks for pb_util),
+// not a single bulk slice.
 //
 // The instance is immutable after construction and therefore trivially
 // thread-safe, matching RandomAccessFile's contract.
 class MemoryReadableFile : public RandomAccessFile {
  public:
-  MemoryReadableFile(string filename, faststring data)
+  MemoryReadableFile(string filename,
+                     faststring data,
+                     size_t encryption_header_size,
+                     shared_ptr<RandomAccessFile> source)
       : filename_(std::move(filename)),
-        data_(std::move(data)) {}
+        encryption_header_size_(encryption_header_size),
+        data_(std::move(data)),
+        file_size_(encryption_header_size_ + data_.size()),
+        source_(std::move(source)) {
+    // 'source_' is present iff the file has an encryption header.
+    DCHECK_EQ(encryption_header_size_ > 0, static_cast<bool>(source_));
+  }
 
   Status Read(uint64_t offset, Slice result) const override {
-    // 'offset' and 'result.size()' are both bounded above by the on-disk
-    // file size, which we cap to the (uint64_t) replay threshold flag
-    // before constructing this object, so the addition below cannot overflow.
-    if (PREDICT_FALSE(offset + result.size() > data_.size())) {
+    // Reject offsets inside the encryption header in release builds too: the
+    // unsigned 'offset - encryption_header_size_' below would otherwise wrap.
+    // The EOF check is written as 'result.size() > file_size_ - offset'
+    // rather than 'offset + result.size() > file_size_' so the comparison
+    // itself is overflow-safe for hostile inputs (the 'offset > file_size_'
+    // clause guards the subtraction).
+    if (PREDICT_FALSE(offset < encryption_header_size_ ||
+                      offset > file_size_ ||
+                      result.size() > file_size_ - offset)) {
       return Status::IOError(
           Substitute("out-of-bounds in-memory read in $0: "
                      "offset=$1 size=$2 file_size=$3",
-                     filename_, offset, result.size(), data_.size()));
+                     filename_, offset, result.size(), file_size_));
     }
-    memcpy(result.mutable_data(), data_.data() + offset, result.size());
-    return Status::OK();
+    const uint64_t buf_offset = offset - encryption_header_size_;
+    memcpy(result.mutable_data(), data_.data() + buf_offset, result.size());
+    if (!source_) {
+      // Unencrypted: data_ already holds plaintext, no Decrypt() needed.
+      return Status::OK();
+    }
+    return source_->Decrypt(offset, ArrayView<Slice>(&result, 1));
   }
 
   Status ReadV(uint64_t offset, ArrayView<Slice> results) const override {
-    for (const auto& s : results) {
-      RETURN_NOT_OK(Read(offset, s));
+    // 'offset' only grows below, so once we know the first slice is past
+    // the encryption header all subsequent slices are too.
+    if (PREDICT_FALSE(offset < encryption_header_size_)) {
+      return Status::IOError(
+          Substitute("out-of-bounds in-memory read in $0: "
+                     "offset=$1 < encryption_header=$2 file_size=$3",
+                     filename_, offset, encryption_header_size_, file_size_));
+    }
+    const uint64_t orig_offset = offset;
+    for (auto& s : results) {
+      // Same overflow-safe EOF check as Read() above.
+      if (PREDICT_FALSE(offset > file_size_ ||
+                        s.size() > file_size_ - offset)) {
+        return Status::IOError(
+            Substitute("out-of-bounds in-memory read in $0: "
+                       "offset=$1 size=$2 file_size=$3",
+                       filename_, offset, s.size(), file_size_));
+      }
+      const uint64_t buf_offset = offset - encryption_header_size_;
+      memcpy(s.mutable_data(), data_.data() + buf_offset, s.size());
       offset += s.size();
     }
-    return Status::OK();
+    if (!source_) {
+      return Status::OK();
+    }
+    // Decrypt the whole vector in one call so the underlying impl can amortize
+    // any per-call setup (cipher context init, IV seed). This is safe for
+    // pb_util's current usage (single-slice Read()s) but, as documented on
+    // RandomAccessFile::Decrypt(), is not equivalent to per-slice decryption
+    // when an *interior* slice is all-zero ciphertext.
+    return source_->Decrypt(orig_offset, results);
+  }
+
+  // The new RandomAccessFile virtuals must mirror the underlying file's
+  // semantics, even though the in-memory replay path doesn't call them today:
+  // the wrapper is otherwise indistinguishable from a real RandomAccessFile
+  // and a future caller could reasonably expect ReadRaw() to return
+  // ciphertext and Decrypt() to decrypt it. Forwarding to 'source_' preserves
+  // both contracts without an extra in-memory bookkeeping path.
+  Status ReadRaw(uint64_t raw_offset, Slice result) const override {
+    if (!source_) {
+      return Read(raw_offset, result);
+    }
+    return source_->ReadRaw(raw_offset, result);
+  }
+
+  Status Decrypt(uint64_t logical_offset,
+                 ArrayView<Slice> data) const override {
+    if (!source_) {
+      return Status::OK();
+    }
+    return source_->Decrypt(logical_offset, data);
   }
 
   Status Size(uint64_t* size) const override {
-    *size = data_.size();
+    // Mirrors PosixRandomAccessFile::Size(), which returns the raw on-disk
+    // size including any encryption header. ReadablePBContainerFile (and any
+    // other caller that mixes Size() with the GetEncryptionHeaderSize() offset
+    // convention) depends on this.
+    *size = file_size_;
     return Status::OK();
   }
 
@@ -1472,18 +1552,32 @@ class MemoryReadableFile : public RandomAccessFile {
     return sizeof(*this) + data_.capacity() + filename_.capacity();
   }
 
-  size_t GetEncryptionHeaderSize() const override { return 0; }
+  size_t GetEncryptionHeaderSize() const override {
+    return encryption_header_size_;
+  }
 
  private:
   const string filename_;
+  const size_t encryption_header_size_;
   const faststring data_;
+  // Cached 'encryption_header_size_ + data_.size()'. Used both to satisfy
+  // Size() (which returns the raw on-disk size including the header) and to
+  // power the overflow-free bounds checks in Read()/ReadV(), without
+  // recomputing the sum on every call.
+  const uint64_t file_size_;
+  // Kept alive solely so that Decrypt() can run against the original file's
+  // encryption header (key/IV). No further disk I/O is performed against it
+  // after the preload completes. Null for unencrypted files, where the
+  // underlying fd is released as soon as the buffer is slurped.
+  const shared_ptr<RandomAccessFile> source_;
 };
 
 // If the metadata file pointed to by 'raw_reader' is small enough (per
-// --log_container_metadata_inmem_replay_threshold_bytes), slurp it entirely
-// into memory and return a MemoryReadableFile wrapping it. Otherwise (or on
-// any I/O error during the preload) return 'raw_reader' unchanged so the
-// caller falls back to streaming reads.
+// --log_container_metadata_inmem_replay_threshold_bytes, measured against the
+// cleartext payload size, i.e. excluding any encryption header), slurp it
+// entirely into memory and return a MemoryReadableFile wrapping it. Otherwise
+// (or on any I/O error during the preload) return 'raw_reader' unchanged so
+// the caller falls back to streaming reads.
 unique_ptr<RandomAccessFile> MaybePreloadMetadataIntoMemory(
     const string& metadata_path,
     unique_ptr<RandomAccessFile> raw_reader) {
@@ -1493,30 +1587,9 @@ unique_ptr<RandomAccessFile> MaybePreloadMetadataIntoMemory(
     return raw_reader;
   }
 
-  // Cheap encrypted-file check first: this avoids a stat() syscall for
-  // encrypted clusters, which always fall back to streaming.
-  //
-  // The streaming path's ability to recover from an incomplete trailing
-  // record (e.g. when a metadata write was interrupted by a crash and the
-  // on-disk tail consists of file-hole zeros) depends on a per-slice
-  // optimization inside DoDecryptV that skips decryption of all-zero
-  // ciphertext slices, leaving them as zeros in plaintext. A bulk read of
-  // the whole payload as a single slice would defeat that optimization and
-  // turn the trailing hole into garbled plaintext, which the PB container
-  // parser would misclassify as corruption instead of an incomplete write.
-  // Until we have a way to preserve that per-slice semantic in the
-  // in-memory path, fall back to streaming whenever encryption is enabled.
-  // Non-encrypted clusters still benefit from the optimization.
-  //
-  // TODO(KUDU-3779): extend the in-memory replay path to support encrypted
-  // metadata files.
   const size_t header_size = raw_reader->GetEncryptionHeaderSize();
-  if (header_size > 0) {
-    return raw_reader;
-  }
-
-  uint64_t file_size = 0;
-  Status s = raw_reader->Size(&file_size);
+  uint64_t raw_file_size = 0;
+  Status s = raw_reader->Size(&raw_file_size);
   if (PREDICT_FALSE(!s.ok())) {
     KLOG_EVERY_N_SECS(WARNING, 10)
         << "Failed to stat metadata file " << metadata_path
@@ -1524,29 +1597,52 @@ unique_ptr<RandomAccessFile> MaybePreloadMetadataIntoMemory(
         << s.ToString();
     return raw_reader;
   }
-  if (file_size == 0) {
-    // Empty metadata file: there's nothing to preload, and the streaming
-    // path will detect EOF immediately.
+  if (PREDICT_FALSE(raw_file_size < header_size)) {
+    // Should be impossible: a valid encrypted file always contains at least
+    // its header. Fall back to streaming and let the normal open-time checks
+    // surface the corruption.
+    KLOG_EVERY_N_SECS(WARNING, 10)
+        << "Metadata file " << metadata_path << " is smaller ("
+        << raw_file_size << " bytes) than its declared encryption header ("
+        << header_size << " bytes); falling back to streaming reads";
     return raw_reader;
   }
-  if (file_size > threshold) {
+  const uint64_t payload_size = raw_file_size - header_size;
+  if (payload_size == 0) {
+    // Empty payload: there's nothing to preload, and the streaming path will
+    // detect EOF immediately after reading the (encryption + container)
+    // headers.
+    return raw_reader;
+  }
+  if (payload_size > threshold) {
     return raw_reader;
   }
 
   faststring buf;
-  buf.resize(file_size);
-  s = raw_reader->Read(/*offset=*/0, Slice(buf.data(), file_size));
+  buf.resize(payload_size);
+  // ReadRaw() bypasses on-the-fly decryption: for encrypted files we
+  // intentionally cache the ciphertext, so that subsequent in-memory reads can
+  // forward small slices through source_->Decrypt() and keep pb_util's
+  // per-slice all-zero recovery semantics intact (see KUDU-2260, and the
+  // class comment on MemoryReadableFile).
+  s = raw_reader->ReadRaw(/*raw_offset=*/header_size,
+                          Slice(buf.data(), payload_size));
   if (PREDICT_FALSE(!s.ok())) {
     KLOG_EVERY_N_SECS(WARNING, 10)
         << "Failed to preload metadata file " << metadata_path
-        << " (" << file_size << " bytes) for in-memory replay; "
+        << " (" << payload_size << " payload bytes) for in-memory replay; "
         << "falling back to streaming reads: " << s.ToString();
     return raw_reader;
   }
   VLOG(1) << "Preloaded metadata file " << metadata_path
-          << " (" << file_size << " bytes) for in-memory replay";
+          << " (" << payload_size << " payload bytes, "
+          << header_size << " header bytes) for in-memory replay";
+  shared_ptr<RandomAccessFile> source;
+  if (header_size > 0) {
+    source = std::move(raw_reader);
+  }
   return std::unique_ptr<RandomAccessFile>(new MemoryReadableFile(
-      metadata_path, std::move(buf)));
+      metadata_path, std::move(buf), header_size, std::move(source)));
 }
 
 } // anonymous namespace

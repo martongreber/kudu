@@ -390,6 +390,18 @@ class Descriptor<RandomAccessFile> : public RandomAccessFile {
     return opened.file()->ReadV(offset, results);
   }
 
+  Status ReadRaw(uint64_t raw_offset, Slice result) const override {
+    ScopedOpenedDescriptor<RandomAccessFile> opened(&base_);
+    RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
+    return opened.file()->ReadRaw(raw_offset, result);
+  }
+
+  Status Decrypt(uint64_t logical_offset, ArrayView<Slice> data) const override {
+    ScopedOpenedDescriptor<RandomAccessFile> opened(&base_);
+    RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
+    return opened.file()->Decrypt(logical_offset, data);
+  }
+
   Status Size(uint64_t *size) const override {
     ScopedOpenedDescriptor<RandomAccessFile> opened(&base_);
     RETURN_NOT_OK(ReopenFileIfNecessary(&opened));

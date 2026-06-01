@@ -223,6 +223,8 @@ class LogBlockManager : public BlockManager {
 
   FRIEND_TEST(LogBlockManagerNativeMetaTest,
               TestContainerBlockLimitingByMetadataSizeWithCompaction);
+  FRIEND_TEST(LogBlockManagerNativeMetaTest,
+              TestInMemoryReplayRecoversTrailingZeros);
   FRIEND_TEST(LogBlockManagerNativeMetaTest, TestMetadataTruncation);
   FRIEND_TEST(LogBlockManagerTest, TestAbortBlock);
   FRIEND_TEST(LogBlockManagerTest, TestCloseFinalizedBlock);

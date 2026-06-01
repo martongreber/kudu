@@ -1065,6 +1065,24 @@ class PosixRandomAccessFile: public RandomAccessFile {
                    encrypted_ ? &encryption_header_ : nullptr);
   }
 
+  Status ReadRaw(uint64_t raw_offset, Slice result) const override {
+    // Unlike Read()/ReadV(), 'raw_offset' is measured from the start of the
+    // physical file and is allowed to fall inside the encryption header (in
+    // particular at offset 0). No decryption is applied; the caller is
+    // expected to feed the result back through Decrypt() at the appropriate
+    // logical offset(s) when needed.
+    return DoReadV(fd_, filename_, raw_offset, ArrayView<Slice>(&result, 1),
+                   /*eh=*/nullptr);
+  }
+
+  Status Decrypt(uint64_t logical_offset, ArrayView<Slice> data) const override {
+    if (!encrypted_) {
+      return Status::OK();
+    }
+    DCHECK_GE(logical_offset, GetEncryptionHeaderSize());
+    return DoDecryptV(&encryption_header_, logical_offset, data);
+  }
+
   Status Size(uint64_t *size) const override {
     MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     TRACE_EVENT1("io", "PosixRandomAccessFile::Size", "path", filename_);

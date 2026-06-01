@@ -1339,6 +1339,144 @@ TEST_P(TestEncryptedEnv, TestEncryption) {
   ASSERT_EQ(kTestData + kTestData2, result3);
 }
 
+// Verifies that for an encrypted RandomAccessFile, the (ReadRaw + Decrypt)
+// pair is byte-equivalent to the plaintext-returning Read() path, including
+// the per-slice all-zero short-circuit inside DoDecryptV (which is what allows
+// KUDU-2260-style trailing-zero recovery to still work when callers cache the
+// ciphertext in memory and re-decrypt small slices on demand).
+TEST_P(TestEncryptedEnv, TestReadRawAndDecrypt) {
+  const string kFile = JoinPathSegments(test_dir_, "encrypted_file_readraw");
+  RWFileOptions rw_opts;
+  rw_opts.is_sensitive = true;
+  unique_ptr<RWFile> rw;
+  ASSERT_OK(env_->NewRWFile(rw_opts, kFile, &rw));
+
+  const size_t header_size = env_->GetEncryptionHeaderSize();
+  // Write a chunk of non-zero plaintext followed by an explicit run of
+  // zeros, mimicking a metadata file whose tail was lost to an interrupted
+  // write (the kernel persists the new file size, the new data is still
+  // all-zero on disk).
+  const string kPlaintext =
+      "metadata-record-0;metadata-record-1;metadata-record-2;trailing-zero-tail";
+  const size_t kZeroTail = 256;
+  ASSERT_OK(rw->Write(header_size, kPlaintext));
+  // Extending via Truncate() leaves a zero-filled tail; on encrypted files
+  // this means the on-disk ciphertext for that region is all zeros, NOT
+  // some random keystream.
+  ASSERT_OK(rw->Truncate(header_size + kPlaintext.size() + kZeroTail));
+  ASSERT_OK(rw->Close());
+
+  RandomAccessFileOptions raf_opts;
+  raf_opts.is_sensitive = true;
+  unique_ptr<RandomAccessFile> raf;
+  ASSERT_OK(env_->NewRandomAccessFile(raf_opts, kFile, &raf));
+  ASSERT_EQ(header_size, raf->GetEncryptionHeaderSize());
+
+  uint64_t file_size = 0;
+  ASSERT_OK(raf->Size(&file_size));
+  ASSERT_EQ(header_size + kPlaintext.size() + kZeroTail, file_size);
+
+  const size_t payload_size = file_size - header_size;
+  faststring ciphertext;
+  ciphertext.resize(payload_size);
+
+  // ReadRaw() at offset == 0 (start of the encryption header) and pulling the
+  // header_size + payload bytes is allowed; the wrapper must not attempt to
+  // decrypt or to apply the GetEncryptionHeaderSize() lower-bound check.
+  faststring full_raw;
+  full_raw.resize(file_size);
+  ASSERT_OK(raf->ReadRaw(/*raw_offset=*/0, Slice(full_raw.data(), file_size)));
+
+  // ReadRaw() of only the payload region (skipping the encryption header) is
+  // the call shape MemoryReadableFile uses; verify it returns the same bytes
+  // as the matching prefix of the full read.
+  ASSERT_OK(raf->ReadRaw(header_size, Slice(ciphertext.data(), payload_size)));
+  ASSERT_EQ(Slice(full_raw.data() + header_size, payload_size),
+            Slice(ciphertext.data(), payload_size));
+
+  // For the zero-filled tail the ciphertext on disk must literally be zeros
+  // (otherwise per-slice IsAllZeros() in DoDecryptV wouldn't be able to
+  // recover the plaintext zeros at startup).
+  ASSERT_TRUE(IsAllZeros(Slice(ciphertext.data() + kPlaintext.size(),
+                               kZeroTail)));
+
+  // Now exercise the "cached ciphertext + per-slice Decrypt()" pattern, which
+  // is exactly how MemoryReadableFile serves reads against encrypted metadata.
+  // 1) A small plaintext-region slice: must round-trip to the original bytes.
+  const size_t kProbeOffset = 8;
+  const size_t kProbeSize = 32;
+  ASSERT_LT(kProbeOffset + kProbeSize, kPlaintext.size());
+  faststring probe;
+  probe.assign_copy(ciphertext.data() + kProbeOffset, kProbeSize);
+  Slice probe_slice(probe.data(), kProbeSize);
+  ASSERT_OK(raf->Decrypt(header_size + kProbeOffset,
+                         ArrayView<Slice>(&probe_slice, 1)));
+  ASSERT_EQ(kPlaintext.substr(kProbeOffset, kProbeSize),
+            probe_slice.ToString());
+
+  // 2) A small slice carved out of the zero tail: per-slice IsAllZeros() must
+  // short-circuit and leave the bytes as zeros, so the buffer stays all-zero
+  // after Decrypt(). This is the invariant KUDU-2260 trailing-zero recovery
+  // depends on.
+  const size_t kTailProbeSize = 64;
+  ASSERT_LT(kTailProbeSize, kZeroTail);
+  faststring tail_probe;
+  tail_probe.assign_copy(ciphertext.data() + kPlaintext.size(), kTailProbeSize);
+  Slice tail_slice(tail_probe.data(), kTailProbeSize);
+  ASSERT_OK(raf->Decrypt(header_size + kPlaintext.size(),
+                         ArrayView<Slice>(&tail_slice, 1)));
+  ASSERT_TRUE(IsAllZeros(tail_slice));
+
+  // 3) A vector Decrypt() over multiple contiguous non-all-zero slices must
+  // behave the same as decrypting each slice individually. (Per the contract
+  // on RandomAccessFile::Decrypt(), this equivalence is *not* guaranteed when
+  // an interior slice is all-zero ciphertext, since the implementation may
+  // short-circuit it and leave the keystream un-advanced; the per-slice
+  // all-zero case is covered by probe (2) above.)
+  const size_t kS1 = 16;
+  const size_t kS2 = 24;
+  ASSERT_LT(kS1 + kS2, kPlaintext.size());
+  faststring v1, v2;
+  v1.assign_copy(ciphertext.data(), kS1);
+  v2.assign_copy(ciphertext.data() + kS1, kS2);
+  Slice s1(v1.data(), kS1);
+  Slice s2(v2.data(), kS2);
+  vector<Slice> vec = { s1, s2 };
+  ASSERT_OK(raf->Decrypt(header_size, ArrayView<Slice>(vec)));
+  ASSERT_EQ(kPlaintext.substr(0, kS1), s1.ToString());
+  ASSERT_EQ(kPlaintext.substr(kS1, kS2), s2.ToString());
+}
+
+// On an unencrypted file, ReadRaw() must behave like Read() and Decrypt() must
+// be a no-op. This is what allows the in-memory replay shim to treat both
+// flavors uniformly.
+TEST_F(TestEnv, TestReadRawAndDecryptUnencrypted) {
+  const string kFile = JoinPathSegments(test_dir_, "plaintext_file_readraw");
+  RWFileOptions rw_opts;
+  rw_opts.is_sensitive = false;
+  unique_ptr<RWFile> rw;
+  ASSERT_OK(env_->NewRWFile(rw_opts, kFile, &rw));
+  const string kPlaintext = "lorem-ipsum-no-encryption-here";
+  ASSERT_OK(rw->Write(0, kPlaintext));
+  ASSERT_OK(rw->Close());
+
+  RandomAccessFileOptions raf_opts;
+  raf_opts.is_sensitive = false;
+  unique_ptr<RandomAccessFile> raf;
+  ASSERT_OK(env_->NewRandomAccessFile(raf_opts, kFile, &raf));
+  ASSERT_EQ(0, raf->GetEncryptionHeaderSize());
+
+  faststring buf;
+  buf.resize(kPlaintext.size());
+  ASSERT_OK(raf->ReadRaw(0, Slice(buf.data(), buf.size())));
+  ASSERT_EQ(kPlaintext, buf.ToString());
+
+  // Decrypt() must be a no-op: the buffer must come out unchanged.
+  Slice s(buf.data(), buf.size());
+  ASSERT_OK(raf->Decrypt(0, ArrayView<Slice>(&s, 1)));
+  ASSERT_EQ(kPlaintext, s.ToString());
+}
+
 TEST_P(TestEncryptedEnv, TestPreallocatedReadEncryptedFile) {
   const string kFile = JoinPathSegments(test_dir_, "encrypted_file");
   unique_ptr<RWFile> rw;

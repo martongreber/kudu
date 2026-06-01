@@ -68,6 +68,7 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/file_cache.h"
+#include "kudu/util/logging_test_util.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/path_util.h"
@@ -1223,16 +1224,12 @@ TEST_P(LogBlockManagerTest, StartupBenchmark) {
 //            path).
 // Both passes run FLAGS_startup_benchmark_reopen_times reopens and use
 // SCOPED_LOG_TIMING; the resulting wall-clock numbers can be compared
-// directly. The optimization only applies to native-meta containers and
-// non-encrypted clusters, so this test is hung off LogBlockManagerNativeMetaTest
-// and skips when encryption is enabled.
+// directly. The optimization only applies to native-meta containers, so this
+// test is hung off LogBlockManagerNativeMetaTest. Both the encrypted and
+// non-encrypted parameterizations exercise the in-memory replay path
+// (encryption-aware as of KUDU-3779).
 TEST_P(LogBlockManagerNativeMetaTest, InMemoryReplayStartupBenchmark) {
   SKIP_IF_SLOW_NOT_ALLOWED();
-  if (std::get<0>(GetParam())) {
-    LOG(INFO) << "Encryption is enabled, in-memory replay falls back to "
-                 "streaming; skipping benchmark.";
-    GTEST_SKIP();
-  }
 
   google::FlagSaver flag_saver;
 
@@ -1340,6 +1337,142 @@ TEST_P(LogBlockManagerNativeMetaTest, InMemoryReplayStartupBenchmark) {
   LOG(INFO) << "Test on --block_manager=" << FLAGS_block_manager;
 }
 #endif
+
+// KUDU-3779: regression test for the in-memory metadata replay path on
+// encrypted clusters. Exercises three properties that the streaming path used
+// to be the only one to provide:
+//   1. A reopen with the in-memory replay path (default flag value) returns
+//      exactly the same block set as a reopen with the streaming path
+//      (--log_container_metadata_inmem_replay_threshold_bytes=0), both for
+//      encrypted and non-encrypted metadata files.
+//   2. A metadata file with a zero-filled tail (the on-disk fingerprint of a
+//      crash mid-append: file size was persisted but data was not) is
+//      correctly recovered as an incomplete write and truncated back to its
+//      last valid record - even when the buffer slurped into memory contains
+//      the trailing-zero ciphertext.
+//   3. Threshold semantics: setting the flag to 0 forces streaming; setting
+//      it just below the cleartext payload size forces streaming for that
+//      file; setting it above forces in-memory replay. All three settings
+//      must reach the same block set on reopen.
+TEST_P(LogBlockManagerNativeMetaTest, TestInMemoryReplayRecoversTrailingZeros) {
+  google::FlagSaver flag_saver;
+
+  // Create a handful of blocks in a single container. Keep the count small so
+  // the test stays fast in debug builds; the in-memory path is exercised as
+  // long as we cross at least one record boundary.
+  constexpr int kNumBlocks = 16;
+  for (int i = 0; i < kNumBlocks; i++) {
+    unique_ptr<WritableBlock> writer;
+    ASSERT_OK(bm_->CreateBlock(test_block_opts_, &writer));
+    ASSERT_OK(writer->Append("payload"));
+    ASSERT_OK(writer->Close());
+  }
+
+  vector<BlockId> baseline;
+  ASSERT_OK(bm_->GetAllBlockIds(&baseline));
+  ASSERT_EQ(kNumBlocks, baseline.size());
+  std::sort(baseline.begin(), baseline.end());
+
+  const string container_path = LogBlockManager::ContainerPathForTests(
+      bm_->all_containers_by_name_.begin()->second.get());
+  const string metadata_path =
+      container_path + LogBlockManager::kContainerMetadataFileSuffix;
+
+  uint64_t good_meta_size;
+  ASSERT_OK(env_->GetFileSize(metadata_path, &good_meta_size));
+
+  // Helper: reopen, sort, compare against 'baseline'.
+  auto reopen_and_verify = [&]() {
+    ASSERT_OK(this->ReopenBlockManager());
+    vector<BlockId> ids;
+    ASSERT_OK(this->bm_->GetAllBlockIds(&ids));
+    std::sort(ids.begin(), ids.end());
+    ASSERT_EQ(baseline, ids);
+  };
+
+  // (1) Streaming-baseline vs. in-memory replay must produce the same block
+  // set. The default flag value (64 MiB) trivially admits this tiny metadata
+  // file, so the second reopen is guaranteed to take the in-memory path.
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 0;
+    NO_FATALS(reopen_and_verify());
+  }
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes =
+        64ULL * 1024 * 1024;
+    NO_FATALS(reopen_and_verify());
+  }
+
+  // (2) Trailing-zero recovery under in-memory replay. We extend the metadata
+  // file with a zero-filled tail (the on-disk fingerprint of a crash
+  // mid-append) and verify that reopen still succeeds, returns the original
+  // block set, and truncates the file back to its valid prefix. We do this
+  // with a few tail sizes for parity with TestMetadataTruncation, which
+  // historically exercised the streaming path only.
+  for (const auto tail_bytes : {1, 8, 128, 4096}) {
+    {
+      RWFileOptions opts;
+      opts.mode = Env::MUST_EXIST;
+      opts.is_sensitive = true;
+      unique_ptr<RWFile> file;
+      ASSERT_OK(env_->NewRWFile(opts, metadata_path, &file));
+      ASSERT_OK(file->Truncate(good_meta_size + tail_bytes));
+    }
+    uint64_t cur_meta_size;
+    ASSERT_OK(env_->GetFileSize(metadata_path, &cur_meta_size));
+    ASSERT_EQ(good_meta_size + tail_bytes, cur_meta_size);
+
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes =
+        64ULL * 1024 * 1024;
+    FLAGS_v = 1;
+    StringVectorSink log_sink;
+    {
+      ScopedRegisterSink srs(&log_sink);
+      NO_FATALS(reopen_and_verify());
+    }
+    int preload_log_lines = 0;
+    for (const string& msg : log_sink.logged_msgs()) {
+      if (msg.find("Preloaded metadata file " + metadata_path) !=
+          string::npos) {
+        ++preload_log_lines;
+      }
+    }
+    ASSERT_GE(preload_log_lines, 1)
+        << "expected MaybePreloadMetadataIntoMemory() to take the in-memory "
+        << "path for " << metadata_path << " (tail_bytes=" << tail_bytes
+        << "), but no preload log line was emitted";
+
+    // The reopen should have truncated the file back to its valid size.
+    ASSERT_OK(env_->GetFileSize(metadata_path, &cur_meta_size));
+    ASSERT_EQ(good_meta_size, cur_meta_size);
+  }
+
+  // (3) Threshold boundary: set the threshold to just below the metadata
+  // file's cleartext payload size. The preload step should bail out (payload
+  // exceeds threshold) and the streaming path should be used. Verifying we
+  // still get the same block set ensures the fallback wiring is correct.
+  ASSERT_OK(env_->GetFileSize(metadata_path, &good_meta_size));
+  unique_ptr<RandomAccessFile> probe;
+  RandomAccessFileOptions probe_opts;
+  probe_opts.is_sensitive = true;
+  ASSERT_OK(env_->NewRandomAccessFile(probe_opts, metadata_path, &probe));
+  const uint64_t header = probe->GetEncryptionHeaderSize();
+  ASSERT_GT(good_meta_size, header);
+  const uint64_t payload = good_meta_size - header;
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = payload - 1;
+    NO_FATALS(reopen_and_verify());
+  }
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = payload;
+    NO_FATALS(reopen_and_verify());
+  }
+}
 
 TEST_P(LogBlockManagerTest, TestFailMultipleTransactionsPerContainer) {
   // Create multiple transactions that will share a container.

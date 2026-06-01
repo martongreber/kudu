@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "kudu/gutil/macros.h"
+#include "kudu/util/array_view.h" // IWYU pragma: keep
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -38,9 +39,6 @@ struct RandomAccessFileOptions;
 struct RWFileOptions;
 struct WritableFileOptions;
 struct SequentialFileOptions;
-
-template <typename T>
-class ArrayView;
 
 // Returned by Env::GetSpaceInfo().
 struct SpaceInfo {
@@ -505,6 +503,52 @@ class RandomAccessFile : public File {
   //
   // Safe for concurrent use by multiple threads.
   virtual Status ReadV(uint64_t offset, ArrayView<Slice> results) const = 0;
+
+  // Reads "result.size" bytes starting at the raw on-disk byte offset
+  // 'raw_offset', WITHOUT applying any per-file decryption transform. For
+  // unencrypted files this is equivalent to Read(); for encrypted files this
+  // returns the ciphertext (and the offset is measured from the start of the
+  // physical file, including any encryption header).
+  //
+  // The default implementation forwards to Read(), which is correct for any
+  // implementation that does not perform on-the-fly decryption. Encrypted
+  // implementations must override this to bypass decryption.
+  //
+  // Safe for concurrent use by multiple threads.
+  virtual Status ReadRaw(uint64_t raw_offset, Slice result) const {
+    DCHECK_EQ(0, GetEncryptionHeaderSize())
+        << "RandomAccessFile::ReadRaw() default implementation is only valid "
+        << "for unencrypted files; encrypted implementations must override";
+    return Read(raw_offset, result);
+  }
+
+  // Decrypts the ciphertext slices in 'data' in place, as if they had been
+  // returned by ReadV(offset, data) on this file. 'offset' is the physical
+  // file offset of the first slice (same convention as Read()/ReadV(), i.e.
+  // measured from the start of the file and must be >= GetEncryptionHeaderSize()
+  // for encrypted files). Subsequent slices are assumed to be contiguous.
+  //
+  // NOTE: a single vectored Decrypt() call is only guaranteed to produce the
+  // same plaintext as decrypting each slice individually when no *interior*
+  // slice is all-zero ciphertext. Encrypted implementations may short-circuit
+  // all-zero slices (e.g. to preserve KUDU-2260's trailing-zero recovery
+  // without advancing the cipher keystream past them); an interior all-zero
+  // slice followed by a non-zero slice would therefore leave the keystream
+  // mis-aligned and mis-decrypt the later slice. Callers that need per-slice
+  // semantics in that case must invoke Decrypt() once per slice.
+  //
+  // The default implementation is a no-op, which is correct for any
+  // implementation that does not perform on-the-fly decryption. Encrypted
+  // implementations must override.
+  //
+  // Safe for concurrent use by multiple threads.
+  virtual Status Decrypt(uint64_t /*offset*/,
+                         ArrayView<Slice> /*data*/) const {
+    DCHECK_EQ(0, GetEncryptionHeaderSize())
+        << "RandomAccessFile::Decrypt() default implementation is only valid "
+        << "for unencrypted files; encrypted implementations must override";
+    return Status::OK();
+  }
 
   // Returns the size of the file
   virtual Status Size(uint64_t *size) const = 0;

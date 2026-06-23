@@ -29,6 +29,8 @@
 
   <properties>
     <kudu-version>1.18.1</kudu-version>
+    <argLine></argLine>
+    <kudu.test.addOpens>--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED</kudu.test.addOpens>
   </properties>
 
   <build>
@@ -40,6 +42,14 @@
         <configuration>
           <source>1.8</source>
           <target>1.8</target>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <argLine>${argLine} ${kudu.test.addOpens}</argLine>
         </configuration>
       </plugin>
       <plugin>

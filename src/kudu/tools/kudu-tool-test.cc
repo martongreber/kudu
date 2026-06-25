@@ -110,6 +110,7 @@
 #include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/rpc/messenger.h"  // IWYU pragma: keep
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/security/test/mini_kdc.h"
 #include "kudu/subprocess/subprocess_protocol.h"
 #include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -10097,6 +10098,49 @@ TEST_F(ToolTest, TestNonDefaultPrincipal) {
                          "ksck",
                          "--sasl_protocol_name=oryx",
                          HostPort::ToCommaSeparatedString(cluster_->master_rpc_addrs())}));
+}
+
+// `diagnose tls_debug` is a security-diagnostic tool — it negotiates TLS
+// against a server but stops before authenticating. It must therefore work
+// against insecure clusters and against Kerberos-secured clusters whether
+// or not the caller has a TGT.
+TEST_F(ToolTest, TestTlsDebugInsecureCluster) {
+  ExternalMiniClusterOptions opts;
+  opts.enable_kerberos = false;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+  const auto& master_addr = cluster_->master(0)->bound_rpc_addr().ToString();
+  string out;
+  NO_FATALS(RunActionStdoutString(
+      Substitute("diagnose tls_debug $0", master_addr), &out));
+  ASSERT_STR_CONTAINS(out, "Negotiated protocol: TLSv1");
+  ASSERT_STR_CONTAINS(out, "Negotiated ciphersuite:");
+}
+
+TEST_F(ToolTest, TestTlsDebugKerberizedNoTicket) {
+  ExternalMiniClusterOptions opts;
+  opts.enable_kerberos = true;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+
+  // Drop the test process's TGT to prove the tool does not require one.
+  ASSERT_OK(cluster_->kdc()->Kdestroy());
+
+  const auto& master_addr = cluster_->master(0)->bound_rpc_addr().ToString();
+  string out;
+  NO_FATALS(RunActionStdoutString(
+      Substitute("diagnose tls_debug $0", master_addr), &out));
+  ASSERT_STR_CONTAINS(out, "Negotiated protocol: TLSv1");
+  ASSERT_STR_CONTAINS(out, "Negotiated ciphersuite:");
+}
+
+TEST_F(ToolTest, TestTlsDebugDisableTls) {
+  ExternalMiniClusterOptions opts;
+  opts.enable_kerberos = false;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+  const auto& master_addr = cluster_->master(0)->bound_rpc_addr().ToString();
+  string out;
+  NO_FATALS(RunActionStdoutString(
+      Substitute("diagnose tls_debug --disable_tls $0", master_addr), &out));
+  ASSERT_STR_CONTAINS(out, "TLS was not negotiated - cleartext connection");
 }
 
 class UnregisterTServerTest : public ToolTest, public ::testing::WithParamInterface<bool> {

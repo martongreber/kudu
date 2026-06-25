@@ -44,6 +44,7 @@
 #include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 #include "kudu/util/openssl_util.h"
@@ -74,6 +75,7 @@ DECLARE_string(tls_min_version);
 DECLARE_string(tls_ciphersuites);
 DECLARE_string(tls_ciphers);
 
+DECLARE_int64(negotiation_timeout_ms);
 DECLARE_int64(timeout_ms);
 DECLARE_string(format);
 
@@ -240,6 +242,21 @@ Status TlsDebug(const RunnerContext& context) {
                                        true,
                                        FLAGS_sasl_protocol_name);
 
+  // skip_authn mode: stop negotiation before SASL/token/JWT authentication.
+  // This lets the tool observe the negotiated TLS parameters against
+  // Kerberos-only servers without requiring a valid TGT. The resulting
+  // connection is not usable for RPCs. set_server_fqdn() is still set since
+  // SendNegotiate() advertises a SASL authn type and Cyrus SASL is
+  // initialized as part of the negotiation flow.
+  client_negotiation.set_skip_authn(true);
+  client_negotiation.set_server_fqdn(hp.host());
+  client_negotiation.set_deadline(
+      MonoTime::Now() + MonoDelta::FromMilliseconds(FLAGS_negotiation_timeout_ms));
+
+  // At least one authn type must be advertised in the NEGOTIATE step, even
+  // though we abort before actually authenticating. PLAIN works against both
+  // Kerberized and non-Kerberized servers since the server only checks the
+  // mechanism list, not the credentials, during the NEGOTIATE step.
   RETURN_NOT_OK(client_negotiation.EnablePlain("tls-test", "tls-test"));
   WARN_NOT_OK(client_negotiation.EnableGSSAPI(), "Couldn't enable GSSAPI, negotiation may fail");
   RETURN_NOT_OK(client_negotiation.Negotiate());

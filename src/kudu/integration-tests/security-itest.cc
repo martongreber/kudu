@@ -23,6 +23,7 @@
 #include <functional>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <tuple>
@@ -53,21 +54,27 @@
 #include "kudu/master/sys_catalog.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/ranger-kms/mini_ranger_kms.h"
+#include "kudu/rpc/blocking_ops.h"
+#include "kudu/rpc/client_negotiation.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/sasl_common.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/kinit_context.h"
+#include "kudu/security/security_flags.h"
 #include "kudu/security/test/mini_kdc.h"
 #include "kudu/security/test/test_certs.h"
+#include "kudu/security/tls_context.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/key_value_test_schema.h"
 #include "kudu/tablet/tablet.pb.h"
+#include "kudu/tools/tool_test_util.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_service.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
-#include "kudu/tools/tool_test_util.h"
 #include "kudu/util/curl_util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/faststring.h"
@@ -75,6 +82,7 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
 #include "kudu/util/openssl_util.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/random.h"
@@ -98,11 +106,15 @@ using kudu::client::KuduTransaction;
 using kudu::client::sp::shared_ptr;
 using kudu::cluster::ExternalMiniCluster;
 using kudu::cluster::ExternalMiniClusterOptions;
+using kudu::rpc::ClientNegotiation;
 using kudu::rpc::Messenger;
 using kudu::security::CreateTestSSLCertWithChainSignedByRoot;
 using kudu::security::CreateTestSSLExpiredCertWithChainSignedByRoot;
+using kudu::security::RpcEncryption;
+using kudu::security::TlsContext;
 using kudu::tools::RunKuduTool;
 using std::get;
+using std::nullopt;
 using std::string;
 using std::tuple;
 using std::unique_ptr;
@@ -476,6 +488,123 @@ TEST_F(SecurityITest, TestRebalanceReportUnauthorized) {
   ASSERT_TRUE(s.IsRuntimeError());
   ASSERT_STR_CONTAINS(err,
       "Not authorized: re-run ksck with administrator privileges");
+}
+
+// `ClientNegotiation::set_skip_authn(true)` skips the SASL/token/JWT
+// authentication step so diagnostic tools like `kudu diagnose tls_debug`
+// can observe negotiated TLS parameters against Kerberos-only servers
+// without holding a TGT. The security invariant under test here is:
+// driving a skip_authn negotiation produces a socket that is USELESS as
+// an RPC channel — any subsequent RPC request sent over it is refused,
+// because the server never reached the SASL exchange and so never
+// authenticated a user.
+//
+// This is the strict version of the test: we don't rely on a separate
+// client-side authentication failure to assert "still secured". We
+// directly take the socket returned by `release_socket()` and try to
+// frame and send a real master RPC over it.
+TEST_F(SecurityITest, TestSkipAuthnSocketIsUseless) {
+  ASSERT_OK(StartCluster());
+  ASSERT_OK(cluster_->kdc()->Kdestroy());
+  ASSERT_OK(rpc::SaslInit());
+
+  const auto& master_addr = cluster_->master(0)->bound_rpc_addr();
+
+  // Phase 1: complete a skip_authn negotiation. With no TGT, this must
+  // still succeed — that is the diagnostic capability we're exposing.
+  unique_ptr<Socket> sock(new Socket());
+  ASSERT_OK(sock->Init(master_addr.family(), 0));
+  ASSERT_OK(sock->Connect(master_addr));
+
+  TlsContext tls_context;
+  ASSERT_OK(tls_context.Init());
+
+  ClientNegotiation cn(std::move(sock), &tls_context,
+                       /*authn_token=*/nullopt,
+                       /*jwt=*/nullopt,
+                       RpcEncryption::REQUIRED,
+                       /*encrypt_loopback=*/true,
+                       /*sasl_proto_name=*/"kudu");
+  cn.set_server_fqdn(master_addr.host());
+  cn.set_skip_authn(true);
+  cn.set_deadline(MonoTime::Now() + MonoDelta::FromSeconds(30));
+  ASSERT_OK(cn.EnablePlain("tls-test", "tls-test"));
+  WARN_NOT_OK(cn.EnableGSSAPI(), "couldn't enable GSSAPI for skip_authn test");
+  ASSERT_OK(cn.Negotiate());
+  ASSERT_TRUE(cn.tls_negotiated());
+
+  // Phase 2: take the negotiated socket and try to use it. Frame a real
+  // ConnectToMaster request — the simplest authenticated master RPC. The
+  // server has not authenticated this connection (skip_authn stopped
+  // negotiation before SASL_INITIATE) so it must refuse the call.
+  unique_ptr<Socket> negotiated = cn.release_socket();
+  ASSERT_OK(negotiated->SetNonBlocking(false));
+
+  rpc::RequestHeader header;
+  header.set_call_id(0);
+  auto* method = header.mutable_remote_method();
+  method->set_service_name("kudu.master.MasterService");
+  method->set_method_name("ConnectToMaster");
+  master::ConnectToMasterRequestPB req;
+
+  const auto deadline = MonoTime::Now() + MonoDelta::FromSeconds(15);
+  // The server may close the socket as soon as it sees an unauthenticated
+  // post-negotiation frame (write fails), OR it may reply with an
+  // ErrorStatusPB frame and then close (write ok, read ok with is_error
+  // set). Both are acceptable refusals; what is NOT acceptable is a
+  // successful RPC response.
+  Status write_status = rpc::SendFramedMessageBlocking(
+      negotiated.get(), header, req, deadline);
+
+  bool got_error_response = false;
+  rpc::ErrorStatusPB::RpcErrorCodePB error_code = rpc::ErrorStatusPB::FATAL_UNKNOWN;
+  Status read_status;
+  if (write_status.ok()) {
+    faststring recv_buf;
+    rpc::ResponseHeader response_header;
+    Slice param_buf;
+    read_status = rpc::ReceiveFramedMessageBlocking(
+        negotiated.get(), &recv_buf, &response_header, &param_buf, deadline);
+    if (read_status.ok()) {
+      ASSERT_TRUE(response_header.is_error())
+          << "skip_authn socket delivered a successful RPC response; "
+          << "this would mean an unauthenticated client could invoke RPCs. "
+          << "response header: " << response_header.DebugString();
+      rpc::ErrorStatusPB error_status;
+      ASSERT_TRUE(error_status.ParseFromArray(param_buf.data(), param_buf.size()))
+          << "could not parse ErrorStatusPB from refused RPC response";
+      got_error_response = true;
+      error_code = error_status.code();
+    }
+  }
+
+  // One of the three valid refusal modes must hold:
+  //   - the write itself failed (server closed the socket immediately), or
+  //   - the read failed (server closed mid-response), or
+  //   - the server replied with an error frame.
+  ASSERT_TRUE(!write_status.ok() || !read_status.ok() || got_error_response)
+      << "skip_authn socket must not deliver a valid RPC response; "
+      << "write: " << write_status.ToString()
+      << ", read: " << read_status.ToString();
+
+  // If we did get a structured error back, it should be one of the FATAL_*
+  // codes that signal the server has rejected the connection.
+  if (got_error_response) {
+    EXPECT_TRUE(error_code == rpc::ErrorStatusPB::FATAL_INVALID_RPC_HEADER ||
+                error_code == rpc::ErrorStatusPB::FATAL_UNAUTHORIZED ||
+                error_code == rpc::ErrorStatusPB::ERROR_INVALID_REQUEST)
+        << "unexpected error code from skip_authn socket: "
+        << rpc::ErrorStatusPB::RpcErrorCodePB_Name(error_code);
+  }
+
+  // Sanity check that what we just demonstrated would have worked over a
+  // properly-authenticated connection: re-kinit as the test admin and a
+  // normal KuduClient negotiation succeeds. (Skipped if the rest of the
+  // test already proved the point — kept as a cheap regression guard
+  // against accidental authn weakening.)
+  ASSERT_OK(cluster_->kdc()->Kinit("test-admin"));
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
 }
 
 // Regression test for KUDU-2121. Set up a Kerberized cluster with optional

@@ -115,6 +115,19 @@ class ClientNegotiation {
   // Set deadline for connection negotiation.
   void set_deadline(const MonoTime& deadline);
 
+  // If true, Negotiate() returns immediately after the TLS handshake step
+  // (or, when --disable_tls is set, after SASL mechanism selection), without
+  // performing SASL/token/JWT authentication. The GSSAPI ticket-cache probe
+  // that normally drops Kerberos when no credentials are available is also
+  // skipped so a Kerberos-only server still progresses through mechanism
+  // selection. The resulting socket cannot be used for RPCs: the server's
+  // ServerNegotiation never reaches the SASL exchange, no authenticated user
+  // is established, and anything subsequently sent over the socket is
+  // refused. Intended for diagnostic tools that only need to observe the
+  // negotiated TLS parameters (e.g. `kudu diagnose tls_debug`). Must be
+  // called before Negotiate().
+  void set_skip_authn(bool skip_authn) { skip_authn_ = skip_authn; }
+
   Socket* socket() { return socket_.get(); }
 
   // Takes and returns the socket owned by this client negotiation. The caller
@@ -262,6 +275,11 @@ class ClientNegotiation {
 
   // Negotiation timeout deadline.
   MonoTime deadline_;
+
+  // If true, Negotiate() returns after the TLS handshake step (or after
+  // mechanism selection when TLS is disabled) and skips the GSSAPI
+  // ticket-cache probe in HandleNegotiate(). See set_skip_authn().
+  bool skip_authn_ = false;
 };
 
 } // namespace rpc

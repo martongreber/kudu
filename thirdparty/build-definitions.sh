@@ -172,35 +172,23 @@ build_libcxx() {
   popd
 }
 
-build_or_find_python() {
-  if [ -n "$PYTHON_EXECUTABLE" ]; then
-    return
-  fi
-
-  # Build Python only if necessary.
-  if [[ $(python3 -V 2>&1) =~ "Python 3." ]]; then
-    PYTHON_EXECUTABLE=$(which python3)
-  elif [[ $(python -V 2>&1) =~ "Python 3." ||
-          $(python -V 2>&1) =~ "Python 2.7." ]]; then
-    PYTHON_EXECUTABLE=$(which python)
-  elif [[ $(python2 -V 2>&1) =~ "Python 2.7." ]]; then
-    PYTHON_EXECUTABLE=$(which python2)
-  else
-    PYTHON_BDIR=$TP_BUILD_DIR/$PYTHON_NAME$MODE_SUFFIX
-    mkdir -p $PYTHON_BDIR
-    pushd $PYTHON_BDIR
-    $PYTHON_SOURCE/configure
-    make -j$PARALLEL $EXTRA_MAKEFLAGS
-    PYTHON_EXECUTABLE="$PYTHON_BDIR/python"
-    popd
-  fi
-}
-
 build_llvm() {
   local TOOLS_ARGS=
   local BUILD_TYPE=$1
 
-  build_or_find_python
+  if [ -z "$PYTHON_EXECUTABLE" ]; then
+    if [[ $(python3 -V 2>&1) =~ "Python 3." ]]; then
+      PYTHON_EXECUTABLE=$(which python3)
+    elif [[ $(python -V 2>&1) =~ "Python 3." ||
+            $(python -V 2>&1) =~ "Python 2.7." ]]; then
+      PYTHON_EXECUTABLE=$(which python)
+    elif [[ $(python2 -V 2>&1) =~ "Python 2.7." ]]; then
+      PYTHON_EXECUTABLE=$(which python2)
+    else
+      echo "Python not found"
+      exit 1
+    fi
+  fi
 
   # Always disabled; these subprojects are built standalone.
   TOOLS_ARGS="$TOOLS_ARGS -DLLVM_TOOL_LIBCXX_BUILD=OFF"

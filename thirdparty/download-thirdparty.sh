@@ -340,12 +340,6 @@ fetch_and_patch \
  $LIBUNWIND_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/libunwind-trace-cache-destructor.patch"
 
-PYTHON_PATCHLEVEL=0
-fetch_and_patch \
- python-${PYTHON_VERSION}.tar.gz \
- $PYTHON_SOURCE \
- $PYTHON_PATCHLEVEL
-
 LLVM_PATCHLEVEL=10
 fetch_and_patch \
  llvm-${LLVM_VERSION}-iwyu-${IWYU_VERSION}.src.tar.gz \

@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -32,6 +33,11 @@ namespace tools {
 
 class Action;
 class Mode;
+
+// The MCP safety classification of an action. Defined in mcp_disposition.h;
+// forward-declared here (with a fixed underlying type) so an action can carry
+// its own disposition without the CLI framework depending on the MCP feature.
+enum class Disposition : uint8_t;
 
 // The command line tool is structured as a tree with two kinds of nodes: modes
 // and actions. Actions are leaf nodes, each representing a particular
@@ -212,6 +218,23 @@ class ActionBuilder {
   // the passed `program_name`.
   ActionBuilder& ProgramName(const std::string& program_name);
 
+  // Sets the MCP safety classification for this action (see mcp_disposition.h).
+  //
+  // Every action reachable from the CLI tree must set this: the MCP serve
+  // startup guard (ValidateDispositionCoverageOrDie) fails loudly if an action
+  // has no disposition, and an unclassified action is never surfaced as a tool.
+  // Actions under the test-only "test" mode are exempt (treated as EXCLUDE).
+  ActionBuilder& McpDisposition(Disposition disposition);
+
+  // Marks this action as operating on the on-disk data of the single node the
+  // server runs on (the fs / wal / pbc / local_replica families, plus a few
+  // node-local admin ops). Advisory metadata consumed by the MCP server.
+  ActionBuilder& McpNodeLocal();
+
+  // Marks this action as an "unsafe" operation (e.g. unsafe_* commands or raw
+  // Raft config edits). Advisory metadata consumed by the MCP server.
+  ActionBuilder& McpUnsafe();
+
   // Add a new required parameter to this builder.
   //
   // This parameter will be parsed as a positional argument following the name
@@ -258,6 +281,12 @@ class ActionBuilder {
 
   std::optional<std::string> program_name_;
 
+  std::optional<Disposition> mcp_disposition_;
+
+  bool mcp_node_local_ = false;
+
+  bool mcp_unsafe_ = false;
+
   ActionRunner runner_;
 
   ActionArgsDescriptor args_;
@@ -299,6 +328,17 @@ class Action {
     return program_name_;
   }
 
+  // The MCP safety classification for this action, or nullopt if the action was
+  // never classified (see ActionBuilder::McpDisposition). The MCP server treats
+  // an unclassified action as non-surfaceable.
+  const std::optional<Disposition>& mcp_disposition() const {
+    return mcp_disposition_;
+  }
+
+  // Whether this action was tagged node-local / unsafe (advisory MCP metadata).
+  bool mcp_node_local() const { return mcp_node_local_; }
+  bool mcp_unsafe() const { return mcp_unsafe_; }
+
   const ActionArgsDescriptor& args() const { return args_; }
 
  private:
@@ -318,6 +358,12 @@ class Action {
 
   std::optional<std::string> program_name_;
 
+  std::optional<Disposition> mcp_disposition_;
+
+  bool mcp_node_local_ = false;
+
+  bool mcp_unsafe_ = false;
+
   ActionRunner runner_;
 
   ActionArgsDescriptor args_;
@@ -336,6 +382,7 @@ std::unique_ptr<Mode> BuildFsMode();
 std::unique_ptr<Mode> BuildHmsMode();
 std::unique_ptr<Mode> BuildLocalReplicaMode();
 std::unique_ptr<Mode> BuildMasterMode();
+std::unique_ptr<Mode> BuildMcpMode();
 std::unique_ptr<Mode> BuildPbcMode();
 std::unique_ptr<Mode> BuildPerfMode();
 std::unique_ptr<Mode> BuildRemoteReplicaMode();
@@ -348,6 +395,18 @@ std::unique_ptr<Mode> BuildWalMode();
 #if defined(KUDU_CLI_TEST_TOOL_ENABLED)
 std::unique_ptr<Mode> BuildTestMode();
 #endif
+
+// Builds the full root mode: the entire top-level CLI action tree, assembled
+// from every Build*Mode() factory (including the test mode in
+// KUDU_CLI_TEST_TOOL_ENABLED builds). 'name' becomes the root mode's name
+// (argv0 for the real CLI; irrelevant to MCP reflection, which drops the root
+// from every command path).
+//
+// This is the single source of truth for the top-level mode list. tool_main.cc's
+// RootMode(), the MCP server's BuildMcpRootMode(), and the disposition-coverage
+// test all delegate here, so a newly added top-level mode is wired in exactly
+// one place rather than three.
+std::unique_ptr<Mode> BuildRootMode(const std::string& name);
 
 } // namespace tools
 } // namespace kudu

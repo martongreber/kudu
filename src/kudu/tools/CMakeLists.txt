@@ -109,6 +109,8 @@ set(KUDU_CLI_TOOL_SRCS
   tool_action_hms.cc
   tool_action_local_replica.cc
   tool_action_master.cc
+  tool_action_mcp.cc
+  mcp_disposition.cc
   tool_action_pbc.cc
   tool_action_perf.cc
   tool_action_remote_replica.cc
@@ -123,6 +125,13 @@ set(KUDU_CLI_TOOL_SRCS
 if (KUDU_CLI_TEST_TOOL_ENABLED)
   set(KUDU_CLI_TOOL_SRCS ${KUDU_CLI_TOOL_SRCS} tool_action_test.cc)
 endif()
+
+# The tool sources without the main() entrypoint. Reused by unit tests that need
+# to reconstruct the action tree in-process: RootMode() lives in the same
+# translation unit as main() (tool_main.cc), so it cannot be linked into a
+# gtest binary directly.
+set(KUDU_CLI_TOOL_SRCS_NO_MAIN ${KUDU_CLI_TOOL_SRCS})
+list(REMOVE_ITEM KUDU_CLI_TOOL_SRCS_NO_MAIN tool_main.cc)
 
 add_executable(kudu ${KUDU_CLI_TOOL_SRCS})
 
@@ -226,3 +235,37 @@ ADD_KUDU_TEST(rebalancer_tool-test
 ADD_KUDU_TEST_DEPENDENCIES(rebalancer_tool-test
   kudu)
 ADD_KUDU_TEST(tool_action-test)
+ADD_KUDU_TEST(tool_action_mcp-test)
+# tool_action_mcp.cc, the disposition table, and the Build*Mode() action
+# factories are compiled into the 'kudu' executable rather than a shared
+# library. tools/list reflects the full action tree, so compile the tool
+# sources (minus the main() entrypoint) directly into the unit test and link
+# the same libs the 'kudu' executable uses. This is the same pattern as
+# mcp_disposition-test below.
+if(NOT NO_TESTS)
+  target_sources(tool_action_mcp-test PRIVATE ${KUDU_CLI_TOOL_SRCS_NO_MAIN})
+  target_link_libraries(tool_action_mcp-test ${KUDU_CLI_TOOL_LINK_LIBS})
+endif()
+ADD_KUDU_TEST(tool_action_mcp-itest)
+# The MCP serve loop (RunMcpServeLoop) lives in tool_action_mcp.cc, which is
+# compiled into the 'kudu' executable rather than a shared library. Compile the
+# tool sources (minus main()) into this integration test so it can drive the
+# loop in-process against a live ExternalMiniCluster. Same pattern as
+# tool_action_mcp-test above; the cluster/itest libs come from
+# SET_KUDU_TEST_LINK_LIBS.
+if(NOT NO_TESTS)
+  target_sources(tool_action_mcp-itest PRIVATE ${KUDU_CLI_TOOL_SRCS_NO_MAIN})
+  target_link_libraries(tool_action_mcp-itest ${KUDU_CLI_TOOL_LINK_LIBS})
+endif()
+ADD_KUDU_TEST_DEPENDENCIES(tool_action_mcp-itest
+  kudu)
+ADD_KUDU_TEST(mcp_disposition-test)
+# The disposition table and the Build*Mode() action factories are compiled into
+# the 'kudu' executable rather than a shared library. Compile them (minus the
+# main() entrypoint) directly into the unit test so it can reconstruct the full
+# action tree and validate disposition coverage against it. The extra link libs
+# mirror the 'kudu' executable's dependencies for those sources.
+if(NOT NO_TESTS)
+  target_sources(mcp_disposition-test PRIVATE ${KUDU_CLI_TOOL_SRCS_NO_MAIN})
+  target_link_libraries(mcp_disposition-test ${KUDU_CLI_TOOL_LINK_LIBS})
+endif()

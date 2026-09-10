@@ -136,7 +136,13 @@ const vector<RawDispositionEntry>& RawEntries() {
     {"pbc edit",                                 Disposition::EXCLUDE, kLocal,  kSafe},
 
     // perf
-    {"perf loadgen",                             Disposition::REJECT,  !kLocal, kSafe},
+    // loadgen is a write-load generator (inserts/upserts rows), hence GATED
+    // rather than SURFACE. Note it runs inline on the single-threaded serve
+    // loop: with a bounded --num_rows_per_thread (the default is 1000) it
+    // returns promptly, but an unbounded value (num_rows_per_thread < 0) or a
+    // very large one will block the loop until it finishes. The write gate
+    // (--allow-writes) and the dry-run preview are the guardrails.
+    {"perf loadgen",                             Disposition::GATED,   !kLocal, kSafe},
     {"perf table_scan",                          Disposition::SURFACE, !kLocal, kSafe},
     {"perf tablet_scan",                         Disposition::SURFACE, !kLocal, kSafe},
 

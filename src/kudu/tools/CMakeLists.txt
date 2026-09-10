@@ -41,6 +41,7 @@ target_link_libraries(tool_proto
 add_library(kudu_tools_util
   color.cc
   diagnostics_log_parser.cc
+  remote_cluster.cc
   table_scanner.cc
   tool_action.cc
   tool_action_common.cc
@@ -213,6 +214,9 @@ ADD_KUDU_TEST(ksck-test)
 ADD_KUDU_TEST(ksck_remote-test
   PROCESSORS 3
   DATA_FILES ../scripts/first_argument.sh)
+ADD_KUDU_TEST(remote_cluster-test PROCESSORS 3)
+ADD_KUDU_TEST_DEPENDENCIES(remote_cluster-test
+  kudu)
 ADD_KUDU_TEST(kudu-admin-test
   NUM_SHARDS 8 PROCESSORS 3)
 ADD_KUDU_TEST_DEPENDENCIES(kudu-admin-test

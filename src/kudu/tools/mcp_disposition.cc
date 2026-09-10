@@ -70,6 +70,7 @@ const vector<RawDispositionEntry>& RawEntries() {
       new vector<RawDispositionEntry>{
     // cluster (RPC, cluster-wide)
     {"cluster ksck",                             Disposition::SURFACE, !kLocal, kSafe},
+    {"cluster gather",                           Disposition::SURFACE, !kLocal, kSafe},
     {"cluster rebalance",                        Disposition::REJECT,  !kLocal, kSafe},
 
     // diagnose (offline log/metric/TLS analysis)

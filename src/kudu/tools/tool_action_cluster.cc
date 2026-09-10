@@ -39,9 +39,12 @@
 #include "kudu/tools/ksck_remote.h"
 #include "kudu/tools/ksck_results.h"
 #include "kudu/tools/rebalancer_tool.h"
+#include "kudu/tools/remote_cluster.h"
+#include "kudu/tools/tool.pb.h"
 #include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/tools/tool_replica_util.h"
+#include "kudu/util/jsonwriter.h"
 #include "kudu/util/status.h"
 #include "kudu/util/string_case.h"
 #include "kudu/util/version_util.h"
@@ -76,6 +79,55 @@ DEFINE_string(sections, "*",
               "VERSION_SUMMARIES, TABLET_SUMMARIES, TABLE_SUMMARIES, "
               "SYSTEM_TABLE_SUMMARIES, CHECKSUM_RESULTS and TOTAL_COUNT.) "
               "If not specified, print all sections.");
+
+// ---------------------------------------------------------------------------
+// Flags for "cluster gather".
+// ---------------------------------------------------------------------------
+
+// fetch_info_concurrency is already DEFINE_int32'd in ksck.cc:63; reuse it.
+DECLARE_int32(fetch_info_concurrency);
+
+DEFINE_string(tservers, "",
+              "Comma-separated list of tablet server UUIDs or host:port "
+              "addresses to target for 'cluster gather'. When set, only those "
+              "servers are contacted (kServers scope). Mutually exclusive with "
+              "--location, --table, --tablet, and --row.");
+
+DEFINE_string(location, "",
+              "Location prefix to target (e.g. /dc1/rack2) for 'cluster "
+              "gather'. Only tablet servers whose location field matches this "
+              "prefix are contacted (kLocation scope). Mutually exclusive with "
+              "--tservers, --table, --tablet, and --row.");
+
+DEFINE_string(table, "",
+              "Table name to target for 'cluster gather'. Only tablet servers "
+              "that host at least one replica of the named table are contacted "
+              "(kTable scope). Mutually exclusive with --tservers, --location, "
+              "--tablet, and --row.");
+
+DEFINE_string(tablet, "",
+              "Tablet identifier to target for 'cluster gather'. Only the ~3 "
+              "tablet servers hosting the named tablet's replicas are contacted "
+              "(kTablet scope); output uses entity-centric projection. "
+              "Mutually exclusive with --tservers, --location, --table, and "
+              "--row.");
+
+DEFINE_string(row, "",
+              "Row primary key in the format '<table>:<pk-json>' for 'cluster "
+              "gather' (same JSON-array format as 'table locate_row'). The "
+              "tablet owning the row is resolved from master metadata and only "
+              "its replica-holders are contacted (kRow scope), with "
+              "entity-centric projection. Mutually exclusive with --tservers, "
+              "--location, --table, and --tablet.");
+
+DEFINE_bool(include_http_metrics, false,
+            "When set, 'cluster gather' also fetches each server's /metrics "
+            "HTTP endpoint and merges the result into its ServerRecord. Off by "
+            "default because it uses a separate HTTP transport and auth path.");
+
+DEFINE_string(gather_format, "json_pretty",
+              "Output format for 'cluster gather'. Acceptable values are "
+              "'json_pretty' and 'json_compact'.");
 
 DEFINE_uint32(max_moves_per_server, 5,
               "Maximum number of replica moves to perform concurrently on one "
@@ -213,6 +265,105 @@ Status RunKsck(const RunnerContext& context) {
   ksck->set_print_sections(Split(FLAGS_sections, ",", strings::SkipEmpty()));
 
   return ksck->RunAndPrintResults();
+}
+
+// Execute the "cluster gather" RPC fan-out action.
+Status RunGather(const RunnerContext& context) {
+  vector<string> master_addresses;
+  RETURN_NOT_OK(ParseMasterAddresses(context, &master_addresses));
+
+  // Validate: at most one entity scope flag may be specified.
+  int scope_count = 0;
+  if (!FLAGS_tservers.empty())  scope_count++;
+  if (!FLAGS_location.empty())  scope_count++;
+  if (!FLAGS_table.empty())     scope_count++;
+  if (!FLAGS_tablet.empty())    scope_count++;
+  if (!FLAGS_row.empty())       scope_count++;
+  if (scope_count > 1) {
+    return Status::InvalidArgument(
+        "at most one of --tservers, --location, --table, --tablet, --row "
+        "may be specified");
+  }
+
+  GatherOptions opts;
+
+  // Populate scope and the corresponding entity field.
+  if (!FLAGS_tservers.empty()) {
+    opts.scope = GatherOptions::Scope::kServers;
+    opts.servers = Split(FLAGS_tservers, ",", strings::SkipEmpty());
+  } else if (!FLAGS_location.empty()) {
+    opts.scope = GatherOptions::Scope::kLocation;
+    opts.location = FLAGS_location;
+  } else if (!FLAGS_table.empty()) {
+    opts.scope = GatherOptions::Scope::kTable;
+    opts.table = FLAGS_table;
+  } else if (!FLAGS_tablet.empty()) {
+    opts.scope = GatherOptions::Scope::kTablet;
+    opts.tablet_id = FLAGS_tablet;
+  } else if (!FLAGS_row.empty()) {
+    opts.scope = GatherOptions::Scope::kRow;
+    // "--row" format: "<table>:<pk-json>".
+    const auto pos = FLAGS_row.find(':');
+    if (pos == string::npos) {
+      return Status::InvalidArgument(
+          "--row must be in the format <table>:<pk-json>; no ':' found");
+    }
+    opts.table = FLAGS_row.substr(0, pos);
+    opts.row_pk_json = FLAGS_row.substr(pos + 1);
+  } else {
+    opts.scope = GatherOptions::Scope::kCluster;
+  }
+
+  // Parse --sections into the Section set.
+  // The default ("*") means the cheap client-accessible set:
+  //   identity + inventory + clock (design doc section 3.10).
+  if (FLAGS_sections == "*") {
+    opts.sections = {
+      Section::kIdentity,
+      Section::kInventory,
+      Section::kClock,
+    };
+  } else {
+    for (const auto& sp : Split(FLAGS_sections, ",", strings::SkipEmpty())) {
+      const string s = sp.ToString();
+      if (iequals(s, "identity")) {
+        opts.sections.insert(Section::kIdentity);
+      } else if (iequals(s, "inventory")) {
+        opts.sections.insert(Section::kInventory);
+      } else if (iequals(s, "consensus")) {
+        opts.sections.insert(Section::kConsensus);
+      } else if (iequals(s, "quiescing")) {
+        opts.sections.insert(Section::kQuiescing);
+      } else if (iequals(s, "flags")) {
+        opts.sections.insert(Section::kFlags);
+      } else if (iequals(s, "memory")) {
+        opts.sections.insert(Section::kMemory);
+      } else if (iequals(s, "clock")) {
+        opts.sections.insert(Section::kClock);
+      } else {
+        return Status::InvalidArgument(Substitute(
+            "unknown section '$0'; known sections for cluster gather: "
+            "identity, inventory, consensus, quiescing, flags, memory, clock",
+            s));
+      }
+    }
+  }
+
+  opts.include_http_metrics = FLAGS_include_http_metrics;
+
+  // Run the fan-out engine.
+  unique_ptr<RemoteGatherer> g;
+  RETURN_NOT_OK(RemoteGatherer::Create(master_addresses, &g));
+  GatherResultsPB result;
+  RETURN_NOT_OK(g->Run(opts, &result));
+
+  // Emit JSON. The MCP serve loop captures cout via ScopedCoutRedirect
+  // (tool_action_mcp.cc:650-660) and returns the output as the tool result.
+  JsonWriter::Mode jmode = (FLAGS_gather_format == "json_compact")
+      ? JsonWriter::COMPACT : JsonWriter::PRETTY;
+  cout << JsonWriter::ToJson(result, jmode) << endl;
+
+  return Status::OK();
 }
 
 // Does the version in 'version_str' support movement of single replicas?
@@ -422,6 +573,36 @@ unique_ptr<Mode> BuildClusterMode() {
         .AddOptionalParameter("tablets")
         .Build();
     builder.AddAction(std::move(ksck));
+  }
+
+  {
+    constexpr auto desc =
+        "Gather per-server and entity-scoped information from a Kudu cluster "
+        "via concurrent RPC fan-out";
+    constexpr auto extra_desc =
+        "Contacts all (or a selected subset of) tablet servers concurrently, "
+        "runs the selected set of probes on each, and emits a structured JSON "
+        "report. The default scope is the whole cluster; use --tservers, "
+        "--location, --table, --tablet, or --row to restrict the target set. "
+        "At most one scope flag may be set. The default section set is "
+        "identity+inventory+clock (client-accessible); use --sections to "
+        "request heavier admin-tier sections (consensus, quiescing, flags, "
+        "memory). Output format is controlled by --gather_format.";
+
+    unique_ptr<Action> gather = ClusterActionBuilder("gather", &RunGather)
+        .Description(desc)
+        .ExtraDescription(extra_desc)
+        .AddOptionalParameter("fetch_info_concurrency")
+        .AddOptionalParameter("gather_format")
+        .AddOptionalParameter("include_http_metrics")
+        .AddOptionalParameter("location")
+        .AddOptionalParameter("row")
+        .AddOptionalParameter("sections")
+        .AddOptionalParameter("table")
+        .AddOptionalParameter("tablet")
+        .AddOptionalParameter("tservers")
+        .Build();
+    builder.AddAction(std::move(gather));
   }
 
   {

@@ -393,6 +393,232 @@ message KsckCountSummaryPB {
   optional int32 replicas = 5;
 }
 
+// Results of "cluster gather", the Kudu per-server RPC fan-out action.
+// See remote_cluster.h for the engine that produces this structure.
+// Field numbers are frozen as of M0 and must not change; additions are
+// append-only (new field numbers only).
+message GatherResultsPB {
+
+  // Metadata about the gather operation itself.
+  message ClusterInfo {
+    // Master addresses used for target resolution.
+    repeated string master_addresses = 1;
+    // Cluster's unique identifier, if available from the master.
+    optional string cluster_id = 2;
+    // Unix epoch milliseconds at the time this report was generated.
+    optional int64 report_time_unix_ms = 3;
+    // Human-readable description of the selector / filter that was applied.
+    optional string applied_selector = 4;
+    // --fetch_info_concurrency value in effect during the gather.
+    optional int32 fetch_info_concurrency = 5;
+    // --timeout_ms value in effect during the gather.
+    optional int64 timeout_ms = 6;
+  }
+
+  // Status of a single probe section on one server.
+  // One ProbeStatus entry is emitted per requested section per server.
+  message ProbeStatus {
+    // Outcome code for a probe section.
+    enum Code {
+      // Probe succeeded and results are present.
+      OK = 0;
+      // Probe timed out (--timeout_ms exceeded).
+      TIMED_OUT = 1;
+      // Probe was rejected due to insufficient authorization.
+      UNAUTHORIZED = 2;
+      // Server was not reachable (connection refused or DNS failure).
+      UNREACHABLE = 3;
+      // Server's heartbeat is stale; RPC was skipped to avoid spending a
+      // full timeout on a server the master already considers dead.
+      PRESUMED_DEAD = 4;
+      // Section was not requested (--sections did not include it).
+      SKIPPED = 5;
+    }
+    // Section identifier, e.g. "identity", "inventory", "consensus".
+    optional string section = 1;
+    optional Code code = 2 [default = OK];
+    // Human-readable error detail; populated when code != OK.
+    optional string message = 3;
+  }
+
+  // Per-replica information as reported by one tablet server (ListTablets probe).
+  message ReplicaInfo {
+    optional string tablet_id = 1;
+    optional string table_name = 2;
+    optional string table_id = 3;
+    // Replica lifecycle state (mirrors tablet::TabletStatePB).
+    optional tablet.TabletStatePB state = 4;
+    // On-disk data state of this replica.
+    optional tablet.TabletDataState tablet_data_state = 5;
+    // Human-readable status string from the tablet server.
+    optional string last_status = 6;
+    // Human-readable partition range description.
+    optional string partition = 7;
+    // Estimated on-disk size in bytes (approximate; see TabletStatusPB).
+    optional int64 estimated_on_disk_size = 8;
+    // Data directories where this replica's blocks reside.
+    repeated string data_dirs = 9;
+    // Raft role string, e.g. "LEADER", "FOLLOWER", "LEARNER".
+    optional string raft_role = 10;
+    // Current Raft term as of the last GetConsensusState probe.
+    optional int64 term = 11;
+    // UUID of the current Raft leader for this tablet.
+    optional string leader_uuid = 12;
+  }
+
+  // A single flag, from the GetFlags probe.
+  message FlagEntry {
+    optional string name = 1;
+    optional string value = 2;
+    // Tags associated with this flag (e.g. "stable", "advanced").
+    repeated string tags = 3;
+  }
+
+  // A single MemTracker node, from the DumpMemTrackers probe.
+  message MemTrackerEntry {
+    optional string id = 1;
+    // Parent tracker id; empty for root trackers.
+    optional string parent_id = 2;
+    // Memory limit in bytes; -1 means unlimited.
+    optional int64 limit_bytes = 3;
+    // Current consumption in bytes.
+    optional int64 current_consumption_bytes = 4;
+    // Peak consumption in bytes since server start.
+    optional int64 peak_consumption_bytes = 5;
+  }
+
+  // Per-server record: one entry per target in the fan-out.
+  message ServerRecord {
+    // Server state as reported by the master.
+    // Values mirror master.TServerStatePB (defined here to avoid a heavy
+    // master.proto dependency in tool_proto).
+    enum ServerState {
+      SERVER_STATE_UNKNOWN = 0;
+      // No special state; server is operating normally.
+      SERVER_STATE_NONE = 1;
+      // Server is in maintenance mode: no new replicas added, failed replicas
+      // are not re-replicated.
+      SERVER_STATE_MAINTENANCE = 2;
+    }
+
+    optional string uuid = 1;
+    // Primary RPC host:port address.
+    optional string host = 2;
+    optional string location = 3;
+    optional string version = 4;
+    // Unix epoch milliseconds when the server process started.
+    optional int64 start_time_unix_ms = 5;
+    // Age of the last heartbeat the master received from this server, in ms.
+    optional int64 millis_since_heartbeat = 6;
+    optional ServerState ts_state = 7 [default = SERVER_STATE_UNKNOWN];
+
+    // Per-section probe outcomes; one entry per requested section.
+    repeated ProbeStatus section_status = 8;
+
+    // Replica inventory (from the ListTablets probe).
+    repeated ReplicaInfo replicas = 9;
+
+    // Non-default flags (from the GetFlags probe).
+    repeated FlagEntry flags = 10;
+
+    // Memory tracker tree (from the DumpMemTrackers probe).
+    repeated MemTrackerEntry mem_trackers = 11;
+
+    // Quiescing info (from the Quiesce probe; read-only, no state change).
+    optional bool is_quiescing = 12;
+    optional int32 num_active_scanners = 13;
+    optional int32 num_leaders = 14;
+
+    // Clock HybridTime (from the ServerClock probe).
+    optional int64 hybrid_time = 15;
+
+    // Error detail if the identity (GetStatus) probe failed.
+    optional string status_error = 16;
+  }
+
+  // One replica copy in an entity-centric (replica-set) view.
+  // The leader copy appears first in ReplicaSetView.copies when known.
+  message ReplicaCopy {
+    optional string ts_uuid = 1;
+    // Primary RPC host:port of the tablet server hosting this copy.
+    optional string ts_host = 2;
+    optional bool is_leader = 3;
+    optional int64 term = 4;
+    optional int64 estimated_on_disk_size = 5;
+    repeated string data_dirs = 6;
+    optional tablet.TabletStatePB state = 7;
+    optional tablet.TabletDataState tablet_data_state = 8;
+    // Probe outcome for this replica's server; set when the server was not
+    // fully reachable or an individual probe failed.
+    optional ProbeStatus replica_probe_status = 9;
+  }
+
+  // Entity-centric projection: one view per resolved tablet.
+  // Produced when the selector is --tablet or --row.
+  message ReplicaSetView {
+    optional string tablet_id = 1;
+    optional string table_name = 2;
+    optional string table_id = 3;
+    // Human-readable partition range.
+    optional string partition = 4;
+    // Replica copies; leader first when the leader is known.
+    repeated ReplicaCopy copies = 5;
+  }
+
+  // Cluster-wide aggregates and skew analysis.
+  message Rollup {
+    // Replica count distribution across the contacted servers.
+    optional int64 total_replica_count = 1;
+    optional int64 min_replica_count = 2;
+    optional int64 max_replica_count = 3;
+    optional double mean_replica_count = 4;
+    optional double stddev_replica_count = 5;
+
+    // On-disk size distribution across the contacted servers.
+    optional int64 total_on_disk_bytes = 6;
+    optional int64 min_on_disk_bytes = 7;
+    optional int64 max_on_disk_bytes = 8;
+    optional double mean_on_disk_bytes = 9;
+    optional double stddev_on_disk_bytes = 10;
+
+    // Leader count distribution.
+    optional int64 total_leader_count = 11;
+    optional int64 min_leader_count = 12;
+    optional int64 max_leader_count = 13;
+
+    // Distinct software versions observed.
+    repeated string distinct_versions = 14;
+
+    // A group of servers sharing the same non-default value for one flag.
+    // Used to surface flag divergence across the cluster.
+    message FlagDivergenceGroup {
+      optional string flag_name = 1;
+      optional string value = 2;
+      repeated string ts_uuids = 3;
+    }
+    repeated FlagDivergenceGroup flag_divergence_groups = 15;
+
+    // Count of servers by probe-status outcome, broken down by section.
+    message ProbeStatusCount {
+      optional string section = 1;
+      // Probe status code; corresponds to ProbeStatus.Code numeric values.
+      optional int32 probe_code = 2;
+      optional int32 count = 3;
+    }
+    repeated ProbeStatusCount servers_by_probe_status = 16;
+  }
+
+  // Metadata about this gather operation.
+  optional ClusterInfo cluster = 1;
+  // Per-server records (server-centric projection).
+  repeated ServerRecord servers = 2;
+  // Per-tablet replica-set views (entity-centric projection for tablet/row
+  // selectors).
+  repeated ReplicaSetView entities = 3;
+  // Cluster-wide aggregate statistics.
+  optional Rollup rollup = 4;
+}
+
 message ColumnPB {
   enum EncodingType {
     AUTO_ENCODING = 0;

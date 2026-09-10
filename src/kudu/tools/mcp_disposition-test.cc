@@ -155,6 +155,17 @@ TEST(McpDispositionTest, RepresentativeActionsOfEachClass) {
   }
 }
 
+// "cluster gather" is the RPC fan-out surface command added in M5/M6.
+// It is a cluster-wide read: SURFACE, not node-local, not unsafe.
+TEST(McpDispositionTest, ClusterGatherIsSurface) {
+  unique_ptr<Mode> root = BuildFullRootMode();
+  const DispositionInfo info = Lookup(root.get(), {"cluster", "gather"});
+  ASSERT_TRUE(info.classified);
+  EXPECT_EQ(Disposition::SURFACE, info.disposition);
+  EXPECT_FALSE(info.node_local);
+  EXPECT_FALSE(info.unsafe);
+}
+
 // Multi-level (submode) command paths key on the full chain, not just parent
 // mode + action. These are the paths that differ from the flat PRD tables.
 TEST(McpDispositionTest, MultiLevelSubmodePaths) {

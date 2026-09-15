@@ -1233,6 +1233,7 @@ std::unique_ptr<Mode> BuildMcpMode() {
   std::unique_ptr<Action> serve =
       ActionBuilder("serve", &RunMcpServe)
       .Description("Serve Kudu admin actions as MCP tools over stdio")
+      .McpDisposition(Disposition::REJECT)
       .ExtraDescription("Reads newline-delimited JSON-RPC requests from stdin "
                         "and writes responses to stdout, one line per request, "
                         "until EOF. Intended to be launched by an MCP host.")

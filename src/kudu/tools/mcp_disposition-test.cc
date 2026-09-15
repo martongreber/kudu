@@ -219,11 +219,6 @@ TEST(McpDispositionTest, ValidateCoveragePassesAgainstCurrentTree) {
   ASSERT_OK(ValidateDispositionCoverage(root.get()));
 }
 
-// The static table itself has no duplicate command paths.
-TEST(McpDispositionTest, RealTableHasNoDuplicates) {
-  ASSERT_OK(CheckDispositionEntriesUnique(DispositionTableEntries()));
-}
-
 // The test-only "test" mode is classified EXCLUDE without needing a table
 // entry, so the coverage invariant does not spuriously fail on it.
 TEST(McpDispositionTest, TestModeIsExcluded) {
@@ -296,18 +291,6 @@ TEST(McpDispositionTest, ValidatorReportsFullSubmodePath) {
   const Status s = ValidateDispositionCoverage(root.get());
   ASSERT_TRUE(s.IsNotFound()) << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "thing subthing bogus_action");
-}
-
-// A duplicate table entry is rejected by the uniqueness checker.
-TEST(McpDispositionTest, DuplicateEntryIsRejected) {
-  vector<RawDispositionEntry> entries = {
-    {"cluster ksck", Disposition::SURFACE, false, false},
-    {"table delete", Disposition::GATED,   false, false},
-    {"cluster ksck", Disposition::SURFACE, false, false},  // duplicate
-  };
-  const Status s = CheckDispositionEntriesUnique(entries);
-  ASSERT_TRUE(s.IsAlreadyPresent()) << s.ToString();
-  ASSERT_STR_CONTAINS(s.ToString(), "cluster ksck");
 }
 
 } // namespace tools

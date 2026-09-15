@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -44,7 +45,11 @@ class Mode;
 //             launchers). Never surfaced in v1.
 //  - EXCLUDE: interactive (drives an editor / stdin) or node-local mutating.
 //             Never surfaced.
-enum class Disposition {
+//
+// The underlying type is fixed so the enum can be forward-declared in
+// tool_action.h (which stores it on each Action) without depending on this
+// header.
+enum class Disposition : uint8_t {
   SURFACE,
   GATED,
   REJECT,
@@ -70,26 +75,12 @@ struct DispositionInfo {
   // these even when their disposition is GATED.
   bool unsafe = false;
 
-  // False if the command path was not found in the disposition table (i.e. the
-  // action is not classified). When false, all other fields are unspecified and
-  // must not be trusted. Callers MUST check this before acting on the result.
+  // False if 'action' carries no disposition (ActionBuilder::McpDisposition was
+  // never called), i.e. the action is not classified. When false, all other
+  // fields are unspecified and must not be trusted. Callers MUST check this
+  // before acting on the result.
   bool classified = false;
 };
-
-// A single raw row of the disposition table, keyed by full command path.
-struct RawDispositionEntry {
-  // The full command path relative to the root mode, with mode names and the
-  // action name joined by single spaces (e.g. "tserver quiesce status").
-  const char* command_path;
-  Disposition disposition;
-  bool node_local;
-  bool unsafe;
-};
-
-// Returns the full, curated disposition table transcribed from the PRD. Every
-// entry is keyed by its full command path. Exposed so tests can inspect the
-// table directly.
-const std::vector<RawDispositionEntry>& DispositionTableEntries();
 
 // Builds the full command path key for an action from its mode chain. 'chain'
 // is the sequence of modes from the root to the action's parent (chain.front()
@@ -100,28 +91,29 @@ const std::vector<RawDispositionEntry>& DispositionTableEntries();
 std::string DispositionCommandPath(const std::vector<Mode*>& chain,
                                    const Action* action);
 
-// Looks up the classification for 'action' given its mode 'chain'. Returns a
-// DispositionInfo whose 'classified' field is false if the action's command
-// path is absent from the table (the caller must not surface such an action).
+// Returns the classification carried by 'action' (set via
+// ActionBuilder::McpDisposition). 'chain' is only used to detect the test-only
+// "test" mode. Returns a DispositionInfo whose 'classified' field is false if
+// the action carries no disposition (the caller must not surface such an
+// action).
 //
 // Actions under the "test" mode (KUDU_CLI_TEST_TOOL_ENABLED test-only tooling)
-// are not real MCP tools; they always resolve to a classified EXCLUDE without a
-// table lookup, so the coverage invariant does not require table entries for
-// them.
+// are not real MCP tools; they always resolve to a classified EXCLUDE without
+// consulting the action, so the coverage invariant does not require test
+// tooling to be classified.
 DispositionInfo DispositionFor(const std::vector<Mode*>& chain,
                                const Action* action);
 
-// Returns an error (naming the offending path) if 'entries' contains any
-// duplicated command_path. Exposed so both the startup guard and unit tests can
-// exercise duplicate detection without relying on process death.
-Status CheckDispositionEntriesUnique(
-    const std::vector<RawDispositionEntry>& entries);
+// Returns a human-readable table of the classification of every action in the
+// tree rooted at 'root', one action per line (full command path, disposition,
+// and node_local / unsafe tags). This is the generated audit view of the MCP
+// safety surface -- what would otherwise be a hand-maintained table.
+std::string DumpDispositions(const Mode* root);
 
 // Walks the entire action tree rooted at 'root' and verifies that every action
-// resolves to exactly one disposition-table entry (actions under the "test"
-// mode are treated as EXCLUDE and skipped, see DispositionFor). Returns an
-// error naming the first offending full command path if an action is not
-// classified, or if the table contains a duplicate entry.
+// carries a disposition (actions under the "test" mode are treated as EXCLUDE
+// and skipped, see DispositionFor). Returns an error naming the first offending
+// full command path if an action is not classified.
 //
 // This is the Status-returning form, suitable for unit tests. The MCP serve
 // startup path should use ValidateDispositionCoverageOrDie() instead so a newly

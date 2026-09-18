@@ -186,6 +186,22 @@ ActionBuilder& ActionBuilder::ProgramName(const string& program_name) {
   return *this;
 }
 
+ActionBuilder& ActionBuilder::McpDisposition(Disposition disposition) {
+  CHECK(!mcp_disposition_.has_value());
+  mcp_disposition_ = disposition;
+  return *this;
+}
+
+ActionBuilder& ActionBuilder::McpNodeLocal() {
+  mcp_node_local_ = true;
+  return *this;
+}
+
+ActionBuilder& ActionBuilder::McpUnsafe() {
+  mcp_unsafe_ = true;
+  return *this;
+}
+
 ActionBuilder& ActionBuilder::AddRequiredParameter(
     const ActionArgsDescriptor::Arg& arg) {
   args_.required.push_back(arg);
@@ -221,6 +237,9 @@ unique_ptr<Action> ActionBuilder::Build() {
   action->description_ = description_;
   action->extra_description_ = extra_description_;
   action->program_name_ = program_name_;
+  action->mcp_disposition_ = mcp_disposition_;
+  action->mcp_node_local_ = mcp_node_local_;
+  action->mcp_unsafe_ = mcp_unsafe_;
   action->runner_ = runner_;
   action->args_ = args_;
   return action;

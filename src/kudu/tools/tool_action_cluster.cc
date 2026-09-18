@@ -38,6 +38,7 @@
 #include "kudu/tools/ksck.h"
 #include "kudu/tools/ksck_remote.h"
 #include "kudu/tools/ksck_results.h"
+#include "kudu/tools/mcp_disposition.h"
 #include "kudu/tools/rebalancer_tool.h"
 #include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
@@ -405,6 +406,7 @@ unique_ptr<Mode> BuildClusterMode() {
 
     unique_ptr<Action> ksck = ClusterActionBuilder("ksck", &RunKsck)
         .Description(desc)
+        .McpDisposition(Disposition::SURFACE)
         .ExtraDescription(extra_desc)
         .AddOptionalParameter("checksum_cache_blocks")
         .AddOptionalParameter("checksum_scan")
@@ -435,6 +437,7 @@ unique_ptr<Mode> BuildClusterMode() {
         "per tablet server.";
     unique_ptr<Action> rebalance = ClusterActionBuilder("rebalance", &RunRebalance)
         .Description(desc)
+        .McpDisposition(Disposition::REJECT)
         .ExtraDescription(extra_desc)
         .AddOptionalParameter("disable_cross_location_rebalancing")
         .AddOptionalParameter("disable_intra_location_rebalancing")

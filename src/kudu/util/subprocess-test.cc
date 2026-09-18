@@ -148,6 +148,98 @@ TEST_F(SubprocessTest, TestReadFromStdoutAndStderr) {
   SCOPED_CLEANUP({ alarm(0); });
 }
 
+// WaitAndCollect() drains both streams and reaps a fast child within the
+// deadline: no timeout, output captured, clean exit status.
+TEST_F(SubprocessTest, TestWaitAndCollect) {
+  alarm(60);
+  SCOPED_CLEANUP({ alarm(0); });
+
+  Subprocess p({ "/bin/bash", "-c", "echo out; echo err 1>&2" });
+  p.ShareParentStdin(false);
+  p.ShareParentStdout(false);
+  p.ShareParentStderr(false);
+  ASSERT_OK(p.Start());
+  const int stdin_fd = p.ReleaseChildStdinFd();
+  if (stdin_fd >= 0) {
+    close(stdin_fd);
+  }
+
+  string out, err;
+  bool timed_out;
+  int wait_status;
+  const MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(60);
+  ASSERT_OK(p.WaitAndCollect(deadline, &out, &err, &timed_out, &wait_status));
+
+  EXPECT_FALSE(timed_out);
+  EXPECT_EQ("out\n", out);
+  EXPECT_EQ("err\n", err);
+  ASSERT_TRUE(WIFEXITED(wait_status));
+  EXPECT_EQ(0, WEXITSTATUS(wait_status));
+}
+
+// An uninitialized deadline means "no timeout": WaitAndCollect() behaves like a
+// draining Wait().
+TEST_F(SubprocessTest, TestWaitAndCollectNoDeadline) {
+  alarm(60);
+  SCOPED_CLEANUP({ alarm(0); });
+
+  Subprocess p({ "/bin/echo", "-n", "hello" });
+  p.ShareParentStdin(false);
+  p.ShareParentStdout(false);
+  ASSERT_OK(p.Start());
+  const int stdin_fd = p.ReleaseChildStdinFd();
+  if (stdin_fd >= 0) {
+    close(stdin_fd);
+  }
+
+  string out;
+  bool timed_out;
+  int wait_status;
+  // Uninitialized MonoTime -> no timeout. Only stdout is collected.
+  ASSERT_OK(p.WaitAndCollect(MonoTime(), &out, /*stderr_out=*/nullptr,
+                             &timed_out, &wait_status));
+
+  EXPECT_FALSE(timed_out);
+  EXPECT_EQ("hello", out);
+  ASSERT_TRUE(WIFEXITED(wait_status));
+  EXPECT_EQ(0, WEXITSTATUS(wait_status));
+}
+
+// A child that runs past the deadline is killed and reaped, with '*timed_out'
+// set rather than blocking WaitAndCollect() forever.
+TEST_F(SubprocessTest, TestWaitAndCollectTimeout) {
+  alarm(60);
+  SCOPED_CLEANUP({ alarm(0); });
+
+  Subprocess p({ "/bin/sleep", "1000" });
+  p.ShareParentStdin(false);
+  p.ShareParentStdout(false);
+  p.ShareParentStderr(false);
+  ASSERT_OK(p.Start());
+  const int stdin_fd = p.ReleaseChildStdinFd();
+  if (stdin_fd >= 0) {
+    close(stdin_fd);
+  }
+
+  string out, err;
+  bool timed_out;
+  int wait_status;
+  const MonoTime start = MonoTime::Now();
+  const MonoTime deadline = start + MonoDelta::FromMilliseconds(200);
+  // A genuine server-side failure would be non-OK; a timeout is a normal
+  // return with '*timed_out' set.
+  ASSERT_OK(p.WaitAndCollect(deadline, &out, &err, &timed_out, &wait_status));
+
+  EXPECT_TRUE(timed_out);
+  EXPECT_EQ("", out);
+  EXPECT_EQ("", err);
+  // The child was SIGKILLed and reaped; wait_status is disregarded on timeout
+  // but should reflect the kill signal.
+  EXPECT_TRUE(WIFSIGNALED(wait_status));
+  // We should have returned near the deadline, not after sleep(1000).
+  EXPECT_LT((MonoTime::Now() - start).ToSeconds(), 30);
+}
+
 // Test that environment variables can be passed to the subprocess.
 TEST_F(SubprocessTest, TestEnvVars) {
   Subprocess p({ "/bin/bash", "-c", "echo $FOO" });

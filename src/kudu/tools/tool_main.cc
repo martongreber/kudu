@@ -59,27 +59,13 @@ using strings::Substitute;
 namespace kudu {
 namespace tools {
 
+// Thin wrapper over the shared BuildRootMode() (tool_action.h), kept so the
+// rest of tool_main.cc (DumpToolXML, RunTool) can keep calling RootMode(). The
+// top-level mode list itself lives in exactly one place (BuildRootMode, defined
+// in tool_action_root.cc), so a newly added top-level mode need not be mirrored
+// here and in the MCP server.
 unique_ptr<Mode> RootMode(const string& name) {
-  return ModeBuilder(name)
-      .Description("Kudu Command Line Tools") // root mode description isn't printed
-      .AddMode(BuildClusterMode())
-      .AddMode(BuildDiagnoseMode())
-      .AddMode(BuildFsMode())
-      .AddMode(BuildHmsMode())
-      .AddMode(BuildLocalReplicaMode())
-      .AddMode(BuildMasterMode())
-      .AddMode(BuildPbcMode())
-      .AddMode(BuildPerfMode())
-      .AddMode(BuildRemoteReplicaMode())
-      .AddMode(BuildTableMode())
-      .AddMode(BuildTabletMode())
-#if defined(KUDU_CLI_TEST_TOOL_ENABLED)
-      .AddMode(BuildTestMode())
-#endif
-      .AddMode(BuildTxnMode())
-      .AddMode(BuildTServerMode())
-      .AddMode(BuildWalMode())
-      .Build();
+  return BuildRootMode(name);
 }
 
 Status MarshalArgs(const vector<Mode*>& chain,

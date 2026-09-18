@@ -113,6 +113,7 @@ set(KUDU_CLI_ACTION_SRCS
   tool_action_hms.cc
   tool_action_local_replica.cc
   tool_action_master.cc
+  tool_action_mcp.cc
   mcp_disposition.cc
   tool_action_pbc.cc
   tool_action_perf.cc
@@ -237,6 +238,20 @@ ADD_KUDU_TEST(rebalancer_tool-test
 ADD_KUDU_TEST_DEPENDENCIES(rebalancer_tool-test
   kudu)
 ADD_KUDU_TEST(tool_action-test)
+ADD_KUDU_TEST(tool_action_mcp-test)
+# tools/list reflects the full CLI action tree, so link the action library to
+# reconstruct it in-process. Same for the two MCP tests below.
+if(NOT NO_TESTS)
+  target_link_libraries(tool_action_mcp-test kudu_cli_actions)
+endif()
+ADD_KUDU_TEST(tool_action_mcp-itest)
+# Drives RunMcpServeLoop() in-process against a live ExternalMiniCluster; the
+# cluster/itest libs come from SET_KUDU_TEST_LINK_LIBS.
+if(NOT NO_TESTS)
+  target_link_libraries(tool_action_mcp-itest kudu_cli_actions)
+endif()
+ADD_KUDU_TEST_DEPENDENCIES(tool_action_mcp-itest
+  kudu)
 ADD_KUDU_TEST(mcp_disposition-test)
 # Reconstructs the full action tree to validate disposition coverage against it.
 if(NOT NO_TESTS)

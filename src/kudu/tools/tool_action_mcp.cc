@@ -1,0 +1,1346 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include <sys/wait.h>
+
+#include <unistd.h>
+
+#include <cctype>
+#include <cstdint>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <ostream>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <rapidjson/document.h>
+
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/strings/numbers.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/strings/util.h"
+#include "kudu/tools/mcp_disposition.h"
+#include "kudu/tools/tool_action.h"
+#include "kudu/tools/tool_action_common.h"
+#include "kudu/util/jsonreader.h"
+#include "kudu/util/jsonwriter.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
+#include "kudu/util/subprocess.h"
+#include "kudu/util/version_info.h"
+
+// Registered on the 'serve' action; read once at startup to gate the exposure
+// registry (see RunMcpServeLoop).
+DEFINE_bool(allow_writes, false,
+            "Whether to expose mutating (write) tools over the MCP protocol. "
+            "When false, only read-only tools are surfaced.");
+
+// Each tools/call runs its action in a fresh child 'kudu' process. This bounds
+// how long that child may run before the server SIGKILLs it and returns a tool
+// error, so a hung action can never wedge the single-threaded serve loop.
+DEFINE_int32(mcp_tool_timeout_sec, 60,
+             "Maximum wall-clock seconds a single MCP tool invocation (a child "
+             "'kudu' process) may run before it is killed and the call returns "
+             "a tool error.");
+
+// The master addresses the serve session connects to. The operator registers
+// the server once with 'kudu mcp serve --master_addresses=...', and tools/call
+// injects this value for any action that needs it, so the addresses never have
+// to appear in the conversation. Defined in the master library
+// (master_options.cc) and linked into the 'kudu' binary; declared here so
+// 'serve' can register it as an optional parameter and tools/call can read it.
+DECLARE_string(master_addresses);
+
+using std::ostringstream;
+using std::pair;
+using std::string;
+using std::unique_ptr;
+using std::unordered_map;
+using std::unordered_set;
+using std::vector;
+using strings::Substitute;
+
+namespace kudu {
+namespace tools {
+
+// The MCP tool result derived from a finished child tool process. Defined at
+// namespace scope (not in the anonymous namespace below) so the crash/timeout
+// mapping in InterpretChildOutcome can be unit tested directly.
+struct ToolOutcome {
+  string text;
+  bool is_error;
+};
+
+// Interprets a finished child tool process into an MCP tool result. 'wait_status'
+// is the raw waitpid() status (meaningful only when !timed_out); 'timed_out' is
+// true if the child was killed for exceeding its deadline. A clean exit (code 0)
+// yields the child's stdout as the (non-error) result. Any other outcome -- a
+// non-zero exit, death by signal (e.g. a CHECK / LOG(FATAL) abort in a CLI action
+// written for the run-once world), or a timeout -- is a tool-execution error: it
+// is reported as isError=true text rather than being allowed to take down the
+// long-lived server. The child's stderr (the action's own diagnostics) is
+// preferred for the error text, falling back to stdout when stderr is empty.
+//
+// Defined at namespace scope (external linkage) so the itest can exercise the
+// exit-0 / non-zero / signal / timeout paths deterministically.
+ToolOutcome InterpretChildOutcome(int wait_status, bool timed_out,
+                                  int timeout_seconds, const string& out,
+                                  const string& err) {
+  auto with_detail = [&](string text) -> ToolOutcome {
+    const string& detail = !err.empty() ? err : out;
+    if (!detail.empty()) {
+      text += "\n";
+      text += detail;
+    }
+    return { std::move(text), true };
+  };
+
+  if (timed_out) {
+    return with_detail(Substitute(
+        "tool timed out after $0 seconds and was killed", timeout_seconds));
+  }
+  if (WIFEXITED(wait_status)) {
+    const int code = WEXITSTATUS(wait_status);
+    if (code == 0) {
+      return { out, false };
+    }
+    return with_detail(Substitute("tool process exited with code $0", code));
+  }
+  if (WIFSIGNALED(wait_status)) {
+    const int sig = WTERMSIG(wait_status);
+    string text = Substitute("tool process was terminated by signal $0", sig);
+#if defined(WCOREDUMP)
+    if (WCOREDUMP(wait_status)) {
+      text += " (core dumped)";
+    }
+#endif
+    return with_detail(std::move(text));
+  }
+  return with_detail(
+      Substitute("tool process ended abnormally (raw status $0)", wait_status));
+}
+
+namespace {
+
+// ----------------------------------------------------------------------------
+// MCP / JSON-RPC constants
+// ----------------------------------------------------------------------------
+
+// serverInfo.name reported in the initialize handshake.
+const char* const kServerName = "kudu-mcp";
+
+// The MCP protocol version this server implements by default. This is what we
+// report when the client does not request a specific (supported) version. Uses
+// the dated MCP revision string format.
+const char* const kDefaultProtocolVersion = "2025-06-18";
+
+// JSON-RPC 2.0 standard error codes (see the JSON-RPC 2.0 spec, section 5.1).
+// The one standard code we do not emit is -32603 (Internal error): every
+// handler here returns a well-formed response and nothing throws, so there is
+// no internal-failure path to surface. Add kJsonRpcInternalError = -32603
+// together with such a path if one is ever introduced.
+constexpr int kJsonRpcParseError = -32700;
+constexpr int kJsonRpcInvalidRequest = -32600;
+constexpr int kJsonRpcMethodNotFound = -32601;
+constexpr int kJsonRpcInvalidParams = -32602;
+
+// Returns true if 'version' is an MCP protocol revision this server can speak.
+// The client's requested version is echoed back only when it is in this set;
+// otherwise the server replies with kDefaultProtocolVersion and the client is
+// expected to adapt or disconnect.
+bool IsSupportedProtocolVersion(const string& version) {
+  return version == "2024-11-05" ||
+         version == "2025-03-26" ||
+         version == "2025-06-18";
+}
+
+// ----------------------------------------------------------------------------
+// Response envelope construction (JsonWriter)
+// ----------------------------------------------------------------------------
+
+// Writes a JSON-RPC 'id' value. The spec permits String, Number, or Null, and
+// requires the response id to equal the request id exactly, so we echo the
+// value verbatim -- including a fractional Number (which the spec discourages
+// clients from sending but does not forbid), since "MUST match" outranks that
+// advice. All four integer widths are handled because rapidjson stores a number
+// as the narrowest type that fits; a large-but-legal id lands in Int64/Uint64,
+// and handling only Int would null it out. A null or absent id, and any invalid
+// type (bool/object/array), is written as JSON null. 'id' may be nullptr.
+void WriteJsonRpcId(JsonWriter* jw, const rapidjson::Value* id) {
+  if (id == nullptr || id->IsNull()) {
+    jw->Null();
+  } else if (id->IsInt()) {
+    jw->Int(id->GetInt());
+  } else if (id->IsInt64()) {
+    jw->Int64(id->GetInt64());
+  } else if (id->IsUint()) {
+    jw->Uint(id->GetUint());
+  } else if (id->IsUint64()) {
+    jw->Uint64(id->GetUint64());
+  } else if (id->IsDouble()) {
+    jw->Double(id->GetDouble());
+  } else if (id->IsString()) {
+    jw->String(id->GetString());
+  } else {
+    // Bool/object/array are not valid JSON-RPC ids. Echo null to stay
+    // well-formed rather than propagating a nonsensical id.
+    jw->Null();
+  }
+}
+
+// Writes the envelope common to every JSON-RPC response
+// ({"jsonrpc":"2.0","id":<id>, ...}) and invokes 'write_body' to emit exactly
+// one of the "result" or "error" members. This is the single place the response
+// shape -- and the "carries EITHER result OR error, never both" invariant -- is
+// expressed; every builder below funnels through here.
+string BuildResponse(const rapidjson::Value* id,
+                     const std::function<void(JsonWriter*)>& write_body) {
+  ostringstream ss;
+  JsonWriter jw(&ss, JsonWriter::COMPACT);
+  jw.StartObject();
+  jw.String("jsonrpc");
+  jw.String("2.0");
+  jw.String("id");
+  WriteJsonRpcId(&jw, id);
+  write_body(&jw);
+  jw.EndObject();
+  return ss.str();
+}
+
+// Builds a JSON-RPC success response whose "result" is an object; the object's
+// fields are written by 'write_result_fields'.
+string BuildResultResponse(
+    const rapidjson::Value* id,
+    const std::function<void(JsonWriter*)>& write_result_fields) {
+  return BuildResponse(id, [&](JsonWriter* jw) {
+    jw->String("result");
+    jw->StartObject();
+    write_result_fields(jw);
+    jw->EndObject();
+  });
+}
+
+// Builds a JSON-RPC error response line:
+//   {"jsonrpc":"2.0","id":<id>,"error":{"code":<code>,"message":<message>}}
+string BuildErrorResponse(const rapidjson::Value* id,
+                          int code,
+                          const string& message) {
+  return BuildResponse(id, [&](JsonWriter* jw) {
+    jw->String("error");
+    jw->StartObject();
+    jw->String("code");
+    jw->Int(code);
+    jw->String("message");
+    jw->String(message);
+    jw->EndObject();
+  });
+}
+
+// Builds the JSON-RPC response to an 'initialize' request. The result reports
+// the negotiated protocol version, the server's declared capabilities (tools
+// only -- no resources), and serverInfo.
+string BuildInitializeResponse(const rapidjson::Value* id,
+                               const string& protocol_version) {
+  return BuildResultResponse(id, [&](JsonWriter* jw) {
+    jw->String("protocolVersion");
+    jw->String(protocol_version);
+
+    // Capabilities: declare only the 'tools' capability. Its value is an empty
+    // object (no sub-capabilities such as listChanged in v1).
+    jw->String("capabilities");
+    jw->StartObject();
+    jw->String("tools");
+    jw->StartObject();
+    jw->EndObject();
+    jw->EndObject();
+
+    jw->String("serverInfo");
+    jw->StartObject();
+    jw->String("name");
+    jw->String(kServerName);
+    jw->String("version");
+    jw->String(VersionInfo::GetShortVersionInfo());
+    jw->EndObject();
+  });
+}
+
+// ----------------------------------------------------------------------------
+// Tool exposure registry + reflection into MCP tool objects
+// ----------------------------------------------------------------------------
+
+// Server-level control flags that are configured once at launch, never per
+// tool call. They must NEVER be surfaced as a tool input property: the model
+// cannot be allowed to flip the write gate or the dry-run switch on a per-call
+// basis. This scrubs 'allow_writes' and any dry-run flag (matched by name so an
+// action that erroneously declares one as an optional parameter is still
+// covered).
+bool IsReservedControlFlag(const string& flag_name) {
+  return flag_name == "allow_writes" ||
+         flag_name.find("dry_run") != string::npos;
+}
+
+// Connection arguments that the server injects from its serve-level
+// FLAGS_master_addresses rather than requiring the model to supply per call.
+// These are the master-address positionals: the plural 'master_addresses'
+// (cluster / table actions) and the singular 'master_address' (master actions).
+bool IsInjectedConnectionArg(const string& arg_name) {
+  return arg_name == kMasterAddressesArg || arg_name == kMasterAddressArg;
+}
+
+// One exposed action and everything tools/list needs to describe it and
+// tools/call needs to invoke it. Built by BuildMcpToolRegistry() by walking the
+// action tree once; the tree must outlive the registry because 'chain' and
+// 'action' point into it.
+struct McpToolEntry {
+  // The flattened tool name, e.g. "table_describe" (see McpToolName()).
+  string tool_name;
+  // The mode chain from the root to the action's parent (chain.front() is the
+  // root), exactly as the disposition lookup and BuildHelpXML walk expect it.
+  vector<Mode*> chain;
+  const Action* action;
+  DispositionInfo disposition;
+};
+
+// Computes the MCP tool name for an action: its full command path with the path
+// separators (spaces) turned into underscores. E.g. a chain {root, "table"}
+// with action "describe" -> "table_describe"; {root, "tserver", "quiesce"} with
+// action "status" -> "tserver_quiesce_status". Mode and action names may
+// themselves contain underscores (e.g. "set_limit", "authz_cache"), so the
+// joined name is NOT reversible by splitting on '_'; callers resolve a name back
+// to an action via the registry, never by string-splitting. This function is
+// the single source of truth so tools/list and tools/call agree.
+string McpToolName(const vector<Mode*>& chain, const Action* action) {
+  string name = DispositionCommandPath(chain, action);
+  std::replace(name.begin(), name.end(), ' ', '_');
+  return name;
+}
+
+// Recursively walks 'mode' (whose full chain from the root is 'chain', with
+// 'mode' as its last element), appending an McpToolEntry for every EXPOSED
+// action. Exposure rule: SURFACE is always exposed; GATED only when
+// 'allow_writes'; REJECT / EXCLUDE / unclassified are never exposed.
+void CollectMcpTools(const vector<Mode*>& chain,
+                     const Mode* mode,
+                     bool allow_writes,
+                     vector<McpToolEntry>* out) {
+  for (const auto& action : mode->actions()) {
+    const DispositionInfo info = DispositionFor(chain, action.get());
+    // The startup coverage invariant guarantees every action is classified;
+    // stay defensive and never surface an action we cannot classify.
+    if (!info.classified) {
+      continue;
+    }
+    bool expose = false;
+    switch (info.disposition) {
+      case Disposition::SURFACE:
+        expose = true;
+        break;
+      case Disposition::GATED:
+        expose = allow_writes;
+        break;
+      case Disposition::REJECT:
+      case Disposition::EXCLUDE:
+        expose = false;
+        break;
+    }
+    if (!expose) {
+      continue;
+    }
+    McpToolEntry entry;
+    entry.tool_name = McpToolName(chain, action.get());
+    entry.chain = chain;
+    entry.action = action.get();
+    entry.disposition = info;
+    out->emplace_back(std::move(entry));
+  }
+  for (const auto& submode : mode->modes()) {
+    vector<Mode*> child_chain(chain);
+    child_chain.push_back(submode.get());
+    CollectMcpTools(child_chain, submode.get(), allow_writes, out);
+  }
+}
+
+// Builds the exposure registry for the tree rooted at 'root': one record per
+// action that should be visible as an MCP tool given 'allow_writes'. This is
+// what tools/list iterates and what tools/call resolves a tool name against.
+// The returned entries borrow from 'root', which must outlive them.
+vector<McpToolEntry> BuildMcpToolRegistry(const Mode* root, bool allow_writes) {
+  vector<McpToolEntry> tools;
+  vector<Mode*> root_chain = { const_cast<Mode*>(root) };
+  for (const auto& mode : root->modes()) {
+    vector<Mode*> child_chain(root_chain);
+    child_chain.push_back(mode.get());
+    CollectMcpTools(child_chain, mode.get(), allow_writes, &tools);
+  }
+  return tools;
+}
+
+// Maps a gflag type string (as reported by google::CommandLineFlagInfo::type)
+// to a JSON Schema type: "bool" -> boolean; the integer families -> integer;
+// "double" -> number; everything else -> string (the safe fallback for any
+// gflag type we do not explicitly recognize, e.g. "string" and "uint64" edge
+// cases). Never returns null.
+const char* JsonSchemaTypeForGflag(const string& gflag_type) {
+  if (gflag_type == "bool") {
+    return "boolean";
+  }
+  if (gflag_type == "int32" || gflag_type == "int64" ||
+      gflag_type == "uint32" || gflag_type == "uint64") {
+    return "integer";
+  }
+  if (gflag_type == "double") {
+    return "number";
+  }
+  return "string";
+}
+
+// Writes a JSON Schema "default" value for an optional flag, typed to match the
+// property's JSON type where possible. gflags reports every default as a
+// string; this converts it to a JSON boolean/number when the flag type calls
+// for one and the string parses cleanly, falling back to the raw string
+// otherwise so the schema is always well-formed.
+void WriteFlagDefault(JsonWriter* jw,
+                      const string& gflag_type,
+                      const string& default_value) {
+  if (gflag_type == "bool") {
+    jw->Bool(default_value == "true");
+    return;
+  }
+  if (gflag_type == "int32" || gflag_type == "int64" ||
+      gflag_type == "uint32" || gflag_type == "uint64") {
+    int64_t v = 0;
+    if (safe_strto64(default_value, &v)) {
+      jw->Int64(v);
+      return;
+    }
+  } else if (gflag_type == "double") {
+    double d = 0;
+    if (safe_strtod(default_value.c_str(), &d)) {
+      jw->Double(d);
+      return;
+    }
+  }
+  jw->String(default_value);
+}
+
+// Writes a single MCP tool object for 'entry' into the open array 'jw'. Mirrors
+// Action::BuildHelpXML's argument handling: required args and the variadic arg
+// become JSON Schema properties (and are listed in "required"), optional flags
+// become typed properties keyed off the gflag type.
+void WriteMcpToolObject(JsonWriter* jw, const McpToolEntry& entry) {
+  const Action* action = entry.action;
+  const ActionArgsDescriptor& args = action->args();
+
+  jw->StartObject();
+
+  jw->String("name");
+  jw->String(entry.tool_name);
+
+  // Description: the action description, plus its extra description if any, plus
+  // a node-local locality note for tagged SURFACE tools.
+  string description = action->description();
+  if (action->extra_description()) {
+    description += " ";
+    description += *action->extra_description();
+  }
+  if (entry.disposition.disposition == Disposition::SURFACE &&
+      entry.disposition.node_local) {
+    description += " Note: this reflects only the local node this server runs "
+                   "on, not the whole cluster.";
+  }
+  jw->String("description");
+  jw->String(description);
+
+  // inputSchema: a JSON Schema object.
+  jw->String("inputSchema");
+  jw->StartObject();
+  {
+    jw->String("type");
+    jw->String("object");
+
+    jw->String("properties");
+    jw->StartObject();
+    {
+      // Required positional args -> string properties. Injected connection args
+      // (the master-address positionals) are omitted: the server fills them in
+      // from its serve-level FLAGS_master_addresses, so the model neither sees
+      // nor supplies them.
+      for (const auto& r : args.required) {
+        if (IsInjectedConnectionArg(r.name)) {
+          continue;
+        }
+        jw->String(r.name);
+        jw->StartObject();
+        jw->String("type");
+        jw->String("string");
+        jw->String("description");
+        jw->String(r.description);
+        jw->EndObject();
+      }
+      // The variadic arg -> an array-of-strings property (required variadic).
+      if (args.variadic) {
+        const ActionArgsDescriptor::Arg& v = *args.variadic;
+        jw->String(v.name);
+        jw->StartObject();
+        jw->String("type");
+        jw->String("array");
+        jw->String("items");
+        jw->StartObject();
+        jw->String("type");
+        jw->String("string");
+        jw->EndObject();
+        jw->String("description");
+        jw->String(v.description);
+        jw->EndObject();
+      }
+      // Optional flags -> typed properties, type read from gflags exactly as
+      // the XML walk reads it. Control flags are never surfaced.
+      for (const auto& o : args.optional) {
+        if (IsReservedControlFlag(o.name)) {
+          continue;
+        }
+        google::CommandLineFlagInfo gflag_info =
+            google::GetCommandLineFlagInfoOrDie(o.name.c_str());
+        // The action may override the gflag's description / default.
+        const string description_str =
+            o.description.value_or(gflag_info.description);
+        const string default_str =
+            o.default_value.value_or(gflag_info.default_value);
+
+        jw->String(o.name);
+        jw->StartObject();
+        jw->String("type");
+        jw->String(JsonSchemaTypeForGflag(gflag_info.type));
+        jw->String("description");
+        jw->String(description_str);
+        jw->String("default");
+        WriteFlagDefault(jw, gflag_info.type, default_str);
+        jw->EndObject();
+      }
+      // GATED tools carry a synthetic 'dry_run' control property. It is an
+      // MCP-level switch, NOT a gflag: when set true, tools/call reconstructs and
+      // returns the exact command that would run instead of executing it. It is
+      // surfaced only on GATED tools (a write is the only thing worth previewing)
+      // and, being reserved by IsReservedControlFlag, can never collide with a
+      // real action flag. It is intentionally absent from required[].
+      if (entry.disposition.disposition == Disposition::GATED) {
+        jw->String("dry_run");
+        jw->StartObject();
+        jw->String("type");
+        jw->String("boolean");
+        jw->String("description");
+        jw->String("If true, do not execute; return the exact kudu command that "
+                   "would run, making no changes.");
+        jw->String("default");
+        jw->Bool(false);
+        jw->EndObject();
+      }
+    }
+    jw->EndObject(); // properties
+
+    // required[]: required args and the (required) variadic arg. Optional flags
+    // are never required.
+    jw->String("required");
+    jw->StartArray();
+    for (const auto& r : args.required) {
+      if (IsInjectedConnectionArg(r.name)) {
+        continue;
+      }
+      jw->String(r.name);
+    }
+    if (args.variadic) {
+      jw->String(args.variadic->name);
+    }
+    jw->EndArray();
+  }
+  jw->EndObject(); // inputSchema
+
+  // annotations: hint the host about read-only vs destructive behavior so it
+  // can decide whether to prompt. GATED tools are mutating (not read-only) and
+  // potentially destructive; SURFACE tools are read-only.
+  jw->String("annotations");
+  jw->StartObject();
+  if (entry.disposition.disposition == Disposition::GATED) {
+    jw->String("readOnlyHint");
+    jw->Bool(false);
+    jw->String("destructiveHint");
+    jw->Bool(true);
+  } else {
+    jw->String("readOnlyHint");
+    jw->Bool(true);
+  }
+  jw->EndObject();
+
+  jw->EndObject(); // tool
+}
+
+// Builds the JSON-RPC response to a 'tools/list' request by emitting one MCP
+// tool object per entry in the pre-built exposure registry.
+string BuildToolsListResponse(const rapidjson::Value* id,
+                              const vector<McpToolEntry>& tools) {
+  return BuildResultResponse(id, [&](JsonWriter* jw) {
+    jw->String("tools");
+    jw->StartArray();
+    for (const auto& entry : tools) {
+      WriteMcpToolObject(jw, entry);
+    }
+    jw->EndArray();
+  });
+}
+
+// Builds the action tree the serve session reflects into MCP tools. Delegates
+// to the shared BuildRootMode() (declared in tool_action.h, defined in
+// tool_action_root.cc). The root mode's name is irrelevant to reflection: it is
+// dropped from every command path (DispositionCommandPath) and tool name
+// (McpToolName).
+unique_ptr<Mode> BuildMcpRootMode() {
+  return BuildRootMode("kudu");
+}
+
+// Determines the protocol version to report in the initialize response. If the
+// client's params carry a supported protocolVersion, it is echoed back;
+// otherwise the server's default supported version is returned.
+string NegotiateProtocolVersion(const JsonReader& reader,
+                                const rapidjson::Value* root) {
+  const rapidjson::Value* params = nullptr;
+  if (reader.ExtractObject(root, "params", &params).ok()) {
+    string requested;
+    if (reader.ExtractString(params, "protocolVersion", &requested).ok() &&
+        !requested.empty() && IsSupportedProtocolVersion(requested)) {
+      return requested;
+    }
+  }
+  return kDefaultProtocolVersion;
+}
+
+// ----------------------------------------------------------------------------
+// tools/call: dispatch a read-only action and capture its text output
+// ----------------------------------------------------------------------------
+
+// Converts a scalar JSON value to the string form the CLI's positional and
+// gflag parsing expects. Strings pass through; numbers and booleans are
+// stringified as gflags would render them. Returns false for a non-scalar
+// (object / array / null), which cannot be a positional arg or a flag value.
+bool JsonScalarToString(const rapidjson::Value& v, string* out) {
+  if (v.IsString()) {
+    *out = v.GetString();
+    return true;
+  }
+  if (v.IsBool()) {
+    *out = v.GetBool() ? "true" : "false";
+    return true;
+  }
+  if (v.IsInt()) {
+    *out = SimpleItoa(v.GetInt());
+    return true;
+  }
+  if (v.IsInt64()) {
+    *out = SimpleItoa(v.GetInt64());
+    return true;
+  }
+  if (v.IsUint()) {
+    *out = SimpleItoa(v.GetUint());
+    return true;
+  }
+  if (v.IsUint64()) {
+    *out = SimpleItoa(v.GetUint64());
+    return true;
+  }
+  if (v.IsDouble()) {
+    *out = SimpleDtoa(v.GetDouble());
+    return true;
+  }
+  return false;
+}
+
+// Computes the value to inject for a connection argument the caller did not
+// supply, from the serve-level FLAGS_master_addresses. The plural
+// 'master_addresses' takes the full flag; the singular 'master_address' takes
+// the first configured address (a single-master action wants one address).
+// Returns "" if no addresses were configured at launch.
+string InjectedConnectionValue(const string& arg_name) {
+  const string& all = FLAGS_master_addresses;
+  if (all.empty()) {
+    return "";
+  }
+  if (arg_name == kMasterAddressArg) {
+    return all.substr(0, all.find(','));
+  }
+  return all;
+}
+
+// Builds a successful JSON-RPC 'tools/call' response carrying an MCP tool
+// result: content is a single text block, and 'isError' distinguishes a normal
+// result from a tool-execution error (a non-OK action Status). Note this is a
+// SUCCESSFUL JSON-RPC result even when is_error is true -- the tool ran and
+// reported a failure, which is not a protocol-level error.
+string BuildToolResultResponse(const rapidjson::Value* id,
+                               const string& text,
+                               bool is_error) {
+  return BuildResultResponse(id, [&](JsonWriter* jw) {
+    jw->String("content");
+    jw->StartArray();
+    {
+      jw->StartObject();
+      jw->String("type");
+      jw->String("text");
+      jw->String("text");
+      jw->String(text);
+      jw->EndObject();
+    }
+    jw->EndArray();
+    jw->String("isError");
+    jw->Bool(is_error);
+  });
+}
+
+// Finds a member of the 'arguments' object by name, or nullptr if 'arguments'
+// is absent / not an object / lacks the member.
+const rapidjson::Value* FindArgument(const rapidjson::Value* arguments,
+                                     const string& key) {
+  if (arguments == nullptr || !arguments->IsObject()) {
+    return nullptr;
+  }
+  auto it = arguments->FindMember(key.c_str());
+  if (it == arguments->MemberEnd()) {
+    return nullptr;
+  }
+  return &it->value;
+}
+
+// Returns 'raw' unchanged if it is made up entirely of characters a POSIX shell
+// treats literally; otherwise wraps it in single quotes (escaping any embedded
+// single quote as the usual '\'' sequence) so the reconstructed dry-run command
+// line is copy-pasteable into a shell without reinterpretation. An empty string
+// becomes '' so it survives as a distinct (empty) argument.
+string ShellQuote(const string& raw) {
+  if (!raw.empty()) {
+    bool safe = true;
+    for (const char c : raw) {
+      const bool ok = std::isalnum(static_cast<unsigned char>(c)) ||
+                      c == '_' || c == '-' || c == '.' || c == '/' ||
+                      c == ':' || c == ',' || c == '=' || c == '@' ||
+                      c == '+' || c == '%';
+      if (!ok) {
+        safe = false;
+        break;
+      }
+    }
+    if (safe) {
+      return raw;
+    }
+  }
+  string out = "'";
+  for (const char c : raw) {
+    if (c == '\'') {
+      out += "'\\''";
+    } else {
+      out += c;
+    }
+  }
+  out += "'";
+  return out;
+}
+
+// Reconstructs the faithful, copy-pasteable command line a GATED tools/call
+// would execute, for the dry-run path: the model sees exactly what would run
+// instead of it running. Format:
+//   kudu <chain-names...> <action-name> <positionals-in-declared-order> \
+//        [--opt=value ...]
+// Positional order matches args().required declaration order (which is why the
+// injected master-address value is emitted at its real slot -- it is part of the
+// command), followed by any variadic values, then the optional flags that were
+// supplied, in declaration order. Each argument is shell-quoted as needed.
+string BuildDryRunCommand(const McpToolEntry& entry,
+                          const unordered_map<string, string>& required_args,
+                          const vector<string>& variadic_args,
+                          const vector<pair<string, string>>& optional_args) {
+  const ActionArgsDescriptor& args = entry.action->args();
+  ostringstream cmd;
+  // DispositionCommandPath drops the root and joins mode names + action with
+  // spaces, e.g. "table add_range_partition".
+  cmd << "kudu " << DispositionCommandPath(entry.chain, entry.action);
+  for (const auto& r : args.required) {
+    const string* value = FindOrNull(required_args, r.name);
+    // Every required arg (injected ones included) was marshalled before this
+    // point, so it is present; stay defensive against a future refactor.
+    if (value != nullptr) {
+      cmd << " " << ShellQuote(*value);
+    }
+  }
+  for (const auto& v : variadic_args) {
+    cmd << " " << ShellQuote(v);
+  }
+  for (const auto& o : optional_args) {
+    cmd << " --" << o.first << "=" << ShellQuote(o.second);
+  }
+  return cmd.str();
+}
+
+// Builds the argv for the child 'kudu' process that executes a tools/call in
+// isolation. argv[0] is the absolute path to this server's own 'kudu' binary.
+//
+// The child's main() runs gflags::ParseCommandLineNonHelpFlags(remove_flags=true),
+// which strips any token it recognizes as a flag from ANY position in argv before
+// the tool framework matches the remaining tokens to a mode/action/positionals.
+// That means a positional value beginning with '-' (e.g. a table name of
+// "--version" or "--flagfile=/etc/passwd") would otherwise be swallowed and
+// interpreted as a child flag rather than treated as data -- flag injection. To
+// prevent it, we emit every real flag (the "--name=value" optionals) FIRST, then a
+// bare "--" end-of-flags sentinel, and only then the positional tokens (mode-chain
+// names, action name, required positionals, variadic values). gflags stops flag
+// processing at the "--" and leaves everything after it as literal positionals, so
+// user-controlled values can no longer masquerade as flags. Flags are
+// position-independent to gflags, so leading the optionals does not change which
+// flags the child sees; the positional order still mirrors BuildDryRunCommand (the
+// injected master-address positional stays in its declared slot).
+vector<string> BuildToolArgv(const string& kudu_binary_path,
+                             const McpToolEntry& entry,
+                             const unordered_map<string, string>& required_args,
+                             const vector<string>& variadic_args,
+                             const vector<pair<string, string>>& optional_args) {
+  const ActionArgsDescriptor& args = entry.action->args();
+  vector<string> argv;
+  argv.emplace_back(kudu_binary_path);
+  // All real flags first, so gflags parses them before the "--" terminator.
+  for (const auto& o : optional_args) {
+    argv.emplace_back(Substitute("--$0=$1", o.first, o.second));
+  }
+  // End-of-flags sentinel: everything after this is a literal positional and can
+  // never be reinterpreted as a child flag.
+  argv.emplace_back("--");
+  // The mode chain names (skipping the root at index 0), then the action name --
+  // e.g. {"table", "describe"} -- each as its own argv element.
+  for (size_t i = 1; i < entry.chain.size(); i++) {
+    argv.emplace_back(entry.chain[i]->name());
+  }
+  argv.emplace_back(entry.action->name());
+  for (const auto& r : args.required) {
+    const string* value = FindOrNull(required_args, r.name);
+    if (value != nullptr) {
+      argv.emplace_back(*value);
+    }
+  }
+  for (const auto& v : variadic_args) {
+    argv.emplace_back(v);
+  }
+  return argv;
+}
+
+// Runs 'argv' as a child process to completion or until the deadline
+// ('timeout_seconds' from now), feeding it no stdin and capturing its stdout and
+// stderr. On timeout the child is SIGKILLed and '*timed_out' is set.
+// '*wait_status' receives the reaped waitpid() status. Returns non-OK only for a
+// failure to spawn / read / reap (a server-side problem); a failed *tool* is a
+// normal return with a non-zero '*wait_status' or '*timed_out'.
+//
+// The concurrent, deadline-bounded drain-and-reap lives in
+// Subprocess::WaitAndCollect() so it can be shared and tested independently;
+// this function just wires the child up the way tool actions expect (no stdin)
+// and hands the outcome to InterpretChildOutcome().
+Status RunToolChild(const vector<string>& argv, int timeout_seconds,
+                    string* out, string* err, int* wait_status,
+                    bool* timed_out) {
+  Subprocess p(argv);
+  p.ShareParentStdin(false);
+  p.ShareParentStdout(false);
+  p.ShareParentStderr(false);
+  RETURN_NOT_OK_PREPEND(p.Start(), "could not start tool subprocess");
+
+  // Close the child's stdin so anything that reads it sees EOF at once; tool
+  // actions consume no stdin.
+  const int stdin_fd = p.ReleaseChildStdinFd();
+  if (stdin_fd >= 0) {
+    ::close(stdin_fd);
+  }
+
+  const MonoTime deadline =
+      MonoTime::Now() + MonoDelta::FromSeconds(timeout_seconds);
+  return p.WaitAndCollect(deadline, out, err, timed_out, wait_status);
+}
+
+// Handles a 'tools/call' request. Resolves the tool name against the pre-built
+// (already write-gated) registry, marshals the JSON arguments into the
+// required/variadic/optional shapes the CLI expects, then EXECUTES the action in
+// a fresh child 'kudu' process (see RunToolChild) and returns the child's output
+// as an MCP tool result. Running each call in its own process is the crash
+// boundary: a CLI action written for the run-once world may CHECK / LOG(FATAL) /
+// exit() on bad state, which in-process would kill the whole server; isolated in
+// a child it becomes an isError result and the serve loop lives on.
+// Protocol-level problems (bad params, unknown tool) return a JSON-RPC error; an
+// action-level failure returns a successful result carrying isError=true.
+string HandleToolsCall(const JsonReader& reader,
+                       const rapidjson::Value* req,
+                       const rapidjson::Value* id,
+                       const vector<McpToolEntry>& tools,
+                       const unordered_set<string>& gated_tool_names,
+                       const string& kudu_binary_path) {
+  const rapidjson::Value* params = nullptr;
+  if (!reader.ExtractObject(req, "params", &params).ok()) {
+    return BuildErrorResponse(id, kJsonRpcInvalidParams,
+                              "Invalid params: missing 'params' object");
+  }
+
+  string name;
+  if (!reader.ExtractString(params, "name", &name).ok()) {
+    return BuildErrorResponse(id, kJsonRpcInvalidParams,
+                              "Invalid params: missing tool 'name'");
+  }
+
+  // Resolve the name against the active (write-gated) registry. A GATED tool is
+  // absent from it when the server was launched without --allow-writes.
+  const McpToolEntry* entry = nullptr;
+  for (const auto& e : tools) {
+    if (e.tool_name == name) {
+      entry = &e;
+      break;
+    }
+  }
+  if (entry == nullptr) {
+    // Defense in depth: a GATED tool is not merely hidden without
+    // --allow-writes, it is explicitly rejected here -- and with an honest
+    // message distinguishing "the write gate is closed" from "no such tool".
+    // 'gated_tool_names' is the FULL (ungated) set of GATED tool names, so a
+    // name that misses the active registry but is a known GATED tool means the
+    // server simply was not started with --allow-writes.
+    if (ContainsKey(gated_tool_names, name)) {
+      return BuildErrorResponse(
+          id, kJsonRpcInvalidParams,
+          Substitute("Invalid params: tool '$0' is a gated (mutating) tool and "
+                     "is not enabled; start the server with --allow-writes to "
+                     "use it", name));
+    }
+    return BuildErrorResponse(
+        id, kJsonRpcInvalidParams,
+        Substitute("Invalid params: unknown tool '$0'", name));
+  }
+
+  // 'arguments' is optional; absent (or an explicit null) means no arguments.
+  const rapidjson::Value* arguments = nullptr;
+  if (params->HasMember("arguments")) {
+    const rapidjson::Value& a = (*params)["arguments"];
+    if (a.IsObject()) {
+      arguments = &a;
+    } else if (!a.IsNull()) {
+      return BuildErrorResponse(id, kJsonRpcInvalidParams,
+                                "Invalid params: 'arguments' must be an object");
+    }
+  }
+
+  // Dry-run is a synthetic MCP-level control, honored ONLY for GATED tools
+  // (for a SURFACE tool it is a harmless unknown argument -- ignored, and never
+  // advertised in the schema). When set, we still validate/marshal every
+  // argument (so malformed args are still reported as -32602, never a partial
+  // mutation) but return the reconstructed command instead of calling Run().
+  // 'dry_run' is a control key, not an action argument: it is consumed here and
+  // excluded from flag marshalling exactly as the reserved/injected args are.
+  bool dry_run = false;
+  if (entry->disposition.disposition == Disposition::GATED) {
+    const rapidjson::Value* dr = FindArgument(arguments, "dry_run");
+    if (dr != nullptr && dr->IsBool()) {
+      dry_run = dr->GetBool();
+    }
+  }
+
+  const ActionArgsDescriptor& args = entry->action->args();
+  unordered_map<string, string> required_args;
+  vector<string> variadic_args;
+
+  // Required positional args, in declaration order (mirrors MarshalArgs).
+  for (const auto& r : args.required) {
+    const rapidjson::Value* v = FindArgument(arguments, r.name);
+    if (IsInjectedConnectionArg(r.name)) {
+      // Injected connection arg: use the caller-supplied value if present,
+      // otherwise inject the serve-level FLAGS_master_addresses.
+      string value;
+      if (v != nullptr) {
+        if (!JsonScalarToString(*v, &value)) {
+          return BuildErrorResponse(
+              id, kJsonRpcInvalidParams,
+              Substitute("Invalid params: '$0' must be a string", r.name));
+        }
+      } else {
+        value = InjectedConnectionValue(r.name);
+      }
+      if (value.empty()) {
+        return BuildToolResultResponse(
+            id,
+            "No master addresses are configured. Launch the server with "
+            "'kudu mcp serve --master_addresses=<addr>[,<addr>...]'.",
+            /*is_error=*/true);
+      }
+      required_args[r.name] = std::move(value);
+      continue;
+    }
+    if (v == nullptr) {
+      return BuildErrorResponse(
+          id, kJsonRpcInvalidParams,
+          Substitute("Invalid params: missing required argument '$0'", r.name));
+    }
+    string value;
+    if (!JsonScalarToString(*v, &value)) {
+      return BuildErrorResponse(
+          id, kJsonRpcInvalidParams,
+          Substitute("Invalid params: argument '$0' must be a scalar", r.name));
+    }
+    required_args[r.name] = std::move(value);
+  }
+
+  // Variadic arg (at most one, at the end): a non-empty JSON array of scalars.
+  if (args.variadic) {
+    const string& vname = args.variadic->name;
+    const rapidjson::Value* v = FindArgument(arguments, vname);
+    if (v == nullptr || !v->IsArray() || v->Empty()) {
+      return BuildErrorResponse(
+          id, kJsonRpcInvalidParams,
+          Substitute("Invalid params: variadic argument '$0' must be a "
+                     "non-empty array", vname));
+    }
+    for (const auto& elem : v->GetArray()) {
+      string value;
+      if (!JsonScalarToString(elem, &value)) {
+        return BuildErrorResponse(
+            id, kJsonRpcInvalidParams,
+            Substitute("Invalid params: elements of '$0' must be scalars",
+                       vname));
+      }
+      variadic_args.emplace_back(std::move(value));
+    }
+  }
+
+  // Collect the optional flags supplied for this call, in declaration order,
+  // validating scalar-ness. Reserved control flags (allow_writes / dry_run) and
+  // injected connection args are never taken from per-call arguments. This is
+  // shared by the dry-run and execute paths below: for dry-run it renders the
+  // command, for execute it becomes the child's --name=value argv elements.
+  vector<pair<string, string>> optional_supplied;
+  for (const auto& o : args.optional) {
+    if (IsReservedControlFlag(o.name) || IsInjectedConnectionArg(o.name)) {
+      continue;
+    }
+    const rapidjson::Value* v = FindArgument(arguments, o.name);
+    if (v == nullptr) {
+      continue;
+    }
+    string value;
+    if (!JsonScalarToString(*v, &value)) {
+      return BuildErrorResponse(
+          id, kJsonRpcInvalidParams,
+          Substitute("Invalid params: optional flag '$0' must be a scalar",
+                     o.name));
+    }
+    optional_supplied.emplace_back(o.name, std::move(value));
+  }
+
+  // Dry-run: the args are fully validated above, so any malformed argument has
+  // already produced a -32602. Reconstruct the faithful command line and return
+  // it WITHOUT executing anything.
+  if (dry_run) {
+    const string command =
+        BuildDryRunCommand(*entry, required_args, variadic_args, optional_supplied);
+    return BuildToolResultResponse(id, command, /*is_error=*/false);
+  }
+
+  // Execute: run the action in a fresh child 'kudu' process. Optional flags go
+  // on the child's command line (not process-global gflags), and its stdout is
+  // the tool result -- no cout redirection or flag save/restore is needed
+  // because the child is a separate process. Crucially, if the action aborts
+  // (CHECK / LOG(FATAL) / exit / a failed flag validator) only the child dies;
+  // RunToolChild reaps it and InterpretChildOutcome turns any non-clean exit
+  // into an isError result, so the serve loop survives to answer the next call.
+  if (kudu_binary_path.empty()) {
+    return BuildToolResultResponse(
+        id,
+        "The MCP server could not locate its own 'kudu' binary, so no tool can "
+        "be executed in this configuration.",
+        /*is_error=*/true);
+  }
+  const vector<string> argv = BuildToolArgv(
+      kudu_binary_path, *entry, required_args, variadic_args, optional_supplied);
+
+  string child_out;
+  string child_err;
+  int wait_status = 0;
+  bool timed_out = false;
+  const Status run_status = RunToolChild(argv, FLAGS_mcp_tool_timeout_sec,
+                                         &child_out, &child_err, &wait_status,
+                                         &timed_out);
+  if (!run_status.ok()) {
+    // We could not spawn or reap the child at all -- a server-side failure, not
+    // a tool failure. Surface it as a tool error so the loop still survives.
+    return BuildToolResultResponse(
+        id,
+        Substitute("Failed to execute tool '$0': $1", name,
+                   run_status.ToString()),
+        /*is_error=*/true);
+  }
+  const ToolOutcome outcome = InterpretChildOutcome(
+      wait_status, timed_out, FLAGS_mcp_tool_timeout_sec, child_out, child_err);
+  return BuildToolResultResponse(id, outcome.text, outcome.is_error);
+}
+
+// ----------------------------------------------------------------------------
+// JSON-RPC framing + method routing
+// ----------------------------------------------------------------------------
+
+// The result of applying JSON-RPC framing rules to one parsed input line.
+struct ParsedRequest {
+  enum class Kind {
+    kRequest,  // well-formed request; 'id'/'method' are set and need a response
+    kIgnore,   // notification (no id, or "notifications/*"): produce no output
+    kError,    // malformed; 'error_line' holds the response to emit verbatim
+  };
+  Kind kind = Kind::kIgnore;
+  // Borrows from the caller's live JsonReader; valid only when kind==kRequest.
+  const rapidjson::Value* id = nullptr;
+  string method;       // set when kind==kRequest
+  string error_line;   // set when kind==kError
+};
+
+// Classifies an already-parsed JSON value 'root' per JSON-RPC framing rules:
+// a non-object or a request missing 'method' yields kError (with the response
+// line prebuilt); a notification (no 'id', or any "notifications/*" method)
+// yields kIgnore; anything else is a kRequest carrying its id and method. This
+// is pure transport framing -- no MCP method semantics live here.
+ParsedRequest ClassifyRequest(const rapidjson::Value* root) {
+  ParsedRequest req;
+  if (!root->IsObject()) {
+    // Valid JSON, but not a JSON-RPC request object (e.g. a bare number or an
+    // array). We cannot recover an id, so reply with a null-id invalid
+    // request. Batch requests (arrays) are not supported in v1.
+    req.kind = ParsedRequest::Kind::kError;
+    req.error_line = BuildErrorResponse(/*id=*/nullptr, kJsonRpcInvalidRequest,
+                                        "Invalid Request");
+    return req;
+  }
+
+  // The presence of an 'id' member is what distinguishes a request (expects a
+  // response) from a notification (never answered). A null id still counts as
+  // present per JSON-RPC.
+  const bool has_id = root->HasMember("id");
+  const rapidjson::Value* id = has_id ? &(*root)["id"] : nullptr;
+
+  // Extract the method. It must be a string to be usable.
+  const bool has_method =
+      root->HasMember("method") && (*root)["method"].IsString();
+  const string method = has_method ? (*root)["method"].GetString() : string();
+
+  // MCP notifications (method "notifications/*") are one-way: never answered,
+  // regardless of whether an id was (incorrectly) supplied.
+  if (has_method && HasPrefixString(method, "notifications/")) {
+    LOG(INFO) << "mcp: received notification '" << method << "' (no reply)";
+    return req;  // kIgnore
+  }
+
+  // A request without an id is a JSON-RPC notification: produce no output.
+  if (!has_id) {
+    if (has_method) {
+      LOG(INFO) << "mcp: received notification '" << method << "' (no reply)";
+    }
+    return req;  // kIgnore
+  }
+
+  // From here on we have a request that requires a response.
+  if (!has_method) {
+    req.kind = ParsedRequest::Kind::kError;
+    req.error_line = BuildErrorResponse(id, kJsonRpcInvalidRequest,
+                                        "Invalid Request: missing 'method'");
+    return req;
+  }
+
+  req.kind = ParsedRequest::Kind::kRequest;
+  req.id = id;
+  req.method = method;
+  return req;
+}
+
+// Routes a well-formed request to its MCP handler and returns the response
+// line. This is the MCP application layer: unlike ClassifyRequest above, it
+// knows the concrete method names. 'method' is guaranteed non-empty and not a
+// notification.
+string DispatchMethod(const string& method,
+                      const rapidjson::Value* id,
+                      const JsonReader& reader,
+                      const rapidjson::Value* root,
+                      const vector<McpToolEntry>& tools,
+                      const unordered_set<string>& gated_tool_names,
+                      const string& kudu_binary_path) {
+  LOG(INFO) << "mcp: received request method '" << method << "'";
+  if (method == "initialize") {
+    return BuildInitializeResponse(id, NegotiateProtocolVersion(reader, root));
+  }
+  if (method == "tools/list") {
+    return BuildToolsListResponse(id, tools);
+  }
+  if (method == "tools/call") {
+    return HandleToolsCall(reader, root, id, tools, gated_tool_names,
+                           kudu_binary_path);
+  }
+  return BuildErrorResponse(id, kJsonRpcMethodNotFound,
+                            Substitute("Method not found: $0", method));
+}
+
+} // anonymous namespace
+
+// Runs the MCP serve loop over the provided streams: a single-threaded
+// JSON-RPC 2.0 dispatcher implementing the MCP lifecycle.
+//
+// The loop reads newline-delimited JSON from 'in'. For each non-blank line it:
+//   - parses the line with JsonReader; on parse failure it emits a JSON-RPC
+//     parse-error response (-32700) with a null id and continues;
+//   - distinguishes requests (which carry an 'id') from notifications (no 'id',
+//     or any "notifications/*" method): notifications receive no response;
+//   - dispatches requests by method:
+//       * "initialize"  -> protocolVersion / capabilities.tools / serverInfo;
+//       * "tools/list"  -> the surfaced tool registry;
+//       * "tools/call"  -> see HandleToolsCall();
+//       * unknown method -> JSON-RPC -32601 (method not found);
+//       * a request with no method -> JSON-RPC -32600 (invalid request).
+//
+// Every response carries "jsonrpc":"2.0", echoes the request id exactly as
+// sent, and contains EITHER "result" OR "error", never both. Blank lines are
+// ignored. The loop terminates on EOF and returns Status::OK(). It is
+// intentionally single-threaded; stdout carries the protocol only (glog goes to
+// stderr), so 'out' must not be interleaved with other writers.
+//
+// Factored out of the action runner so it can be unit tested against in-memory
+// streams.
+Status RunMcpServeLoop(std::istream& in, std::ostream& out) {
+  // Build the action tree once for this serve session and reflect it into the
+  // exposure registry. The tree must outlive the registry (its entries borrow
+  // from it), so both live for the whole loop.
+  //
+  // The startup invariant: fail loudly and immediately if any reachable CLI
+  // action is not classified in the disposition table (i.e. a new action was
+  // added without a disposition entry), rather than silently mis-handling it.
+  unique_ptr<Mode> root = BuildMcpRootMode();
+  ValidateDispositionCoverageOrDie(root.get());
+  const vector<McpToolEntry> tools =
+      BuildMcpToolRegistry(root.get(), FLAGS_allow_writes);
+
+  // The FULL (ungated) set of GATED tool names, computed once. It lets
+  // HandleToolsCall tell "this tool exists but the write gate is closed" apart
+  // from "no such tool" when a name misses the active (write-gated) registry.
+  // When --allow-writes is set the active registry already contains every GATED
+  // tool, so this set is only ever consulted on the closed-gate path.
+  unordered_set<string> gated_tool_names;
+  for (const auto& e : BuildMcpToolRegistry(root.get(), /*allow_writes=*/true)) {
+    if (e.disposition.disposition == Disposition::GATED) {
+      gated_tool_names.insert(e.tool_name);
+    }
+  }
+
+  // Resolve this server's own 'kudu' binary once. Each tools/call executes its
+  // action in a fresh child of this binary, so a crash (CHECK / LOG(FATAL) /
+  // exit / a failed flag validator) or a runaway action kills only the child and
+  // the serve loop survives. If the binary cannot be located we keep serving:
+  // HandleToolsCall turns an empty path into an isError tool result rather than
+  // taking the server down.
+  string kudu_binary_path;
+  {
+    const Status s = GetKuduToolAbsolutePathSafe(&kudu_binary_path);
+    if (!s.ok()) {
+      LOG(WARNING) << "mcp: could not locate the 'kudu' binary; tool calls will "
+                   << "return an error until this is resolved: " << s.ToString();
+      kudu_binary_path.clear();
+    }
+  }
+
+  string line;
+  while (std::getline(in, line)) {
+    // Ignore blank / whitespace-only lines: nothing to parse, nothing to
+    // answer.
+    if (line.find_first_not_of(" \t\r\n") == string::npos) {
+      continue;
+    }
+
+    JsonReader reader(line);
+    Status s = reader.Init();
+    if (!s.ok()) {
+      // Malformed JSON must not take down a long-lived server. Reply with a
+      // JSON-RPC parse error (null id, since we could not read one) and carry
+      // on with the next line.
+      LOG(WARNING) << "mcp: parse error on JSON-RPC line: " << s.ToString();
+      out << BuildErrorResponse(/*id=*/nullptr, kJsonRpcParseError, "Parse error")
+          << std::endl;
+      continue;
+    }
+
+    // Framing: classify the parsed line as a request needing a response, an
+    // ignorable notification, or a malformed line with a ready-to-emit error.
+    // Method-specific handling stays out of the loop (see DispatchMethod).
+    const rapidjson::Value* root = reader.root();
+    ParsedRequest req = ClassifyRequest(root);
+    switch (req.kind) {
+      case ParsedRequest::Kind::kIgnore:
+        continue;
+      case ParsedRequest::Kind::kError:
+        out << req.error_line << std::endl;
+        continue;
+      case ParsedRequest::Kind::kRequest:
+        out << DispatchMethod(req.method, req.id, reader, root, tools,
+                              gated_tool_names, kudu_binary_path)
+            << std::endl;
+        continue;
+    }
+  }
+
+  // getline stopped: either EOF or a stream error. Both terminate the server
+  // cleanly.
+  return Status::OK();
+}
+
+namespace {
+
+Status RunMcpServe(const RunnerContext& /*context*/) {
+  return RunMcpServeLoop(std::cin, std::cout);
+}
+
+} // anonymous namespace
+
+std::unique_ptr<Mode> BuildMcpMode() {
+  std::unique_ptr<Action> serve =
+      ActionBuilder("serve", &RunMcpServe)
+      .Description("Serve Kudu admin actions as MCP tools over stdio")
+      .McpDisposition(Disposition::REJECT)
+      .ExtraDescription("Reads newline-delimited JSON-RPC requests from stdin "
+                        "and writes responses to stdout, one line per request, "
+                        "until EOF. Intended to be launched by an MCP host.")
+      .AddOptionalParameter("allow_writes")
+      // The serve-level master addresses. Injected into tools/call dispatch for
+      // actions that need them, so the addresses never appear in the
+      // conversation.
+      .AddOptionalParameter("master_addresses")
+      .Build();
+
+  return ModeBuilder("mcp")
+      .Description("Operate as a Model Context Protocol (MCP) server")
+      .AddAction(std::move(serve))
+      .Build();
+}
+
+} // namespace tools
+} // namespace kudu

@@ -1,0 +1,222 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+= Kudu MCP Server
+
+:author: Kudu Team
+:imagesdir: ./images
+:icons: font
+:toc: left
+:toclevels: 3
+:doctype: book
+:backend: html5
+:sectlinks:
+:experimental:
+
+include::top.adoc[tags=version]
+
+[[kudu_mcp]]
+== Overview
+
+The Kudu MCP server exposes the `kudu` command-line tool to an AI agent as a
+set of callable tools over the
+link:https://modelcontextprotocol.io/[Model Context Protocol] (MCP). It lets an
+MCP-aware host (a chat client, an IDE assistant, an agent framework) inspect and
+operate a Kudu cluster in natural language, without the operator hand-typing CLI
+commands.
+
+The server speaks JSON-RPC 2.0 over stdio: it reads one request per line from
+stdin and writes one response per line to stdout. It is meant to be launched as
+a child process by an MCP host, not run interactively.
+
+There is no separate tool catalog to maintain. At startup the server rebuilds
+the full `kudu` action tree and reflects each eligible action into an MCP tool,
+deriving the tool name, description, and input schema from the action's own
+flags and arguments. New CLI actions become available automatically once they
+are classified (see <<disposition,Tool exposure>>).
+
+== Starting the server
+
+[source,bash]
+----
+kudu mcp serve --master_addresses=master-1:7051,master-2:7051,master-3:7051
+----
+
+By default only read-only tools are exposed. To also expose mutating tools, add
+`--allow_writes` (see <<knobs,Configuration knobs>>).
+
+The `master_addresses` you pass at launch are remembered for the whole session
+and injected into every tool call that needs them, so the cluster address never
+has to appear in the conversation and the agent cannot point a tool at a
+different cluster.
+
+== Connecting an MCP client
+
+Register the server with your MCP host as a stdio command. The exact
+configuration format depends on the host; the shape is always a command plus
+arguments, for example:
+
+[source,json]
+----
+{
+  "mcpServers": {
+    "kudu": {
+      "command": "kudu",
+      "args": [
+        "mcp", "serve",
+        "--master_addresses=master-1:7051,master-2:7051,master-3:7051"
+      ]
+    }
+  }
+}
+----
+
+The host performs the MCP `initialize` handshake, then calls `tools/list` to
+discover the available tools and `tools/call` to run one. The server advertises
+only the `tools` capability (no resources or prompts).
+
+[[disposition]]
+== Tool exposure
+
+Not every CLI action is safe to hand to an agent. Each action carries a safety
+classification that decides whether -- and how -- it is surfaced:
+
+[cols="1,4",options="header"]
+|===
+| Classification | Behavior
+
+| `SURFACE`
+| Read-only. Always exposed. Actions that read only the local node's on-disk
+  data (the `fs` / `wal` / `pbc` / `local_replica` families) are still exposed
+  but tagged in their description as reflecting only the node the server runs on.
+
+| `GATED`
+| Cluster mutation. Hidden unless the server was started with `--allow_writes`.
+  When exposed, the tool is annotated as destructive so the host can prompt for
+  confirmation, and it accepts a `dry_run` argument (see below).
+
+| `REJECT`
+| Long-running or non-returning actions (admin operations, daemon launchers)
+  that would freeze the single-threaded serve loop. Never surfaced. The `serve`
+  action itself is `REJECT` so the server cannot re-expose itself.
+
+| `EXCLUDE`
+| Interactive (drives an editor or stdin) or node-local mutating actions. Never
+  surfaced.
+|===
+
+Coverage is enforced at startup: if any reachable action lacks a classification
+the server refuses to start, so a newly added CLI action can never be
+surfaced by accident.
+
+[[node_local]]
+=== Node-local tools and where to run the server
+
+Most tools talk to the cluster over RPC using the injected `master_addresses`,
+so it does not matter which host the server runs on -- register it wherever your
+MCP host lives.
+
+Node-local tools are the exception. Actions in the `fs`, `wal`, `pbc`, and
+`local_replica` families read the on-disk data (WAL, data directories,
+protobuf-container metadata) of the *single machine the server process runs on*,
+not the cluster. Their results are only meaningful when the server is co-located
+with that node's data. If you want to inspect a specific tablet server's or
+master's local storage, register and launch a `kudu mcp serve` instance *on that
+node* (pointed at its `--fs_wal_dir` / `--fs_data_dirs` as those actions
+require), and treat it as a separate MCP server from any cluster-wide one. To
+make this hard to miss, node-local tools carry a note in their description
+saying they reflect only the local node.
+
+=== Read-only vs. write annotations
+
+Every tool reports MCP `annotations` describing its behavior. `SURFACE` tools
+set `readOnlyHint: true`; `GATED` tools set `readOnlyHint: false` and
+`destructiveHint: true`. Hosts use these hints to decide when to ask the user
+before running a tool.
+
+=== Dry run for mutating tools
+
+Every `GATED` tool accepts a synthetic boolean `dry_run` argument. When
+`dry_run` is `true`, the server validates all arguments but does *not* execute
+anything -- instead it returns the exact, copy-pasteable `kudu` command line
+that would have run. This lets an agent (or a human reviewing the agent) preview
+a mutation before allowing it. `dry_run` is an MCP-level control, not a real
+CLI flag, and only appears on `GATED` tools.
+
+== How a tool call runs
+
+Each `tools/call` is executed in a fresh child `kudu` process rather than
+in-process. This is deliberate:
+
+* *Crash isolation.* A CLI action written for the run-once world may `CHECK`,
+  `LOG(FATAL)`, or `exit()` on bad state. In a child process that only kills the
+  child; the server reaps it, turns the failure into a tool error, and keeps
+  serving.
+* *Timeout.* Each child is bounded by `--mcp_tool_timeout_sec`. If it runs
+  longer it is killed and the call returns a tool error, so a wedged action can
+  never hang the serve loop.
+* *Injection safety.* Argument values are passed after a `--` end-of-flags
+  sentinel, so a value that looks like a flag (for example a table named
+  `--flagfile=...`) is always treated as data, never as a child flag.
+
+A clean exit (code 0) returns the child's stdout as the tool result. Any other
+outcome -- non-zero exit, death by signal, or timeout -- is returned as a tool
+error (`isError: true`) carrying the child's diagnostics. Note that a failed
+tool is still a successful JSON-RPC response; only protocol problems (bad
+params, unknown tool) produce a JSON-RPC error.
+
+[[knobs]]
+== Configuration knobs
+
+These flags are set once on the `kudu mcp serve` command line and apply to the
+whole session. They are never exposed as tool arguments -- an agent cannot flip
+them per call.
+
+[cols="1,1,4",options="header"]
+|===
+| Flag | Default | Description
+
+| `--master_addresses`
+| (none)
+| Comma-separated master addresses for the cluster the server operates on.
+  Injected into every tool call that needs a cluster connection. If unset,
+  cluster tools return an error asking for it.
+
+| `--allow_writes`
+| `false`
+| When `false`, only read-only (`SURFACE`) tools are surfaced. Set to `true` to
+  additionally surface mutating (`GATED`) tools. A `GATED` tool called while the
+  gate is closed returns an explicit error saying the server must be restarted
+  with `--allow_writes`.
+
+| `--mcp_tool_timeout_sec`
+| `60`
+| Maximum wall-clock seconds a single tool invocation (child `kudu` process) may
+  run before it is killed and the call returns a tool error.
+|===
+
+== Notes and limitations
+
+* The server is single-threaded and handles one request at a time. Stdout
+  carries only the JSON-RPC protocol; all logging goes to stderr.
+* Batch JSON-RPC requests are not supported.
+* Protocol versions `2024-11-05`, `2025-03-26`, and `2025-06-18` are supported;
+  the server negotiates the client's requested version when it is one of these
+  and otherwise falls back to its default (`2025-06-18`).
+* The set of tools is fixed for the lifetime of a serve session (it reflects the
+  action tree and the `--allow_writes` setting at launch); restart the server to
+  change it.

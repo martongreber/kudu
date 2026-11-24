@@ -350,9 +350,8 @@ Status Info(const RunnerContext& context) {
 
 unique_ptr<Mode> BuildTabletMode() {
   unique_ptr<Action> add_replica =
-      ClusterActionBuilder("add_replica", &AddReplica)
+      ClusterActionBuilder("add_replica", &AddReplica, Disposition::Gated())
       .Description("Add a new replica to a tablet's Raft configuration")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddRequiredParameter({ kTsUuidArg,
                               "UUID of the tablet server that should host the new replica" })
@@ -362,10 +361,9 @@ unique_ptr<Mode> BuildTabletMode() {
       .Build();
 
   unique_ptr<Action> change_replica_type =
-      ClusterActionBuilder("change_replica_type", &ChangeReplicaType)
+      ClusterActionBuilder("change_replica_type", &ChangeReplicaType, Disposition::Gated())
       .Description(
           "Change the type of an existing replica in a tablet's Raft configuration")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddRequiredParameter({ kTsUuidArg,
                               "UUID of the tablet server hosting the existing replica" })
@@ -375,9 +373,8 @@ unique_ptr<Mode> BuildTabletMode() {
       .Build();
 
   unique_ptr<Action> remove_replica =
-      ClusterActionBuilder("remove_replica", &RemoveReplica)
+      ClusterActionBuilder("remove_replica", &RemoveReplica, Disposition::Gated())
       .Description("Remove an existing replica from a tablet's Raft configuration")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddRequiredParameter({ kTsUuidArg,
                               "UUID of the tablet server hosting the existing replica" })
@@ -391,10 +388,10 @@ unique_ptr<Mode> BuildTabletMode() {
       "the copy succeeds, use remove_replica manually. If the copy fails, the "
       "new replica will be deleted automatically after some time, and then the "
       "move can be retried.";
+  // Excluded from MCP: blocks until the replica movement completes.
   unique_ptr<Action> move_replica =
-      ClusterActionBuilder("move_replica", &MoveReplica)
+      ClusterActionBuilder("move_replica", &MoveReplica, Disposition::Exclude())
       .Description("Move a tablet replica from one tablet server to another")
-      .McpDisposition(Disposition::REJECT)
       .ExtraDescription(move_extra_desc)
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddRequiredParameter({ kFromTsUuidArg, "UUID of the tablet server to move from" })
@@ -402,9 +399,8 @@ unique_ptr<Mode> BuildTabletMode() {
       .Build();
 
   unique_ptr<Action> leader_step_down =
-      ClusterActionBuilder("leader_step_down", &LeaderStepDown)
+      ClusterActionBuilder("leader_step_down", &LeaderStepDown, Disposition::Gated())
       .Description("Change the tablet's leader")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddOptionalParameter("abrupt")
       .AddOptionalParameter("new_leader_uuid")
@@ -420,11 +416,11 @@ unique_ptr<Mode> BuildTabletMode() {
       .AddAction(std::move(remove_replica))
       .Build();
 
+  // Excluded from MCP: an unsafe last-resort recovery operation that discards
+  // the tablet's data; it is for an operator, not an agent.
   unique_ptr<Action> replace_tablet =
-      ClusterActionBuilder("unsafe_replace_tablet", &ReplaceTablet)
+      ClusterActionBuilder("unsafe_replace_tablet", &ReplaceTablet, Disposition::Exclude())
       .Description("Replace a tablet with an empty one, deleting the previous tablet.")
-      .McpDisposition(Disposition::GATED)
-      .McpUnsafe()
       .ExtraDescription("Use this tool to repair a table when one of its tablets has permanently "
                         "lost all of its replicas. It replaces the unrecoverable tablet with a new "
                         "empty one representing the same partition. Its primary use is to jettison "
@@ -437,10 +433,9 @@ unique_ptr<Mode> BuildTabletMode() {
       .Build();
 
   unique_ptr<Action> info =
-      ClusterActionBuilder("info", &Info)
+      ClusterActionBuilder("info", &Info, Disposition::SurfaceMetadata())
       .Description("Show information of the table which the tablets blongs to "
                    "and where the tablets replicas are located.")
-      .McpDisposition(Disposition::SURFACE)
       .AddRequiredParameter({ kTabletIdsCsvArg, kTabletIdsCsvArgDesc })
       .AddOptionalParameter("format")
       .Build();

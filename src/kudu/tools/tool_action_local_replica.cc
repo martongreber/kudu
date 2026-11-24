@@ -1293,10 +1293,8 @@ Status DumpDataDirs(const RunnerContext& context) {
 
 unique_ptr<Mode> BuildDumpMode() {
   unique_ptr<Action> dump_block_ids =
-      ActionBuilder("block_ids", &DumpBlockIdsForLocalReplica)
+      ActionBuilder("block_ids", &DumpBlockIdsForLocalReplica, Disposition::SurfaceMetadata())
       .Description("Dump the IDs of all blocks belonging to a local replica")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")
@@ -1304,10 +1302,8 @@ unique_ptr<Mode> BuildDumpMode() {
       .Build();
 
   unique_ptr<Action> dump_data_dirs =
-      ActionBuilder("data_dirs", &DumpDataDirs)
+      ActionBuilder("data_dirs", &DumpDataDirs, Disposition::SurfaceMetadata())
       .Description("Dump the data directories where the replica's data is stored")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")
@@ -1315,10 +1311,8 @@ unique_ptr<Mode> BuildDumpMode() {
       .Build();
 
   unique_ptr<Action> dump_meta =
-      ActionBuilder("meta", &DumpMeta)
+      ActionBuilder("meta", &DumpMeta, Disposition::SurfaceMetadata())
       .Description("Dump the metadata of a local replica")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")
@@ -1326,11 +1320,8 @@ unique_ptr<Mode> BuildDumpMode() {
       .Build();
 
   unique_ptr<Action> dump_rowset =
-      ActionBuilder("rowset", &DumpRowSet)
+      ActionBuilder("rowset", &DumpRowSet, Disposition::SurfaceUserData())
       .Description("Dump the rowset contents of a local replica")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
-      .McpUserData()
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddOptionalParameter("dump_all_columns")
       .AddOptionalParameter("dump_metadata")
@@ -1344,12 +1335,9 @@ unique_ptr<Mode> BuildDumpMode() {
       .Build();
 
   unique_ptr<Action> dump_wals =
-      ActionBuilder("wals", &DumpWals)
+      ActionBuilder("wals", &DumpWals, Disposition::SurfaceUserData())
       .Description("Dump all WAL (write-ahead log) segments of "
         "a local replica")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
-      .McpUserData()
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")
@@ -1371,11 +1359,9 @@ unique_ptr<Mode> BuildDumpMode() {
 
 unique_ptr<Mode> BuildLocalReplicaMode() {
   unique_ptr<Action> print_replica_uuids =
-      ActionBuilder("print_replica_uuids", &PrintReplicaUuids)
+      ActionBuilder("print_replica_uuids", &PrintReplicaUuids, Disposition::SurfaceMetadata())
       .Description("Print all tablet replica peer UUIDs found in a "
                    "tablet's Raft configuration")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddRequiredParameter({ kTabletIdsCsvArg, kTabletIdsCsvArgDesc })
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")
@@ -1383,11 +1369,8 @@ unique_ptr<Mode> BuildLocalReplicaMode() {
       .Build();
 
   unique_ptr<Action> rewrite_raft_config =
-      ActionBuilder("rewrite_raft_config", &RewriteRaftConfig)
+      ActionBuilder("rewrite_raft_config", &RewriteRaftConfig, Disposition::Exclude())
       .Description("Rewrite a tablet replica's Raft configuration")
-      .McpDisposition(Disposition::EXCLUDE)
-      .McpNodeLocal()
-      .McpUnsafe()
       .AddRequiredParameter({ kTabletIdsCsvArg, kTabletIdsCsvArgDesc })
       .AddRequiredVariadicParameter({ kRaftPeersArg, kRaftPeersArgDesc })
       .AddOptionalParameter("fs_data_dirs")
@@ -1396,11 +1379,8 @@ unique_ptr<Mode> BuildLocalReplicaMode() {
       .Build();
 
   unique_ptr<Action> set_term =
-      ActionBuilder("set_term", &SetRaftTerm)
+      ActionBuilder("set_term", &SetRaftTerm, Disposition::Exclude())
       .Description("Bump the current term stored in consensus metadata")
-      .McpDisposition(Disposition::EXCLUDE)
-      .McpNodeLocal()
-      .McpUnsafe()
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddRequiredParameter({ kTermArg,
                               "the new raft term (must be greater "
@@ -1411,10 +1391,8 @@ unique_ptr<Mode> BuildLocalReplicaMode() {
       .Build();
 
   unique_ptr<Action> delete_rowsets =
-      ActionBuilder("delete_rowsets", &DeleteRowsets)
+      ActionBuilder("delete_rowsets", &DeleteRowsets, Disposition::Exclude())
           .Description("Delete rowsets from a local replica.")
-          .McpDisposition(Disposition::EXCLUDE)
-          .McpNodeLocal()
           .ExtraDescription("The common usage pattern of this tool is described below.\n"
               "That involves checking the result by a dry run of the tablet server with the "
               "modified tablet's data after running the tool. It's crucial to customize tablet "
@@ -1444,11 +1422,8 @@ unique_ptr<Mode> BuildLocalReplicaMode() {
           .Build();
 
   unique_ptr<Action> unsafe_recreate =
-      ActionBuilder("unsafe_recreate", &UnsafeRecreateCmeta)
+      ActionBuilder("unsafe_recreate", &UnsafeRecreateCmeta, Disposition::Exclude())
       .Description("Rewrite the consensus metadata based on the provided arguments")
-      .McpDisposition(Disposition::EXCLUDE)
-      .McpNodeLocal()
-      .McpUnsafe()
       .AddRequiredParameter({kTabletIdArg, kTabletIdArgDesc})
       .AddRequiredParameter({"term", "Raft term"})
       .AddRequiredParameter({"index", "OpId index"})
@@ -1476,10 +1451,8 @@ unique_ptr<Mode> BuildLocalReplicaMode() {
       .Build();
 
   unique_ptr<Action> copy_from_remote =
-      ActionBuilder("copy_from_remote", &CopyFromRemote)
+      ActionBuilder("copy_from_remote", &CopyFromRemote, Disposition::Exclude())
       .Description("Copy tablet replicas from a remote server")
-      .McpDisposition(Disposition::EXCLUDE)
-      .McpNodeLocal()
       .AddRequiredParameter({ kTabletIdsCsvArg, kTabletIdsCsvArgDesc })
       .AddRequiredParameter({ "source", "Source RPC address of "
                               "form hostname:port" })
@@ -1494,12 +1467,10 @@ unique_ptr<Mode> BuildLocalReplicaMode() {
       .Build();
 
   unique_ptr<Action> copy_from_local =
-      ActionBuilder("copy_from_local", &CopyFromLocal)
+      ActionBuilder("copy_from_local", &CopyFromLocal, Disposition::Exclude())
       .Description("Copy tablet replicas from local filesystem. Before using this tool, you "
           "MUST stop the master/tserver you want to copy from, and make sure --src_*_dir(s) and "
           "--dst_*_dir(s) are exactly what whey should be.")
-      .McpDisposition(Disposition::EXCLUDE)
-      .McpNodeLocal()
       .AddRequiredParameter({ kTabletIdsCsvArg, kTabletIdsCsvArgDesc })
       .AddOptionalParameter("src_fs_wal_dir")
       .AddOptionalParameter("src_fs_metadata_dir")
@@ -1511,10 +1482,8 @@ unique_ptr<Mode> BuildLocalReplicaMode() {
       .Build();
 
   unique_ptr<Action> list =
-      ActionBuilder("list", &ListLocalReplicas)
+      ActionBuilder("list", &ListLocalReplicas, Disposition::SurfaceMetadata())
       .Description("Show list of tablet replicas in the local filesystem")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")
       .AddOptionalParameter("fs_wal_dir")
@@ -1522,11 +1491,9 @@ unique_ptr<Mode> BuildLocalReplicaMode() {
       .Build();
 
   unique_ptr<Action> delete_local_replica =
-      ActionBuilder("delete", &DeleteLocalReplicas)
+      ActionBuilder("delete", &DeleteLocalReplicas, Disposition::Exclude())
       .Description("Delete tablet replicas from the local filesystem. "
           "By default, leaves a tombstone record upon replica removal.")
-      .McpDisposition(Disposition::EXCLUDE)
-      .McpNodeLocal()
       .AddRequiredParameter({ kTabletIdsGlobArg, kTabletIdsGlobArgDesc })
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")
@@ -1537,10 +1504,8 @@ unique_ptr<Mode> BuildLocalReplicaMode() {
       .Build();
 
   unique_ptr<Action> data_size =
-      ActionBuilder("data_size", &SummarizeDataSize)
+      ActionBuilder("data_size", &SummarizeDataSize, Disposition::SurfaceMetadata())
       .Description("Summarize the data size/space usage of the given local replica(s).")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddRequiredParameter({ kTabletIdGlobArg, kTabletIdGlobArgDesc })
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")

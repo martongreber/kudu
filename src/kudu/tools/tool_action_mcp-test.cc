@@ -158,7 +158,6 @@ class ScopedAllowWrites {
 struct VisitedAction {
   string tool_name;
   const Action* action;
-  DispositionInfo info;
 };
 
 // Collects every action of the tree rooted at 'root' via the shared
@@ -170,7 +169,7 @@ vector<VisitedAction> CollectActions(const Mode* root) {
                                   const Action* action) {
     string name = DispositionCommandPath(chain, action);
     std::replace(name.begin(), name.end(), ' ', '_');
-    out.push_back({ std::move(name), action, DispositionFor(action) });
+    out.push_back({ std::move(name), action });
     return Status::OK();
   }));
   return out;
@@ -205,6 +204,26 @@ const rapidjson::Value* FindToolSchema(const JsonReader& reader,
     }
   }
   return nullptr;
+}
+
+// Sets 'description' to the description of tool 'tool_name' from a tools/list
+// response line owned by 'reader'. Returns false if the tool is absent.
+bool FindToolDescription(const JsonReader& reader,
+                         const string& tool_name,
+                         string* description) {
+  const rapidjson::Value* result = nullptr;
+  CHECK_OK(reader.ExtractObject(reader.root(), "result", &result));
+  vector<const rapidjson::Value*> tools;
+  CHECK_OK(reader.ExtractObjectArray(result, "tools", &tools));
+  for (const auto* t : tools) {
+    string n;
+    CHECK_OK(reader.ExtractString(t, "name", &n));
+    if (n == tool_name) {
+      CHECK_OK(reader.ExtractString(t, "description", description));
+      return true;
+    }
+  }
+  return false;
 }
 
 } // anonymous namespace
@@ -510,18 +529,23 @@ TEST(ToolActionMcpTest, GatedToolsAppearOnlyWithAllowWritesAndAreTagged) {
   ASSERT_TRUE(destructive) << "GATED tool must be destructive-hinted: " << line;
 }
 
-// Bad path: REJECT (cluster_rebalance) and EXCLUDE (pbc_edit) tools NEVER
-// appear, in either the default mode or with --mcp_allow_writes.
-TEST(ToolActionMcpTest, RejectAndExcludeToolsNeverAppear) {
-  for (bool allow_writes : {false, true}) {
-    const vector<string> names = ToolNames(RunToolsList(allow_writes));
-    ASSERT_FALSE(Contains(names, "cluster_rebalance"))
-        << "REJECT tool leaked (allow_writes=" << allow_writes << ")";
-    ASSERT_FALSE(Contains(names, "pbc_edit"))
-        << "EXCLUDE tool leaked (allow_writes=" << allow_writes << ")";
-    // The MCP server's own blocking 'serve' action (REJECT) must not appear.
-    ASSERT_FALSE(Contains(names, "mcp_serve"))
-        << "mcp_serve leaked (allow_writes=" << allow_writes << ")";
+// Bad path: EXCLUDE tools -- blocking (cluster_rebalance), interactive
+// (pbc_edit), unsafe recovery (tablet_unsafe_replace_tablet,
+// remote_replica_unsafe_change_config) -- NEVER appear, in either the default
+// mode or with every gate open.
+TEST(ToolActionMcpTest, ExcludedToolsNeverAppear) {
+  for (bool allow : {false, true}) {
+    const vector<string> names = ToolNames(
+        RunToolsList(/*allow_writes=*/allow, /*allow_data_reads=*/allow));
+    for (const char* tool : {"cluster_rebalance",
+                             "pbc_edit",
+                             "tablet_unsafe_replace_tablet",
+                             "remote_replica_unsafe_change_config",
+                             // The MCP server's own blocking 'serve' action.
+                             "mcp_serve"}) {
+      ASSERT_FALSE(Contains(names, tool))
+          << "EXCLUDE tool '" << tool << "' leaked (gates open=" << allow << ")";
+    }
   }
 }
 
@@ -942,16 +966,15 @@ TEST(ToolActionMcpTest, DryRunLeavesOptionalFlagStateUnchanged) {
 }
 
 // ---------------------------------------------------------------------------
-// No REJECT / EXCLUDE action is ever exposed (exhaustive tree walk)
+// No EXCLUDE action is ever exposed (exhaustive tree walk)
 // ---------------------------------------------------------------------------
 
-// The RejectAndExcludeToolsNeverAppear test above checks three hand-picked
-// names. This is the exhaustive form: walk the REAL action tree, and for EVERY
-// action classified REJECT or EXCLUDE assert its MCP tool name is absent from
-// tools/list in BOTH write modes. A newly added blocking or interactive action
-// that is mistakenly surfaced fails here without needing a bespoke per-name
-// assertion.
-TEST(ToolActionMcpTest, NoRejectOrExcludeActionIsEverExposed) {
+// The ExcludedToolsNeverAppear test above checks a few hand-picked names. This
+// is the exhaustive form: walk the REAL action tree, and for EVERY action
+// classified EXCLUDE assert its MCP tool name is absent from tools/list in BOTH
+// write modes. A newly added blocking or interactive action that is mistakenly
+// surfaced fails here without needing a bespoke per-name assertion.
+TEST(ToolActionMcpTest, NoExcludedActionIsEverExposed) {
   unique_ptr<Mode> root = BuildRootMode("kudu");
 
   // The set of names the server actually surfaces, in each write mode.
@@ -965,36 +988,29 @@ TEST(ToolActionMcpTest, NoRejectOrExcludeActionIsEverExposed) {
     return unordered_set<string>(n.begin(), n.end());
   }();
 
-  int reject_or_exclude_seen = 0;
+  int excluded_seen = 0;
   for (const auto& v : CollectActions(root.get())) {
-    const DispositionInfo& info = v.info;
-    ASSERT_TRUE(info.classified)
-        << "unclassified action leaked into the tree: " << v.tool_name;
-    if (info.disposition != Disposition::REJECT &&
-        info.disposition != Disposition::EXCLUDE) {
+    if (v.action->mcp_disposition().kind() != Disposition::Kind::EXCLUDE) {
       continue;
     }
-    ++reject_or_exclude_seen;
+    ++excluded_seen;
     const string& tool = v.tool_name;
     ASSERT_EQ(0, surfaced_closed.count(tool))
-        << DispositionToString(info.disposition) << " action '" << tool
-        << "' is surfaced without --mcp_allow_writes";
+        << "EXCLUDE action '" << tool << "' is surfaced without --mcp_allow_writes";
     ASSERT_EQ(0, surfaced_open.count(tool))
-        << DispositionToString(info.disposition) << " action '" << tool
-        << "' is surfaced with --mcp_allow_writes";
+        << "EXCLUDE action '" << tool << "' is surfaced with --mcp_allow_writes";
   }
 
-  // Sanity: the tree really did contain REJECT/EXCLUDE actions, so the walk
-  // above was not vacuously green.
-  ASSERT_GT(reject_or_exclude_seen, 0)
-      << "expected the action tree to contain REJECT/EXCLUDE actions";
+  // Sanity: the tree really did contain EXCLUDE actions, so the walk above was
+  // not vacuously green.
+  ASSERT_GT(excluded_seen, 0) << "expected the action tree to contain EXCLUDE actions";
 }
 
-// Dispatch side: calling a REJECT (cluster_rebalance) or an EXCLUDE
-// (pbc_edit) tool by name is refused server-side -- it is not in the registry
+// Dispatch side: calling an EXCLUDE tool (cluster_rebalance, pbc_edit) by name
+// is refused server-side -- it is not in the registry
 // in either write mode, so tools/call returns -32602 (unknown tool), never a
 // tool result that would run it.
-TEST(ToolActionMcpTest, ToolsCallRejectOrExcludeToolIsRefused) {
+TEST(ToolActionMcpTest, ToolsCallExcludedToolIsRefused) {
   for (bool allow_writes : {false, true}) {
     ScopedAllowWrites allow(allow_writes);
     for (const char* tool : {"cluster_rebalance", "pbc_edit"}) {
@@ -1034,10 +1050,7 @@ TEST(ToolActionMcpTest, NoSurfacedToolExposesUnsafeOrExperimentalFlag) {
 
   int checked = 0;
   for (const auto& v : CollectActions(root.get())) {
-    const DispositionInfo& info = v.info;
-    ASSERT_TRUE(info.classified);
-    if (info.disposition != Disposition::SURFACE &&
-        info.disposition != Disposition::GATED) {
+    if (v.action->mcp_disposition().kind() == Disposition::Kind::EXCLUDE) {
       continue;
     }
     ++checked;
@@ -1278,6 +1291,37 @@ TEST(ToolActionMcpTest, UserDataToolsRequireAllowDataReads) {
   const string message = ErrorMessageOf(line);
   ASSERT_STR_CONTAINS(message, "--mcp_allow_data_reads");
   ASSERT_STR_NOT_CONTAINS(message, "--mcp_allow_writes");
+}
+
+// The description of a SURFACE tool notes when it reflects only the local node
+// (its scope, derived from the builder type, is NODE_LOCAL) and when it returns
+// row-level user data. Cluster-scoped metadata reads carry neither note.
+TEST(ToolActionMcpTest, DescriptionNotesNodeLocalScopeAndUserData) {
+  const char* const kNodeLocalNote = "reflects only the local node";
+  const char* const kUserDataNote = "unredacted row-level user data";
+  const string line = RunToolsList(/*allow_writes=*/false, /*allow_data_reads=*/true);
+  JsonReader reader(line);
+  ASSERT_OK(reader.Init());
+
+  struct Expected {
+    const char* tool;
+    bool node_local;
+    bool user_data;
+  };
+  for (const auto& e : vector<Expected>{
+           { "cluster_ksck", false, false },
+           { "fs_list", true, false },
+           { "table_scan", false, true },
+           { "wal_dump", true, true },
+       }) {
+    SCOPED_TRACE(e.tool);
+    string description;
+    ASSERT_TRUE(FindToolDescription(reader, e.tool, &description)) << line;
+    ASSERT_EQ(e.node_local, description.find(kNodeLocalNote) != string::npos)
+        << description;
+    ASSERT_EQ(e.user_data, description.find(kUserDataNote) != string::npos)
+        << description;
+  }
 }
 
 // ---------------------------------------------------------------------------

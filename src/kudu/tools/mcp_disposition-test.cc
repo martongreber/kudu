@@ -22,24 +22,52 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/strings/join.h"
-#include "kudu/gutil/strings/substitute.h"
 #include "kudu/tools/tool_action.h"
+#include "kudu/tools/tool_action_common.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 
 using std::string;
 using std::unique_ptr;
 using std::vector;
-using strings::Substitute;
 
 namespace kudu {
 namespace tools {
+
+// Every CLI action must be classified for the MCP server, and that is enforced
+// at compile time: the disposition is a required constructor argument of every
+// action builder, so a builder cannot be created from just a name and a runner.
+static_assert(!std::is_constructible_v<ActionBuilder, string, ActionRunner>);
+static_assert(!std::is_constructible_v<RpcActionBuilder, string, ActionRunner>);
+static_assert(!std::is_constructible_v<ClusterActionBuilder, string, ActionRunner>);
+static_assert(!std::is_constructible_v<MasterActionBuilder, string, ActionRunner>);
+static_assert(!std::is_constructible_v<TServerActionBuilder, string, ActionRunner>);
+static_assert(std::is_constructible_v<ActionBuilder, string, ActionRunner, Disposition>);
+// The scope is derived from the builder type, not passed by hand: the
+// constructor that takes one is not public.
+static_assert(
+    !std::is_constructible_v<ActionBuilder, string, ActionRunner, Disposition, McpScope>);
+
+// A Disposition can only come from its factories: there is no default
+// (unclassified) value.
+static_assert(!std::is_default_constructible_v<Disposition>);
+
+// The factories set the expected kind and user-data tag.
+static_assert(Disposition::SurfaceMetadata().kind() == Disposition::Kind::SURFACE);
+static_assert(!Disposition::SurfaceMetadata().user_data());
+static_assert(Disposition::SurfaceUserData().kind() == Disposition::Kind::SURFACE);
+static_assert(Disposition::SurfaceUserData().user_data());
+static_assert(Disposition::Gated().kind() == Disposition::Kind::GATED);
+static_assert(!Disposition::Gated().user_data());
+static_assert(Disposition::Exclude().kind() == Disposition::Kind::EXCLUDE);
+static_assert(!Disposition::Exclude().user_data());
 
 namespace {
 
@@ -48,15 +76,15 @@ Status NoOpRunner(const RunnerContext& /*context*/) {
   return Status::OK();
 }
 
-unique_ptr<Action> MakeAction(const string& name) {
-  return ActionBuilder(name, &NoOpRunner)
+unique_ptr<Action> MakeAction(const string& name, Disposition d) {
+  return ActionBuilder(name, &NoOpRunner, d)
       .Description("synthetic test action")
       .Build();
 }
 
 // Resolves a command path (e.g. {"tserver", "quiesce", "status"}) against
-// 'root', returning the mode chain (root..parent) and the leaf action. CHECKs
-// if the path cannot be resolved.
+// 'root', returning the mode chain (root..parent) and the leaf action. Records
+// a fatal failure if the path cannot be resolved.
 void ResolvePath(const Mode* root,
                  const vector<string>& path,
                  vector<Mode*>* chain,
@@ -90,135 +118,101 @@ void ResolvePath(const Mode* root,
   *action = found;
 }
 
-// Convenience: resolve 'path' against 'root' and return its disposition.
-DispositionInfo Lookup(const Mode* root, const vector<string>& path) {
+// Resolves 'path' against 'root' and checks its classification. Call it under
+// ASSERT_NO_FATAL_FAILURE().
+void CheckAction(const Mode* root,
+                 const vector<string>& path,
+                 Disposition::Kind kind,
+                 McpScope scope,
+                 bool user_data = false) {
+  SCOPED_TRACE(JoinStrings(path, " "));
   vector<Mode*> chain;
   const Action* action = nullptr;
-  ResolvePath(root, path, &chain, &action);
-  // A fatal assertion in ResolvePath() only returns from it, not the caller, so
-  // guard the null 'action' rather than dereferencing it in DispositionFor().
-  // The recorded failure fails the test; otherwise the binary would SIGSEGV.
-  if (action == nullptr) {
-    return DispositionInfo();
-  }
-  return DispositionFor(action);
+  ASSERT_NO_FATAL_FAILURE(ResolvePath(root, path, &chain, &action));
+  const Disposition d = action->mcp_disposition();
+  ASSERT_EQ(DispositionKindToString(kind), DispositionKindToString(d.kind()));
+  ASSERT_EQ(scope, action->mcp_scope());
+  ASSERT_EQ(user_data, d.user_data());
 }
+
+constexpr auto kSurface = Disposition::Kind::SURFACE;
+constexpr auto kGated = Disposition::Kind::GATED;
+constexpr auto kExclude = Disposition::Kind::EXCLUDE;
+constexpr auto kCluster = McpScope::CLUSTER;
+constexpr auto kNodeLocal = McpScope::NODE_LOCAL;
 
 } // anonymous namespace
 
-// ---------------------------------------------------------------------------
-// Happy path: a representative action of each disposition class resolves to the
-// expected classification and flags against the real action tree.
-// ---------------------------------------------------------------------------
-TEST(McpDispositionTest, RepresentativeActionsOfEachClass) {
+// A representative action of each disposition kind resolves to the expected
+// classification against the real action tree.
+TEST(McpDispositionTest, RepresentativeActionsOfEachKind) {
   unique_ptr<Mode> root = BuildRootMode("kudu");
-
   // SURFACE: a core cluster read.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"cluster", "ksck"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::SURFACE, info.disposition);
-    ASSERT_FALSE(info.node_local);
-    ASSERT_FALSE(info.unsafe);
-  }
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"cluster", "ksck"}, kSurface, kCluster));
+  // SURFACE: a metadata read is not tagged user_data.
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"table", "describe"}, kSurface, kCluster));
+  // SURFACE + node-local: a node-local read.
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"fs", "list"}, kSurface, kNodeLocal));
+  // SURFACE + user_data: a row-level read.
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"table", "scan"}, kSurface, kCluster,
+                                      /*user_data=*/true));
   // GATED: a destructive cluster mutation.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"table", "delete"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::GATED, info.disposition);
-    ASSERT_FALSE(info.node_local);
-  }
-  // REJECT: a blocking long-runner.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"cluster", "rebalance"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::REJECT, info.disposition);
-  }
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"table", "delete"}, kGated, kCluster));
+  // EXCLUDE: a blocking long-runner.
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"cluster", "rebalance"}, kExclude, kCluster));
   // EXCLUDE: an interactive node-local action.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"pbc", "edit"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::EXCLUDE, info.disposition);
-    ASSERT_TRUE(info.node_local);
-  }
-  // SURFACE + node_local: a node-local read.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"fs", "list"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::SURFACE, info.disposition);
-    ASSERT_TRUE(info.node_local);
-  }
-  // unsafe flag: an unsafe_* op is tagged.
-  {
-    const DispositionInfo info =
-        Lookup(root.get(), {"tablet", "unsafe_replace_tablet"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::GATED, info.disposition);
-    ASSERT_TRUE(info.unsafe);
-  }
-  // user_data flag: a row-level read is tagged.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"table", "scan"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::SURFACE, info.disposition);
-    ASSERT_TRUE(info.user_data);
-    ASSERT_FALSE(info.node_local);
-  }
-  // A metadata read is not tagged user_data.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"table", "describe"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_FALSE(info.user_data);
-  }
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"pbc", "edit"}, kExclude, kNodeLocal));
 }
 
 // Actions that read row-level user data are all tagged, so a host can gate
 // them separately from metadata reads.
 TEST(McpDispositionTest, UserDataReadsAreTagged) {
   unique_ptr<Mode> root = BuildRootMode("kudu");
-  const vector<vector<string>> kUserDataPaths = {
-    {"table", "scan"},
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"table", "scan"}, kSurface, kCluster,
+                                      /*user_data=*/true));
+  const vector<vector<string>> kNodeLocalUserDataPaths = {
     {"wal", "dump"},
     {"local_replica", "dump", "rowset"},
     {"local_replica", "dump", "wals"},
     {"fs", "dump", "cfile"},
     {"fs", "dump", "block"},
   };
-  for (const auto& path : kUserDataPaths) {
-    SCOPED_TRACE(JoinStrings(path, " "));
-    const DispositionInfo info = Lookup(root.get(), path);
-    ASSERT_TRUE(info.classified);
-    ASSERT_TRUE(info.user_data);
+  for (const auto& path : kNodeLocalUserDataPaths) {
+    ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), path, kSurface, kNodeLocal,
+                                        /*user_data=*/true));
   }
 }
 
-// Actions that mutate local state or run for a long time are never surfaced,
-// even though parts of them look like reads.
-TEST(McpDispositionTest, MutatingOrLongRunningActionsAreNotSurfaced) {
+// Actions that mutate local state, run for a long time, or are unsafe recovery
+// operations are never surfaced, even though parts of them look like reads or
+// ordinary cluster mutations.
+TEST(McpDispositionTest, MutatingLongRunningOrUnsafeActionsAreExcluded) {
   unique_ptr<Mode> root = BuildRootMode("kudu");
-  // 'fs check --repair' writes to disk.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"fs", "check"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::EXCLUDE, info.disposition);
-    ASSERT_TRUE(info.node_local);
-  }
-  // 'master add' is a multi-step job on the new master's node.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"master", "add"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::EXCLUDE, info.disposition);
-    ASSERT_TRUE(info.node_local);
-  }
-  // 'perf loadgen' runs long by design.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"perf", "loadgen"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::REJECT, info.disposition);
+  const vector<vector<string>> kExcludedPaths = {
+    // 'fs check --repair' writes to disk.
+    {"fs", "check"},
+    // 'master add' is a multi-step job on the new master's node.
+    {"master", "add"},
+    // 'perf loadgen' runs long by design.
+    {"perf", "loadgen"},
+    // Unsafe last-resort recovery operations.
+    {"tablet", "unsafe_replace_tablet"},
+    {"remote_replica", "unsafe_change_config"},
+    {"master", "unsafe_rebuild"},
+    // The MCP server must never re-expose itself.
+    {"mcp", "serve"},
+  };
+  for (const auto& path : kExcludedPaths) {
+    SCOPED_TRACE(JoinStrings(path, " "));
+    vector<Mode*> chain;
+    const Action* action = nullptr;
+    ASSERT_NO_FATAL_FAILURE(ResolvePath(root.get(), path, &chain, &action));
+    ASSERT_EQ(DispositionKindToString(kExclude),
+              DispositionKindToString(action->mcp_disposition().kind()));
   }
 }
 
-// Actions that read files on the local node are tagged node-local.
+// Actions that read files on the local node are node-local.
 TEST(McpDispositionTest, LocalFileReadsAreNodeLocal) {
   unique_ptr<Mode> root = BuildRootMode("kudu");
   const vector<vector<string>> kNodeLocalPaths = {
@@ -227,47 +221,70 @@ TEST(McpDispositionTest, LocalFileReadsAreNodeLocal) {
     {"perf", "tablet_scan"},
   };
   for (const auto& path : kNodeLocalPaths) {
-    SCOPED_TRACE(JoinStrings(path, " "));
-    const DispositionInfo info = Lookup(root.get(), path);
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::SURFACE, info.disposition);
-    ASSERT_TRUE(info.node_local);
+    ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), path, kSurface, kNodeLocal));
   }
+}
+
+// The scope is derived from the builder type rather than chosen by hand: an
+// RPC action builder yields CLUSTER, the plain builder yields NODE_LOCAL.
+TEST(McpDispositionTest, ScopeIsDerivedFromBuilderType) {
+  unique_ptr<Action> local =
+      ActionBuilder("local", &NoOpRunner, Disposition::SurfaceMetadata())
+      .Description("d")
+      .Build();
+  ASSERT_EQ(McpScope::NODE_LOCAL, local->mcp_scope());
+
+  unique_ptr<Action> rpc =
+      RpcActionBuilder("rpc", &NoOpRunner, Disposition::SurfaceMetadata())
+      .Description("d")
+      .Build();
+  ASSERT_EQ(McpScope::CLUSTER, rpc->mcp_scope());
+
+  unique_ptr<Action> cluster =
+      ClusterActionBuilder("cluster", &NoOpRunner, Disposition::Gated())
+      .Description("d")
+      .Build();
+  ASSERT_EQ(McpScope::CLUSTER, cluster->mcp_scope());
+
+  unique_ptr<Action> master =
+      MasterActionBuilder("master", &NoOpRunner, Disposition::SurfaceMetadata())
+      .Description("d")
+      .Build();
+  ASSERT_EQ(McpScope::CLUSTER, master->mcp_scope());
+
+  unique_ptr<Action> tserver =
+      TServerActionBuilder("tserver", &NoOpRunner, Disposition::Exclude())
+      .Description("d")
+      .Build();
+  ASSERT_EQ(McpScope::CLUSTER, tserver->mcp_scope());
+}
+
+// Cluster RPC actions are built by an RPC action builder, so their derived scope
+// is CLUSTER. These three used to declare master_addresses by hand on the plain
+// builder, which would have made them NODE_LOCAL.
+TEST(McpDispositionTest, ClusterRpcActionsAreClusterScoped) {
+  unique_ptr<Mode> root = BuildRootMode("kudu");
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"master", "remove"}, kGated, kCluster));
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"table", "recall"}, kGated, kCluster));
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"table", "add_column"}, kGated, kCluster));
 }
 
 // Multi-level (submode) command paths key on the full chain, not just parent
 // mode + action.
 TEST(McpDispositionTest, MultiLevelSubmodePaths) {
   unique_ptr<Mode> root = BuildRootMode("kudu");
-
   // tserver quiesce status: SURFACE read under the 'quiesce' submode.
-  {
-    const DispositionInfo info =
-        Lookup(root.get(), {"tserver", "quiesce", "status"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::SURFACE, info.disposition);
-  }
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"tserver", "quiesce", "status"},
+                                      kSurface, kCluster));
   // tserver quiesce start: GATED mutation under the 'quiesce' submode.
-  {
-    const DispositionInfo info =
-        Lookup(root.get(), {"tserver", "quiesce", "start"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::GATED, info.disposition);
-  }
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"tserver", "quiesce", "start"},
+                                      kGated, kCluster));
   // table set_limit disk_size: GATED under the 'set_limit' submode.
-  {
-    const DispositionInfo info =
-        Lookup(root.get(), {"table", "set_limit", "disk_size"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::GATED, info.disposition);
-  }
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"table", "set_limit", "disk_size"},
+                                      kGated, kCluster));
   // fs dump uuid: SURFACE node-local read under the 'dump' submode.
-  {
-    const DispositionInfo info = Lookup(root.get(), {"fs", "dump", "uuid"});
-    ASSERT_TRUE(info.classified);
-    ASSERT_EQ(Disposition::SURFACE, info.disposition);
-    ASSERT_TRUE(info.node_local);
-  }
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"fs", "dump", "uuid"},
+                                      kSurface, kNodeLocal));
 }
 
 // The full command path key is built from the mode chain (minus root) plus the
@@ -284,20 +301,12 @@ TEST(McpDispositionTest, CommandPathKeyBuilding) {
             DispositionCommandPath(chain, action));
 }
 
-// The whole action tree resolves: every action has exactly one table entry.
-// This is the invariant that catches a newly added but unclassified CLI action.
-TEST(McpDispositionTest, ValidateCoveragePassesAgainstCurrentTree) {
-  unique_ptr<Mode> root = BuildRootMode("kudu");
-  ASSERT_OK(ValidateDispositionCoverage(root.get()));
-}
-
 // The test-only "test" mode actions are explicitly classified EXCLUDE.
 TEST(McpDispositionTest, TestModeIsExcluded) {
 #if defined(KUDU_CLI_TEST_TOOL_ENABLED)
   unique_ptr<Mode> root = BuildRootMode("kudu");
-  const DispositionInfo info = Lookup(root.get(), {"test", "mini_cluster"});
-  ASSERT_TRUE(info.classified);
-  ASSERT_EQ(Disposition::EXCLUDE, info.disposition);
+  ASSERT_NO_FATAL_FAILURE(CheckAction(root.get(), {"test", "mini_cluster"},
+                                      kExclude, kNodeLocal));
 #else
   GTEST_SKIP() << "test mode is not compiled in this build";
 #endif
@@ -308,11 +317,11 @@ TEST(McpDispositionTest, TestModeIsExcluded) {
 TEST(McpDispositionTest, VisitActionsWalksWholeTree) {
   unique_ptr<Mode> submode = ModeBuilder("sub")
       .Description("synthetic submode")
-      .AddAction(MakeAction("b"))
+      .AddAction(MakeAction("b", Disposition::Gated()))
       .Build();
   unique_ptr<Mode> parent = ModeBuilder("top")
       .Description("synthetic parent mode")
-      .AddAction(MakeAction("a"))
+      .AddAction(MakeAction("a", Disposition::SurfaceMetadata()))
       .AddMode(std::move(submode))
       .Build();
   unique_ptr<Mode> root = ModeBuilder("kudu")
@@ -339,65 +348,26 @@ TEST(McpDispositionTest, VisitActionsWalksWholeTree) {
   ASSERT_EQ(vector<string>({ "top a" }), visited);
 }
 
-// ---------------------------------------------------------------------------
-// Bad paths.
-// ---------------------------------------------------------------------------
-
-// An unknown command path reports "not classified" rather than silently
-// defaulting to some disposition.
-TEST(McpDispositionTest, UnknownPathIsNotClassified) {
-  // Build a synthetic tree with an action that is absent from the table.
-  unique_ptr<Mode> child = ModeBuilder("nonsense")
+// The audit dump lists every action with its kind and tags.
+TEST(McpDispositionTest, DumpDispositionsListsKindAndTags) {
+  unique_ptr<Mode> child = ModeBuilder("top")
       .Description("synthetic mode")
-      .AddAction(MakeAction("bogus_action"))
+      .AddAction(MakeAction("meta", Disposition::SurfaceMetadata()))
+      .AddAction(MakeAction("rows", Disposition::SurfaceUserData()))
+      .AddAction(ClusterActionBuilder("write", &NoOpRunner, Disposition::Gated())
+                 .Description("d")
+                 .Build())
+      .AddAction(MakeAction("never", Disposition::Exclude()))
       .Build();
   unique_ptr<Mode> root = ModeBuilder("kudu")
       .Description("root")
       .AddMode(std::move(child))
       .Build();
-
-  const DispositionInfo info = Lookup(root.get(), {"nonsense", "bogus_action"});
-  ASSERT_FALSE(info.classified);
-}
-
-// The validator fails and names the offending full command path when the tree
-// contains an action missing from the table.
-TEST(McpDispositionTest, ValidatorFailsOnMissingClassification) {
-  // "cluster" is a real mode, but "cluster bogus_action" is not in the table,
-  // so the full path must be reported.
-  unique_ptr<Mode> cluster = ModeBuilder("cluster")
-      .Description("synthetic cluster mode")
-      .AddAction(MakeAction("bogus_action"))
-      .Build();
-  unique_ptr<Mode> root = ModeBuilder("kudu")
-      .Description("root")
-      .AddMode(std::move(cluster))
-      .Build();
-
-  const Status s = ValidateDispositionCoverage(root.get());
-  ASSERT_TRUE(s.IsNotFound()) << s.ToString();
-  ASSERT_STR_CONTAINS(s.ToString(), "cluster bogus_action");
-}
-
-// The validator reports the full multi-level path for an unclassified action
-// nested under a submode.
-TEST(McpDispositionTest, ValidatorReportsFullSubmodePath) {
-  unique_ptr<Mode> submode = ModeBuilder("subthing")
-      .Description("synthetic submode")
-      .AddAction(MakeAction("bogus_action"))
-      .Build();
-  unique_ptr<Mode> parent = ModeBuilder("thing")
-      .Description("synthetic parent mode")
-      .AddMode(std::move(submode))
-      .Build();
-  unique_ptr<Mode> root = ModeBuilder("kudu")
-      .Description("root")
-      .AddMode(std::move(parent))
-      .Build();
-
-  const Status s = ValidateDispositionCoverage(root.get());
-  ASSERT_TRUE(s.IsNotFound()) << s.ToString();
-  ASSERT_STR_CONTAINS(s.ToString(), "thing subthing bogus_action");
+  ASSERT_EQ("top meta\tSURFACE node_local\n"
+            "top rows\tSURFACE node_local user_data\n"
+            "top write\tGATED\n"
+            "top never\tEXCLUDE node_local\n",
+            DumpDispositions(root.get()));
 }
 
 } // namespace tools

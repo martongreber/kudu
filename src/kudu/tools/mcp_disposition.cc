@@ -21,8 +21,6 @@
 
 #include <functional>
 #include <memory>
-#include <optional>
-#include <ostream>
 #include <string>
 #include <vector>
 
@@ -31,7 +29,6 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tools/tool_action.h"
 
-using std::optional;
 using std::string;
 using std::vector;
 using strings::Substitute;
@@ -39,12 +36,11 @@ using strings::Substitute;
 namespace kudu {
 namespace tools {
 
-const char* DispositionToString(Disposition d) {
-  switch (d) {
-    case Disposition::SURFACE: return "SURFACE";
-    case Disposition::GATED:   return "GATED";
-    case Disposition::REJECT:  return "REJECT";
-    case Disposition::EXCLUDE: return "EXCLUDE";
+const char* DispositionKindToString(Disposition::Kind kind) {
+  switch (kind) {
+    case Disposition::Kind::SURFACE: return "SURFACE";
+    case Disposition::Kind::GATED:   return "GATED";
+    case Disposition::Kind::EXCLUDE: return "EXCLUDE";
   }
   return "UNKNOWN";
 }
@@ -66,22 +62,6 @@ string DispositionCommandPath(const vector<Mode*>& chain,
     path += action->name();
   }
   return path;
-}
-
-DispositionInfo DispositionFor(const Action* action) {
-  CHECK(action != nullptr);
-  const optional<Disposition>& d = action->mcp_disposition();
-  if (!d.has_value()) {
-    // Not classified. classified stays false; caller must not surface it.
-    return DispositionInfo();
-  }
-  DispositionInfo info;
-  info.disposition = *d;
-  info.node_local = action->mcp_node_local();
-  info.unsafe = action->mcp_unsafe();
-  info.user_data = action->mcp_user_data();
-  info.classified = true;
-  return info;
 }
 
 namespace {
@@ -115,43 +95,21 @@ string DumpDispositions(const Mode* root) {
   string out;
   CHECK_OK(VisitActions(root, [&](const vector<Mode*>& chain,
                                   const Action* action) {
-    const DispositionInfo info = DispositionFor(action);
+    const Disposition d = action->mcp_disposition();
     string tags;
-    if (info.node_local) {
+    if (action->mcp_scope() == McpScope::NODE_LOCAL) {
       tags += " node_local";
     }
-    if (info.unsafe) {
-      tags += " unsafe";
-    }
-    if (info.user_data) {
+    if (d.user_data()) {
       tags += " user_data";
     }
     out.append(Substitute("$0\t$1$2\n",
                           DispositionCommandPath(chain, action),
-                          info.classified ? DispositionToString(info.disposition)
-                                          : "UNCLASSIFIED",
+                          DispositionKindToString(d.kind()),
                           tags));
     return Status::OK();
   }));
   return out;
-}
-
-Status ValidateDispositionCoverage(const Mode* root) {
-  return VisitActions(root, [](const vector<Mode*>& chain,
-                               const Action* action) {
-    if (!DispositionFor(action).classified) {
-      return Status::NotFound(Substitute(
-          "CLI action is not classified for the MCP server (missing "
-          "ActionBuilder::McpDisposition): '$0'",
-          DispositionCommandPath(chain, action)));
-    }
-    return Status::OK();
-  });
-}
-
-void ValidateDispositionCoverageOrDie(const Mode* root) {
-  const Status s = ValidateDispositionCoverage(root);
-  CHECK(s.ok()) << "MCP disposition coverage is incomplete: " << s.ToString();
 }
 
 } // namespace tools

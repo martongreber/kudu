@@ -394,7 +394,8 @@ struct McpToolEntry {
   // root), exactly as the disposition lookup and BuildHelpXML walk expect it.
   vector<Mode*> chain;
   const Action* action;
-  DispositionInfo disposition;
+
+  Disposition disposition() const { return action->mcp_disposition(); }
 };
 
 // Computes the MCP tool name for an action: its full command path with the path
@@ -411,29 +412,25 @@ string McpToolName(const vector<Mode*>& chain, const Action* action) {
   return name;
 }
 
-// The server-level gates that decide which classified actions are exposed.
+// The server-level gates that decide which actions are exposed.
 struct McpGates {
   bool allow_writes = false;
   bool allow_data_reads = false;
 };
 
 // Exposure rule: SURFACE is exposed; GATED only when 'allow_writes'; a tool
-// tagged user_data additionally needs 'allow_data_reads'. REJECT / EXCLUDE /
-// unclassified are never exposed.
-bool IsExposed(const DispositionInfo& info, const McpGates& gates) {
-  if (!info.classified) {
+// returning user data additionally needs 'allow_data_reads'. EXCLUDE is never
+// exposed.
+bool IsExposed(const Disposition& d, const McpGates& gates) {
+  if (d.user_data() && !gates.allow_data_reads) {
     return false;
   }
-  if (info.user_data && !gates.allow_data_reads) {
-    return false;
-  }
-  switch (info.disposition) {
-    case Disposition::SURFACE:
+  switch (d.kind()) {
+    case Disposition::Kind::SURFACE:
       return true;
-    case Disposition::GATED:
+    case Disposition::Kind::GATED:
       return gates.allow_writes;
-    case Disposition::REJECT:
-    case Disposition::EXCLUDE:
+    case Disposition::Kind::EXCLUDE:
       return false;
   }
   return false;
@@ -453,17 +450,14 @@ vector<McpToolEntry> BuildMcpToolRegistry(const Mode* root,
   unordered_map<string, string> paths_by_name;
   CHECK_OK(VisitActions(root, [&](const vector<Mode*>& chain,
                                   const Action* action) {
-    const DispositionInfo info = DispositionFor(action);
-    // The startup coverage invariant guarantees every action is classified;
-    // IsExposed() stays defensive and never surfaces an unclassified action.
-    if (!IsExposed(info, gates)) {
+    const Disposition d = action->mcp_disposition();
+    if (!IsExposed(d, gates)) {
       return Status::OK();
     }
     McpToolEntry entry;
     entry.tool_name = McpToolName(chain, action);
     entry.chain = chain;
     entry.action = action;
-    entry.disposition = info;
     const string path = DispositionCommandPath(chain, action);
     const auto inserted = paths_by_name.emplace(entry.tool_name, path);
     CHECK(inserted.second) << Substitute(
@@ -573,12 +567,12 @@ void WriteMcpToolObject(JsonWriter* jw, const McpToolEntry& entry) {
     description += " ";
     description += *action->extra_description();
   }
-  if (entry.disposition.disposition == Disposition::SURFACE &&
-      entry.disposition.node_local) {
+  if (entry.disposition().kind() == Disposition::Kind::SURFACE &&
+      action->mcp_scope() == McpScope::NODE_LOCAL) {
     description += " Note: this reflects only the local node this server runs "
                    "on, not the whole cluster.";
   }
-  if (entry.disposition.user_data) {
+  if (entry.disposition().user_data()) {
     description += " Note: the output contains unredacted row-level user data.";
   }
   jw->String("description");
@@ -680,7 +674,7 @@ void WriteMcpToolObject(JsonWriter* jw, const McpToolEntry& entry) {
       // surfaced only on GATED tools (a write is the only thing worth previewing)
       // and, being reserved by IsReservedControlFlag, can never collide with a
       // real action flag. It is intentionally absent from required[].
-      if (entry.disposition.disposition == Disposition::GATED) {
+      if (entry.disposition().kind() == Disposition::Kind::GATED) {
         jw->String("dry_run");
         jw->StartObject();
         jw->String("type");
@@ -718,7 +712,7 @@ void WriteMcpToolObject(JsonWriter* jw, const McpToolEntry& entry) {
   // potentially destructive; SURFACE tools are read-only.
   jw->String("annotations");
   jw->StartObject();
-  if (entry.disposition.disposition == Disposition::GATED) {
+  if (entry.disposition().kind() == Disposition::Kind::GATED) {
     jw->String("readOnlyHint");
     jw->Bool(false);
     jw->String("destructiveHint");
@@ -1102,7 +1096,7 @@ string HandleToolsCall(const JsonReader& reader,
         id, kJsonRpcInvalidParams,
         Substitute("Invalid params: unknown tool '$0'", name));
   }
-  const bool gated = entry->disposition.disposition == Disposition::GATED;
+  const bool gated = entry->disposition().kind() == Disposition::Kind::GATED;
 
   // 'arguments' is optional; absent (or an explicit null) means no arguments.
   const rapidjson::Value* arguments = nullptr;
@@ -1515,13 +1509,9 @@ Status RunMcpServeLoop(istream& in, ostream& out,
                        const string& kudu_binary_path) {
   // Build the action tree once for this serve session and reflect it into the
   // exposure registry. The tree must outlive the registry (its entries borrow
-  // from it), so both live for the whole loop.
-  //
-  // The startup invariant: fail loudly and immediately if any reachable CLI
-  // action is not classified in the disposition table (i.e. a new action was
-  // added without a disposition entry), rather than silently mis-handling it.
+  // from it), so both live for the whole loop. Every action is classified by
+  // construction (the disposition is a required ActionBuilder argument).
   unique_ptr<Mode> root = BuildMcpRootMode();
-  ValidateDispositionCoverageOrDie(root.get());
   McpGates gates;
   gates.allow_writes = FLAGS_mcp_allow_writes;
   gates.allow_data_reads = FLAGS_mcp_allow_data_reads;
@@ -1547,12 +1537,12 @@ Status RunMcpServeLoop(istream& in, ostream& out,
       }
       vector<string> kinds;
       vector<string> flags;
-      if (e.disposition.disposition == Disposition::GATED &&
+      if (e.disposition().kind() == Disposition::Kind::GATED &&
           !gates.allow_writes) {
         kinds.emplace_back("is a gated (mutating) tool");
         flags.emplace_back("--mcp_allow_writes");
       }
-      if (e.disposition.user_data && !gates.allow_data_reads) {
+      if (e.disposition().user_data() && !gates.allow_data_reads) {
         kinds.emplace_back("returns row-level user data");
         flags.emplace_back("--mcp_allow_data_reads");
       }
@@ -1646,9 +1636,8 @@ Status RunMcpServe(const RunnerContext& /*context*/) {
 
 unique_ptr<Mode> BuildMcpMode() {
   unique_ptr<Action> serve =
-      ActionBuilder("serve", &RunMcpServe)
+      ActionBuilder("serve", &RunMcpServe, Disposition::Exclude())
       .Description("Serve Kudu admin actions as MCP tools over stdio")
-      .McpDisposition(Disposition::REJECT)
       .ExtraDescription("Reads newline-delimited JSON-RPC requests from stdin "
                         "and writes responses to stdout, one line per request, "
                         "until EOF. Intended to be launched by an MCP host.")

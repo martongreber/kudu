@@ -163,8 +163,17 @@ string Mode::BuildHelpXML(const vector<Mode*>& chain) const {
   return xml;
 }
 
-ActionBuilder::ActionBuilder(string name, ActionRunner runner)
+ActionBuilder::ActionBuilder(string name, ActionRunner runner, Disposition disposition)
+    : ActionBuilder(std::move(name), std::move(runner), disposition, McpScope::NODE_LOCAL) {
+}
+
+ActionBuilder::ActionBuilder(string name,
+                             ActionRunner runner,
+                             Disposition disposition,
+                             McpScope mcp_scope)
     : name_(std::move(name)),
+      mcp_disposition_(disposition),
+      mcp_scope_(mcp_scope),
       runner_(std::move(runner)) {
 }
 
@@ -183,27 +192,6 @@ ActionBuilder& ActionBuilder::ExtraDescription(const string& extra_description) 
 ActionBuilder& ActionBuilder::ProgramName(const string& program_name) {
   CHECK(!program_name_.has_value());
   program_name_ = program_name;
-  return *this;
-}
-
-ActionBuilder& ActionBuilder::McpDisposition(Disposition disposition) {
-  CHECK(!mcp_disposition_.has_value());
-  mcp_disposition_ = disposition;
-  return *this;
-}
-
-ActionBuilder& ActionBuilder::McpNodeLocal() {
-  mcp_node_local_ = true;
-  return *this;
-}
-
-ActionBuilder& ActionBuilder::McpUnsafe() {
-  mcp_unsafe_ = true;
-  return *this;
-}
-
-ActionBuilder& ActionBuilder::McpUserData() {
-  mcp_user_data_ = true;
   return *this;
 }
 
@@ -237,15 +225,11 @@ ActionBuilder& ActionBuilder::AddOptionalParameter(
 
 unique_ptr<Action> ActionBuilder::Build() {
   CHECK(!description_.empty());
-  unique_ptr<Action> action(new Action());
+  unique_ptr<Action> action(new Action(mcp_disposition_, mcp_scope_));
   action->name_ = name_;
   action->description_ = description_;
   action->extra_description_ = extra_description_;
   action->program_name_ = program_name_;
-  action->mcp_disposition_ = mcp_disposition_;
-  action->mcp_node_local_ = mcp_node_local_;
-  action->mcp_unsafe_ = mcp_unsafe_;
-  action->mcp_user_data_ = mcp_user_data_;
   action->runner_ = runner_;
   action->args_ = args_;
   return action;

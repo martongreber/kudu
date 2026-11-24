@@ -1235,9 +1235,8 @@ Status TabletScan(const RunnerContext& context) {
 
 unique_ptr<Mode> BuildPerfMode() {
   unique_ptr<Action> loadgen =
-      ClusterActionBuilder("loadgen", &TestLoadGenerator)
+      ClusterActionBuilder("loadgen", &TestLoadGenerator, Disposition::Exclude())
       .Description("Run load generation with optional scan afterwards")
-      .McpDisposition(Disposition::REJECT)
       .ExtraDescription(
           "Run load generation tool which inserts auto-generated data into "
           "an existing or auto-created table as fast as possible. "
@@ -1291,9 +1290,8 @@ unique_ptr<Mode> BuildPerfMode() {
       .Build();
 
   unique_ptr<Action> table_scan =
-      ClusterActionBuilder("table_scan", &TableScan)
+      ClusterActionBuilder("table_scan", &TableScan, Disposition::SurfaceMetadata())
       .Description("Show row count and scanning time cost of tablets in a table")
-      .McpDisposition(Disposition::SURFACE)
       .ExtraDescription("Show row count and scanning time of tablets in a table. "
           "This can be useful to check for row count skew across different tablets, "
           "or whether there is a long latency tail when scanning different tables.")
@@ -1312,10 +1310,8 @@ unique_ptr<Mode> BuildPerfMode() {
 
   // TODO(aserbin): move this to tool_local_replica.cc
   unique_ptr<Action> tablet_scan =
-      ActionBuilder("tablet_scan", &TabletScan)
+      ActionBuilder("tablet_scan", &TabletScan, Disposition::SurfaceMetadata())
       .Description("Show row count of a local tablet")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddOptionalParameter("fs_data_dirs")
       .AddOptionalParameter("fs_metadata_dir")

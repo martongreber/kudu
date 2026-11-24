@@ -26,6 +26,7 @@
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
+#include "kudu/tools/mcp_disposition.h"
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/test_macros.h"
@@ -44,7 +45,7 @@ using std::vector;
 
 TEST(ToolActionTest, TestActionBuildHelpXML) {
   unique_ptr<Action> action =
-      ActionBuilder("sample", nullptr)
+      ActionBuilder("sample", nullptr, Disposition::Exclude())
           .Description("d")
           .ExtraDescription("ed")
           .AddRequiredParameter({ "required", "rpd" })
@@ -81,7 +82,7 @@ TEST(ToolActionTest, TestActionBuildHelpXML) {
 
 TEST(ToolActionTest, TestModeBuildHelpXML) {
   unique_ptr<Action> action =
-      ActionBuilder("action", nullptr)
+      ActionBuilder("action", nullptr, Disposition::Exclude())
           .Description("ad")
           .AddRequiredParameter({ "required", "rpd" })
           .Build();

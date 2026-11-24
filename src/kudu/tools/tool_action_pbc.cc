@@ -298,10 +298,8 @@ Status EditFile(const RunnerContext& context) {
 
 unique_ptr<Mode> BuildPbcMode() {
   unique_ptr<Action> dump =
-      ActionBuilder("dump", &DumpPBContainerFile)
+      ActionBuilder("dump", &DumpPBContainerFile, Disposition::SurfaceMetadata())
       .Description("Dump a PBC (protobuf container) file")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddRequiredParameter({kPathArg, "path to PBC file"})
       .AddOptionalParameter("debug")
       .AddOptionalParameter("oneline")
@@ -310,10 +308,8 @@ unique_ptr<Mode> BuildPbcMode() {
       .Build();
 
   unique_ptr<Action> edit =
-      ActionBuilder("edit", &EditFile)
+      ActionBuilder("edit", &EditFile, Disposition::Exclude())
       .Description("Edit a PBC (protobuf container) file")
-      .McpDisposition(Disposition::EXCLUDE)
-      .McpNodeLocal()
       .AddRequiredParameter({kPathArg, "path to PBC file"})
       .AddOptionalParameter("backup")
       .AddOptionalParameter("json")

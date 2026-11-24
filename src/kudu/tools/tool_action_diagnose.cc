@@ -285,19 +285,15 @@ Status TlsDebug(const RunnerContext& context) {
 
 unique_ptr<Mode> BuildDiagnoseMode() {
   unique_ptr<Action> parse_stacks =
-      ActionBuilder("parse_stacks", &ParseStacks)
+      ActionBuilder("parse_stacks", &ParseStacks, Disposition::SurfaceMetadata())
       .Description("Parse sampled stack traces out of a diagnostics log")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddRequiredVariadicParameter({ kLogPathArg, kLogPathArgDesc })
       .Build();
 
   // TODO(awong): add timestamp bounds
   unique_ptr<Action> parse_metrics =
-      ActionBuilder("parse_metrics", &ParseMetrics)
+      ActionBuilder("parse_metrics", &ParseMetrics, Disposition::SurfaceMetadata())
       .Description("Parse metrics out of a diagnostics log")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
       .AddRequiredVariadicParameter({ kLogPathArg, kLogPathArgDesc })
       .AddOptionalParameter("tablet_ids")
       .AddOptionalParameter("simple_metrics")
@@ -306,9 +302,8 @@ unique_ptr<Mode> BuildDiagnoseMode() {
       .Build();
 
   unique_ptr<Action> tls_debug =
-      RpcActionBuilder("tls_debug", &TlsDebug)
+      RpcActionBuilder("tls_debug", &TlsDebug, Disposition::SurfaceMetadata())
       .Description("Connect to a running cluster and dump TLS debug information")
-      .McpDisposition(Disposition::SURFACE)
       .AddRequiredParameter({"server_addr", "Address of a Kudu Master or Tablet server "
                                             "of the form 'hostname:port'."})
       .AddOptionalParameter("disable_tls")

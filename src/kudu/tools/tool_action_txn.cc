@@ -443,9 +443,8 @@ Status ShowTxn(const RunnerContext& context) {
 
 unique_ptr<Mode> BuildTxnMode() {
   unique_ptr<Action> list =
-      ClusterActionBuilder("list", &ListTxns)
+      ClusterActionBuilder("list", &ListTxns, Disposition::SurfaceMetadata())
       .Description("Show details of multi-row transactions in the cluster")
-      .McpDisposition(Disposition::SURFACE)
       .AddOptionalParameter(
           "columns",
           string("txn_id,user,state,commit_datetime,start_datetime,last_transition_datetime"),
@@ -460,7 +459,7 @@ unique_ptr<Mode> BuildTxnMode() {
   // TODO(awong): extend the GET_METADATA call for participants to also return
   // table ID, partition info, etc. so we can display it.
   unique_ptr<Action> show =
-      ClusterActionBuilder("show", &ShowTxn)
+      ClusterActionBuilder("show", &ShowTxn, Disposition::SurfaceMetadata())
       .AddRequiredParameter({ kTxnIdArg, "Transaction ID on which to operate" })
       .AddOptionalParameter(
           "columns",
@@ -476,7 +475,6 @@ unique_ptr<Mode> BuildTxnMode() {
                  "participant_commit_hybridtime"))
       .AddOptionalParameter("timeout_ms")
       .Description("Show details of a specific transaction")
-      .McpDisposition(Disposition::SURFACE)
       .Build();
 
   return ModeBuilder("txn")

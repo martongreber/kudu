@@ -1626,6 +1626,7 @@ TEST_F(ToolTest, TestModeHelp) {
           "status",
           "timestamp",
           "list",
+          "remove",
         }));
   }
   {
@@ -1747,7 +1748,8 @@ TEST_F(ToolTest, TestModeHelp) {
     };
     NO_FATALS(RunTestHelp(kCmd, kTableModeRegexes));
     NO_FATALS(RunTestHelpRpcFlags(kCmd,
-        { "add_range_partition",
+        { "add_column",
+          "add_range_partition",
           "clear_comment",
           "column_remove_default",
           "column_set_block_size",
@@ -1764,6 +1766,7 @@ TEST_F(ToolTest, TestModeHelp) {
           "get_extra_configs",
           "list",
           "locate_row",
+          "recall",
           "rename_column",
           "rename_table",
           "scan",

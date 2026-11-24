@@ -957,27 +957,24 @@ unique_ptr<Mode> BuildHmsMode() {
     "Metastore configuration.";
 
   unique_ptr<Action> hms_check =
-      ClusterActionBuilder("check", &CheckHmsMetadata)
+      ClusterActionBuilder("check", &CheckHmsMetadata, Disposition::SurfaceMetadata())
       .Description("Check metadata consistency between Kudu and the Hive Metastore catalogs")
-      .McpDisposition(Disposition::SURFACE)
       .AddOptionalParameter("hive_metastore_sasl_enabled", nullopt, kHmsSaslEnabledDesc)
       .AddOptionalParameter("hive_metastore_uris", nullopt, kHmsUrisDesc)
       .AddOptionalParameter("ignore_other_clusters")
       .Build();
 
   unique_ptr<Action> hms_downgrade =
-      ClusterActionBuilder("downgrade", &HmsDowngrade)
+      ClusterActionBuilder("downgrade", &HmsDowngrade, Disposition::Gated())
       .Description("Downgrade the metadata to legacy format for Kudu and the Hive Metastores")
-      .McpDisposition(Disposition::GATED)
       .AddOptionalParameter("hive_metastore_sasl_enabled", nullopt, kHmsSaslEnabledDesc)
       .AddOptionalParameter("hive_metastore_uris", nullopt, kHmsUrisDesc)
       .Build();
 
   unique_ptr<Action> hms_fix =
-      ClusterActionBuilder("fix", &FixHmsMetadata)
+      ClusterActionBuilder("fix", &FixHmsMetadata, Disposition::Gated())
       .Description("Fix automatically-repairable metadata inconsistencies in the "
                    "Kudu and Hive Metastore catalogs")
-      .McpDisposition(Disposition::GATED)
       .AddOptionalParameter("dryrun")
       .AddOptionalParameter("drop_orphan_hms_tables")
       .AddOptionalParameter("create_missing_hms_tables")
@@ -989,9 +986,8 @@ unique_ptr<Mode> BuildHmsMode() {
       .Build();
 
   unique_ptr<Action> hms_list =
-      ClusterActionBuilder("list", &List)
+      ClusterActionBuilder("list", &List, Disposition::SurfaceMetadata())
       .Description("List the Kudu table HMS entries")
-      .McpDisposition(Disposition::SURFACE)
       .AddOptionalParameter("columns",
                             Substitute("database,table,type,$0",
                                               HmsClient::kKuduTableNameKey),
@@ -1007,10 +1003,9 @@ unique_ptr<Mode> BuildHmsMode() {
       .Build();
 
   unique_ptr<Action> hms_precheck =
-      ClusterActionBuilder("precheck", &Precheck)
+      ClusterActionBuilder("precheck", &Precheck, Disposition::SurfaceMetadata())
       .Description("Check that the Kudu cluster is prepared to enable "
                    "the Hive Metastore integration")
-      .McpDisposition(Disposition::SURFACE)
       .Build();
 
   return ModeBuilder("hms").Description("Operate on remote Hive Metastores")

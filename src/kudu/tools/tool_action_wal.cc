@@ -58,11 +58,8 @@ Status Dump(const RunnerContext& context) {
 
 unique_ptr<Mode> BuildWalMode() {
   unique_ptr<Action> dump =
-      ActionBuilder("dump", &Dump)
+      ActionBuilder("dump", &Dump, Disposition::SurfaceUserData())
       .Description("Dump a WAL (write-ahead log) file")
-      .McpDisposition(Disposition::SURFACE)
-      .McpNodeLocal()
-      .McpUserData()
       .AddRequiredParameter({ kPathArg, "path to WAL file" })
       .AddOptionalParameter("print_entries")
       .AddOptionalParameter("print_meta")

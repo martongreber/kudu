@@ -22,9 +22,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
-#include <limits>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -38,6 +38,7 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+// IWYU pragma: no_include <yaml-cpp/yaml.h>
 // IWYU pragma: no_include <yaml-cpp/node/impl.h>
 // IWYU pragma: no_include <yaml-cpp/node/node.h>
 
@@ -55,8 +56,8 @@
 #include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
-#include "kudu/fs/fs.pb.h"
 #include "kudu/fs/default_key_provider.h"
+#include "kudu/fs/fs.pb.h"
 #include "kudu/fs/key_provider.h"
 #include "kudu/fs/ranger_kms_key_provider.h"
 #include "kudu/gutil/map-util.h"
@@ -79,6 +80,7 @@
 #include "kudu/security/security_flags.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
+#include "kudu/tools/mcp_disposition.h"
 #include "kudu/tools/tool.pb.h" // IWYU pragma: keep
 #include "kudu/tools/tool_action.h"
 #include "kudu/tserver/tserver.pb.h"
@@ -524,8 +526,10 @@ Status GetServerFlags(const string& address,
 
 } // anonymous namespace
 
-RpcActionBuilder::RpcActionBuilder(std::string name, ActionRunner runner)
-    : ActionBuilder(std::move(name), std::move(runner)) {
+RpcActionBuilder::RpcActionBuilder(std::string name,
+                                   ActionRunner runner,
+                                   Disposition disposition)
+    : ActionBuilder(std::move(name), std::move(runner), disposition, McpScope::CLUSTER) {
 }
 
 unique_ptr<Action> RpcActionBuilder::Build() {
@@ -534,18 +538,24 @@ unique_ptr<Action> RpcActionBuilder::Build() {
   return ActionBuilder::Build();
 }
 
-ClusterActionBuilder::ClusterActionBuilder(std::string name, ActionRunner runner)
-    : RpcActionBuilder(std::move(name), std::move(runner)) {
+ClusterActionBuilder::ClusterActionBuilder(std::string name,
+                                           ActionRunner runner,
+                                           Disposition disposition)
+    : RpcActionBuilder(std::move(name), std::move(runner), disposition) {
   AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc });
 }
 
-MasterActionBuilder::MasterActionBuilder(std::string name, ActionRunner runner)
-    : RpcActionBuilder(std::move(name), std::move(runner)) {
+MasterActionBuilder::MasterActionBuilder(std::string name,
+                                         ActionRunner runner,
+                                         Disposition disposition)
+    : RpcActionBuilder(std::move(name), std::move(runner), disposition) {
   AddRequiredParameter({ kMasterAddressArg, kMasterAddressDesc });
 }
 
-TServerActionBuilder::TServerActionBuilder(std::string name, ActionRunner runner)
-    : RpcActionBuilder(std::move(name), std::move(runner)) {
+TServerActionBuilder::TServerActionBuilder(std::string name,
+                                           ActionRunner runner,
+                                           Disposition disposition)
+    : RpcActionBuilder(std::move(name), std::move(runner), disposition) {
   AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc });
 }
 

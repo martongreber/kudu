@@ -17,7 +17,6 @@
 
 #pragma once
 
-#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -26,6 +25,7 @@
 #include <vector>
 
 #include "kudu/gutil/strings/stringpiece.h"
+#include "kudu/tools/mcp_disposition.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -33,11 +33,6 @@ namespace tools {
 
 class Action;
 class Mode;
-
-// The MCP safety classification of an action. Defined in mcp_disposition.h;
-// forward-declared here (with a fixed underlying type) so an action can carry
-// its own disposition without the CLI framework depending on the MCP feature.
-enum class Disposition : uint8_t;
 
 // The command line tool is structured as a tree with two kinds of nodes: modes
 // and actions. Actions are leaf nodes, each representing a particular
@@ -195,10 +190,14 @@ struct ActionArgsDescriptor {
 // Builds a new action (leaf) node.
 class ActionBuilder {
  public:
-  // Creates a new ActionBuilder with a specific name (e.g. "format") and
-  // action runner. The name uniquely identifies the action amongst its
-  // siblings in the tree.
-  ActionBuilder(std::string name, ActionRunner runner);
+  // Creates a new ActionBuilder with a specific name (e.g. "format"), action
+  // runner, and MCP safety classification (see mcp_disposition.h). The name
+  // uniquely identifies the action amongst its siblings in the tree.
+  //
+  // The disposition is a constructor argument rather than a builder setter so
+  // that adding a CLI action without classifying it for the MCP server is a
+  // compile-time error.
+  ActionBuilder(std::string name, ActionRunner runner, Disposition disposition);
   virtual ~ActionBuilder() = default;
 
   // Sets the description of this action (e.g. "Format a new Kudu filesystem"),
@@ -217,27 +216,6 @@ class ActionBuilder {
   // This will ensure logging is initialized as if the program binary name was
   // the passed `program_name`.
   ActionBuilder& ProgramName(const std::string& program_name);
-
-  // Sets the MCP safety classification for this action (see mcp_disposition.h).
-  //
-  // Every action reachable from the CLI tree must set this:
-  // ValidateDispositionCoverage[OrDie]() (mcp_disposition.h) fails if an action
-  // has no disposition, and an unclassified action is never surfaced as a tool.
-  ActionBuilder& McpDisposition(Disposition disposition);
-
-  // Marks this action as operating on the on-disk data of the single node the
-  // server runs on (the fs / wal / pbc / local_replica families, plus a few
-  // node-local admin ops). Advisory metadata consumed by the MCP server.
-  ActionBuilder& McpNodeLocal();
-
-  // Marks this action as an "unsafe" operation (e.g. unsafe_* commands or raw
-  // Raft config edits). Advisory metadata consumed by the MCP server.
-  ActionBuilder& McpUnsafe();
-
-  // Marks this action as returning row-level user data (e.g. scanned rows or
-  // decoded WAL / rowset contents) rather than metadata. Advisory metadata
-  // consumed by the MCP server.
-  ActionBuilder& McpUserData();
 
   // Add a new required parameter to this builder.
   //
@@ -277,6 +255,14 @@ class ActionBuilder {
   virtual std::unique_ptr<Action> Build();
 
  protected:
+  // Like the public constructor, but with an explicit MCP scope. Only
+  // RpcActionBuilder uses it, to derive CLUSTER; it is not public so that the
+  // scope cannot be chosen by hand at a call site.
+  ActionBuilder(std::string name,
+                ActionRunner runner,
+                Disposition disposition,
+                McpScope mcp_scope);
+
   const std::string name_;
 
   std::string description_;
@@ -285,13 +271,12 @@ class ActionBuilder {
 
   std::optional<std::string> program_name_;
 
-  std::optional<Disposition> mcp_disposition_;
+  const Disposition mcp_disposition_;
 
-  bool mcp_node_local_ = false;
-
-  bool mcp_unsafe_ = false;
-
-  bool mcp_user_data_ = false;
+  // Derived, not chosen: RpcActionBuilder (and so every RPC action builder)
+  // passes CLUSTER, since an action that makes no RPCs can only work on the
+  // local node's data.
+  const McpScope mcp_scope_;
 
   ActionRunner runner_;
 
@@ -334,25 +319,22 @@ class Action {
     return program_name_;
   }
 
-  // The MCP safety classification for this action, or nullopt if the action was
-  // never classified (see ActionBuilder::McpDisposition). The MCP server treats
-  // an unclassified action as non-surfaceable.
-  const std::optional<Disposition>& mcp_disposition() const {
-    return mcp_disposition_;
-  }
+  // The MCP safety classification for this action (see mcp_disposition.h).
+  Disposition mcp_disposition() const { return mcp_disposition_; }
 
-  // Whether this action was tagged node-local / unsafe / user-data (advisory
-  // MCP metadata).
-  bool mcp_node_local() const { return mcp_node_local_; }
-  bool mcp_unsafe() const { return mcp_unsafe_; }
-  bool mcp_user_data() const { return mcp_user_data_; }
+  // Whether this action operates on a whole cluster or on the local node's data
+  // (see McpScope). Derived from the builder type.
+  McpScope mcp_scope() const { return mcp_scope_; }
 
   const ActionArgsDescriptor& args() const { return args_; }
 
  private:
   friend class ActionBuilder;
 
-  Action() = default;
+  Action(Disposition mcp_disposition, McpScope mcp_scope)
+      : mcp_disposition_(mcp_disposition),
+        mcp_scope_(mcp_scope) {
+  }
 
   // Sets optional flag parameter default value in cases where it has been
   // overridden from the default gflag value.
@@ -366,13 +348,9 @@ class Action {
 
   std::optional<std::string> program_name_;
 
-  std::optional<Disposition> mcp_disposition_;
+  Disposition mcp_disposition_;
 
-  bool mcp_node_local_ = false;
-
-  bool mcp_unsafe_ = false;
-
-  bool mcp_user_data_ = false;
+  McpScope mcp_scope_;
 
   ActionRunner runner_;
 

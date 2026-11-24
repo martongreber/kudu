@@ -61,6 +61,7 @@ class TabletServerServiceProxy;
 } // namespace tserver
 
 namespace tools {
+class Disposition;
 
 // Constants for parameters and descriptions.
 extern const char* const kMasterAddressesArg;
@@ -88,26 +89,26 @@ extern const char* const kCurrentLeaderUUIDArg;
 // cluster or a particular Kudu RPC server.
 class RpcActionBuilder : public ActionBuilder {
  public:
-  RpcActionBuilder(std::string name, ActionRunner runner);
+  RpcActionBuilder(std::string name, ActionRunner runner, Disposition disposition);
   std::unique_ptr<Action> Build() override;
 };
 
 // Builder for actions involving RPC communications with a Kudu cluster.
 class ClusterActionBuilder : public RpcActionBuilder {
  public:
-  ClusterActionBuilder(std::string name, ActionRunner runner);
+  ClusterActionBuilder(std::string name, ActionRunner runner, Disposition disposition);
 };
 
 // Builder for actions involving RPC communications with a Kudu master.
 class MasterActionBuilder : public RpcActionBuilder {
  public:
-  MasterActionBuilder(std::string name, ActionRunner runner);
+  MasterActionBuilder(std::string name, ActionRunner runner, Disposition disposition);
 };
 
 // Builder for actions involving RPC communications with a Kudu tablet server.
 class TServerActionBuilder : public RpcActionBuilder {
  public:
-  TServerActionBuilder(std::string name, ActionRunner runner);
+  TServerActionBuilder(std::string name, ActionRunner runner, Disposition disposition);
 };
 
 // Utility methods used by multiple actions across different modes.

@@ -486,9 +486,8 @@ unique_ptr<Mode> BuildTestMode() {
       SerializeRequest(start));
 
   unique_ptr<Action> control_shell =
-      ActionBuilder("mini_cluster", &RunControlShell)
+      ActionBuilder("mini_cluster", &RunControlShell, Disposition::Exclude())
       .Description("Spawn a control shell for running a mini-cluster")
-      .McpDisposition(Disposition::EXCLUDE)
       .ExtraDescription(extra)
       .AddOptionalParameter("serialization")
       .Build();

@@ -609,9 +609,8 @@ unique_ptr<Mode> BuildClusterMode() {
         "to output detailed information on cluster status even if no "
         "inconsistency is found in metadata.";
 
-    unique_ptr<Action> ksck = ClusterActionBuilder("ksck", &RunKsck)
+    unique_ptr<Action> ksck = ClusterActionBuilder("ksck", &RunKsck, Disposition::SurfaceMetadata())
         .Description(desc)
-        .McpDisposition(Disposition::SURFACE)
         .ExtraDescription(extra_desc)
         .AddOptionalParameter("checksum_cache_blocks")
         .AddOptionalParameter("checksum_scan")
@@ -640,9 +639,9 @@ unique_ptr<Mode> BuildClusterMode() {
         "balance the count of replicas per table on each tablet server, "
         "and after that attempting to balance the total number of replicas "
         "per tablet server.";
-    unique_ptr<Action> rebalance = ClusterActionBuilder("rebalance", &RunRebalance)
+    unique_ptr<Action> rebalance = ClusterActionBuilder("rebalance", &RunRebalance,
+                                                        Disposition::Exclude())
         .Description(desc)
-        .McpDisposition(Disposition::REJECT)
         .ExtraDescription(extra_desc)
         .AddOptionalParameter("disable_cross_location_rebalancing")
         .AddOptionalParameter("disable_intra_location_rebalancing")
@@ -676,9 +675,8 @@ unique_ptr<Mode> BuildClusterMode() {
         "unsafe. The check is a snapshot: tablets whose replicas are being "
         "moved at the time are reported, but the moves are not anticipated.";
     unique_ptr<Action> check =
-        ClusterActionBuilder("check", &RunCheckLocationMaintenance)
+        ClusterActionBuilder("check", &RunCheckLocationMaintenance, Disposition::SurfaceMetadata())
         .Description(desc)
-        .McpDisposition(Disposition::SURFACE)
         .ExtraDescription(extra_desc)
         .AddOptionalParameter("fetch_info_concurrency")
         .AddOptionalParameter("location")

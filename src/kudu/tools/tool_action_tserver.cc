@@ -699,27 +699,25 @@ Status LocationQuiescingStatus(const RunnerContext& context) {
 
 unique_ptr<Mode> BuildTServerMode() {
   unique_ptr<Action> dump_memtrackers =
-      TServerActionBuilder("dump_memtrackers", &TserverDumpMemTrackers)
+      TServerActionBuilder("dump_memtrackers", &TserverDumpMemTrackers,
+                           Disposition::SurfaceMetadata())
       .Description("Dump the memtrackers from a Kudu Tablet Server")
-      .McpDisposition(Disposition::SURFACE)
       .AddOptionalParameter("format")
       .AddOptionalParameter("memtracker_output")
       .Build();
 
   unique_ptr<Action> get_flags =
-      TServerActionBuilder("get_flags", &TServerGetFlags)
+      TServerActionBuilder("get_flags", &TServerGetFlags, Disposition::SurfaceMetadata())
       .Description("Get the gflags for a Kudu Tablet Server")
-      .McpDisposition(Disposition::SURFACE)
       .AddOptionalParameter("all_flags")
       .AddOptionalParameter("flags")
       .AddOptionalParameter("flag_tags")
       .Build();
 
   unique_ptr<Action> run =
-      ActionBuilder("run", &TServerRun)
+      ActionBuilder("run", &TServerRun, Disposition::Exclude())
       .ProgramName("kudu-tserver")
       .Description("Run a Kudu Tablet Server")
-      .McpDisposition(Disposition::REJECT)
       .ExtraDescription("Note: The tablet server is started in this process and "
                         "runs until interrupted.\n\n"
                         "The most common configuration flags are described below. "
@@ -740,9 +738,8 @@ unique_ptr<Mode> BuildTServerMode() {
       .Build();
 
   unique_ptr<Action> set_flag =
-      TServerActionBuilder("set_flag", &TServerSetFlag)
+      TServerActionBuilder("set_flag", &TServerSetFlag, Disposition::Gated())
       .Description("Change a gflag value on a Kudu Tablet Server")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kFlagArg, "Name of the gflag" })
       .AddRequiredParameter({ kValueArg, "New value for the gflag" })
       .AddOptionalParameter("force")
@@ -750,30 +747,26 @@ unique_ptr<Mode> BuildTServerMode() {
       .Build();
 
   unique_ptr<Action> set_flag_for_all =
-      ClusterActionBuilder("set_flag_for_all", &TServerSetAllTServersFlag)
+      ClusterActionBuilder("set_flag_for_all", &TServerSetAllTServersFlag, Disposition::Gated())
       .Description("Change a gflag value for all Kudu Tablet Servers in the cluster")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kFlagArg, "Name of the gflag" })
       .AddRequiredParameter({ kValueArg, "New value for the gflag" })
       .AddOptionalParameter("force")
       .Build();
 
   unique_ptr<Action> status =
-      TServerActionBuilder("status", &TServerStatus)
+      TServerActionBuilder("status", &TServerStatus, Disposition::SurfaceMetadata())
       .Description("Get the status of a Kudu Tablet Server")
-      .McpDisposition(Disposition::SURFACE)
       .Build();
 
   unique_ptr<Action> timestamp =
-      TServerActionBuilder("timestamp", &TServerTimestamp)
+      TServerActionBuilder("timestamp", &TServerTimestamp, Disposition::SurfaceMetadata())
       .Description("Get the current timestamp of a Kudu Tablet Server")
-      .McpDisposition(Disposition::SURFACE)
       .Build();
 
   unique_ptr<Action> list_tservers =
-      ClusterActionBuilder("list", &ListTServers)
+      ClusterActionBuilder("list", &ListTServers, Disposition::SurfaceMetadata())
       .Description("List tablet servers in a Kudu cluster")
-      .McpDisposition(Disposition::SURFACE)
       .AddOptionalParameter("columns", string("uuid,rpc-addresses"),
                             string("Comma-separated list of tserver info fields to "
                                    "include in output.\nPossible values: uuid, "
@@ -783,24 +776,21 @@ unique_ptr<Mode> BuildTServerMode() {
       .Build();
 
   unique_ptr<Action> quiescing_status =
-      TServerActionBuilder("status", &QuiescingStatus)
+      TServerActionBuilder("status", &QuiescingStatus, Disposition::SurfaceMetadata())
       .Description("Output information about the quiescing state of a Tablet "
                    "Server.")
-      .McpDisposition(Disposition::SURFACE)
       .Build();
   unique_ptr<Action> start_quiescing =
-      TServerActionBuilder("start", &StartQuiescingTServer)
+      TServerActionBuilder("start", &StartQuiescingTServer, Disposition::Gated())
       .Description("Start quiescing the given Tablet Server. While a Tablet "
                    "Server is quiescing, Tablet replicas on it will no longer "
                    "attempt to become leader, and new scan requests will be "
                    "retried at other servers.")
-      .McpDisposition(Disposition::GATED)
       .AddOptionalParameter("error_if_not_fully_quiesced")
       .Build();
   unique_ptr<Action> stop_quiescing =
-      TServerActionBuilder("stop", &StopQuiescingTServer)
+      TServerActionBuilder("stop", &StopQuiescingTServer, Disposition::Gated())
       .Description("Stop quiescing a Tablet Server.")
-      .McpDisposition(Disposition::GATED)
       .Build();
   unique_ptr<Mode> quiesce = ModeBuilder("quiesce")
       .Description("Operate on the quiescing state of a Kudu Tablet Server.")
@@ -810,11 +800,10 @@ unique_ptr<Mode> BuildTServerMode() {
       .Build();
 
   unique_ptr<Action> enter_maintenance =
-      ClusterActionBuilder("enter_maintenance", &EnterMaintenance)
+      ClusterActionBuilder("enter_maintenance", &EnterMaintenance, Disposition::Gated())
       .Description("Begin maintenance on the Tablet Server. While under "
                    "maintenance, downtime of the Tablet Server will not lead "
                    "to the immediate re-replication of its tablet replicas.")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kTServerIdArg, kTServerIdDesc })
       .AddOptionalParameter("allow_missing_tserver")
       .Build();
@@ -822,9 +811,8 @@ unique_ptr<Mode> BuildTServerMode() {
   // because if the tserver is missing, the non-existent tserver's state is
   // already NONE and so exit_maintenance is a no-op.
   unique_ptr<Action> exit_maintenance =
-      ClusterActionBuilder("exit_maintenance", &ExitMaintenance)
+      ClusterActionBuilder("exit_maintenance", &ExitMaintenance, Disposition::Gated())
       .Description("End maintenance of the Tablet Server.")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kTServerIdArg, kTServerIdDesc })
       .Build();
   unique_ptr<Mode> state = ModeBuilder("state")
@@ -834,10 +822,9 @@ unique_ptr<Mode> BuildTServerMode() {
       .Build();
 
   unique_ptr<Action> unregister_tserver =
-      ClusterActionBuilder("unregister", &UnregisterTServer)
+      ClusterActionBuilder("unregister", &UnregisterTServer, Disposition::Gated())
           .Description(
               "Unregister a tablet server from the master's in-memory state and system catalog.")
-          .McpDisposition(Disposition::GATED)
           .AddRequiredParameter({kTServerIdArg, kTServerIdDesc})
           .AddOptionalParameter("force_unregister_live_tserver")
           .AddOptionalParameter("remove_tserver_state")
@@ -861,14 +848,13 @@ unique_ptr<Mode> BuildTServerMode() {
 
 unique_ptr<Mode> BuildLocationQuiesceMode() {
   unique_ptr<Action> quiescing_status =
-      ClusterActionBuilder("status", &LocationQuiescingStatus)
+      ClusterActionBuilder("status", &LocationQuiescingStatus, Disposition::SurfaceMetadata())
       .Description("Output information about the quiescing state of every Tablet "
                    "Server in a location.")
-      .McpDisposition(Disposition::SURFACE)
       .AddRequiredParameter({ kLocationArg, kLocationDesc })
       .Build();
   unique_ptr<Action> start_quiescing =
-      ClusterActionBuilder("start", &LocationStartQuiescing)
+      ClusterActionBuilder("start", &LocationStartQuiescing, Disposition::Gated())
       .Description("Start quiescing every Tablet Server in a location. While a "
                    "Tablet Server is quiescing, Tablet replicas on it will no "
                    "longer attempt to become leader, and new scan requests will "
@@ -880,15 +866,13 @@ unique_ptr<Mode> BuildLocationQuiesceMode() {
                         "here. To wait for the location to drain, re-run with "
                         "--error_if_not_fully_quiesced until it succeeds, or watch "
                         "'kudu cluster location quiesce status'.")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kLocationArg, kLocationDesc })
       .AddOptionalParameter("error_if_not_fully_quiesced")
       .AddOptionalParameter("dry_run")
       .Build();
   unique_ptr<Action> stop_quiescing =
-      ClusterActionBuilder("stop", &LocationStopQuiescing)
+      ClusterActionBuilder("stop", &LocationStopQuiescing, Disposition::Gated())
       .Description("Stop quiescing every Tablet Server in a location.")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kLocationArg, kLocationDesc })
       .AddOptionalParameter("dry_run")
       .Build();
@@ -903,7 +887,7 @@ unique_ptr<Mode> BuildLocationQuiesceMode() {
 
 unique_ptr<Mode> BuildLocationStateMode() {
   unique_ptr<Action> enter_maintenance =
-      ClusterActionBuilder("enter_maintenance", &LocationEnterMaintenance)
+      ClusterActionBuilder("enter_maintenance", &LocationEnterMaintenance, Disposition::Gated())
       .Description("Begin maintenance on every Tablet Server in a location. "
                    "While under maintenance, downtime of a Tablet Server will "
                    "not lead to the immediate re-replication of its tablet "
@@ -912,14 +896,12 @@ unique_ptr<Mode> BuildLocationStateMode() {
                         "offline; run 'kudu cluster location check' for that. If it "
                         "fails for any Tablet Server in the location, re-run it "
                         "until it succeeds for all of them.")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kLocationArg, kLocationDesc })
       .AddOptionalParameter("dry_run")
       .Build();
   unique_ptr<Action> exit_maintenance =
-      ClusterActionBuilder("exit_maintenance", &LocationExitMaintenance)
+      ClusterActionBuilder("exit_maintenance", &LocationExitMaintenance, Disposition::Gated())
       .Description("End maintenance of every Tablet Server in a location.")
-      .McpDisposition(Disposition::GATED)
       .AddRequiredParameter({ kLocationArg, kLocationDesc })
       .AddOptionalParameter("dry_run")
       .Build();
